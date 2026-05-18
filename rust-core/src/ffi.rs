@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::fingerprint;
 use crate::serato;
 
 #[derive(Debug, Error)]
@@ -14,6 +15,8 @@ pub enum CoreError {
     IoError { message: String },
     #[error("serato format error: {message}")]
     SeratoFormat { message: String },
+    #[error("fingerprint error: {message}")]
+    Fingerprint { message: String },
 }
 
 impl From<std::io::Error> for CoreError {
@@ -29,6 +32,17 @@ impl From<serato::SeratoError> for CoreError {
                 CoreError::IoError { message: io_err.to_string() }
             }
             other => CoreError::SeratoFormat { message: other.to_string() },
+        }
+    }
+}
+
+impl From<fingerprint::FingerprintError> for CoreError {
+    fn from(err: fingerprint::FingerprintError) -> Self {
+        match err {
+            fingerprint::FingerprintError::Io(io_err) => {
+                CoreError::IoError { message: io_err.to_string() }
+            }
+            other => CoreError::Fingerprint { message: other.to_string() },
         }
     }
 }
@@ -58,4 +72,9 @@ pub fn rewrite_crate_path(
         crate_file.write_to_path(&path)?;
     }
     Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
+}
+
+pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> {
+    let path = PathBuf::from(file_path);
+    Ok(fingerprint::fingerprint_file(&path)?)
 }

@@ -23,13 +23,25 @@ thiserror = "1"
 
 # --- Domain dependencies ---
 # Added incrementally as their respective modules are implemented.
-# Pinned versions will be set when each is first wired up so we don't
-# carry uncompiled dependencies in the workspace.
 #
-# triseratops          — Serato library reader/writer (Pillar A)
-# rusty_chromaprint    — audio fingerprinting (foundation, day 1)
-# symphonia            — audio decoder feeding chromaprint
-# lofty                — broad-format tag I/O (read in SP-1, write in SP-1.5)
+# Serato `.crate` reader/writer is implemented in-house (rust-core/src/
+# serato.rs) — see CLAUDE.md for the AGPL-avoidance rationale.
+
+# Audio fingerprinting (foundation, day 1 — Approach 3 in the design).
+# Pure Rust, MIT-declared via Cargo.toml (note: upstream repo at
+# github.com/darksv/rusty-chromaprint lacks a LICENSE file at time of
+# adoption; we rely on the crates.io declaration).
+rusty-chromaprint = "0.3"
+
+# Audio decoder feeding chromaprint. MPL-2.0 — file-level copyleft,
+# fine for library use without modification. Default features include
+# MP3, FLAC, WAV, Vorbis; extra features pick up the rest of Serato's
+# supported set.
+symphonia = { version = "0.6", features = ["mp3", "aac", "alac", "isomp4", "aiff"] }
+
+# Tag I/O (read in SP-1, write in SP-1.5) — added when the tags module
+# is implemented.
+# lofty = "..."
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

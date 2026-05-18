@@ -20,6 +20,12 @@ namespace crate_agent_core {
   // number of paths that were rewritten.
   [Throws=CoreError]
   u32 rewrite_crate_path(string crate_path, string old_path, string new_path);
+
+  // Decode an audio file and return its Chromaprint perceptual
+  // fingerprint as a sequence of 32-bit hashes. Stable across
+  // re-encodings of the same recording within Chromaprint's tolerance.
+  [Throws=CoreError]
+  sequence<u32> fingerprint_audio_file(string file_path);
 };
 
 // Strongly-typed error surface for Rust → Swift error propagation.
@@ -31,4 +37,5 @@ interface CoreError {
   InvalidInput(string reason);
   IoError(string message);
   SeratoFormat(string message);
+  Fingerprint(string message);
 };
