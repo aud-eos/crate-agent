@@ -73,3 +73,12 @@ targets:
         optional: true
     dependencies:
       - target: CrateAgent
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        # The test target imports CrateAgent, whose Swift module
+        # references the crate_agent_coreFFI C module. The test target
+        # therefore needs the same modulemap and library search paths
+        # the main target has, so Swift can resolve the FFI symbols.
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/build-output"
+        LIBRARY_SEARCH_PATHS: "$(SRCROOT)/build-output"
