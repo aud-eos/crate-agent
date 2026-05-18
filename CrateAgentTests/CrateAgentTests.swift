@@ -2,6 +2,55 @@ import GRDB
 import XCTest
 @testable import CrateAgent
 
+@MainActor
+final class SeratoWatchdogTests: XCTestCase {
+
+    func testReportsNotRunningWhenNoSeratoAppPresent() {
+        let watchdog = SeratoWatchdog(
+            runningBundleIdentifiersProvider: {
+                ["com.apple.Finder", "com.apple.dock", "com.spotify.client"]
+            }
+        )
+        XCTAssertFalse(watchdog.isSeratoRunning)
+    }
+
+    func testReportsRunningWhenSeratoDjProIsPresent() {
+        let watchdog = SeratoWatchdog(
+            runningBundleIdentifiersProvider: {
+                ["com.apple.Finder", "com.serato.djpro"]
+            }
+        )
+        XCTAssertTrue(watchdog.isSeratoRunning)
+    }
+
+    func testRecognizesAnyComSeratoPrefixedApp() {
+        // Forward-compatible: future Serato apps under the same
+        // bundle prefix must trigger the guard without code changes.
+        let watchdog = SeratoWatchdog(
+            runningBundleIdentifiersProvider: {
+                ["com.serato.future-unreleased-app"]
+            }
+        )
+        XCTAssertTrue(watchdog.isSeratoRunning)
+    }
+
+    func testRefreshPicksUpStateChange() {
+        var simulatedRunningApps: [String] = []
+        let watchdog = SeratoWatchdog(
+            runningBundleIdentifiersProvider: { simulatedRunningApps }
+        )
+        XCTAssertFalse(watchdog.isSeratoRunning)
+
+        simulatedRunningApps = ["com.serato.djpro"]
+        watchdog.refresh()
+        XCTAssertTrue(watchdog.isSeratoRunning)
+
+        simulatedRunningApps = []
+        watchdog.refresh()
+        XCTAssertFalse(watchdog.isSeratoRunning)
+    }
+}
+
 final class RustFFIBridgeTests: XCTestCase {
 
     func testCoreVersionReturnsCargoVersionString() throws {
