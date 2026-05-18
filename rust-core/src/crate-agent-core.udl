@@ -21,6 +21,25 @@ namespace crate_agent_core {
   [Throws=CoreError]
   u32 rewrite_crate_path(string crate_path, string old_path, string new_path);
 
+  // Read a Serato `database V2` file from disk and return every track
+  // path it references (the UTF-16BE-decoded `pfil` field inside each
+  // `otrk` container).
+  [Throws=CoreError]
+  sequence<string> read_database_paths(string database_path);
+
+  // Rewrite every `otrk → pfil` entry in the given `database V2` file
+  // whose current value equals `old_path`, replacing it with `new_path`.
+  // Writes the file back if any replacements were made. Returns the
+  // number of paths that were rewritten. Preserves all other per-track
+  // metadata (artist, title, BPM, beatgrid references, etc.) byte-exact.
+  [Throws=CoreError]
+  u32 rewrite_database_path(string database_path, string old_path, string new_path);
+
+  // Number of `otrk` entries in a `database V2` file. Useful for
+  // progress reporting on full library scans.
+  [Throws=CoreError]
+  u32 database_track_count(string database_path);
+
   // Decode an audio file and return its Chromaprint perceptual
   // fingerprint as a sequence of 32-bit hashes. Stable across
   // re-encodings of the same recording within Chromaprint's tolerance.

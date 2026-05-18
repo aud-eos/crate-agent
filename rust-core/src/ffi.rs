@@ -88,6 +88,35 @@ pub fn rewrite_crate_path(
     Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
 }
 
+pub fn read_database_paths(database_path: String) -> Result<Vec<String>, CoreError> {
+    let path = PathBuf::from(database_path);
+    let database = serato::DatabaseV2::read_from_path(&path)?;
+    Ok(database.track_paths())
+}
+
+pub fn rewrite_database_path(
+    database_path: String,
+    old_path: String,
+    new_path: String,
+) -> Result<u32, CoreError> {
+    if old_path == new_path {
+        return Ok(0);
+    }
+    let path = PathBuf::from(database_path);
+    let mut database = serato::DatabaseV2::read_from_path(&path)?;
+    let count = database.rewrite_path(&old_path, &new_path);
+    if count > 0 {
+        database.write_to_path(&path)?;
+    }
+    Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
+}
+
+pub fn database_track_count(database_path: String) -> Result<u32, CoreError> {
+    let path = PathBuf::from(database_path);
+    let database = serato::DatabaseV2::read_from_path(&path)?;
+    Ok(u32::try_from(database.track_count()).expect("track count exceeded u32"))
+}
+
 pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> {
     let path = PathBuf::from(file_path);
     Ok(fingerprint::fingerprint_file(&path)?)
