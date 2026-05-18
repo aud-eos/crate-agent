@@ -9,10 +9,10 @@ import GRDB
 ///
 /// Lives at `~/Library/Application Support/crate-agent/library.sqlite`
 /// at runtime; tests open an in-memory variant via `openInMemory()`.
-public final class Database {
-    public static let shared: Database = {
+public final class LibraryDatabase {
+    public static let shared: LibraryDatabase = {
         do {
-            return try Database.openDefault()
+            return try LibraryDatabase.openDefault()
         } catch {
             // Loud failure per the no-silent-failures invariant.
             // If we cannot open the sidecar DB, the app cannot do
@@ -31,7 +31,7 @@ public final class Database {
 
     /// Open the production database file under Application Support.
     /// Creates the directory and migrates the schema on first launch.
-    public static func openDefault() throws -> Database {
+    public static func openDefault() throws -> LibraryDatabase {
         let applicationSupportUrl = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -48,13 +48,13 @@ public final class Database {
         )
         let databaseUrl = crateAgentDirectory.appendingPathComponent("library.sqlite")
         let pool = try DatabasePool(path: databaseUrl.path)
-        return try Database(writer: pool)
+        return try LibraryDatabase(writer: pool)
     }
 
     /// Open an in-memory database. Used by unit and integration tests.
-    public static func openInMemory() throws -> Database {
+    public static func openInMemory() throws -> LibraryDatabase {
         let queue = try DatabaseQueue()
-        return try Database(writer: queue)
+        return try LibraryDatabase(writer: queue)
     }
 
     private static func runMigrations(_ writer: any DatabaseWriter) throws {
