@@ -2,24 +2,33 @@
 //
 // As features land, new types and functions are declared here; uniffi
 // generates the Swift bindings during the build step.
-//
-// SP-1 surface is intentionally minimal — the bare set needed to prove
-// the FFI bridge works end-to-end (a Swift caller invoking a Rust
-// function and getting a typed response back). Real Serato I/O,
-// fingerprinting, and tag operations are added as those modules are
-// implemented.
 
 namespace crate_agent_core {
   // Liveness check used by the Swift app at startup to verify the Rust
   // core is linked and callable. Returns the core's version string.
   string core_version();
+
+  // Read a Serato `.crate` file from disk and return every track path
+  // it references (the UTF-16BE-decoded `ptrk` field inside each
+  // `otrk` container).
+  [Throws=CoreError]
+  sequence<string> read_crate_paths(string crate_path);
+
+  // Rewrite every `otrk → ptrk` entry in the given `.crate` file whose
+  // current value equals `old_path`, replacing it with `new_path`.
+  // Writes the file back if any replacements were made. Returns the
+  // number of paths that were rewritten.
+  [Throws=CoreError]
+  u32 rewrite_crate_path(string crate_path, string old_path, string new_path);
 };
 
 // Strongly-typed error surface for Rust → Swift error propagation.
-// Variants grow as real operations are added.
+// `interface`-style errors carry per-variant data, so error messages
+// survive the FFI boundary instead of being reduced to a bare name.
 [Error]
-enum CoreError {
-  "NotImplemented",
-  "InvalidInput",
-  "IoError",
+interface CoreError {
+  NotImplemented();
+  InvalidInput(string reason);
+  IoError(string message);
+  SeratoFormat(string message);
 };
