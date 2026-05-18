@@ -10,6 +10,10 @@ struct LibraryBrowserView: View {
                 .font(.title)
             Text("Library browser will live here.")
                 .foregroundStyle(.secondary)
+            Divider().padding(.horizontal, 80)
+            Text("Rust core v\(coreVersion())")
+                .font(.caption.monospaced())
+                .foregroundStyle(.tertiary)
         }
         .frame(minWidth: 800, minHeight: 600)
         .padding()

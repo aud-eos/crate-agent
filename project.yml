@@ -26,7 +26,11 @@ targets:
     sources:
       - path: CrateAgent
         excludes:
-          - "Generated/**"  # uniffi-generated Swift bindings live here once produced
+          # The C header is consumed via SWIFT_OBJC_BRIDGING_HEADER and
+          # the modulemap is wired via HEADER_SEARCH_PATHS; only the
+          # generated .swift file should be compiled into the target.
+          - "Generated/*.h"
+          - "Generated/*.modulemap"
     resources:
       - path: CrateAgent/Resources
         optional: true
