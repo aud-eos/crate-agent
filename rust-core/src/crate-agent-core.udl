@@ -26,6 +26,27 @@ namespace crate_agent_core {
   // re-encodings of the same recording within Chromaprint's tolerance.
   [Throws=CoreError]
   sequence<u32> fingerprint_audio_file(string file_path);
+
+  // Read metadata tags and audio properties from an audio file. All
+  // text fields are optional — real-world files often have partial
+  // metadata. duration_seconds is populated from audio properties
+  // regardless of whether the file carries tags.
+  [Throws=CoreError]
+  AudioTags read_audio_tags(string file_path);
+};
+
+dictionary AudioTags {
+  string? title;
+  string? artist;
+  string? album;
+  string? album_artist;
+  string? genre;
+  u32? year;
+  u32? track_number;
+  u32? total_tracks;
+  f64? bpm;
+  string? comment;
+  u64? duration_seconds;
 };
 
 // Strongly-typed error surface for Rust → Swift error propagation.
@@ -38,4 +59,5 @@ interface CoreError {
   IoError(string message);
   SeratoFormat(string message);
   Fingerprint(string message);
+  Tag(string message);
 };

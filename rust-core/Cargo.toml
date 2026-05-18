@@ -39,9 +39,11 @@ rusty-chromaprint = "0.3"
 # supported set.
 symphonia = { version = "0.6", features = ["mp3", "aac", "alac", "isomp4", "aiff"] }
 
-# Tag I/O (read in SP-1, write in SP-1.5) — added when the tags module
-# is implemented.
-# lofty = "..."
+# Tag I/O (read in SP-1, write in SP-1.5). MIT/Apache-2.0, supports
+# MP3 (ID3v2), M4A/MP4 (iTunes atoms), FLAC/OGG (Vorbis comments),
+# WAV (RIFF INFO + ID3), AIFF (ID3) — covers every format Serato
+# accepts. Unified Accessor API across formats.
+lofty = "0.24"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

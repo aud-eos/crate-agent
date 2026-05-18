@@ -4,6 +4,9 @@ use thiserror::Error;
 
 use crate::fingerprint;
 use crate::serato;
+use crate::tags;
+
+pub use crate::tags::AudioTags;
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -17,6 +20,8 @@ pub enum CoreError {
     SeratoFormat { message: String },
     #[error("fingerprint error: {message}")]
     Fingerprint { message: String },
+    #[error("tag error: {message}")]
+    Tag { message: String },
 }
 
 impl From<std::io::Error> for CoreError {
@@ -43,6 +48,15 @@ impl From<fingerprint::FingerprintError> for CoreError {
                 CoreError::IoError { message: io_err.to_string() }
             }
             other => CoreError::Fingerprint { message: other.to_string() },
+        }
+    }
+}
+
+impl From<tags::TagError> for CoreError {
+    fn from(err: tags::TagError) -> Self {
+        match err {
+            tags::TagError::Io(io_err) => CoreError::IoError { message: io_err.to_string() },
+            other => CoreError::Tag { message: other.to_string() },
         }
     }
 }
@@ -77,4 +91,9 @@ pub fn rewrite_crate_path(
 pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> {
     let path = PathBuf::from(file_path);
     Ok(fingerprint::fingerprint_file(&path)?)
+}
+
+pub fn read_audio_tags(file_path: String) -> Result<AudioTags, CoreError> {
+    let path = PathBuf::from(file_path);
+    Ok(tags::read_tags(&path)?)
 }
