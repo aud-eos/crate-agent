@@ -41,7 +41,7 @@ lipo -create \
 echo "==> Generating Swift FFI bindings"
 mkdir -p "$SWIFT_GENERATED_DIR"
 (cd "$RUST_DIR" && cargo run $CARGO_FLAGS --bin uniffi-bindgen -- \
-    generate crate-agent-core.udl \
+    generate src/crate-agent-core.udl \
     --language swift \
     --out-dir "$SWIFT_GENERATED_DIR")
 
