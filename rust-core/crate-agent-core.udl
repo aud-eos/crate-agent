@@ -1,0 +1,25 @@
+// Interface definition for the Rust core, consumed by Swift via uniffi.
+//
+// As features land, new types and functions are declared here; uniffi
+// generates the Swift bindings during the build step.
+//
+// SP-1 surface is intentionally minimal — the bare set needed to prove
+// the FFI bridge works end-to-end (a Swift caller invoking a Rust
+// function and getting a typed response back). Real Serato I/O,
+// fingerprinting, and tag operations are added as those modules are
+// implemented.
+
+namespace crate_agent_core {
+  // Liveness check used by the Swift app at startup to verify the Rust
+  // core is linked and callable. Returns the core's version string.
+  string core_version();
+};
+
+// Strongly-typed error surface for Rust → Swift error propagation.
+// Variants grow as real operations are added.
+[Error]
+enum CoreError {
+  "NotImplemented",
+  "InvalidInput",
+  "IoError",
+};

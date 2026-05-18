@@ -1,0 +1,38 @@
+[package]
+name = "crate-agent-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "crate_agent_core"
+# staticlib: linkable into the Swift app via XCFramework / direct static lib
+# rlib: enables Rust-side unit tests
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# FFI surface — uniffi generates Swift bindings from crate-agent-core.udl
+uniffi = { version = "0.28", features = ["cli"] }
+
+# Serialization for FFI payload types and event-log inverse payloads
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error types
+thiserror = "1"
+
+# --- Domain dependencies ---
+# Added incrementally as their respective modules are implemented.
+# Pinned versions will be set when each is first wired up so we don't
+# carry uncompiled dependencies in the workspace.
+#
+# triseratops          — Serato library reader/writer (Pillar A)
+# rusty_chromaprint    — audio fingerprinting (foundation, day 1)
+# symphonia            — audio decoder feeding chromaprint
+# lofty                — broad-format tag I/O (read in SP-1, write in SP-1.5)
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[dev-dependencies]
+# Test utilities go here as tests are written

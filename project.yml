@@ -1,0 +1,71 @@
+name: CrateAgent
+options:
+  bundleIdPrefix: com.crateagent
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    DEVELOPMENT_TEAM: ""  # Set to your Apple Developer team ID for signed builds
+
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "6.29.0"
+
+targets:
+  CrateAgent:
+    type: application
+    platform: macOS
+    sources:
+      - path: CrateAgent
+        excludes:
+          - "Generated/**"  # uniffi-generated Swift bindings live here once produced
+    resources:
+      - path: CrateAgent/Resources
+        optional: true
+    dependencies:
+      - package: GRDB
+        product: GRDB
+      # Rust static library produced by scripts/build-rust.sh
+      - framework: build-output/libcrate_agent_core.a
+        embed: false
+        optional: true
+    info:
+      path: CrateAgent/Info.plist
+      properties:
+        CFBundleDisplayName: crate-agent
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSApplicationCategoryType: public.app-category.utilities
+        LSUIElement: false  # window app with dock icon, not menu-bar-only
+        NSHumanReadableCopyright: ""
+        NSAppleMusicUsageDescription: "crate-agent reads and updates your Serato DJ library and audio files."
+    entitlements:
+      path: CrateAgent/CrateAgent.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        # SP-1 deliberately runs outside the App Sandbox: we need
+        # broad read/write access to ~/Music, ~/Music/_Serato_, and
+        # external drives. Revisit for Mac App Store distribution.
+    settings:
+      base:
+        OTHER_LDFLAGS: "-lc++"
+        LIBRARY_SEARCH_PATHS: "$(SRCROOT)/build-output"
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/build-output"
+        SWIFT_OBJC_BRIDGING_HEADER: "CrateAgent/Generated/crate_agent_coreFFI.h"
+
+  CrateAgentTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: CrateAgentTests
+        optional: true
+    dependencies:
+      - target: CrateAgent

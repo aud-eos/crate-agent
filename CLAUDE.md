@@ -1,0 +1,92 @@
+# CLAUDE.md — crate-agent
+
+Project-level guidance for Claude Code working on this repository.
+
+## What this project is
+
+A macOS-native Serato DJ library management companion. Read [`README.md`](./README.md) and [`design-plan.md`](./design-plan.md) before making non-trivial changes — the design plan documents architectural decisions that are *intentional and not up for re-litigation* without explicit discussion.
+
+## Invariants — the load-bearing rules
+
+These are the rules whose violation has bitten (or would bite) someone writing different code in this repo. Following them is not optional. If a change requires breaking one, raise it in the PR — do not silently work around.
+
+### 1. All state changes go through `applyMutation`
+
+The "apply track mutation" primitive in `OperationEngine` is the single chokepoint for every state-changing operation: rename, tag set, find/replace, MusicBrainz match, re-encode. Each new feature **adds a mutation type**, it does not add a new code path.
+
+Why this exists: without the chokepoint, every feature reinvents (a) the Serato-running guard, (b) the SQLite transaction, (c) the event log entry. Two of those three would always get forgotten. The chokepoint guarantees consistency.
+
+How to apply: when adding a new feature that modifies tracks, add a `TrackMutation` case and implement its apply / inverse logic. Do not write a parallel path that goes around `OperationEngine`.
+
+### 2. Every mutation logs an event with an inverse payload
+
+The `events` table is append-only and serves two queries:
+
+- Undo: `SELECT * FROM events WHERE batch_id = ? ORDER BY event_id DESC` → apply inverse_payload in order
+- Per-file history: `SELECT * FROM events WHERE file_id = ? ORDER BY timestamp DESC`
+
+Every mutation MUST write both `payload_json` (forward) and `inverse_payload_json` (reverse). Without the inverse, undo is broken. Without the event, history is broken.
+
+How to apply: when writing a new mutation, the inverse computation is part of the spec, not an afterthought. If the inverse is hard (e.g., re-encoding loses data), state explicitly how undo works (e.g., "restore from archive folder if still present, else fail").
+
+### 3. Serato library files are never written while Serato is running
+
+`SeratoWatchdog` observes Serato's running state. When Serato is running, writes to `~/Music/_Serato_/*.crate` and database files MUST queue, not proceed. Filesystem-level operations (moving files) can still proceed; only the Serato library update is deferred.
+
+Why this exists: Serato caches the library in memory and overwrites the disk version when it saves. Any write we make while Serato is running gets silently overwritten when Serato next saves. From the user's perspective: their changes vanish at random.
+
+How to apply: anything touching `~/Music/_Serato_/` goes through `OperationEngine`, which routes through `SeratoWatchdog`. Never write directly to `_Serato_` files from another code path.
+
+### 4. Track identity is Chromaprint, not path
+
+`tracks.fingerprint_hash` is the canonical track identity. `files.path` is just a label — it's how humans refer to files; it's how Serato refers to files; it is not how `crate-agent` refers to recordings.
+
+Why this exists: paths change (rename, move, re-encode); fingerprints don't (within Chromaprint's perceptual tolerance). If we used path-as-identity, every feature past sub-project 1 would break the moment a user renamed a track.
+
+How to apply: new features that need to refer to "the same recording" should use `track_id`, not `path` or `file_id`. The `files ←→ tracks` relationship is many-to-one (multiple files can encode the same recording — FLAC and MP3 of the same song); use the right side of that relationship.
+
+### 5. The folder layout is artist-first-letter, hardcoded
+
+`<MusicFolder>/<Letter>/<filename>.ext` — single-letter buckets by the normalized first letter of the artist. **No configurable folder template in SP-1.** The normalizer (strip articles, normalize numerics, strip symbols) lives in `ArtistLetterNormalizer.swift` and is the single source of truth for the letter assignment.
+
+Why this exists: the project owner's personal organizational scheme, and a deliberate YAGNI — building a full folder-template engine is real work, building artist-first-letter bucketing is a 100-line function. Multi-user configurability is a Pillar C concern, not a foundation concern.
+
+How to apply: do not introduce a path-template system in SP-1, SP-1.5, SP-2, or SP-3. When `ArtistLetterNormalizer` edge cases arise (Unicode normalization, hieroglyphic artist names, etc.), extend the normalizer rather than escaping the bucketing scheme.
+
+### 6. Filename templates are user-configurable (separate from folder layout)
+
+Filename portion only — Beets-style `$artist - $title ($mixtype).mp3`. The folder portion (rule 5) is not part of this template. Sanitization for filesystem-illegal characters happens in `FilenameTemplateEngine`.
+
+### 7. No multi-machine library portability
+
+Backup (Flavor 1) and sidecar-DB sync (Flavor 3) are in scope. **Cross-machine library portability (Flavor 2) is explicitly out of scope** — we do not build path translation layers, drive-relative path rewrites, or USB-stick portable libraries. Serato's absolute-path model is accepted as a constraint.
+
+Why this exists: a path-translation layer is a major engineering effort that would bloat the foundation. The project owner is one person on one main Mac with an external backup. Solve the actual problem, not the abstract one.
+
+## Conventions
+
+- **Variable naming:** descriptive. No single-character identifiers — even in lambdas/callbacks. (`post` not `p`, `index` not `i`.)
+- **Comments:** default to none. Only when the *why* is non-obvious. Never explain *what* the code does.
+- **No `eslint-disable` / similar lint bypasses.** Fix the underlying code.
+- **No environment-variable fallback values.** Assert at module level that required vars exist; fail fast.
+- **No silent failures.** Reject unknown fields, throw on unexpected states. Loud failures > silent bugs.
+- **Run formatter before committing.** `cargo fmt` for Rust, `swiftformat` (or Xcode's built-in) for Swift.
+
+## Build commands
+
+```
+# Rust core (run from repo root)
+./scripts/build-rust.sh         # universal static lib for arm64+x86_64
+cargo test --manifest-path rust-core/Cargo.toml   # Rust unit tests
+
+# Xcode project
+xcodegen generate                # regenerate .xcodeproj from project.yml
+xcodebuild -scheme CrateAgent test  # run Swift tests
+```
+
+## Where things live
+
+- **Design plan:** [`design-plan.md`](./design-plan.md) — read before significant changes
+- **Architectural primitives:** `CrateAgent/Services/OperationEngine.swift` (mutation primitive), `CrateAgent/Services/SeratoWatchdog.swift` (running-state guard), `CrateAgent/Database/Database.swift` (event log + schema)
+- **Rust FFI surface:** `rust-core/crate-agent-core.udl` (interface definitions), `rust-core/src/ffi.rs` (implementations)
+- **Sub-project sketches:** see `design-plan.md` § "Sketches: SP-1.5, SP-2, SP-3"
