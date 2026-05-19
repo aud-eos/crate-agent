@@ -2230,3 +2230,175 @@ private final class ConcurrencyCounter: @unchecked Sendable {
         running -= 1
     }
 }
+
+final class ArtistLetterNormalizerTests: XCTestCase {
+
+    func testStripsLeadingArticleCaseInsensitive() {
+        XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "The Beatles"), "Beatles")
+        XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "THE Doors"), "Doors")
+        XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "the Strokes"), "Strokes")
+        XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "A Tribe Called Quest"),
+                       "Tribe Called Quest")
+        XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "An American Tail"),
+                       "American Tail")
+    }
+
+    func testKeepsArtistsWhoseNameStartsWithArticleLetters() {
+        // "Anthrax" must not have its "An " stripped — the article
+        // rule is space-bounded.
+        XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "Anthrax"), "Anthrax")
+        XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "The"), "The")
+    }
+
+    func testBucketLetterForPlainAlphabeticArtist() {
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "Aphex Twin"), "A")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "Zomby"), "Z")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "madlib"), "M",
+                       "lowercase input must uppercase to the same bucket")
+    }
+
+    func testBucketLetterStripsLeadingArticle() {
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "The Beatles"), "B")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "A Tribe Called Quest"), "T")
+    }
+
+    func testBucketLetterForLeadingDigit() {
+        // From the design plan: 2Pac → T (Two).
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "2Pac"), "T")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "311"), "T",
+                       "leading digit takes priority — '3' → 'Three' → 'T'")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "50 Cent"), "F",
+                       "leading '5' → 'Five' → 'F'")
+    }
+
+    func testBucketLetterForLeadingSymbolLeetspeak() {
+        // From the design plan: $uicideboy$ → S.
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "$uicideboy$"), "S")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "@ndrew"), "A",
+                       "@ visually substitutes for A")
+    }
+
+    func testBucketLetterFallsBackToHashWhenNoLetterDerivable() {
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: ""), "#")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "   "), "#")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: nil), "#")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "~~~"), "#",
+                       "all-symbol artist with no known leetspeak → unknown bucket")
+    }
+
+    func testBucketLetterSkipsUnknownSymbolsAndFindsFirstLetter() {
+        // Underscores, parens, etc. that don't have leetspeak mappings
+        // should be skipped so the first real letter wins.
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "(Sandy) Alex G"), "S")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "...And You Will Know Us"),
+                       "A")
+    }
+}
+
+final class FilenameTemplateEngineTests: XCTestCase {
+
+    private let sampleMetadata = SeratoMetadata(
+        artist: "Aphex Twin",
+        title: "Windowlicker",
+        album: "Windowlicker EP",
+        genre: "IDM",
+        bpm: "126.000",
+        musicalKey: "Am",
+        comment: "twelve-bar",
+        length: "06:07",
+        label: "Warp"
+    )
+
+    func testRendersBasicSubstitution() {
+        let rendered = FilenameTemplateEngine.render(
+            template: "$artist - $title.$ext",
+            metadata: sampleMetadata,
+            fileExtension: "mp3"
+        )
+        XCTAssertEqual(rendered, "Aphex Twin - Windowlicker.mp3")
+    }
+
+    func testRendersAllSupportedFields() {
+        let rendered = FilenameTemplateEngine.render(
+            template: "$artist | $album | $genre | $bpm | $key | $length | $label | $comment",
+            metadata: sampleMetadata,
+            fileExtension: "mp3"
+        )
+        // Serato stores `length` as "06:07" with a literal colon, but
+        // `:` is a legacy filesystem hazard on macOS (Finder still
+        // rewrites it to `/` for display, and HFS+ disallowed it
+        // outright). The sanitizer replaces it with `_` — this test
+        // also pins that behavior.
+        XCTAssertEqual(
+            rendered,
+            "Aphex Twin | Windowlicker EP | IDM | 126.000 | Am | 06_07 | Warp | twelve-bar"
+        )
+    }
+
+    func testMissingMetadataFieldRendersAsEmpty() {
+        let sparseMetadata = SeratoMetadata(artist: "Boards of Canada")
+        let rendered = FilenameTemplateEngine.render(
+            template: "$artist - $title.$ext",
+            metadata: sparseMetadata,
+            fileExtension: "flac"
+        )
+        XCTAssertEqual(rendered, "Boards of Canada - .flac",
+                       "missing title renders as empty — caller handles the result")
+    }
+
+    func testUnknownIdentifierRendersAsEmpty() {
+        let rendered = FilenameTemplateEngine.render(
+            template: "$artist - $nonexistent",
+            metadata: sampleMetadata,
+            fileExtension: "mp3"
+        )
+        XCTAssertEqual(rendered, "Aphex Twin - ")
+    }
+
+    func testDoubleDollarRendersLiteralDollar() {
+        let rendered = FilenameTemplateEngine.render(
+            template: "$$$artist",
+            metadata: sampleMetadata,
+            fileExtension: "mp3"
+        )
+        XCTAssertEqual(rendered, "$Aphex Twin")
+    }
+
+    func testSanitizesFilesystemIllegalCharacters() {
+        let dangerousMetadata = SeratoMetadata(
+            artist: "AC/DC",
+            title: "Back: In * Black?"
+        )
+        let rendered = FilenameTemplateEngine.render(
+            template: "$artist - $title",
+            metadata: dangerousMetadata,
+            fileExtension: "mp3"
+        )
+        XCTAssertEqual(
+            rendered, "AC_DC - Back_ In _ Black_",
+            "/, :, *, ? must all be replaced with _ so the filename can't escape its folder"
+        )
+    }
+
+    func testPreservesUnicodeAndWhitespace() {
+        let rendered = FilenameTemplateEngine.render(
+            template: "$artist - $title",
+            metadata: SeratoMetadata(artist: "Sigur Rós", title: "Hoppípolla"),
+            fileExtension: "mp3"
+        )
+        XCTAssertEqual(rendered, "Sigur Rós - Hoppípolla",
+                       "non-ASCII letters and spaces must pass through")
+    }
+
+    func testTrailingDollarSignIsLiteral() {
+        // `$` at end-of-string with no identifier should not crash;
+        // readIdentifier returns empty, substitute returns empty,
+        // engine moves on.
+        let rendered = FilenameTemplateEngine.render(
+            template: "track $",
+            metadata: sampleMetadata,
+            fileExtension: "mp3"
+        )
+        XCTAssertEqual(rendered, "track ")
+    }
+}
