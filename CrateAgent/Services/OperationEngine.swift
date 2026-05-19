@@ -15,18 +15,27 @@ import GRDB
 ///      always reflects the user's intent even when Serato hasn't
 ///      seen the change yet.
 ///
-/// Mutations supported in SP-1 v2:
-///   - `indexNewFile`  : insert a file row, log event (no Serato write)
-///   - `renameFile`    : update file's path, log event, rewrite every
-///                       `.crate` referencing the old path, plus the
-///                       `database V2` file. Serato writes use the FFI
-///                       functions exposed by the Rust core.
+/// Mutations supported in SP-1:
+///   - `indexNewFile`              : insert a file row, log event
+///   - `renameFile`                : update path, rewrite Serato refs
+///   - `setMetadata`               : update file's metadata snapshot
+///                                   from Serato (no Serato write —
+///                                   used by the reload flow)
+///   - `commitMetadataToSerato`    : write metadata into Serato's
+///                                   database V2 (no DB update —
+///                                   assumes DB is already current).
+///                                   Gated by SeratoWatchdog like
+///                                   renames.
 public actor OperationEngine {
 
     private let database: LibraryDatabase
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
-    private var pendingSeratoRenames: [SeratoPendingRename] = []
+
+    /// Pending writes to Serato library files. Either a path
+    /// rewrite or a metadata update. Drained when Serato exits via
+    /// `drainPendingSeratoUpdates`.
+    private var pendingSeratoWrites: [SeratoPendingWrite] = []
 
     /// Backing subject for `queueDepthPublisher`. CurrentValueSubject
     /// emits the latest value on subscribe, so UI bindings render
@@ -35,7 +44,7 @@ public actor OperationEngine {
     /// domain.
     private let queueDepthSubject = CurrentValueSubject<Int, Never>(0)
 
-    /// Observable stream of `pendingSeratoRenames.count`. Emits a new
+    /// Observable stream of `pendingSeratoWrites.count`. Emits a new
     /// value after every enqueue and every drain step. UI subscribers
     /// (e.g., the menu bar status item) display "N changes pending."
     public nonisolated var queueDepthPublisher: AnyPublisher<Int, Never> {
@@ -69,34 +78,44 @@ public actor OperationEngine {
             try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
         }
 
-        if let seratoRename = executionResult.seratoRename {
+        if let pendingWrite = executionResult.seratoWrite {
             let isSeratoRunning = await seratoWatchdog.isSeratoRunning
             if isSeratoRunning {
-                pendingSeratoRenames.append(seratoRename)
-                queueDepthSubject.send(pendingSeratoRenames.count)
+                pendingSeratoWrites.append(pendingWrite)
+                queueDepthSubject.send(pendingSeratoWrites.count)
             } else {
-                try await applySeratoRename(seratoRename)
+                try await applySeratoWrite(pendingWrite)
             }
         }
 
         return executionResult.eventId
     }
 
-    /// Number of Serato-side rewrites queued because Serato was
-    /// running at apply time. Surfaced for UI ("M changes pending").
-    public var pendingSeratoRenameCount: Int {
-        pendingSeratoRenames.count
+    /// Number of Serato library writes (renames + metadata updates)
+    /// currently queued because Serato was running at apply time.
+    /// Surfaced for UI ("M changes pending").
+    public var pendingSeratoWriteCount: Int {
+        pendingSeratoWrites.count
     }
 
-    /// Apply every queued Serato rewrite. Call this when Serato has
+    /// Apply every queued Serato write. Call this when Serato has
     /// just exited (the SeratoSyncCoordinator drives this). Drains
     /// the queue oldest-first and stops at the first failure, leaving
     /// the remaining entries queued for retry.
     public func drainPendingSeratoUpdates() async throws {
-        while let next = pendingSeratoRenames.first {
-            try await applySeratoRename(next)
-            pendingSeratoRenames.removeFirst()
-            queueDepthSubject.send(pendingSeratoRenames.count)
+        while let next = pendingSeratoWrites.first {
+            try await applySeratoWrite(next)
+            pendingSeratoWrites.removeFirst()
+            queueDepthSubject.send(pendingSeratoWrites.count)
+        }
+    }
+
+    private func applySeratoWrite(_ write: SeratoPendingWrite) async throws {
+        switch write {
+        case .rename(let rename):
+            try await applySeratoRename(rename)
+        case .metadataUpdate(let update):
+            try await applySeratoMetadataUpdate(update)
         }
     }
 
@@ -150,11 +169,48 @@ public actor OperationEngine {
         }
     }
 
+    private func applySeratoMetadataUpdate(_ update: SeratoPendingMetadataUpdate) async throws {
+        let databaseV2Path = seratoLocator.databaseV2Url.path
+        guard FileManager.default.fileExists(atPath: databaseV2Path) else {
+            // No database V2 exists yet — Serato has never run on
+            // this machine. The metadata update is a no-op (nothing
+            // for Serato to "see").
+            return
+        }
+
+        let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
+            fromAbsolute: update.absolutePath
+        )
+
+        do {
+            _ = try updateDatabaseRecord(
+                databasePath: databaseV2Path,
+                trackPath: seratoRelativePath,
+                update: SeratoMetadataUpdate(
+                    artist: update.metadata.artist,
+                    title: update.metadata.title,
+                    album: update.metadata.album,
+                    genre: update.metadata.genre,
+                    bpm: update.metadata.bpm,
+                    key: update.metadata.musicalKey,
+                    comment: update.metadata.comment,
+                    length: update.metadata.length,
+                    label: update.metadata.label
+                )
+            )
+        } catch {
+            throw OperationEngineError.seratoRewriteFailed(
+                path: databaseV2Path,
+                underlying: String(describing: error)
+            )
+        }
+    }
+
     // MARK: - Synchronous SQL apply
 
     private struct ExecutionResult: Sendable {
         let eventId: Int64
-        let seratoRename: SeratoPendingRename?
+        let seratoWrite: SeratoPendingWrite?
     }
 
     private static func executeAndLog(
@@ -168,17 +224,28 @@ public actor OperationEngine {
             let eventId = try applyIndexNewFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
-            return ExecutionResult(eventId: eventId, seratoRename: nil)
+            return ExecutionResult(eventId: eventId, seratoWrite: nil)
         case .renameFile(let payload):
             let (eventId, seratoRename) = try applyRenameFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
-            return ExecutionResult(eventId: eventId, seratoRename: seratoRename)
+            return ExecutionResult(
+                eventId: eventId,
+                seratoWrite: .rename(seratoRename)
+            )
         case .setMetadata(let payload):
             let eventId = try applySetMetadata(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
-            return ExecutionResult(eventId: eventId, seratoRename: nil)
+            return ExecutionResult(eventId: eventId, seratoWrite: nil)
+        case .commitMetadataToSerato(let payload):
+            let (eventId, seratoUpdate) = try applyCommitMetadataToSerato(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(
+                eventId: eventId,
+                seratoWrite: .metadataUpdate(seratoUpdate)
+            )
         }
     }
 
@@ -317,6 +384,42 @@ public actor OperationEngine {
         return (eventId, seratoRename)
     }
 
+    private static func applyCommitMetadataToSerato(
+        _ payload: CommitMetadataToSeratoPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, SeratoPendingMetadataUpdate) {
+        guard let fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+
+        // The forward payload journals the metadata being pushed to
+        // Serato. There's no inverse "previous Serato state" we
+        // could capture here (we don't read Serato's current state
+        // during apply — and it would race against Serato's own
+        // writes anyway). The inverse payload is a copy of the
+        // forward payload as a placeholder; full undo of a
+        // commitMetadataToSerato is "re-issue with the user's
+        // previous metadata," and the previous metadata is recorded
+        // in the prior `setMetadata` event in the same batch.
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .metadataCommittedToSerato,
+            forwardPayload: payload,
+            inversePayload: payload,
+            in: db
+        )
+
+        let pending = SeratoPendingMetadataUpdate(
+            absolutePath: fileRecord.path,
+            metadata: payload.metadata
+        )
+        return (eventId, pending)
+    }
+
     private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
         batchId: String,
         timestamp: Int64,
@@ -360,6 +463,7 @@ public enum TrackMutation: Sendable {
     case indexNewFile(IndexNewFilePayload)
     case renameFile(RenameFilePayload)
     case setMetadata(SetMetadataPayload)
+    case commitMetadataToSerato(CommitMetadataToSeratoPayload)
 }
 
 public struct IndexNewFilePayload: Codable, Sendable, Equatable {
@@ -448,6 +552,25 @@ public struct SetMetadataPayload: Codable, Sendable, Equatable {
     }
 }
 
+/// Writes the specified metadata fields into Serato's `database V2`
+/// for the file. Does NOT touch crate-agent's DB (the caller should
+/// have already run `setMetadata` first). Gated by SeratoWatchdog —
+/// queued while Serato is running, applied when Serato exits.
+///
+/// Typically batched with a `setMetadata` mutation under the same
+/// batch_id when the user edits metadata in crate-agent's UI: the
+/// setMetadata updates crate-agent's snapshot, the
+/// commitMetadataToSerato propagates the change to Serato.
+public struct CommitMetadataToSeratoPayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public let metadata: SeratoMetadata
+
+    public init(fileId: Int64, metadata: SeratoMetadata) {
+        self.fileId = fileId
+        self.metadata = metadata
+    }
+}
+
 public struct RenameFilePayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public let newPath: String
@@ -468,13 +591,31 @@ public struct RemoveFilePayload: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - Queue types
+
+/// A Serato library write that's queued because Serato was running
+/// at the time the mutation was applied. Drained by
+/// `drainPendingSeratoUpdates` when Serato exits.
+enum SeratoPendingWrite: Sendable, Equatable {
+    case rename(SeratoPendingRename)
+    case metadataUpdate(SeratoPendingMetadataUpdate)
+}
+
 /// A Serato-side rewrite scheduled by `renameFile`. Carries absolute
-/// paths; `applySeratoRename` converts them to the Serato-relative
+/// paths; the rename application converts them to the Serato-relative
 /// form (`/Users/x/Music/...` → `Users/x/Music/...`) before calling
 /// the FFI rewrite functions.
 struct SeratoPendingRename: Sendable, Equatable {
     let oldAbsolutePath: String
     let newAbsolutePath: String
+}
+
+/// A Serato-side metadata update scheduled by
+/// `commitMetadataToSerato`. Carries the absolute path of the file
+/// and the new metadata to write into Serato's `database V2`.
+struct SeratoPendingMetadataUpdate: Sendable, Equatable {
+    let absolutePath: String
+    let metadata: SeratoMetadata
 }
 
 // MARK: - Errors
