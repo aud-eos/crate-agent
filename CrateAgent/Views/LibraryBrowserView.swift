@@ -12,6 +12,8 @@ struct LibraryBrowserView: View {
     @State private var isDropTargeted: Bool = false
     @State private var lastImportSummary: String?
     @State private var showHistorySheet: Bool = false
+    @State private var renameTarget: FileRecord?
+    @State private var selectedFileIds: Set<FileRecord.ID> = []
 
     private var filteredSortedFiles: [FileRecord] {
         let filtered: [FileRecord]
@@ -63,6 +65,10 @@ struct LibraryBrowserView: View {
         }
         .sheet(isPresented: $showHistorySheet) {
             HistoryView()
+                .environmentObject(services)
+        }
+        .sheet(item: $renameTarget) { fileToRename in
+            RenameDialogView(file: fileToRename)
                 .environmentObject(services)
         }
     }
@@ -138,7 +144,7 @@ struct LibraryBrowserView: View {
 
     @ViewBuilder
     private var tableSection: some View {
-        Table(filteredSortedFiles, sortOrder: $sortOrder) {
+        Table(filteredSortedFiles, selection: $selectedFileIds, sortOrder: $sortOrder) {
             TableColumn("Artist", value: \.artistOrEmpty) { file in
                 Text(file.artist ?? "—")
                     .foregroundStyle(file.artist == nil ? .tertiary : .primary)
@@ -186,6 +192,19 @@ struct LibraryBrowserView: View {
             .width(min: 140, ideal: 240)
         }
         .searchable(text: $searchText, prompt: "Filter by artist, title, album, or path…")
+        .contextMenu(forSelectionType: FileRecord.ID.self) { selectedIds in
+            if let singleId = selectedIds.first, selectedIds.count == 1,
+               let file = filteredSortedFiles.first(where: { $0.id == singleId }) {
+                Button("Rename…") {
+                    renameTarget = file
+                }
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [URL(fileURLWithPath: file.path)]
+                    )
+                }
+            }
+        }
     }
 
     @ViewBuilder
