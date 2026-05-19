@@ -2402,3 +2402,106 @@ final class FilenameTemplateEngineTests: XCTestCase {
         XCTAssertEqual(rendered, "track ")
     }
 }
+
+final class RenameDestinationPlannerTests: XCTestCase {
+
+    private let musicFolder = URL(fileURLWithPath: "/Users/test/Music", isDirectory: true)
+
+    private func makeFile(
+        path: String = "/Users/test/Music/A/old.mp3",
+        artist: String? = "Aphex Twin",
+        title: String? = "Windowlicker"
+    ) -> FileRecord {
+        FileRecord(
+            id: 1,
+            path: path,
+            volumeUuid: "v1",
+            inode: 1,
+            fileSize: 1024,
+            mtime: 1,
+            artist: artist,
+            title: title
+        )
+    }
+
+    func testDestinationCombinesBucketLetterAndRenderedFilename() {
+        let destination = RenameDestinationPlanner.destination(
+            forFile: makeFile(),
+            musicFolder: musicFolder,
+            template: "$artist - $title.$ext"
+        )
+        XCTAssertEqual(
+            destination.path,
+            "/Users/test/Music/A/Aphex Twin - Windowlicker.mp3"
+        )
+    }
+
+    func testDestinationUsesArticleStrippedBucket() {
+        // "The Beatles" → bucket B, filename keeps the literal artist.
+        let destination = RenameDestinationPlanner.destination(
+            forFile: makeFile(artist: "The Beatles", title: "Hey Jude"),
+            musicFolder: musicFolder,
+            template: "$artist - $title.$ext"
+        )
+        XCTAssertEqual(
+            destination.path,
+            "/Users/test/Music/B/The Beatles - Hey Jude.mp3"
+        )
+    }
+
+    func testDestinationPreservesExtensionFromSourcePath() {
+        // Source path has .flac; the destination must also be .flac.
+        let destination = RenameDestinationPlanner.destination(
+            forFile: makeFile(
+                path: "/Users/test/Music/Sub/lossless.flac",
+                artist: "Boards of Canada",
+                title: "Roygbiv"
+            ),
+            musicFolder: musicFolder,
+            template: "$artist - $title.$ext"
+        )
+        XCTAssertEqual(
+            destination.path,
+            "/Users/test/Music/B/Boards of Canada - Roygbiv.flac"
+        )
+    }
+
+    func testDestinationFallsBackToHashBucketForEmptyArtist() {
+        let destination = RenameDestinationPlanner.destination(
+            forFile: makeFile(artist: nil, title: "Untitled"),
+            musicFolder: musicFolder,
+            template: "$artist - $title.$ext"
+        )
+        XCTAssertTrue(
+            destination.path.contains("/#/"),
+            "missing artist must route to the # fallback bucket — got '\(destination.path)'"
+        )
+    }
+}
+
+final class UserPreferencesFilenameTemplateTests: XCTestCase {
+
+    private let key = "FilenameTemplate"
+
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: key)
+        super.tearDown()
+    }
+
+    func testFilenameTemplateDefaultsWhenUnset() {
+        XCTAssertEqual(
+            UserPreferences.filenameTemplate,
+            UserPreferences.defaultFilenameTemplate
+        )
+    }
+
+    func testFilenameTemplateRoundTripsSavedValue() {
+        UserPreferences.filenameTemplate = "$artist · $title.$ext"
+        XCTAssertEqual(UserPreferences.filenameTemplate, "$artist · $title.$ext")
+    }
+}

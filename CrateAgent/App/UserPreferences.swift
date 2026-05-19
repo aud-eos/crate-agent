@@ -69,8 +69,25 @@ public enum UserPreferences {
         UserDefaults.standard.set(UInt64(eventId), forKey: key)
     }
 
+    /// Default template used by the manual rename dialog. Beets-style
+    /// `$field` syntax; see FilenameTemplateEngine. The user-saved
+    /// override (if any) takes precedence; both forms always include
+    /// the extension via `$ext` so renames don't accidentally drop it.
+    public static let defaultFilenameTemplate = "$artist - $title.$ext"
+
+    public static var filenameTemplate: String {
+        get {
+            UserDefaults.standard.string(forKey: Key.filenameTemplate)
+                ?? defaultFilenameTemplate
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: Key.filenameTemplate)
+        }
+    }
+
     enum Key {
         static let watchedMusicFolderPath = "WatchedMusicFolderPath"
         static let lastFSEventIdPrefix = "LastFSEventId:"
+        static let filenameTemplate = "FilenameTemplate"
     }
 }
