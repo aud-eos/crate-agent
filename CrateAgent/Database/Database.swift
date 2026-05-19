@@ -63,6 +63,7 @@ public final class LibraryDatabase {
         migrator.eraseDatabaseOnSchemaChange = false
         #endif
         InitialSchemaMigration.register(in: &migrator)
+        PivotToSeratoSourceOfTruthMigration.register(in: &migrator)
         try migrator.migrate(writer)
     }
 }

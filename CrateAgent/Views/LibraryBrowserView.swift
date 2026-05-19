@@ -43,13 +43,13 @@ struct LibraryBrowserView: View {
         HStack(spacing: 12) {
             if let progress = services.scanProgress, !services.initialScanComplete {
                 ProgressView().controlSize(.small)
-                Text("Scanning… \(progress.filesIndexed) indexed, \(progress.filesSkipped) known")
+                Text("Indexing Serato library… \(progress.filesIndexed) of \(progress.seratoReferenceCount)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             } else if services.initialScanComplete {
                 Image(systemName: "checkmark.circle")
                     .foregroundStyle(.green)
-                Text("Library scan complete")
+                Text("Library in sync with Serato")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -70,6 +70,7 @@ struct LibraryBrowserView: View {
                 showRestartAlert = true
             }
             .controlSize(.small)
+            .help("Watched folder for rename detection. crate-agent indexes only files Serato references; add tracks via Serato or drag-drop onto this window.")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
