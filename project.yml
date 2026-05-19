@@ -61,6 +61,13 @@ targets:
     settings:
       base:
         OTHER_LDFLAGS: "-lc++"
+        # The uniffi-generated FFI header opens with `#pragma once`. Swift
+        # compiles the bridging header as a PCH, where the header IS the
+        # main file — Clang warns on every build. The pragma is harmless
+        # in that context (the header is also re-included via the
+        # modulemap). Pass the suppression through to Swift's embedded
+        # Clang via `-Xcc` rather than post-processing generated output.
+        OTHER_SWIFT_FLAGS: "-Xcc -Wno-pragma-once-outside-header"
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/build-output"
         HEADER_SEARCH_PATHS: "$(SRCROOT)/build-output"
         SWIFT_OBJC_BRIDGING_HEADER: "CrateAgent/Generated/crate_agent_coreFFI.h"
