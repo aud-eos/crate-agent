@@ -184,80 +184,258 @@ public actor FingerprintWorker {
         totalPending: Int,
         fingerprintFunction: @escaping FingerprintFunction
     ) async {
-        var completedResults: [ProcessResult] = []
-        completedResults.reserveCapacity(batch.count)
+        // Build a dedup plan: copy from already-done byte-twins
+        // where possible, fingerprint one representative per
+        // (size, hash) group and propagate to siblings.
+        let plan = await planBatch(batch)
 
-        await withTaskGroup(of: ProcessResult.self) { group in
-            var iterator = batch.makeIterator()
+        var representativeResults: [(BatchPlan.Group, ProcessResult)] = []
+        representativeResults.reserveCapacity(plan.toFingerprint.count)
 
-            // Seed up to `concurrency` worker tasks. The outer scope
-            // owns the iterator (sequential), but each `runOne` body
-            // executes concurrently — that's the standard bounded-
-            // parallelism pattern with TaskGroup.
+        await withTaskGroup(of: GroupResult.self) { group in
+            var iterator = plan.toFingerprint.enumerated().makeIterator()
+
+            // Seed `concurrency` representative fingerprint tasks.
             for _ in 0..<concurrency {
-                guard let next = iterator.next() else { break }
-                group.addTask { await Self.runOne(file: next, function: fingerprintFunction) }
+                guard let (index, assignment) = iterator.next() else { break }
+                let representative = assignment.representative
+                group.addTask {
+                    let result = await Self.runOne(
+                        file: representative, function: fingerprintFunction
+                    )
+                    return GroupResult(index: index, result: result)
+                }
             }
 
-            while let result = await group.next() {
-                // Accumulate first; flush below in one transaction.
-                // Per-file writes flood ValueObservation subscribers
-                // (the library browser re-renders 13k rows on every
-                // tick), beach-balling MainActor under heavy load.
-                completedResults.append(result)
-                if !Task.isCancelled, let next = iterator.next() {
-                    group.addTask { await Self.runOne(file: next, function: fingerprintFunction) }
+            while let groupResult = await group.next() {
+                let assignment = plan.toFingerprint[groupResult.index]
+                representativeResults.append((assignment, groupResult.result))
+                if !Task.isCancelled, let (index, next) = iterator.next() {
+                    let representative = next.representative
+                    group.addTask {
+                        let result = await Self.runOne(
+                            file: representative, function: fingerprintFunction
+                        )
+                        return GroupResult(index: index, result: result)
+                    }
                 }
             }
         }
 
-        // One SQL transaction per batch instead of one per file.
-        // ValueObservation now fires roughly once per ~40 files
-        // (concurrency × 4) instead of once per file — MainActor
-        // can render in between.
-        await flushBatchResults(completedResults, totalPending: totalPending)
+        // Flush plan in one transaction: copy-from-existing rows +
+        // representative results (propagated to siblings).
+        await flushBatchPlan(
+            plan: plan,
+            representativeResults: representativeResults,
+            totalPending: totalPending
+        )
     }
 
-    private func flushBatchResults(
-        _ results: [ProcessResult],
+    private func flushBatchPlan(
+        plan: BatchPlan,
+        representativeResults: [(BatchPlan.Group, ProcessResult)],
         totalPending: Int
     ) async {
-        guard !results.isEmpty else { return }
+        let totalFiles = plan.toCopyFromExistingTwin.count
+            + representativeResults.reduce(0) { $0 + 1 + $1.0.siblingIds.count }
+        guard totalFiles > 0 else { return }
+
+        var doneCount = 0
+        var failedCount = 0
+        var lastPath: String?
+
         do {
             try await database.writer.write { db in
-                for result in results {
+                // Step 1: copy-from-existing — files whose byte-twin
+                // already had a fingerprint in the DB. No decode work
+                // was needed; just write the same hash to this row.
+                for entry in plan.toCopyFromExistingTwin {
+                    try db.execute(
+                        sql: """
+                            UPDATE files
+                            SET chromaprint_fingerprint = ?,
+                                fingerprint_status = ?
+                            WHERE id = ?
+                            """,
+                        arguments: [
+                            entry.fingerprint,
+                            FingerprintStatus.done.rawValue,
+                            entry.fileId,
+                        ]
+                    )
+                }
+
+                // Step 2: representative results — write the outcome
+                // to the representative AND to every sibling. Siblings
+                // share the byte content so they share the outcome
+                // (success or failure).
+                for (assignment, result) in representativeResults {
                     let (hash, status): (Data?, FingerprintStatus) = {
                         switch result.outcome {
                         case .success(let bytes): return (bytes, .done)
                         case .failure: return (nil, .failed)
                         }
                     }()
+                    // Apply to the representative.
                     try db.execute(
-                        sql: "UPDATE files SET chromaprint_fingerprint = ?, fingerprint_status = ? WHERE id = ?",
+                        sql: """
+                            UPDATE files
+                            SET chromaprint_fingerprint = ?,
+                                fingerprint_status = ?
+                            WHERE id = ?
+                            """,
                         arguments: [hash, status.rawValue, result.fileId]
                     )
+                    // Propagate to siblings.
+                    for siblingId in assignment.siblingIds {
+                        try db.execute(
+                            sql: """
+                                UPDATE files
+                                SET chromaprint_fingerprint = ?,
+                                    fingerprint_status = ?
+                                WHERE id = ?
+                                """,
+                            arguments: [hash, status.rawValue, siblingId]
+                        )
+                    }
                 }
             }
-            for result in results {
+
+            doneCount = plan.toCopyFromExistingTwin.count
+            for (assignment, result) in representativeResults {
                 switch result.outcome {
-                case .success: totalDone += 1
-                case .failure: totalFailed += 1
+                case .success: doneCount += 1 + assignment.siblingIds.count
+                case .failure: failedCount += 1 + assignment.siblingIds.count
                 }
             }
+            lastPath = representativeResults.last?.1.path
         } catch {
-            // Whole-batch failure: count every result as failed for
-            // progress purposes and log. Future runs pick up the
-            // still-pending rows (their DB state didn't change).
             Self.logger.error(
-                "Batch persist of \(results.count) fingerprints failed: \(error.localizedDescription, privacy: .public)"
+                "Batch persist of \(totalFiles) fingerprints failed: \(error.localizedDescription, privacy: .public)"
             )
-            totalFailed += results.count
+            failedCount = totalFiles
         }
 
+        totalDone += doneCount
+        totalFailed += failedCount
+
         emitProgress(
-            lastPath: results.last?.path,
-            pending: max(0, totalPending - results.count)
+            lastPath: lastPath,
+            pending: max(0, totalPending - totalFiles)
         )
+    }
+
+    // MARK: - Batch planning (byte-twin dedup)
+
+    /// Build the dedup plan for a batch. Three sources of work:
+    /// - `toCopyFromExistingTwin`: a row outside the batch already
+    ///   has the same (file_size, lightweight_hash) with a non-null
+    ///   fingerprint and `fingerprint_status = .done`. Copy that
+    ///   fingerprint, skip the decode entirely.
+    /// - `toFingerprint[].representative`: one file per
+    ///   (size, hash) group that has no DB twin gets fingerprinted;
+    ///   the result fans out to `siblingIds`.
+    /// - Files with no `lightweight_hash`: standalone groups of
+    ///   one. They can't be deduplicated until backfill populates
+    ///   their hash on a later scan.
+    private func planBatch(_ batch: [FileRecord]) async -> BatchPlan {
+        struct GroupingKey: Hashable {
+            let fileSize: Int64
+            let hash: Data
+        }
+        var groups: [GroupingKey: [FileRecord]] = [:]
+        var groupOrder: [GroupingKey] = []
+        var standaloneFiles: [FileRecord] = []
+        for file in batch {
+            guard let hash = file.lightweightHash else {
+                standaloneFiles.append(file)
+                continue
+            }
+            let key = GroupingKey(fileSize: file.fileSize, hash: hash)
+            if groups[key] == nil { groupOrder.append(key) }
+            groups[key, default: []].append(file)
+        }
+
+        var copyFromExisting: [BatchPlan.CopyEntry] = []
+        var assignments: [BatchPlan.Group] = []
+
+        // Files with no hash: each is its own representative.
+        for file in standaloneFiles {
+            assignments.append(BatchPlan.Group(
+                representative: file,
+                siblingIds: []
+            ))
+        }
+
+        for key in groupOrder {
+            let groupFiles = groups[key]!
+            let inBatchIds = Set(groupFiles.compactMap(\.id))
+
+            // Check for an existing done twin in the DB. excludes
+            // the in-batch members so a batch-internal already-done
+            // file (shouldn't happen — they're filtered as pending
+            // before this — but defensive) doesn't get treated as
+            // an external source.
+            let existingFingerprint = await lookupExistingDoneFingerprint(
+                fileSize: key.fileSize,
+                lightweightHash: key.hash,
+                excludingFileIds: inBatchIds
+            )
+
+            if let fingerprint = existingFingerprint {
+                for file in groupFiles {
+                    guard let identifier = file.id else { continue }
+                    copyFromExisting.append(
+                        BatchPlan.CopyEntry(fileId: identifier, fingerprint: fingerprint)
+                    )
+                }
+                continue
+            }
+
+            // No external twin: fingerprint one representative,
+            // copy result to siblings.
+            let representative = groupFiles[0]
+            let siblings = groupFiles.dropFirst().compactMap(\.id)
+            assignments.append(BatchPlan.Group(
+                representative: representative,
+                siblingIds: Array(siblings)
+            ))
+        }
+
+        return BatchPlan(
+            toCopyFromExistingTwin: copyFromExisting,
+            toFingerprint: assignments
+        )
+    }
+
+    private func lookupExistingDoneFingerprint(
+        fileSize: Int64,
+        lightweightHash: Data,
+        excludingFileIds: Set<Int64>
+    ) async -> Data? {
+        let excludeList = excludingFileIds.map(String.init).joined(separator: ",")
+        let excludeClause = excludeList.isEmpty ? "" : " AND id NOT IN (\(excludeList))"
+        let sql = """
+            SELECT chromaprint_fingerprint FROM files
+            WHERE file_size = ?
+              AND lightweight_hash = ?
+              AND fingerprint_status = 'done'
+              AND chromaprint_fingerprint IS NOT NULL
+            \(excludeClause)
+            LIMIT 1
+            """
+        do {
+            return try await database.writer.read { db in
+                try Data.fetchOne(
+                    db, sql: sql, arguments: [fileSize, lightweightHash]
+                )
+            }
+        } catch {
+            Self.logger.error(
+                "Twin lookup failed: \(error.localizedDescription, privacy: .public)"
+            )
+            return nil
+        }
     }
 
     private static func runOne(
@@ -346,5 +524,40 @@ private struct ProcessResult: Sendable {
     enum Outcome: Sendable {
         case success(Data)
         case failure
+    }
+}
+
+/// One representative result paired with the index of its
+/// assignment in `BatchPlan.toFingerprint`, so we can pull the
+/// sibling list back out at flush time without searching.
+private struct GroupResult: Sendable {
+    let index: Int
+    let result: ProcessResult
+}
+
+/// Output of `planBatch` — the unit of work the FingerprintWorker
+/// is about to do, factored so the same plan covers (a) files
+/// whose byte-twin already has a fingerprint (free), (b)
+/// representatives that need to be fingerprinted with their
+/// fingerprint copied to siblings, and (c) standalone files with
+/// no hash to dedup against.
+struct BatchPlan: Sendable, Equatable {
+    /// Files that get a fingerprint copied from a DB row whose
+    /// (file_size, lightweight_hash) matches. No Chromaprint work
+    /// needed at all — these write straight to the DB at flush
+    /// time.
+    let toCopyFromExistingTwin: [CopyEntry]
+    /// One Chromaprint run per group; the resulting hash gets
+    /// fanned out across the representative + every sibling.
+    let toFingerprint: [Group]
+
+    struct CopyEntry: Sendable, Equatable {
+        let fileId: Int64
+        let fingerprint: Data
+    }
+
+    struct Group: Sendable, Equatable {
+        let representative: FileRecord
+        let siblingIds: [Int64]
     }
 }
