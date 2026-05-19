@@ -6,6 +6,7 @@ use crate::fingerprint;
 use crate::serato;
 use crate::tags;
 
+pub use crate::serato::SeratoTrackRecord;
 pub use crate::tags::AudioTags;
 
 #[derive(Debug, Error)]
@@ -115,6 +116,12 @@ pub fn database_track_count(database_path: String) -> Result<u32, CoreError> {
     let path = PathBuf::from(database_path);
     let database = serato::DatabaseV2::read_from_path(&path)?;
     Ok(u32::try_from(database.track_count()).expect("track count exceeded u32"))
+}
+
+pub fn read_database_records(database_path: String) -> Result<Vec<SeratoTrackRecord>, CoreError> {
+    let path = PathBuf::from(database_path);
+    let database = serato::DatabaseV2::read_from_path(&path)?;
+    Ok(database.track_records())
 }
 
 pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> {

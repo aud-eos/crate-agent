@@ -40,6 +40,14 @@ namespace crate_agent_core {
   [Throws=CoreError]
   u32 database_track_count(string database_path);
 
+  // Read a Serato `database V2` file and return full track metadata
+  // records — path plus the well-known `t*` text fields (artist,
+  // title, album, genre, BPM, key, comment, length, label). Used by
+  // the Serato-exit reload flow to mirror Serato metadata changes
+  // into crate-agent's DB.
+  [Throws=CoreError]
+  sequence<SeratoTrackRecord> read_database_records(string database_path);
+
   // Decode an audio file and return its Chromaprint perceptual
   // fingerprint as a sequence of 32-bit hashes. Stable across
   // re-encodings of the same recording within Chromaprint's tolerance.
@@ -52,6 +60,28 @@ namespace crate_agent_core {
   // regardless of whether the file carries tags.
   [Throws=CoreError]
   AudioTags read_audio_tags(string file_path);
+};
+
+// Full track-level metadata extracted from a Serato `database V2`
+// entry. `path` is required (an otrk without `pfil` is useless and
+// gets dropped before the FFI boundary); every other field is
+// present when the corresponding `t*` tag exists in the otrk and
+// decodes as valid UTF-16BE.
+//
+// `bpm`, `length` and other numeric-ish fields are exposed as
+// strings because Serato stores them as strings (e.g. "128.000",
+// "03:24"). Lossless on the FFI boundary; callers parse as needed.
+dictionary SeratoTrackRecord {
+  string path;
+  string? artist;
+  string? title;
+  string? album;
+  string? genre;
+  string? bpm;
+  string? key;
+  string? comment;
+  string? length;
+  string? label;
 };
 
 dictionary AudioTags {

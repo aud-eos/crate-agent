@@ -137,6 +137,79 @@ fn extract_path_from_otrk(otrk_payload: &[u8], path_tag: &[u8; 4]) -> Option<Str
     decode_utf16be(&path_record.payload)
 }
 
+/// Extract a full `SeratoTrackRecord` from an `otrk` container's
+/// payload. Returns `None` if the container has no `pfil` (path)
+/// field — an entry without a path can't be matched to a file on
+/// disk and has nothing useful to expose.
+///
+/// Other fields decode each on a best-effort basis: if a `t*` tag is
+/// present but its UTF-16BE payload is malformed, that field stays
+/// `None` and the rest of the record is still returned. Unknown
+/// tags inside the `otrk` (and Serato's database has many) are
+/// intentionally ignored — adding more tag mappings is incremental.
+fn extract_track_record(otrk_payload: &[u8]) -> Option<SeratoTrackRecord> {
+    let nested = TlvRecord::parse_all(otrk_payload).ok()?;
+
+    let path = nested
+        .iter()
+        .find(|record| &record.tag == TAG_PFIL)
+        .and_then(|record| decode_utf16be(&record.payload))?;
+
+    let mut track = SeratoTrackRecord {
+        path,
+        artist: None,
+        title: None,
+        album: None,
+        genre: None,
+        bpm: None,
+        key: None,
+        comment: None,
+        length: None,
+        label: None,
+    };
+
+    for field in &nested {
+        match &field.tag {
+            b"tart" => track.artist = decode_utf16be(&field.payload),
+            b"tsng" => track.title = decode_utf16be(&field.payload),
+            b"talb" => track.album = decode_utf16be(&field.payload),
+            b"tgen" => track.genre = decode_utf16be(&field.payload),
+            b"tbpm" => track.bpm = decode_utf16be(&field.payload),
+            b"tkey" => track.key = decode_utf16be(&field.payload),
+            b"tcom" => track.comment = decode_utf16be(&field.payload),
+            b"tlen" => track.length = decode_utf16be(&field.payload),
+            b"tlbl" => track.label = decode_utf16be(&field.payload),
+            _ => {}
+        }
+    }
+
+    Some(track)
+}
+
+/// Full per-track metadata extracted from a Serato `database V2`
+/// entry. `path` is required; all other fields are present when the
+/// corresponding `t*` tag exists in the `otrk` container and decodes
+/// as valid UTF-16BE.
+///
+/// The text fields (`bpm`, `key`, `length`, `label`) are returned as
+/// strings rather than parsed numerics. Serato stores BPM as
+/// `"128.000"`, length as `"03:24"`, etc. — preserving the source
+/// representation keeps the FFI surface lossless; callers parse as
+/// they see fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeratoTrackRecord {
+    pub path: String,
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub bpm: Option<String>,
+    pub key: Option<String>,
+    pub comment: Option<String>,
+    pub length: Option<String>,
+    pub label: Option<String>,
+}
+
 /// Return every track path stored in `otrk` containers of the given
 /// record list, keyed by the path tag (`ptrk` for `.crate`, `pfil` for
 /// `database V2`).
@@ -264,6 +337,22 @@ impl DatabaseV2 {
 
     pub fn track_paths(&self) -> Vec<String> {
         track_paths_in_otrks(&self.records, TAG_PFIL)
+    }
+
+    /// Full metadata records for every track entry. Where
+    /// `track_paths()` returns only the `pfil` path, this also
+    /// extracts the well-known `t*` text fields (artist, title,
+    /// album, genre, BPM, key, comment, length, label) from each
+    /// `otrk` container.
+    ///
+    /// Records without a `pfil` are skipped — an `otrk` entry that
+    /// can't be located on disk has nothing useful to expose.
+    pub fn track_records(&self) -> Vec<SeratoTrackRecord> {
+        self.records
+            .iter()
+            .filter(|record| &record.tag == TAG_OTRK)
+            .filter_map(|record| extract_track_record(&record.payload))
+            .collect()
     }
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
@@ -521,6 +610,94 @@ mod tests {
         assert_eq!(parsed.track_count(), 4);
     }
 
+    #[test]
+    fn database_track_records_extracts_well_known_metadata_tags() {
+        // Synthesize a single otrk containing pfil + the full set of
+        // metadata tags we extract, plus an unknown tag (`zzzz`) to
+        // verify it's silently ignored.
+        fn nested(tag: &[u8; 4], value: &str) -> TlvRecord {
+            TlvRecord { tag: *tag, payload: encode_utf16be(value) }
+        }
+        let otrk_fields = [
+            nested(TAG_PFIL, "Users/x/Music/A/Track.mp3"),
+            nested(b"tart", "Some Artist"),
+            nested(b"tsng", "Some Title"),
+            nested(b"talb", "Some Album"),
+            nested(b"tgen", "House"),
+            nested(b"tbpm", "128.000"),
+            nested(b"tkey", "Am"),
+            nested(b"tcom", "a comment"),
+            nested(b"tlen", "03:24"),
+            nested(b"tlbl", "Some Label"),
+            TlvRecord { tag: *b"zzzz", payload: vec![1, 2, 3, 4] },
+        ];
+        let mut otrk_payload = Vec::new();
+        TlvRecord::write_all(&otrk_fields, &mut otrk_payload).unwrap();
+        let vrsn = TlvRecord {
+            tag: *b"vrsn",
+            payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+        };
+        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let mut bytes = Vec::new();
+        TlvRecord::write_all(&[vrsn, otrk], &mut bytes).unwrap();
+
+        let database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let records = database.track_records();
+        assert_eq!(records.len(), 1);
+        let track = &records[0];
+        assert_eq!(track.path, "Users/x/Music/A/Track.mp3");
+        assert_eq!(track.artist.as_deref(), Some("Some Artist"));
+        assert_eq!(track.title.as_deref(), Some("Some Title"));
+        assert_eq!(track.album.as_deref(), Some("Some Album"));
+        assert_eq!(track.genre.as_deref(), Some("House"));
+        assert_eq!(track.bpm.as_deref(), Some("128.000"));
+        assert_eq!(track.key.as_deref(), Some("Am"));
+        assert_eq!(track.comment.as_deref(), Some("a comment"));
+        assert_eq!(track.length.as_deref(), Some("03:24"));
+        assert_eq!(track.label.as_deref(), Some("Some Label"));
+    }
+
+    #[test]
+    fn database_track_records_returns_none_for_otrk_without_pfil() {
+        // An otrk that has tart but no pfil — useless to crate-agent
+        // (no file to match against), should be skipped.
+        let tart_only = TlvRecord { tag: *b"tart", payload: encode_utf16be("Ghost Artist") };
+        let mut otrk_payload = Vec::new();
+        TlvRecord::write_all(&[tart_only], &mut otrk_payload).unwrap();
+        let vrsn = TlvRecord {
+            tag: *b"vrsn",
+            payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+        };
+        let mut bytes = Vec::new();
+        TlvRecord::write_all(
+            &[vrsn, TlvRecord { tag: *TAG_OTRK, payload: otrk_payload }],
+            &mut bytes,
+        )
+        .unwrap();
+
+        let database = DatabaseV2::from_bytes(&bytes).unwrap();
+        assert_eq!(database.track_records().len(), 0);
+    }
+
+    #[test]
+    fn database_track_records_leaves_optional_fields_none_when_tags_absent() {
+        // Only path present — every other field should be None.
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/path-only.mp3"],
+        );
+        let database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let records = database.track_records();
+        assert_eq!(records.len(), 1);
+        let track = &records[0];
+        assert_eq!(track.path, "Users/x/Music/A/path-only.mp3");
+        assert!(track.artist.is_none());
+        assert!(track.title.is_none());
+        assert!(track.album.is_none());
+        assert!(track.bpm.is_none());
+    }
+
     /// Opt-in integration test: parses a real Serato `database V2`
     /// file from disk if the env var points at one. Does not print
     /// any path content — only structural counts — so it is safe to
@@ -546,6 +723,29 @@ mod tests {
         );
         assert!(otrk_count > 0, "expected a non-empty database");
         assert_eq!(otrk_count, path_count, "every otrk should expose exactly one pfil");
+
+        // Track-record extraction: count records and tally how many
+        // populated each well-known metadata field. Useful as a
+        // sanity check on real-world data — emits the tallies via
+        // eprintln so devs can see field coverage without printing
+        // any actual track names.
+        let records = database.track_records();
+        let mut artist_count = 0;
+        let mut title_count = 0;
+        let mut bpm_count = 0;
+        let mut key_count = 0;
+        for record in &records {
+            if record.artist.is_some() { artist_count += 1; }
+            if record.title.is_some() { title_count += 1; }
+            if record.bpm.is_some() { bpm_count += 1; }
+            if record.key.is_some() { key_count += 1; }
+        }
+        eprintln!(
+            "metadata coverage: {} records, {} with artist, {} with title, {} with bpm, {} with key",
+            records.len(), artist_count, title_count, bpm_count, key_count
+        );
+        assert_eq!(records.len(), path_count, "every otrk with a pfil should yield a record");
+
         // Round-trip the bytes (parse → serialize) and confirm byte-exactness.
         let original_bytes = std::fs::read(&path).unwrap();
         let serialized = database.to_bytes().unwrap();
