@@ -2505,3 +2505,31 @@ final class UserPreferencesFilenameTemplateTests: XCTestCase {
         XCTAssertEqual(UserPreferences.filenameTemplate, "$artist · $title.$ext")
     }
 }
+
+final class SettingsTemplatePreviewerTests: XCTestCase {
+
+    func testPreviewIncludesBucketLetterAndRenderedFilename() {
+        // Sample metadata has artist "Aphex Twin" → bucket A.
+        let preview = SettingsTemplatePreviewer.preview(
+            template: "$artist - $title.$ext"
+        )
+        XCTAssertEqual(preview, "<Music>/A/Aphex Twin - Windowlicker.mp3")
+    }
+
+    func testPreviewReflectsCustomTemplate() {
+        let preview = SettingsTemplatePreviewer.preview(
+            template: "$bpm — $artist — $title.$ext"
+        )
+        XCTAssertEqual(preview, "<Music>/A/126.000 — Aphex Twin — Windowlicker.mp3")
+    }
+
+    func testPreviewSanitizesIllegalCharactersInPreview() {
+        // The sample length field is "06:07" — `:` must be sanitized.
+        // Pins that the settings preview shows the same sanitization
+        // the production rename path applies.
+        let preview = SettingsTemplatePreviewer.preview(
+            template: "$length-$title.$ext"
+        )
+        XCTAssertEqual(preview, "<Music>/A/06_07-Windowlicker.mp3")
+    }
+}

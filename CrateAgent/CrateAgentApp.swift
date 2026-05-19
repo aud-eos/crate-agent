@@ -22,5 +22,10 @@ struct CrateAgentApp: App {
                 .environmentObject(services.seratoWatchdog)
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView()
+                .environmentObject(services)
+        }
     }
 }
