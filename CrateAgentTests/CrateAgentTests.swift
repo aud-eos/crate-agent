@@ -344,6 +344,151 @@ final class OperationEngineTests: XCTestCase {
     }
 }
 
+final class FilesystemSyncCoordinatorTests: XCTestCase {
+
+    @MainActor
+    private func makeCoordinator(
+        seratoDirectory: URL? = nil
+    ) throws -> (FilesystemSyncCoordinator, OperationEngine, LibraryDatabase) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        let locator = SeratoLibraryLocator(
+            seratoDirectory: seratoDirectory ?? URL(fileURLWithPath: "/dev/null")
+        )
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator
+        )
+        let coordinator = FilesystemSyncCoordinator(
+            operationEngine: engine,
+            database: database
+        )
+        return (coordinator, engine, database)
+    }
+
+    private func makeTemporaryAudioFile(extension fileExtension: String = "mp3") throws -> URL {
+        let tempUrl = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-sync-\(UUID().uuidString).\(fileExtension)")
+        try Data("audio bytes".utf8).write(to: tempUrl)
+        return tempUrl
+    }
+
+    func testCreatedAudioFileGetsIndexed() async throws {
+        let (coordinator, _, database) = try await MainActor.run { try makeCoordinator() }
+        let audioFile = try makeTemporaryAudioFile()
+        defer { try? FileManager.default.removeItem(at: audioFile) }
+
+        let observation = FSEventsObservation(
+            path: audioFile.path, isFile: true, wasCreated: true
+        )
+        await coordinator.handleObservations([observation])
+
+        let indexed = try await database.writer.read { db in
+            try FileRecord.fetchOne(db, sql: "SELECT * FROM files WHERE path = ?",
+                                    arguments: [audioFile.path])
+        }
+        XCTAssertNotNil(indexed)
+        XCTAssertEqual(indexed?.path, audioFile.path)
+        XCTAssertGreaterThan(indexed?.fileSize ?? 0, 0)
+        XCTAssertEqual(indexed?.fingerprintStatus, .pending)
+    }
+
+    func testCreatedNonAudioFileIsIgnored() async throws {
+        let (coordinator, _, database) = try await MainActor.run { try makeCoordinator() }
+        let textFile = try makeTemporaryAudioFile(extension: "txt")
+        defer { try? FileManager.default.removeItem(at: textFile) }
+
+        let observation = FSEventsObservation(
+            path: textFile.path, isFile: true, wasCreated: true
+        )
+        await coordinator.handleObservations([observation])
+
+        let count = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(count, 0, "non-audio files must not be indexed")
+    }
+
+    func testCreatedDirectoryIsIgnored() async throws {
+        let (coordinator, _, database) = try await MainActor.run { try makeCoordinator() }
+
+        let observation = FSEventsObservation(
+            path: "/some/dir.mp3",  // .mp3 extension but isDirectory flag wins
+            isFile: false,
+            isDirectory: true,
+            wasCreated: true
+        )
+        await coordinator.handleObservations([observation])
+
+        let count = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(count, 0)
+    }
+
+    func testRenameObservationUsesInodeLookupToUpdateRow() async throws {
+        let (coordinator, engine, database) = try await MainActor.run { try makeCoordinator() }
+        let audioFile = try makeTemporaryAudioFile()
+        defer { try? FileManager.default.removeItem(at: audioFile) }
+
+        // Pre-populate the DB with a stale path that doesn't exist
+        // on disk; the file at the real path has the same inode, so
+        // the coordinator should recognize this as a rename and
+        // update the row.
+        var statBuffer = stat()
+        guard stat(audioFile.path, &statBuffer) == 0 else {
+            XCTFail("could not stat temp file")
+            return
+        }
+        let realInode = Int64(statBuffer.st_ino)
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/imaginary/old-location.mp3",
+            volumeUuid: (try? audioFile.resourceValues(forKeys: [.volumeUUIDStringKey]))?
+                .volumeUUIDString ?? "unknown-volume",
+            inode: realInode,
+            fileSize: 11,
+            mtime: 1
+        )))
+
+        let observation = FSEventsObservation(
+            path: audioFile.path, isFile: true, wasRenamed: true
+        )
+        await coordinator.handleObservations([observation])
+
+        let updated = try await database.writer.read { db in
+            try FileRecord.fetchOne(db, sql: "SELECT * FROM files WHERE inode = ?",
+                                    arguments: [realInode])
+        }
+        XCTAssertEqual(updated?.path, audioFile.path,
+                       "rename event should update path on the existing inode row")
+
+        let fileCount = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(fileCount, 1, "rename must not insert a second row")
+    }
+
+    func testRenameOfOldPathSideIsIgnored() async throws {
+        let (coordinator, _, database) = try await MainActor.run { try makeCoordinator() }
+
+        // wasRenamed event for a path where the file does NOT exist
+        // (this is the "old path" side of a rename — the new-path
+        // event is what carries the update).
+        let nonexistentPath = "/tmp/crate-agent-test-nonexistent-\(UUID().uuidString).mp3"
+        let observation = FSEventsObservation(
+            path: nonexistentPath, isFile: true, wasRenamed: true
+        )
+        await coordinator.handleObservations([observation])
+
+        let fileCount = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(fileCount, 0)
+    }
+}
+
 final class FSEventsWatcherTests: XCTestCase {
 
     func testObservationParsesCreatedFileFlag() {
