@@ -75,6 +75,28 @@ public actor LibraryScanner {
         for (absolutePath, record) in seratoRecords {
             if let existingFile = knownFilesByPath[absolutePath],
                let fileId = existingFile.id {
+                // Backfill lightweightHash for rows that pre-date the
+                // cross-volume-move feature. Idempotent: skipped when
+                // the hash is already present. Direct DB write rather
+                // than a mutation — the hash is a derived value, not
+                // a user action, so it doesn't belong in the event log.
+                if existingFile.lightweightHash == nil {
+                    if let hash = LightweightHashCalculator.compute(forFileAt: absolutePath) {
+                        do {
+                            try await database.writer.write { db in
+                                try db.execute(
+                                    sql: "UPDATE files SET lightweight_hash = ? WHERE id = ?",
+                                    arguments: [hash, fileId]
+                                )
+                            }
+                        } catch {
+                            Self.logger.error(
+                                "Hash backfill for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                            )
+                        }
+                    }
+                }
+
                 let seratoMetadata = makeSeratoMetadata(fromRecord: record)
                 let storedMetadata = makeSeratoMetadata(fromFileRecord: existingFile)
                 if seratoMetadata == storedMetadata {
@@ -96,7 +118,10 @@ public actor LibraryScanner {
                 continue
             }
 
-            guard let metadata = FileMetadataCollector.collect(at: absolutePath) else {
+            guard let metadata = FileMetadataCollector.collect(
+                at: absolutePath,
+                includeLightweightHash: true
+            ) else {
                 Self.logger.warning(
                     "Serato references \(absolutePath, privacy: .public) but the file is missing or unreadable; skipping"
                 )
@@ -111,6 +136,7 @@ public actor LibraryScanner {
                     inode: metadata.inode,
                     fileSize: metadata.fileSize,
                     mtime: metadata.mtime,
+                    lightweightHash: metadata.lightweightHash,
                     metadata: makeSeratoMetadata(fromRecord: record)
                 )))
                 filesIndexed += 1
