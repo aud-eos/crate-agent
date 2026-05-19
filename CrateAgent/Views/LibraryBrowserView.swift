@@ -71,6 +71,7 @@ struct LibraryBrowserView: View {
         .sheet(isPresented: $showCleanupSheet) {
             LibraryHygieneView()
                 .environmentObject(services)
+                .environmentObject(services.seratoWatchdog)
         }
         .sheet(item: $renameTarget) { fileToRename in
             RenameDialogView(file: fileToRename)
