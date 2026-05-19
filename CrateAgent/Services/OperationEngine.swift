@@ -18,6 +18,9 @@ import GRDB
 /// Mutations supported in SP-1:
 ///   - `indexNewFile`              : insert a file row, log event
 ///   - `renameFile`                : update path, rewrite Serato refs
+///   - `removeFile`                : delete a file row (does NOT touch
+///                                   Serato — used as the inverse of
+///                                   `indexNewFile` during undo).
 ///   - `setMetadata`               : update file's metadata snapshot
 ///                                   from Serato (no Serato write —
 ///                                   used by the reload flow)
@@ -105,6 +108,77 @@ public actor OperationEngine {
     /// Surfaced for UI ("M changes pending").
     public var pendingSeratoWriteCount: Int {
         pendingSeratoWrites.count
+    }
+
+    /// Reverse every event in `batchId` in newest-first order, applying
+    /// each inverse mutation under a single fresh `undo:<originalBatchId>:<uuid>`
+    /// batch. The new batch is itself journaled, so "undo of undo"
+    /// (redo) is just another `undoBatch` call against the returned id.
+    ///
+    /// Failure modes:
+    /// - empty batch → `batchNotFound`
+    /// - batch contains an event whose inverse isn't supported (today:
+    ///   `metadataCommittedToSerato`, `trackAddedToSerato`) →
+    ///   `undoNotSupported`, thrown **before** any inverse runs, so
+    ///   the DB stays in its pre-undo state
+    /// - apply-time drift (e.g. the file was removed in a later batch
+    ///   so renameFile can't find it) → bubbles up as `fileNotFound`
+    ///   with partial undo state already applied — caller can issue
+    ///   a follow-up undo of the partial undo batch to revert
+    ///
+    /// Returns the new batch id so the caller (UI) can offer "Undo the
+    /// undo" without having to scan the events table.
+    @discardableResult
+    public func undoBatch(_ batchId: String) async throws -> String {
+        let events: [EventRecord] = try await database.writer.read { db in
+            try EventRecord
+                .filter(Column("batch_id") == batchId)
+                .order(Column("event_id").desc)
+                .fetchAll(db)
+        }
+
+        guard !events.isEmpty else {
+            throw OperationEngineError.batchNotFound(batchId: batchId)
+        }
+
+        // Pre-decode every inverse before mutating anything. If any
+        // event in the batch is non-reversible, we fail clean — no
+        // partial undo state lands in the DB.
+        let inverseMutations = try events.map { event in
+            try Self.decodeInverseMutation(event: event)
+        }
+
+        let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
+        for inverseMutation in inverseMutations {
+            _ = try await apply(inverseMutation, batchId: undoBatchId)
+        }
+        return undoBatchId
+    }
+
+    private static func decodeInverseMutation(event: EventRecord) throws -> TrackMutation {
+        guard let inverseJsonData = event.inversePayloadJson.data(using: .utf8) else {
+            throw OperationEngineError.payloadEncodingFailed
+        }
+        let decoder = JSONDecoder()
+        switch event.eventType {
+        case .fileRenamed:
+            let payload = try decoder.decode(RenameFilePayload.self, from: inverseJsonData)
+            return .renameFile(payload)
+        case .metadataSet:
+            let payload = try decoder.decode(SetMetadataPayload.self, from: inverseJsonData)
+            return .setMetadata(payload)
+        case .trackImported:
+            let payload = try decoder.decode(RemoveFilePayload.self, from: inverseJsonData)
+            return .removeFile(payload)
+        case .fileRemoved:
+            let payload = try decoder.decode(IndexNewFilePayload.self, from: inverseJsonData)
+            return .indexNewFile(payload)
+        case .metadataCommittedToSerato, .trackAddedToSerato:
+            // Reversing these requires either reading Serato's current
+            // state (racy) or a `removeTrackFromSerato` FFI we don't
+            // have yet. Document as unsupported rather than half-undo.
+            throw OperationEngineError.undoNotSupported(eventType: event.eventType)
+        }
     }
 
     /// Apply every queued Serato write. Call this when Serato has
@@ -370,6 +444,11 @@ public actor OperationEngine {
                 eventId: eventId,
                 seratoWrite: .rename(seratoRename)
             )
+        case .removeFile(let payload):
+            let eventId = try applyRemoveFile(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(eventId: eventId, seratoWrite: nil)
         case .setMetadata(let payload):
             let eventId = try applySetMetadata(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
@@ -392,6 +471,61 @@ public actor OperationEngine {
                 seratoWrite: .addTrack(seratoAdd)
             )
         }
+    }
+
+    private static func applyRemoveFile(
+        _ payload: RemoveFilePayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> Int64 {
+        guard let fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+
+        // The inverse of a removal is a full reinsertion. Capture
+        // every field the indexer needs so undo can rebuild the row
+        // byte-for-byte (modulo the new auto-incremented id, which
+        // isn't user-visible).
+        let inversePayload = IndexNewFilePayload(
+            path: fileRecord.path,
+            volumeUuid: fileRecord.volumeUuid,
+            inode: fileRecord.inode,
+            fileSize: fileRecord.fileSize,
+            mtime: fileRecord.mtime,
+            lightweightHash: fileRecord.lightweightHash,
+            metadata: SeratoMetadata(
+                artist: fileRecord.artist,
+                title: fileRecord.title,
+                album: fileRecord.album,
+                genre: fileRecord.genre,
+                bpm: fileRecord.bpm,
+                musicalKey: fileRecord.musicalKey,
+                comment: fileRecord.comment,
+                length: fileRecord.length,
+                label: fileRecord.label
+            )
+        )
+
+        // Insert the event BEFORE deleting the file: at delete time,
+        // the schema's ON DELETE SET NULL cascade rewrites every
+        // file_id referencing this row (including the event we just
+        // inserted) to NULL. Per-file-history queries can't find the
+        // event afterward, but the batch_id grouping is preserved
+        // and the inverse payload carries everything undo needs.
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .fileRemoved,
+            forwardPayload: payload,
+            inversePayload: inversePayload,
+            in: db
+        )
+
+        try fileRecord.delete(db)
+
+        return eventId
     }
 
     private static func applyIndexNewFile(
@@ -651,6 +785,7 @@ public actor OperationEngine {
 public enum TrackMutation: Sendable {
     case indexNewFile(IndexNewFilePayload)
     case renameFile(RenameFilePayload)
+    case removeFile(RemoveFilePayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)
     case addTrackToSerato(AddTrackToSeratoPayload)
@@ -860,6 +995,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case payloadEncodingFailed
     case seratoEnumerationFailed(directory: String, underlying: String)
     case seratoRewriteFailed(path: String, underlying: String)
+    case batchNotFound(batchId: String)
+    case undoNotSupported(eventType: EventType)
 
     public var errorDescription: String? {
         switch self {
@@ -873,6 +1010,10 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Failed to enumerate Serato crate files in \(directory): \(underlying)"
         case .seratoRewriteFailed(let path, let underlying):
             return "Failed to rewrite Serato library file \(path): \(underlying)"
+        case .batchNotFound(let batchId):
+            return "No events were found for batch \(batchId); nothing to undo."
+        case .undoNotSupported(let eventType):
+            return "Events of type \(eventType.rawValue) can't be undone yet."
         }
     }
 }

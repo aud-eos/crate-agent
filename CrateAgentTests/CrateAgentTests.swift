@@ -627,6 +627,290 @@ final class OperationEngineTests: XCTestCase {
     }
 }
 
+// MARK: - Undo / removeFile coverage
+
+extension OperationEngineTests {
+
+    func testRemoveFileDeletesRowAndJournalsInverse() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 10, mtime: 1,
+            metadata: SeratoMetadata(artist: "X", title: "Y")
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/track.mp3"])
+        }!
+
+        try await engine.apply(.removeFile(RemoveFilePayload(fileId: fileId)))
+
+        // Row is gone.
+        let remaining = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(remaining, 0)
+
+        // Removal event was logged. After the delete cascade, the
+        // event's file_id is NULL — fetch by event_type instead.
+        let removalEvent = try await database.writer.read { db in
+            try EventRecord
+                .filter(Column("event_type") == EventType.fileRemoved.rawValue)
+                .fetchOne(db)!
+        }
+        XCTAssertNil(removalEvent.fileId,
+                     "ON DELETE SET NULL cascade must NULL the event's file_id on removal")
+
+        let inverse = try JSONDecoder().decode(
+            IndexNewFilePayload.self,
+            from: removalEvent.inversePayloadJson.data(using: .utf8)!
+        )
+        XCTAssertEqual(inverse.path, "/Music/A/track.mp3")
+        XCTAssertEqual(inverse.volumeUuid, "v1")
+        XCTAssertEqual(inverse.inode, 1)
+        XCTAssertEqual(inverse.metadata.artist, "X")
+        XCTAssertEqual(inverse.metadata.title, "Y")
+    }
+
+    func testUndoBatchRestoresRenameFile() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/original.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/original.mp3"])
+        }!
+
+        let renameBatchId = "test-rename-batch"
+        try await engine.apply(
+            .renameFile(RenameFilePayload(fileId: fileId, newPath: "/Music/A/renamed.mp3")),
+            batchId: renameBatchId
+        )
+
+        let pathAfterRename = try await database.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT path FROM files WHERE id = ?",
+                                arguments: [fileId])
+        }!
+        XCTAssertEqual(pathAfterRename, "/Music/A/renamed.mp3")
+
+        let undoBatchId = try await engine.undoBatch(renameBatchId)
+        XCTAssertTrue(undoBatchId.hasPrefix("undo:\(renameBatchId):"),
+                      "returned batch id should encode the original batch for traceability")
+
+        let pathAfterUndo = try await database.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT path FROM files WHERE id = ?",
+                                arguments: [fileId])
+        }!
+        XCTAssertEqual(pathAfterUndo, "/Music/A/original.mp3")
+
+        // Undo itself was journaled, under the new batch id.
+        let undoEventCount = try await database.writer.read { db in
+            try EventRecord
+                .filter(Column("batch_id") == undoBatchId)
+                .fetchCount(db)
+        }
+        XCTAssertEqual(undoEventCount, 1, "undo must journal its own events")
+    }
+
+    func testUndoBatchRestoresSetMetadata() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "Original", title: "Track")
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/track.mp3"])
+        }!
+
+        let editBatchId = "metadata-edit-batch"
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(
+                fileId: fileId,
+                metadata: SeratoMetadata(artist: "Edited", title: "Track")
+            )),
+            batchId: editBatchId
+        )
+
+        let artistAfterEdit = try await database.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT artist FROM files WHERE id = ?",
+                                arguments: [fileId])
+        }!
+        XCTAssertEqual(artistAfterEdit, "Edited")
+
+        _ = try await engine.undoBatch(editBatchId)
+
+        let artistAfterUndo = try await database.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT artist FROM files WHERE id = ?",
+                                arguments: [fileId])
+        }!
+        XCTAssertEqual(artistAfterUndo, "Original",
+                       "undo must restore the artist captured in the inverse payload")
+    }
+
+    func testUndoBatchOfIndexNewFileRemovesRow() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+
+        let importBatchId = "test-import-batch"
+        try await engine.apply(
+            .indexNewFile(IndexNewFilePayload(
+                path: "/Music/A/imported.mp3",
+                volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+            )),
+            batchId: importBatchId
+        )
+
+        let countAfterImport = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(countAfterImport, 1)
+
+        _ = try await engine.undoBatch(importBatchId)
+
+        let countAfterUndo = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(countAfterUndo, 0,
+                       "undo of an indexNewFile event must remove the row")
+    }
+
+    func testUndoBatchAppliesEventsInReverseOrder() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/start.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "A0")
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/start.mp3"])
+        }!
+
+        let compositeBatchId = "composite"
+        // rename first…
+        try await engine.apply(
+            .renameFile(RenameFilePayload(fileId: fileId, newPath: "/Music/A/middle.mp3")),
+            batchId: compositeBatchId
+        )
+        // …then edit metadata.
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(
+                fileId: fileId,
+                metadata: SeratoMetadata(artist: "A1")
+            )),
+            batchId: compositeBatchId
+        )
+
+        // Undo should reverse the metadata edit first (newest), then
+        // the rename (oldest). Final state matches pre-batch state.
+        _ = try await engine.undoBatch(compositeBatchId)
+        let restored = try await database.writer.read { db in
+            try FileRecord.fetchOne(db, key: fileId)!
+        }
+        XCTAssertEqual(restored.path, "/Music/A/start.mp3")
+        XCTAssertEqual(restored.artist, "A0")
+    }
+
+    func testUndoBatchThrowsForUnknownBatchId() async throws {
+        let (engine, _, _) = try await MainActor.run { try makeEngine() }
+        do {
+            _ = try await engine.undoBatch("nonexistent-batch")
+            XCTFail("expected batchNotFound to throw")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .batchNotFound(batchId: "nonexistent-batch"))
+        }
+    }
+
+    func testUndoBatchThrowsForUnsupportedEventTypeWithoutPartialState() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+
+        // Bootstrap a file so the addTrackToSerato payload resolves.
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/dropped.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/dropped.mp3"])
+        }!
+
+        // Simulate the drag-drop batch's addTrackToSerato leg. The
+        // Serato-side write fails (test locator points at /dev/null),
+        // but the DB event lands first — that's what undoBatch will
+        // encounter and reject.
+        let dragDropBatchId = "drag-drop-batch"
+        do {
+            _ = try await engine.apply(
+                .addTrackToSerato(AddTrackToSeratoPayload(
+                    fileId: fileId, metadata: SeratoMetadata()
+                )),
+                batchId: dragDropBatchId
+            )
+        } catch {
+            // Expected: Serato write fails because locator → /dev/null.
+        }
+
+        do {
+            _ = try await engine.undoBatch(dragDropBatchId)
+            XCTFail("expected undoNotSupported to throw")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .undoNotSupported(eventType: .trackAddedToSerato))
+        }
+
+        // No undo events should have been written.
+        let undoEvents = try await database.writer.read { db in
+            try EventRecord
+                .filter(Column("batch_id").like("undo:\(dragDropBatchId):%"))
+                .fetchCount(db)
+        }
+        XCTAssertEqual(undoEvents, 0,
+                       "rejecting unsupported event type must not leave partial undo state")
+    }
+
+    func testUndoBatchOfRemoveFileRestoresRow() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/gone.mp3",
+            volumeUuid: "v1", inode: 42, fileSize: 10, mtime: 1_700_000_000,
+            metadata: SeratoMetadata(artist: "Ghost", title: "Track")
+        )))
+        let originalFileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/gone.mp3"])
+        }!
+
+        let removalBatchId = "removal-batch"
+        try await engine.apply(
+            .removeFile(RemoveFilePayload(fileId: originalFileId)),
+            batchId: removalBatchId
+        )
+        let countAfterRemove = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(countAfterRemove, 0)
+
+        _ = try await engine.undoBatch(removalBatchId)
+
+        let restored = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/gone.mp3").fetchOne(db)
+        }
+        XCTAssertNotNil(restored, "row must reappear at the original path")
+        XCTAssertEqual(restored?.inode, 42)
+        XCTAssertEqual(restored?.fileSize, 10)
+        XCTAssertEqual(restored?.mtime, 1_700_000_000)
+        XCTAssertEqual(restored?.artist, "Ghost")
+        XCTAssertEqual(restored?.title, "Track")
+    }
+}
+
 final class LibraryScannerTests: XCTestCase {
 
     @MainActor
