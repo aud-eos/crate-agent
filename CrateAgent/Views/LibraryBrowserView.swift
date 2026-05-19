@@ -12,6 +12,7 @@ struct LibraryBrowserView: View {
     @State private var isDropTargeted: Bool = false
     @State private var lastImportSummary: String?
     @State private var showHistorySheet: Bool = false
+    @State private var showCleanupSheet: Bool = false
     @State private var renameTarget: FileRecord?
     @State private var selectedFileIds: Set<FileRecord.ID> = []
 
@@ -67,6 +68,10 @@ struct LibraryBrowserView: View {
             HistoryView()
                 .environmentObject(services)
         }
+        .sheet(isPresented: $showCleanupSheet) {
+            LibraryHygieneView()
+                .environmentObject(services)
+        }
         .sheet(item: $renameTarget) { fileToRename in
             RenameDialogView(file: fileToRename)
                 .environmentObject(services)
@@ -119,6 +124,14 @@ struct LibraryBrowserView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            Button {
+                showCleanupSheet = true
+            } label: {
+                Label("Cleanup", systemImage: "sparkles")
+            }
+            .controlSize(.small)
+            .help("Scan the library for whitespace issues and apply trims as a single undoable batch.")
 
             Button {
                 showHistorySheet = true

@@ -96,10 +96,14 @@ public enum EventHistoryQuery {
     }
 
     static func canUndoBatch(typeList: [String]) -> Bool {
-        // Mirror OperationEngine.decodeInverseMutation's whitelist —
-        // unsupported types here must match the engine's throw.
+        // Mirror OperationEngine.decodeInverseMutation's whitelist.
+        // `metadataCommittedToSerato` was on this list before SP-1.5
+        // landed undo-aware commits — every production caller today
+        // (the hygiene runner) supplies `previousMetadata`, so the
+        // engine accepts the inverse. Only `trackAddedToSerato`
+        // remains unconditionally unsupported (it needs a Rust-side
+        // removeTrackFromSerato FFI we don't have yet).
         let unsupportedRaw: Set<String> = [
-            EventType.metadataCommittedToSerato.rawValue,
             EventType.trackAddedToSerato.rawValue,
         ]
         return !typeList.contains(where: unsupportedRaw.contains)

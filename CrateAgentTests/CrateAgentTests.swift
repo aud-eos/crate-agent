@@ -1890,14 +1890,20 @@ final class EventHistoryQueryTests: XCTestCase {
         ))
     }
 
-    func testCanUndoBatchRejectsSeratoSideEvents() {
+    func testCanUndoBatchRejectsAddTrackToSerato() {
         XCTAssertFalse(EventHistoryQuery.canUndoBatch(
             typeList: [
                 EventType.trackImported.rawValue,
                 EventType.trackAddedToSerato.rawValue,
             ]
         ))
-        XCTAssertFalse(EventHistoryQuery.canUndoBatch(
+    }
+
+    func testCanUndoBatchAllowsCommitMetadataToSeratoSinceSP15() {
+        // SP-1.5 made `commitMetadataToSerato` undoable when callers
+        // supply previousMetadata. Every production caller (the
+        // hygiene runner) does, so the UI gate now allows the batch.
+        XCTAssertTrue(EventHistoryQuery.canUndoBatch(
             typeList: [
                 EventType.metadataSet.rawValue,
                 EventType.metadataCommittedToSerato.rawValue,
@@ -2601,5 +2607,191 @@ final class AppLauncherTests: XCTestCase {
             XCTFail("launcher should be in .ready after onboarding; got \(launcher.state)")
             return
         }
+    }
+}
+
+final class LibraryHygieneAnalyzerTests: XCTestCase {
+
+    private func makeFile(
+        id: Int64 = 1,
+        path: String = "/Music/A/track.mp3",
+        artist: String? = nil,
+        title: String? = nil,
+        album: String? = nil,
+        comment: String? = nil
+    ) -> FileRecord {
+        FileRecord(
+            id: id,
+            path: path,
+            volumeUuid: "v1",
+            inode: id,
+            fileSize: 1, mtime: 1,
+            artist: artist,
+            title: title,
+            album: album,
+            comment: comment
+        )
+    }
+
+    func testFindsNoIssuesWhenAllFieldsClean() {
+        let issues = LibraryHygiene.findWhitespaceIssues(in: [
+            makeFile(artist: "Aphex Twin", title: "Windowlicker"),
+        ])
+        XCTAssertEqual(issues.count, 0)
+    }
+
+    func testFindsLeadingAndTrailingWhitespace() {
+        let issues = LibraryHygiene.findWhitespaceIssues(in: [
+            makeFile(id: 1, artist: " Aphex Twin", title: "Windowlicker"),
+            makeFile(id: 2, artist: "Boards of Canada", title: "Roygbiv "),
+        ])
+        XCTAssertEqual(issues.count, 2)
+        let firstFileIssues = issues.filter { $0.fileId == 1 }
+        XCTAssertEqual(firstFileIssues.first?.field, .artist)
+        XCTAssertEqual(firstFileIssues.first?.oldValue, " Aphex Twin")
+        XCTAssertEqual(firstFileIssues.first?.newValue, "Aphex Twin")
+        let secondFileIssues = issues.filter { $0.fileId == 2 }
+        XCTAssertEqual(secondFileIssues.first?.field, .title)
+        XCTAssertEqual(secondFileIssues.first?.newValue, "Roygbiv")
+    }
+
+    func testPreservesInternalWhitespace() {
+        // "Aphex   Twin" with three internal spaces is NOT a trim
+        // issue. Style/case normalization is a separate analyzer.
+        let issues = LibraryHygiene.findWhitespaceIssues(in: [
+            makeFile(artist: "Aphex   Twin"),
+        ])
+        XCTAssertEqual(issues.count, 0,
+                       "internal whitespace must not be flagged as trim-worthy")
+    }
+
+    func testDetectsMultipleFieldsOnOneFile() {
+        let issues = LibraryHygiene.findWhitespaceIssues(in: [
+            makeFile(
+                artist: " Artist",
+                title: "Title ",
+                album: "  Album  "
+            ),
+        ])
+        XCTAssertEqual(issues.count, 3)
+        let fields = Set(issues.map(\.field))
+        XCTAssertEqual(fields, [.artist, .title, .album])
+    }
+
+    func testMergedTrimmedMetadataAppliesEveryFix() {
+        let file = makeFile(
+            artist: " Artist",
+            title: "Title ",
+            album: "  Album  ",
+            comment: "fine"
+        )
+        let issues = LibraryHygiene.findWhitespaceIssues(in: [file])
+        let merged = LibraryHygiene.mergedTrimmedMetadata(forFile: file, issues: issues)
+        XCTAssertEqual(merged.artist, "Artist")
+        XCTAssertEqual(merged.title, "Title")
+        XCTAssertEqual(merged.album, "Album")
+        XCTAssertEqual(merged.comment, "fine",
+                       "untouched fields preserve their original values")
+    }
+}
+
+final class LibraryHygieneRunnerTests: XCTestCase {
+
+    @MainActor
+    private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator
+        )
+        return (engine, database)
+    }
+
+    func testApplyTrimsEverySelectedField() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: " Artist  ", title: "Title ")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let issues = LibraryHygiene.findWhitespaceIssues(in: files)
+        XCTAssertEqual(issues.count, 2)
+
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        _ = try await runner.applyWhitespaceFixes(issues, files: files)
+
+        let cleaned = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        XCTAssertEqual(cleaned.first?.artist, "Artist")
+        XCTAssertEqual(cleaned.first?.title, "Title")
+    }
+
+    func testApplyJournalsBothMutationsUnderSameBatchId() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: " Artist")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let issues = LibraryHygiene.findWhitespaceIssues(in: files)
+
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        let batchId = try await runner.applyWhitespaceFixes(issues, files: files)
+
+        let batchEvents = try await database.writer.read { db in
+            try EventRecord
+                .filter(Column("batch_id") == batchId)
+                .order(Column("event_id").asc)
+                .fetchAll(db)
+        }
+        XCTAssertEqual(batchEvents.count, 2,
+                       "one setMetadata + one commitMetadataToSerato per affected file")
+        XCTAssertEqual(batchEvents.map(\.eventType),
+                       [.metadataSet, .metadataCommittedToSerato])
+    }
+
+    func testHygieneBatchIsFullyUndoable() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: " Aphex Twin ", title: "Windowlicker ")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let issues = LibraryHygiene.findWhitespaceIssues(in: files)
+
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        let batchId = try await runner.applyWhitespaceFixes(issues, files: files)
+
+        // Sanity: after fix, fields are trimmed.
+        let postFix = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).first!
+        }
+        XCTAssertEqual(postFix.artist, "Aphex Twin")
+        XCTAssertEqual(postFix.title, "Windowlicker")
+
+        // Undo the batch — both events must be reversible. Pre-PR
+        // this threw undoNotSupported because commitMetadataToSerato
+        // was uninvertible.
+        _ = try await engine.undoBatch(batchId)
+
+        let postUndo = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).first!
+        }
+        XCTAssertEqual(postUndo.artist, " Aphex Twin ",
+                       "undo of hygiene must restore the original whitespace")
+        XCTAssertEqual(postUndo.title, "Windowlicker ")
     }
 }
