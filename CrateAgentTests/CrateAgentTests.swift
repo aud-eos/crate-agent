@@ -3456,6 +3456,166 @@ final class LibraryHygieneRunnerTests: XCTestCase {
     }
 }
 
+final class DuplicateFinderTests: XCTestCase {
+
+    private func makeFile(
+        id: Int64,
+        path: String,
+        size: Int64 = 1024,
+        lightweightHash: Data? = nil,
+        chromaprintFingerprint: Data? = nil,
+        fingerprintStatus: FingerprintStatus = .pending
+    ) -> FileRecord {
+        FileRecord(
+            id: id,
+            path: path,
+            volumeUuid: "v1",
+            inode: id,
+            fileSize: size,
+            mtime: 1,
+            lightweightHash: lightweightHash,
+            chromaprintFingerprint: chromaprintFingerprint,
+            fingerprintStatus: fingerprintStatus
+        )
+    }
+
+    // MARK: - Byte-level
+
+    func testByteLevelGroupsFilesWithSameSizeAndHash() {
+        let hash = Data([0xAA, 0xBB, 0xCC])
+        let groups = DuplicateFinder.findDuplicates(
+            in: [
+                makeFile(id: 1, path: "/Music/A/one.mp3", lightweightHash: hash),
+                makeFile(id: 2, path: "/Music/B/copy.mp3", lightweightHash: hash),
+                makeFile(id: 3, path: "/Music/A/unrelated.mp3",
+                         lightweightHash: Data([0xFF])),
+            ],
+            mode: .byteLevel
+        )
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups.first?.size, 2)
+        XCTAssertEqual(groups.first?.files.map(\.id), [1, 2])
+    }
+
+    func testByteLevelDistinguishesFilesWithSameHashButDifferentSize() {
+        // Lightweight hash collisions across different file sizes
+        // are astronomically unlikely but the implementation must
+        // include size in the bucket key.
+        let hash = Data([0xAA])
+        let groups = DuplicateFinder.findDuplicates(
+            in: [
+                makeFile(id: 1, path: "/Music/A/big.mp3", size: 5_000_000, lightweightHash: hash),
+                makeFile(id: 2, path: "/Music/A/small.mp3", size: 1_000_000, lightweightHash: hash),
+            ],
+            mode: .byteLevel
+        )
+        XCTAssertEqual(groups.count, 0,
+                       "different file sizes must NOT match even with identical hash")
+    }
+
+    func testByteLevelSkipsFilesWithoutHash() {
+        let groups = DuplicateFinder.findDuplicates(
+            in: [
+                makeFile(id: 1, path: "/Music/A/missing-hash.mp3", lightweightHash: nil),
+                makeFile(id: 2, path: "/Music/B/also-missing.mp3", lightweightHash: nil),
+            ],
+            mode: .byteLevel
+        )
+        XCTAssertEqual(groups.count, 0,
+                       "files without lightweight_hash can't be matched — must not group as duplicates")
+    }
+
+    func testByteLevelDropsSingletonGroups() {
+        // A single file in its own bucket isn't a duplicate.
+        let groups = DuplicateFinder.findDuplicates(
+            in: [makeFile(id: 1, path: "/Music/A/solo.mp3",
+                          lightweightHash: Data([0xAB]))],
+            mode: .byteLevel
+        )
+        XCTAssertEqual(groups.count, 0)
+    }
+
+    // MARK: - Perceptual
+
+    func testPerceptualGroupsFilesWithSameFingerprint() {
+        let fingerprint = Data([0xDE, 0xAD, 0xBE, 0xEF])
+        let groups = DuplicateFinder.findDuplicates(
+            in: [
+                makeFile(id: 1, path: "/Music/A/track.mp3",
+                         chromaprintFingerprint: fingerprint,
+                         fingerprintStatus: .done),
+                makeFile(id: 2, path: "/Music/A/track.flac",
+                         chromaprintFingerprint: fingerprint,
+                         fingerprintStatus: .done),
+                makeFile(id: 3, path: "/Music/A/different.mp3",
+                         chromaprintFingerprint: Data([0xFE]),
+                         fingerprintStatus: .done),
+            ],
+            mode: .perceptual
+        )
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups.first?.size, 2)
+        XCTAssertEqual(Set(groups.first?.files.map(\.id) ?? []), [1, 2],
+                       "perceptual must group MP3 + FLAC of the same recording")
+    }
+
+    func testPerceptualSkipsFilesWithoutDoneStatus() {
+        let fingerprint = Data([0x01, 0x02])
+        let groups = DuplicateFinder.findDuplicates(
+            in: [
+                makeFile(id: 1, path: "/Music/A/done.mp3",
+                         chromaprintFingerprint: fingerprint,
+                         fingerprintStatus: .done),
+                makeFile(id: 2, path: "/Music/A/pending.mp3",
+                         chromaprintFingerprint: fingerprint,  // tagged but worker hadn't marked done
+                         fingerprintStatus: .pending),
+                makeFile(id: 3, path: "/Music/A/failed.mp3",
+                         chromaprintFingerprint: nil,
+                         fingerprintStatus: .failed),
+            ],
+            mode: .perceptual
+        )
+        XCTAssertEqual(groups.count, 0,
+                       "only fingerprint_status = .done rows can participate in perceptual grouping")
+    }
+
+    // MARK: - Group sorting
+
+    func testGroupsAreSortedByDescendingSize() {
+        let hashA = Data([0xAA])
+        let hashB = Data([0xBB])
+        let groups = DuplicateFinder.findDuplicates(
+            in: [
+                makeFile(id: 1, path: "/Music/A/a1.mp3", lightweightHash: hashA),
+                makeFile(id: 2, path: "/Music/A/a2.mp3", lightweightHash: hashA),
+                makeFile(id: 3, path: "/Music/A/a3.mp3", lightweightHash: hashA),
+                makeFile(id: 4, path: "/Music/B/b1.mp3", lightweightHash: hashB),
+                makeFile(id: 5, path: "/Music/B/b2.mp3", lightweightHash: hashB),
+            ],
+            mode: .byteLevel
+        )
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertEqual(groups.first?.size, 3,
+                       "biggest group must come first (the most impactful issue)")
+        XCTAssertEqual(groups.last?.size, 2)
+    }
+
+    // MARK: - Coverage helper
+
+    func testFingerprintCoverageCountsDoneRows() {
+        let coverage = DuplicateFinder.fingerprintCoverage(in: [
+            makeFile(id: 1, path: "/a.mp3", chromaprintFingerprint: Data([0x01]),
+                     fingerprintStatus: .done),
+            makeFile(id: 2, path: "/b.mp3", chromaprintFingerprint: Data([0x02]),
+                     fingerprintStatus: .done),
+            makeFile(id: 3, path: "/c.mp3", fingerprintStatus: .pending),
+            makeFile(id: 4, path: "/d.mp3", fingerprintStatus: .failed),
+        ])
+        XCTAssertEqual(coverage.done, 2)
+        XCTAssertEqual(coverage.total, 4)
+    }
+}
+
 final class WriteFileTagsMutationTests: XCTestCase {
 
     /// Captures calls from the injected fileTagWriter so the test
