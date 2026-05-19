@@ -346,6 +346,13 @@ final class OperationEngineTests: XCTestCase {
         return (seratoDirectory, crateFileUrl)
     }
 
+    /// Public wrapper so other test classes (e.g., LibraryScannerTests)
+    /// can synthesize crate files without duplicating the byte
+    /// layout. Forwards to the private implementation.
+    static func synthesizeCrateBytesForTest(withTrackPaths trackPaths: [String]) -> Data {
+        synthesizeCrateBytes(withTrackPaths: trackPaths)
+    }
+
     /// TLV-format `.crate` file with a version header + one `otrk` per
     /// path containing a UTF-16BE `ptrk` payload. Mirrors the Rust
     /// `synthetic_library` test helper so behavior is consistent
@@ -395,124 +402,154 @@ final class OperationEngineTests: XCTestCase {
 final class LibraryScannerTests: XCTestCase {
 
     @MainActor
-    private func makeScanner() throws -> (LibraryScanner, OperationEngine, LibraryDatabase) {
+    private func makeScanner(
+        seratoDirectory: URL
+    ) throws -> (LibraryScanner, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = SeratoLibraryLocator(seratoDirectory: seratoDirectory)
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator
         )
-        let scanner = LibraryScanner(operationEngine: engine, database: database)
-        return (scanner, engine, database)
+        let scanner = LibraryScanner(
+            operationEngine: engine,
+            database: database,
+            seratoLocator: locator
+        )
+        return (scanner, database)
     }
 
-    private func makeTempLibrary(
-        filesAtRelativePaths relativePaths: [String]
-    ) throws -> URL {
-        let rootUrl = FileManager.default.temporaryDirectory
-            .appendingPathComponent("crate-agent-test-scanner-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: rootUrl, withIntermediateDirectories: true)
-        for relativePath in relativePaths {
-            let fileUrl = rootUrl.appendingPathComponent(relativePath)
+    /// Set up a temp filesystem with:
+    ///   - real audio files at the given absolute paths (so stat
+    ///     returns valid metadata for indexing)
+    ///   - a synthetic Serato library at `seratoDirectory` whose
+    ///     .crate file references those same paths in the Serato-
+    ///     relative form crate-agent decodes
+    /// Returns the seratoDirectory URL plus the absolute paths the
+    /// scanner should index.
+    private func makeSeratoFixture(
+        absoluteFilePaths: [String]
+    ) throws -> (seratoDirectory: URL, absoluteFilePaths: [String]) {
+        for filePath in absoluteFilePaths {
+            let parentDir = (filePath as NSString).deletingLastPathComponent
             try FileManager.default.createDirectory(
-                at: fileUrl.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+                atPath: parentDir, withIntermediateDirectories: true
             )
-            try Data("audio".utf8).write(to: fileUrl)
+            try Data("audio".utf8).write(to: URL(fileURLWithPath: filePath))
         }
-        return rootUrl
+
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-scanner-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = testRoot.appendingPathComponent("_Serato_", isDirectory: true)
+        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: subcratesDirectory, withIntermediateDirectories: true
+        )
+
+        // Convert absolute paths to Serato's relative form
+        // (`Users/x/...`) — strip the leading slash.
+        let seratoRelativePaths = absoluteFilePaths.map { path -> String in
+            path.hasPrefix("/") ? String(path.dropFirst()) : path
+        }
+        let crateBytes = OperationEngineTests.synthesizeCrateBytesForTest(
+            withTrackPaths: seratoRelativePaths
+        )
+        try crateBytes.write(to: subcratesDirectory.appendingPathComponent("Test.crate"))
+        return (seratoDirectory, absoluteFilePaths)
     }
 
-    func testScanIndexesAllAudioFiles() async throws {
-        let (scanner, _, database) = try await MainActor.run { try makeScanner() }
-        let libraryRoot = try makeTempLibrary(filesAtRelativePaths: [
-            "A/Track One.mp3",
-            "A/Track Two.flac",
-            "B/Some Song.m4a",
-            "B/Subfolder/Deep Cut.wav",
-        ])
-        defer { try? FileManager.default.removeItem(at: libraryRoot) }
+    func testScanIndexesEveryPathSeratoReferences() async throws {
+        let scratchDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-music-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratchDirectory) }
 
-        let result = try await scanner.scan(libraryRoot)
-        XCTAssertEqual(result.filesEncountered, 4)
-        XCTAssertEqual(result.filesIndexed, 4)
+        let absoluteFilePaths = [
+            scratchDirectory.appendingPathComponent("A/Alpha.mp3").path,
+            scratchDirectory.appendingPathComponent("A/Beta.flac").path,
+            scratchDirectory.appendingPathComponent("B/Sub/Gamma.m4a").path,
+        ]
+        let (seratoDirectory, _) = try makeSeratoFixture(absoluteFilePaths: absoluteFilePaths)
+        defer { try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent()) }
+
+        let (scanner, database) = try await MainActor.run {
+            try makeScanner(seratoDirectory: seratoDirectory)
+        }
+
+        let result = try await scanner.scan()
+        XCTAssertEqual(result.seratoReferenceCount, 3)
+        XCTAssertEqual(result.filesIndexed, 3)
         XCTAssertEqual(result.filesSkipped, 0)
 
-        let indexedCount = try await database.writer.read { db in
-            try FileRecord.fetchCount(db)
+        let indexedPaths = try await database.writer.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT path FROM files"))
         }
-        XCTAssertEqual(indexedCount, 4)
+        XCTAssertEqual(indexedPaths, Set(absoluteFilePaths))
     }
 
-    func testScanSkipsNonAudioFiles() async throws {
-        let (scanner, _, database) = try await MainActor.run { try makeScanner() }
-        let libraryRoot = try makeTempLibrary(filesAtRelativePaths: [
-            "A/Track.mp3",
-            "A/.DS_Store",
-            "A/cover.jpg",
-            "A/notes.txt",
-        ])
-        defer { try? FileManager.default.removeItem(at: libraryRoot) }
+    func testScanSkipsSeratoReferencesWhereFileIsMissing() async throws {
+        let scratchDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-missing-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratchDirectory) }
 
-        let result = try await scanner.scan(libraryRoot)
-        XCTAssertEqual(result.filesEncountered, 1, "only the .mp3 should be encountered")
+        let realFile = scratchDirectory.appendingPathComponent("Real.mp3").path
+        let phantomFile = scratchDirectory.appendingPathComponent("Phantom.mp3").path
+        let (seratoDirectory, _) = try makeSeratoFixture(
+            absoluteFilePaths: [realFile]  // only create the first one
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent()) }
 
-        let indexedCount = try await database.writer.read { db in
-            try FileRecord.fetchCount(db)
+        // Manually add the phantom path to the .crate so Serato
+        // references it even though the file doesn't exist.
+        let crateFileUrl = seratoDirectory.appendingPathComponent("Subcrates/Test.crate")
+        let seratoRelativePaths = [realFile, phantomFile].map { String($0.dropFirst()) }
+        let updatedCrateBytes = OperationEngineTests.synthesizeCrateBytesForTest(
+            withTrackPaths: seratoRelativePaths
+        )
+        try updatedCrateBytes.write(to: crateFileUrl)
+
+        let (scanner, database) = try await MainActor.run {
+            try makeScanner(seratoDirectory: seratoDirectory)
         }
-        XCTAssertEqual(indexedCount, 1)
+        let result = try await scanner.scan()
+        XCTAssertEqual(result.seratoReferenceCount, 2)
+        XCTAssertEqual(result.filesIndexed, 1, "real file gets indexed")
+        XCTAssertEqual(result.filesSkipped, 1, "phantom file is skipped — Serato references but disk doesn't have it")
+
+        let indexedPaths = try await database.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT path FROM files")
+        }
+        XCTAssertEqual(indexedPaths, [realFile])
     }
 
-    func testRescanSkipsAlreadyIndexedFiles() async throws {
-        let (scanner, _, database) = try await MainActor.run { try makeScanner() }
-        let libraryRoot = try makeTempLibrary(filesAtRelativePaths: [
-            "A/Track.mp3",
-            "B/Other.flac",
-        ])
-        defer { try? FileManager.default.removeItem(at: libraryRoot) }
+    func testRescanDoesNotDuplicateAlreadyKnownFiles() async throws {
+        let scratchDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-rescan-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratchDirectory) }
 
-        let firstResult = try await scanner.scan(libraryRoot)
+        let absoluteFilePaths = [
+            scratchDirectory.appendingPathComponent("Track.mp3").path,
+            scratchDirectory.appendingPathComponent("Other.flac").path,
+        ]
+        let (seratoDirectory, _) = try makeSeratoFixture(absoluteFilePaths: absoluteFilePaths)
+        defer { try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent()) }
+
+        let (scanner, database) = try await MainActor.run {
+            try makeScanner(seratoDirectory: seratoDirectory)
+        }
+        let firstResult = try await scanner.scan()
         XCTAssertEqual(firstResult.filesIndexed, 2)
-        XCTAssertEqual(firstResult.filesSkipped, 0)
 
-        let secondResult = try await scanner.scan(libraryRoot)
-        XCTAssertEqual(secondResult.filesEncountered, 2)
-        XCTAssertEqual(secondResult.filesIndexed, 0,
-                       "second scan must not re-index known files")
-        XCTAssertEqual(secondResult.filesSkipped, 2)
+        let secondResult = try await scanner.scan()
+        XCTAssertEqual(secondResult.filesIndexed, 0, "second scan must not re-index")
+        XCTAssertEqual(secondResult.filesSkipped, 0,
+                       "files already present in DB are no-ops, not skips")
 
         let totalRows = try await database.writer.read { db in
             try FileRecord.fetchCount(db)
         }
-        XCTAssertEqual(totalRows, 2, "rescan must not duplicate rows")
-    }
-
-    func testProgressCallbackFiresOnFinalBatchEvenForSmallScans() async throws {
-        let (scanner, _, _) = try await MainActor.run { try makeScanner() }
-        let libraryRoot = try makeTempLibrary(filesAtRelativePaths: [
-            "A/Track.mp3",
-            "B/Other.flac",
-        ])
-        defer { try? FileManager.default.removeItem(at: libraryRoot) }
-
-        let progressLock = NSLock()
-        var progressUpdates: [LibraryScanner.ScanProgress] = []
-
-        _ = try await scanner.scan(libraryRoot) { progress in
-            progressLock.lock()
-            progressUpdates.append(progress)
-            progressLock.unlock()
-        }
-
-        progressLock.lock()
-        let snapshot = progressUpdates
-        progressLock.unlock()
-
-        XCTAssertFalse(snapshot.isEmpty, "at least one progress callback expected")
-        XCTAssertEqual(snapshot.last?.filesIndexed, 2)
-        XCTAssertEqual(snapshot.last?.filesEncountered, 2)
+        XCTAssertEqual(totalRows, 2)
     }
 }
 
@@ -546,7 +583,12 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         return tempUrl
     }
 
-    func testCreatedAudioFileGetsIndexed() async throws {
+    func testCreatedAudioFileIsIgnored() async throws {
+        // Under the Serato-source-of-truth design, the coordinator
+        // does NOT auto-index new files appearing on disk. New
+        // tracks enter the library exclusively through Serato (or,
+        // eventually, the drag-drop import flow). Verifying this is
+        // the inverse of the previous test by design.
         let (coordinator, _, database) = try await MainActor.run { try makeCoordinator() }
         let audioFile = try makeTemporaryAudioFile()
         defer { try? FileManager.default.removeItem(at: audioFile) }
@@ -556,14 +598,10 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         )
         await coordinator.handleObservations([observation])
 
-        let indexed = try await database.writer.read { db in
-            try FileRecord.fetchOne(db, sql: "SELECT * FROM files WHERE path = ?",
-                                    arguments: [audioFile.path])
+        let count = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
         }
-        XCTAssertNotNil(indexed)
-        XCTAssertEqual(indexed?.path, audioFile.path)
-        XCTAssertGreaterThan(indexed?.fileSize ?? 0, 0)
-        XCTAssertEqual(indexed?.fingerprintStatus, .pending)
+        XCTAssertEqual(count, 0, "new file create events must not index — Serato is the source of truth")
     }
 
     func testCreatedNonAudioFileIsIgnored() async throws {

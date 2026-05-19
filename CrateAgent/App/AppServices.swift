@@ -96,7 +96,8 @@ public final class AppServices: ObservableObject {
 
         self.libraryScanner = LibraryScanner(
             operationEngine: engine,
-            database: database
+            database: database,
+            seratoLocator: seratoLocator
         )
 
         // Resume from the last seen event ID if we have one for this
@@ -155,11 +156,10 @@ public final class AppServices: ObservableObject {
     }
 
     private func runInitialScan() async {
-        let watchedFolder = watchedMusicFolder
         let scanner = libraryScanner
 
         do {
-            _ = try await scanner.scan(watchedFolder) { [weak self] progress in
+            _ = try await scanner.scan { [weak self] progress in
                 Task { @MainActor in
                     self?.scanProgress = progress
                 }

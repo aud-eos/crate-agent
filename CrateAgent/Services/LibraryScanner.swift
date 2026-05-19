@@ -2,35 +2,37 @@ import Foundation
 import GRDB
 import os.log
 
-/// Walks a music folder recursively and indexes every audio file
-/// that isn't already in the library database. Used by AppServices
-/// on launch to bootstrap the index from existing files — without it,
-/// the user's pre-existing library would be invisible to crate-agent
-/// until each file got renamed (which is exactly what we're trying
-/// to fix).
+/// Hydrates the local files table from Serato's library. Serato is
+/// the source of truth — crate-agent only knows about tracks Serato
+/// references. The scanner reads `database V2` plus every `.crate`,
+/// diffs against the current `files` table, and indexes the set of
+/// paths Serato has that crate-agent doesn't yet.
 ///
-/// The scanner is idempotent: repeated runs skip files already in
-/// `files`, so re-running on every launch (or after a folder change)
-/// is fast. The first run on a real library walks tens of thousands
-/// of files; the bottleneck is filesystem I/O, not DB writes.
+/// Adding tracks to crate-agent's library means adding them to
+/// Serato's library first (either via Serato directly or via the
+/// drag-drop import flow, landing in a follow-up PR). The scanner
+/// itself never walks the filesystem looking for arbitrary audio
+/// files.
 ///
-/// Progress is reported via the per-batch callback so the UI can
-/// show "Indexed N of M" during long initial scans. The callback runs
-/// on whatever thread Swift concurrency chooses; UI code should hop
-/// to MainActor inside the callback if it needs to update state.
+/// Idempotent: running the scanner repeatedly only inserts newly-
+/// appearing Serato references. Tracks Serato has removed are not
+/// (yet) removed from the local table — that's a sync-direction
+/// question for a later refinement.
 public actor LibraryScanner {
 
-    public static let defaultAudioExtensions: Set<String> = FilesystemSyncCoordinator.defaultAudioExtensions
-
     public struct ScanProgress: Sendable, Equatable {
-        public let filesEncountered: Int
+        /// Total paths Serato references in its library.
+        public let seratoReferenceCount: Int
+        /// Paths newly inserted into the local DB this scan.
         public let filesIndexed: Int
+        /// Paths Serato references that are missing on disk or
+        /// couldn't be stat'd; logged but otherwise skipped.
         public let filesSkipped: Int
         public let lastIndexedPath: String?
     }
 
     public struct ScanResult: Sendable, Equatable {
-        public let filesEncountered: Int
+        public let seratoReferenceCount: Int
         public let filesIndexed: Int
         public let filesSkipped: Int
     }
@@ -44,68 +46,55 @@ public actor LibraryScanner {
 
     private let operationEngine: OperationEngine
     private let database: LibraryDatabase
-    private let audioExtensions: Set<String>
+    private let seratoLocator: SeratoLibraryLocator
 
     public init(
         operationEngine: OperationEngine,
         database: LibraryDatabase,
-        audioExtensions: Set<String> = LibraryScanner.defaultAudioExtensions
+        seratoLocator: SeratoLibraryLocator
     ) {
         self.operationEngine = operationEngine
         self.database = database
-        self.audioExtensions = audioExtensions
+        self.seratoLocator = seratoLocator
     }
 
-    /// Walk `directoryUrl` recursively and index every previously-
-    /// unseen audio file. Skips files whose path already exists in
-    /// the `files` table (path-based dedup is sufficient for a
-    /// startup scan — inode-based cross-volume detection happens via
-    /// FSEvents during normal operation).
+    /// Read Serato's library, diff against the local DB, and index
+    /// any newly-referenced tracks. The optional `progress` callback
+    /// fires every 50 indexed files plus once at the end.
     ///
-    /// Throws only on catastrophic failure (DB unavailable at start).
-    /// Per-file errors are logged and the scan continues.
+    /// Throws only on catastrophic failure (DB unavailable, Serato
+    /// library unreadable). Per-file errors are logged and the scan
+    /// continues so a single broken file doesn't abort the whole run.
     @discardableResult
-    public func scan(
-        _ directoryUrl: URL,
-        progress: ProgressHandler? = nil
-    ) async throws -> ScanResult {
+    public func scan(progress: ProgressHandler? = nil) async throws -> ScanResult {
+        Self.logger.info("Starting Serato library scan")
+
+        let referenceSet = try await SeratoLibraryReferenceSet.collectInBackground(
+            from: seratoLocator
+        )
         Self.logger.info(
-            "Starting library scan at \(directoryUrl.path, privacy: .public)"
+            "Serato references \(referenceSet.paths.count, privacy: .public) paths"
         )
 
-        // Snapshot known paths up front so we don't query the DB per
-        // file during the walk. On a 32k-track library this saves
-        // ~32k queries.
         let knownPaths: Set<String> = try await database.writer.read { db in
             let paths = try String.fetchAll(db, sql: "SELECT path FROM files")
             return Set(paths)
         }
 
-        let enumerator = FileManager.default.enumerator(
-            at: directoryUrl,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        )
+        // Paths Serato has but crate-agent doesn't — the work to do.
+        // Sorted so iteration order is stable across runs (helps with
+        // debug log readability and progress monotonicity).
+        let pathsToIndex = referenceSet.paths
+            .subtracting(knownPaths)
+            .sorted()
 
-        var filesEncountered = 0
         var filesIndexed = 0
         var filesSkipped = 0
 
-        while let fileUrl = enumerator?.nextObject() as? URL {
-            let pathExtension = fileUrl.pathExtension.lowercased()
-            guard audioExtensions.contains(pathExtension) else { continue }
-
-            filesEncountered += 1
-            let filePath = fileUrl.path
-
-            if knownPaths.contains(filePath) {
-                filesSkipped += 1
-                continue
-            }
-
+        for filePath in pathsToIndex {
             guard let metadata = FileMetadataCollector.collect(at: filePath) else {
                 Self.logger.warning(
-                    "could not stat \(filePath, privacy: .public); skipping"
+                    "Serato references \(filePath, privacy: .public) but the file is missing or unreadable; skipping"
                 )
                 filesSkipped += 1
                 continue
@@ -122,18 +111,15 @@ public actor LibraryScanner {
                 filesIndexed += 1
             } catch {
                 Self.logger.error(
-                    "index of \(filePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    "Index of \(filePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 filesSkipped += 1
                 continue
             }
 
-            // Per-file progress updates would deluge the UI; emit
-            // batched updates every 50 files for a responsive but
-            // not chatty indicator.
             if filesIndexed % 50 == 0 {
                 progress?(ScanProgress(
-                    filesEncountered: filesEncountered,
+                    seratoReferenceCount: referenceSet.paths.count,
                     filesIndexed: filesIndexed,
                     filesSkipped: filesSkipped,
                     lastIndexedPath: filePath
@@ -141,19 +127,18 @@ public actor LibraryScanner {
             }
         }
 
-        // Final progress callback so the UI lands on the real total.
         progress?(ScanProgress(
-            filesEncountered: filesEncountered,
+            seratoReferenceCount: referenceSet.paths.count,
             filesIndexed: filesIndexed,
             filesSkipped: filesSkipped,
             lastIndexedPath: nil
         ))
 
         Self.logger.info(
-            "Library scan complete: \(filesEncountered) audio files, \(filesIndexed) newly indexed, \(filesSkipped) skipped"
+            "Library scan complete: \(filesIndexed) newly indexed, \(filesSkipped) skipped, \(referenceSet.paths.count) Serato references total"
         )
         return ScanResult(
-            filesEncountered: filesEncountered,
+            seratoReferenceCount: referenceSet.paths.count,
             filesIndexed: filesIndexed,
             filesSkipped: filesSkipped
         )

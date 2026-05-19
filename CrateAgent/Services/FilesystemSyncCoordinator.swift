@@ -6,22 +6,29 @@ import os.log
 /// on the `OperationEngine`. Sits between the raw filesystem watcher
 /// (an event source) and the engine (a mutation sink).
 ///
-/// SP-1 v1 behavior:
-/// - `wasCreated` + audio extension + file exists → `indexNewFile`
-/// - `wasRenamed` + file exists at the new path → look up by inode in
-///   the `files` table; if found, issue `renameFile`; if not, fall
-///   through to `indexNewFile`
-/// - `wasRenamed` events where the file does not exist at the
-///   observed path are skipped — that's the old-path side of a
-///   rename; the new-path event arriving in the same batch (or
-///   immediately after) carries the inode that lets us update the
-///   row in place.
-/// - `wasRemoved` is deferred until removeFile lands in
+/// Per the project's "Serato is the source of truth" design, the
+/// coordinator ONLY processes events for files crate-agent already
+/// knows about — i.e., files that the LibraryScanner pulled in from
+/// Serato's library. New files appearing under the watched folder
+/// that aren't in Serato are intentionally ignored. The user adds
+/// new tracks via Serato itself (or, in a future PR, by dragging
+/// onto crate-agent's window).
+///
+/// Behavior:
+/// - `wasRenamed` + file exists + inode matches a known file →
+///   `renameFile` (the file moved; update Serato's pointers)
+/// - `wasRenamed` + file exists + inode does NOT match any known
+///   file → ignore (file isn't in Serato; not our concern)
+/// - `wasRenamed` + file doesn't exist → ignore (old-path side of
+///   a rename; the new-path event carries the update)
+/// - `wasCreated` → ignore (new files only enter via Serato or
+///   drag-drop, not auto-indexed)
+/// - `wasRemoved` → deferred until removeFile lands in
 ///   OperationEngine.
 ///
 /// Audio extension filter prevents OS-side metadata files
-/// (`.DS_Store`, `.localized`, sidecar `*.cue`, etc.) from polluting
-/// the library. The default set covers every format Serato accepts.
+/// (`.DS_Store`, `.localized`, sidecar `*.cue`, etc.) from
+/// triggering needless DB lookups.
 public actor FilesystemSyncCoordinator {
 
     public static let defaultAudioExtensions: Set<String> = [
@@ -62,20 +69,20 @@ public actor FilesystemSyncCoordinator {
         guard audioExtensions.contains(pathExtension) else { return }
 
         let fileExistsOnDisk = FileManager.default.fileExists(atPath: observation.path)
+        guard observation.wasRenamed && fileExistsOnDisk else {
+            // wasCreated / wasRenamed-old-side / wasRemoved /
+            // wasModified are all no-ops under the Serato-source-of-
+            // truth design. New files come in via the LibraryScanner
+            // (which reads Serato) or via the drag-drop import flow
+            // (future PR); FSEvents is only for tracking existing
+            // file movement.
+            return
+        }
 
-        if observation.wasRenamed && fileExistsOnDisk {
-            await handleRenameOrIndex(path: observation.path)
-            return
-        }
-        if observation.wasCreated && fileExistsOnDisk {
-            await indexNewFile(path: observation.path)
-            return
-        }
-        // wasRenamed + !fileExistsOnDisk: old-path side of a rename;
-        // intentionally ignored. wasRemoved: deferred to a later commit.
+        await handleRename(path: observation.path)
     }
 
-    private func handleRenameOrIndex(path: String) async {
+    private func handleRename(path: String) async {
         guard let metadata = FileMetadataCollector.collect(at: path) else {
             Self.logger.warning(
                 "could not stat file at \(path, privacy: .public); skipping"
@@ -83,8 +90,6 @@ public actor FilesystemSyncCoordinator {
             return
         }
 
-        // If a file with this inode is already known, the event
-        // represents a move/rename of that file to its new path.
         let existingFile: FileRecord?
         do {
             existingFile = try await database.writer.read { db in
@@ -100,50 +105,25 @@ public actor FilesystemSyncCoordinator {
             return
         }
 
-        if let existing = existingFile, let fileId = existing.id {
-            if existing.path == path {
-                return  // row already up to date — likely a duplicate event
-            }
-            do {
-                try await operationEngine.apply(.renameFile(RenameFilePayload(
-                    fileId: fileId,
-                    newPath: path
-                )))
-            } catch {
-                Self.logger.error(
-                    "rename mutation for file \(fileId) failed: \(error.localizedDescription, privacy: .public)"
-                )
-            }
+        guard let existing = existingFile, let fileId = existing.id else {
+            // File at this inode isn't in crate-agent's DB → not in
+            // Serato's library → not our concern. Apple Music files,
+            // user's general music folder, etc. all hit this branch.
             return
         }
-
-        // No prior knowledge of this inode → treat the rename event
-        // as "discovered a new file at this path."
-        await indexNewFile(path: path, metadata: metadata)
-    }
-
-    private func indexNewFile(path: String, metadata precomputed: FileMetadata? = nil) async {
-        let metadata = precomputed ?? FileMetadataCollector.collect(at: path)
-        guard let metadata else {
-            Self.logger.warning(
-                "could not stat file at \(path, privacy: .public); skipping index"
-            )
-            return
+        if existing.path == path {
+            return  // already up to date; duplicate event
         }
 
         do {
-            try await operationEngine.apply(.indexNewFile(IndexNewFilePayload(
-                path: metadata.path,
-                volumeUuid: metadata.volumeUuid,
-                inode: metadata.inode,
-                fileSize: metadata.fileSize,
-                mtime: metadata.mtime
+            try await operationEngine.apply(.renameFile(RenameFilePayload(
+                fileId: fileId,
+                newPath: path
             )))
         } catch {
             Self.logger.error(
-                "index mutation for \(path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                "rename mutation for file \(fileId) failed: \(error.localizedDescription, privacy: .public)"
             )
         }
     }
-
 }
