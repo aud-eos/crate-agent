@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 import GRDB
 import os.log
@@ -77,7 +76,7 @@ public actor FilesystemSyncCoordinator {
     }
 
     private func handleRenameOrIndex(path: String) async {
-        guard let metadata = collectFileMetadata(at: path) else {
+        guard let metadata = FileMetadataCollector.collect(at: path) else {
             Self.logger.warning(
                 "could not stat file at \(path, privacy: .public); skipping"
             )
@@ -124,7 +123,7 @@ public actor FilesystemSyncCoordinator {
     }
 
     private func indexNewFile(path: String, metadata precomputed: FileMetadata? = nil) async {
-        let metadata = precomputed ?? collectFileMetadata(at: path)
+        let metadata = precomputed ?? FileMetadataCollector.collect(at: path)
         guard let metadata else {
             Self.logger.warning(
                 "could not stat file at \(path, privacy: .public); skipping index"
@@ -147,37 +146,4 @@ public actor FilesystemSyncCoordinator {
         }
     }
 
-    // MARK: - File metadata extraction
-
-    /// Per-file metadata pulled from `stat(2)` and URL resource keys.
-    /// Used to populate `IndexNewFilePayload` and to compare inodes
-    /// against the database when handling a rename event.
-    struct FileMetadata: Sendable, Equatable {
-        let path: String
-        let volumeUuid: String
-        let inode: Int64
-        let fileSize: Int64
-        let mtime: Int64
-    }
-
-    /// Returns nil if the file does not exist or is not stat-able
-    /// (insufficient permissions, broken symlink, etc.). Errors are
-    /// not propagated because the coordinator handles them as
-    /// "skip this event"; per-event logging happens in the call site.
-    private func collectFileMetadata(at path: String) -> FileMetadata? {
-        var statBuffer = stat()
-        guard stat(path, &statBuffer) == 0 else { return nil }
-
-        let url = URL(fileURLWithPath: path)
-        let volumeUuidString = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?
-            .volumeUUIDString ?? "unknown-volume"
-
-        return FileMetadata(
-            path: path,
-            volumeUuid: volumeUuidString,
-            inode: Int64(statBuffer.st_ino),
-            fileSize: Int64(statBuffer.st_size),
-            mtime: Int64(statBuffer.st_mtimespec.tv_sec)
-        )
-    }
 }

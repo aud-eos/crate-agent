@@ -1,10 +1,11 @@
+import Combine
 import Foundation
 import os.log
 
 /// Top-level service container for the running application. Owns
 /// every long-lived component and wires them together at startup —
 /// the database, the Serato watchdog, the operation engine, both
-/// coordinators, and the FSEvents watcher.
+/// coordinators, the FSEvents watcher, and the library scanner.
 ///
 /// `CrateAgentApp` constructs this once via `@StateObject` so the
 /// container's lifetime matches the app's. Views receive the
@@ -24,9 +25,17 @@ public final class AppServices: ObservableObject {
     public let seratoLocator: SeratoLibraryLocator
     public let operationEngine: OperationEngine
     public let filesystemSyncCoordinator: FilesystemSyncCoordinator
+    public let libraryScanner: LibraryScanner
 
-    // Retained for their side-effects (subscriptions, stream
-    // lifetime) — not directly accessed by views.
+    /// Latest progress from the running initial scan, or nil when no
+    /// scan is in flight. Views observe via @Published.
+    @Published public private(set) var scanProgress: LibraryScanner.ScanProgress?
+
+    /// `true` once the initial scan task has completed at least once
+    /// since launch. The UI can use this to distinguish "still
+    /// scanning" from "library appears empty" states.
+    @Published public private(set) var initialScanComplete: Bool = false
+
     private let seratoSyncCoordinator: SeratoSyncCoordinator
     private let fsEventsWatcher: FSEventsWatcher
 
@@ -35,11 +44,12 @@ public final class AppServices: ObservableObject {
         category: "AppServices"
     )
 
-    /// Convenience bootstrap that uses the default music folder and
-    /// the on-disk library database. Crashes on failure.
+    /// Convenience bootstrap that reads UserPreferences for the
+    /// watched music folder and opens the on-disk library database.
+    /// Crashes on failure.
     public static func bootstrap() -> AppServices {
         do {
-            let watchedFolder = try Self.defaultMusicFolder()
+            let watchedFolder = try UserPreferences.resolveMusicFolder()
             let database = try LibraryDatabase.openDefault()
             return try AppServices(
                 watchedMusicFolder: watchedFolder,
@@ -71,21 +81,24 @@ public final class AppServices: ObservableObject {
             seratoWatchdog: seratoWatchdog
         )
 
-        let coordinator = FilesystemSyncCoordinator(
+        let filesystemCoordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
             database: database
         )
-        self.filesystemSyncCoordinator = coordinator
+        self.filesystemSyncCoordinator = filesystemCoordinator
+
+        self.libraryScanner = LibraryScanner(
+            operationEngine: engine,
+            database: database
+        )
 
         // FSEventsWatcher hands the coordinator each batched event
-        // group. The closure is @Sendable and captures the
-        // (Sendable, actor-isolated) coordinator; per-batch handling
-        // happens in a detached Task to keep the watcher's dispatch
-        // queue free for the next callback.
+        // group via a detached Task; the watcher's dispatch queue
+        // stays free for the next callback.
         self.fsEventsWatcher = FSEventsWatcher(
             watchedPaths: [watchedMusicFolder.path]
         ) { observations in
-            Task { await coordinator.handleObservations(observations) }
+            Task { await filesystemCoordinator.handleObservations(observations) }
         }
 
         // All stored properties are now assigned; start lifecycle.
@@ -95,18 +108,36 @@ public final class AppServices: ObservableObject {
         Self.logger.info(
             "AppServices ready; watching \(watchedMusicFolder.path, privacy: .public)"
         )
+
+        // Kick off the initial library scan in the background so the
+        // UI shows live progress without blocking app launch. New
+        // files discovered between AppServices.init and scan
+        // completion are also picked up by the FSEvents watcher and
+        // deduplicated by the scanner's path-based skip logic.
+        Task { @MainActor in
+            await runInitialScan()
+        }
     }
 
     deinit {
         fsEventsWatcher.stop()
     }
 
-    private static func defaultMusicFolder() throws -> URL {
-        try FileManager.default.url(
-            for: .musicDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false
-        )
+    private func runInitialScan() async {
+        let watchedFolder = watchedMusicFolder
+        let scanner = libraryScanner
+
+        do {
+            _ = try await scanner.scan(watchedFolder) { [weak self] progress in
+                Task { @MainActor in
+                    self?.scanProgress = progress
+                }
+            }
+        } catch {
+            Self.logger.error(
+                "Initial library scan failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+        initialScanComplete = true
     }
 }
