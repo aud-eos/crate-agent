@@ -43,6 +43,7 @@ public actor FingerprintWorker {
     private let concurrency: Int
     private let fingerprintFunction: FingerprintFunction
     private let pollIntervalNanos: UInt64
+    private let batchCooldownNanos: UInt64
 
     private var progressHandler: ProgressHandler?
     private var workTask: Task<Void, Never>?
@@ -53,12 +54,21 @@ public actor FingerprintWorker {
         database: LibraryDatabase,
         concurrency: Int? = nil,
         fingerprintFunction: @escaping FingerprintFunction = { try fingerprintAudioFile(filePath: $0) },
-        pollIntervalSeconds: Double = 5
+        pollIntervalSeconds: Double = 5,
+        batchCooldownMillis: UInt64 = 200
     ) {
         self.database = database
-        self.concurrency = max(1, concurrency ?? (ProcessInfo.processInfo.activeProcessorCount - 2))
+        // Conservative default: a *quarter* of the cores. Earlier
+        // versions used cores - 2 which pegged a real 32k-track
+        // library at full CPU on every available core, making the
+        // user's machine unusable. Fingerprinting is a background
+        // task — taking 4× longer in wall time but leaving the
+        // user's computer responsive is the right tradeoff.
+        let defaultConcurrency = max(1, ProcessInfo.processInfo.activeProcessorCount / 4)
+        self.concurrency = max(1, concurrency ?? defaultConcurrency)
         self.fingerprintFunction = fingerprintFunction
         self.pollIntervalNanos = UInt64(pollIntervalSeconds * 1_000_000_000)
+        self.batchCooldownNanos = batchCooldownMillis * 1_000_000
     }
 
     /// Start the background loop. No-op if already running.
@@ -157,6 +167,14 @@ public actor FingerprintWorker {
                 totalPending: pendingCount,
                 fingerprintFunction: fingerprintFunction
             )
+
+            // Cooperative cooldown so we don't pin CPU continuously
+            // across batches. Even at 200ms per batch, this dwarfs
+            // the fingerprint work itself in % CPU dropped — the
+            // user's machine stays responsive between bursts.
+            if batchCooldownNanos > 0 {
+                try? await Task.sleep(nanoseconds: batchCooldownNanos)
+            }
         }
         Self.logger.info("FingerprintWorker stopped")
     }
@@ -166,6 +184,9 @@ public actor FingerprintWorker {
         totalPending: Int,
         fingerprintFunction: @escaping FingerprintFunction
     ) async {
+        var completedResults: [ProcessResult] = []
+        completedResults.reserveCapacity(batch.count)
+
         await withTaskGroup(of: ProcessResult.self) { group in
             var iterator = batch.makeIterator()
 
@@ -178,15 +199,65 @@ public actor FingerprintWorker {
                 group.addTask { await Self.runOne(file: next, function: fingerprintFunction) }
             }
 
-            // For each completion, persist the result and (optionally)
-            // queue the next pending file from the same batch.
             while let result = await group.next() {
-                await self.applyResult(result, totalPending: totalPending)
+                // Accumulate first; flush below in one transaction.
+                // Per-file writes flood ValueObservation subscribers
+                // (the library browser re-renders 13k rows on every
+                // tick), beach-balling MainActor under heavy load.
+                completedResults.append(result)
                 if !Task.isCancelled, let next = iterator.next() {
                     group.addTask { await Self.runOne(file: next, function: fingerprintFunction) }
                 }
             }
         }
+
+        // One SQL transaction per batch instead of one per file.
+        // ValueObservation now fires roughly once per ~40 files
+        // (concurrency × 4) instead of once per file — MainActor
+        // can render in between.
+        await flushBatchResults(completedResults, totalPending: totalPending)
+    }
+
+    private func flushBatchResults(
+        _ results: [ProcessResult],
+        totalPending: Int
+    ) async {
+        guard !results.isEmpty else { return }
+        do {
+            try await database.writer.write { db in
+                for result in results {
+                    let (hash, status): (Data?, FingerprintStatus) = {
+                        switch result.outcome {
+                        case .success(let bytes): return (bytes, .done)
+                        case .failure: return (nil, .failed)
+                        }
+                    }()
+                    try db.execute(
+                        sql: "UPDATE files SET chromaprint_fingerprint = ?, fingerprint_status = ? WHERE id = ?",
+                        arguments: [hash, status.rawValue, result.fileId]
+                    )
+                }
+            }
+            for result in results {
+                switch result.outcome {
+                case .success: totalDone += 1
+                case .failure: totalFailed += 1
+                }
+            }
+        } catch {
+            // Whole-batch failure: count every result as failed for
+            // progress purposes and log. Future runs pick up the
+            // still-pending rows (their DB state didn't change).
+            Self.logger.error(
+                "Batch persist of \(results.count) fingerprints failed: \(error.localizedDescription, privacy: .public)"
+            )
+            totalFailed += results.count
+        }
+
+        emitProgress(
+            lastPath: results.last?.path,
+            pending: max(0, totalPending - results.count)
+        )
     }
 
     private static func runOne(
@@ -206,38 +277,6 @@ public actor FingerprintWorker {
         } catch {
             return ProcessResult(fileId: fileId, path: file.path, outcome: .failure)
         }
-    }
-
-    private func applyResult(_ result: ProcessResult, totalPending: Int) async {
-        switch result.outcome {
-        case .success(let bytes):
-            do {
-                try await writeFingerprint(
-                    fileId: result.fileId, hash: bytes, status: .done
-                )
-                totalDone += 1
-            } catch {
-                Self.logger.error(
-                    "Persist of fingerprint for \(result.path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
-                )
-                totalFailed += 1
-            }
-        case .failure:
-            do {
-                try await writeFingerprint(
-                    fileId: result.fileId, hash: nil, status: .failed
-                )
-            } catch {
-                Self.logger.error(
-                    "Persist of failure status for \(result.path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
-                )
-            }
-            totalFailed += 1
-        }
-        emitProgress(
-            lastPath: result.path,
-            pending: max(0, totalPending - 1)
-        )
     }
 
     private func emitProgress(lastPath: String?, pending: Int) {
@@ -266,19 +305,6 @@ public actor FingerprintWorker {
                 .filter(Column("fingerprint_status") == FingerprintStatus.pending.rawValue)
                 .limit(limit)
                 .fetchAll(db)
-        }
-    }
-
-    private func writeFingerprint(
-        fileId: Int64,
-        hash: Data?,
-        status: FingerprintStatus
-    ) async throws {
-        try await database.writer.write { db in
-            try db.execute(
-                sql: "UPDATE files SET chromaprint_fingerprint = ?, fingerprint_status = ? WHERE id = ?",
-                arguments: [hash, status.rawValue, fileId]
-            )
         }
     }
 
