@@ -18,7 +18,11 @@ import os.log
 /// - `wasRenamed` + file exists + inode matches a known file →
 ///   `renameFile` (the file moved; update Serato's pointers)
 /// - `wasRenamed` + file exists + inode does NOT match any known
-///   file → ignore (file isn't in Serato; not our concern)
+///   file + lightweight hash matches a known file →
+///   `renameFile` with cross-volume identity update (the file moved
+///   to a different volume; refresh inode + volume_uuid alongside path)
+/// - `wasRenamed` + file exists + neither inode nor hash matches
+///   anything → ignore (file isn't in Serato; not our concern)
 /// - `wasRenamed` + file doesn't exist → ignore (old-path side of
 ///   a rename; the new-path event carries the update)
 /// - `wasCreated` → ignore (new files only enter via Serato or
@@ -83,16 +87,22 @@ public actor FilesystemSyncCoordinator {
     }
 
     private func handleRename(path: String) async {
-        guard let metadata = FileMetadataCollector.collect(at: path) else {
+        guard let metadata = FileMetadataCollector.collect(
+            at: path,
+            includeLightweightHash: true
+        ) else {
             Self.logger.warning(
                 "could not stat file at \(path, privacy: .public); skipping"
             )
             return
         }
 
-        let existingFile: FileRecord?
+        // First pass: same-volume rename (inode + volume_uuid match).
+        // This is the common case — Finder rename, mv within a volume,
+        // editor "Save As" reusing the inode, etc.
+        let inodeMatch: FileRecord?
         do {
-            existingFile = try await database.writer.read { db in
+            inodeMatch = try await database.writer.read { db in
                 try FileRecord
                     .filter(Column("inode") == metadata.inode)
                     .filter(Column("volume_uuid") == metadata.volumeUuid)
@@ -105,20 +115,75 @@ public actor FilesystemSyncCoordinator {
             return
         }
 
-        guard let existing = existingFile, let fileId = existing.id else {
-            // File at this inode isn't in crate-agent's DB → not in
-            // Serato's library → not our concern. Apple Music files,
-            // user's general music folder, etc. all hit this branch.
+        if let existing = inodeMatch, let fileId = existing.id {
+            if existing.path == path {
+                return  // already up to date; duplicate event
+            }
+            await applyRename(
+                fileId: fileId,
+                newPath: path,
+                crossVolumeIdentity: nil
+            )
             return
         }
-        if existing.path == path {
-            return  // already up to date; duplicate event
+
+        // Second pass: cross-volume move fallback (file_size +
+        // lightweight_hash match an existing row whose inode/volume
+        // didn't). The hash skips the inode lookup's exact-match
+        // semantics — same content at a new inode on a new volume.
+        guard let lightweightHash = metadata.lightweightHash else {
+            // No hash computed (file unreadable, or stat ran but the
+            // hash didn't): fall back to inode-only behavior, which
+            // we've already exhausted. Not our file.
+            return
         }
 
+        let hashMatch: FileRecord?
+        do {
+            hashMatch = try await database.writer.read { db in
+                try FileRecord
+                    .filter(Column("file_size") == metadata.fileSize)
+                    .filter(Column("lightweight_hash") == lightweightHash)
+                    .fetchOne(db)
+            }
+        } catch {
+            Self.logger.error(
+                "DB hash lookup at \(path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+            )
+            return
+        }
+
+        guard let existing = hashMatch, let fileId = existing.id else {
+            // Not in Serato's library — not our concern.
+            return
+        }
+        if existing.path == path
+            && existing.inode == metadata.inode
+            && existing.volumeUuid == metadata.volumeUuid {
+            return  // already up to date; duplicate event after the row was updated
+        }
+
+        Self.logger.info(
+            "Cross-volume move detected for file \(fileId): \(existing.path, privacy: .public) → \(path, privacy: .public)"
+        )
+        await applyRename(
+            fileId: fileId,
+            newPath: path,
+            crossVolumeIdentity: (volumeUuid: metadata.volumeUuid, inode: metadata.inode)
+        )
+    }
+
+    private func applyRename(
+        fileId: Int64,
+        newPath: String,
+        crossVolumeIdentity: (volumeUuid: String, inode: Int64)?
+    ) async {
         do {
             try await operationEngine.apply(.renameFile(RenameFilePayload(
                 fileId: fileId,
-                newPath: path
+                newPath: newPath,
+                newVolumeUuid: crossVolumeIdentity?.volumeUuid,
+                newInode: crossVolumeIdentity?.inode
             )))
         } catch {
             Self.logger.error(

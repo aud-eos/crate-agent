@@ -1385,3 +1385,185 @@ final class DatabaseSchemaTests: XCTestCase {
         XCTAssertEqual(events.first?.eventType, .fileRenamed)
     }
 }
+
+final class LightweightHashCalculatorTests: XCTestCase {
+
+    private func makeTempFile(bytes: Data) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-hash-\(UUID().uuidString).bin")
+        try bytes.write(to: url)
+        return url
+    }
+
+    func testHashIsNilForMissingFile() {
+        let hash = LightweightHashCalculator.compute(
+            forFileAt: "/tmp/crate-agent-test-this-path-should-not-exist-\(UUID().uuidString).mp3"
+        )
+        XCTAssertNil(hash)
+    }
+
+    func testHashIsDeterministicForSmallFile() throws {
+        // Below the 2MB threshold: hashes the whole file.
+        let payload = Data("hello world\n".utf8)
+        let url = try makeTempFile(bytes: payload)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let hashA = LightweightHashCalculator.compute(forFileAt: url.path)
+        let hashB = LightweightHashCalculator.compute(forFileAt: url.path)
+        XCTAssertNotNil(hashA)
+        XCTAssertEqual(hashA, hashB)
+        XCTAssertEqual(hashA?.count, 32)  // SHA-256
+    }
+
+    func testHashChangesWhenContentChanges() throws {
+        let urlA = try makeTempFile(bytes: Data("alpha".utf8))
+        let urlB = try makeTempFile(bytes: Data("beta".utf8))
+        defer {
+            try? FileManager.default.removeItem(at: urlA)
+            try? FileManager.default.removeItem(at: urlB)
+        }
+        XCTAssertNotEqual(
+            LightweightHashCalculator.compute(forFileAt: urlA.path),
+            LightweightHashCalculator.compute(forFileAt: urlB.path)
+        )
+    }
+
+    func testHashUsesHeadAndTailForLargeFile() throws {
+        // 3MB file: above the 2MB threshold. Build it so that head
+        // and tail windows are predictable — 1MB of 'A', 1MB of 'M'
+        // (middle bytes that DON'T get hashed), 1MB of 'Z'.
+        let mb = 1024 * 1024
+        var payload = Data(count: 3 * mb)
+        payload.withUnsafeMutableBytes { rawBuffer in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            for index in 0..<mb { bytes[index] = UInt8(ascii: "A") }
+            for index in mb..<(2 * mb) { bytes[index] = UInt8(ascii: "M") }
+            for index in (2 * mb)..<(3 * mb) { bytes[index] = UInt8(ascii: "Z") }
+        }
+        let urlA = try makeTempFile(bytes: payload)
+        defer { try? FileManager.default.removeItem(at: urlA) }
+
+        // Identical head + tail, but middle bytes flipped to 'X'.
+        var payloadVariant = payload
+        payloadVariant.withUnsafeMutableBytes { rawBuffer in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            for index in mb..<(2 * mb) { bytes[index] = UInt8(ascii: "X") }
+        }
+        let urlB = try makeTempFile(bytes: payloadVariant)
+        defer { try? FileManager.default.removeItem(at: urlB) }
+
+        let hashA = LightweightHashCalculator.compute(forFileAt: urlA.path)
+        let hashB = LightweightHashCalculator.compute(forFileAt: urlB.path)
+        XCTAssertNotNil(hashA)
+        XCTAssertEqual(hashA, hashB,
+                       "Middle-bytes-only mutation must not affect the hash — only head+tail windows are sampled")
+
+        // Tail-byte mutation MUST change the hash.
+        var payloadTailChanged = payload
+        payloadTailChanged.withUnsafeMutableBytes { rawBuffer in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            bytes[3 * mb - 1] = UInt8(ascii: "Q")
+        }
+        let urlC = try makeTempFile(bytes: payloadTailChanged)
+        defer { try? FileManager.default.removeItem(at: urlC) }
+        XCTAssertNotEqual(hashA, LightweightHashCalculator.compute(forFileAt: urlC.path))
+    }
+}
+
+extension FilesystemSyncCoordinatorTests {
+
+    func testCrossVolumeMoveIsDetectedViaLightweightHash() async throws {
+        let (coordinator, _, database) = try await MainActor.run { try makeCoordinator() }
+        let audioFile = try makeTemporaryAudioFile()
+        defer { try? FileManager.default.removeItem(at: audioFile) }
+
+        // Compute the real hash of the file on disk — this is what
+        // FilesystemSyncCoordinator will look up.
+        guard let realHash = LightweightHashCalculator.compute(forFileAt: audioFile.path) else {
+            XCTFail("could not compute hash for temp file")
+            return
+        }
+        // Real stat info, used to verify the coordinator wrote the
+        // new identity onto the row.
+        var statBuffer = stat()
+        guard stat(audioFile.path, &statBuffer) == 0 else {
+            XCTFail("could not stat temp file")
+            return
+        }
+        let realInode = Int64(statBuffer.st_ino)
+        let realVolumeUuid = (try? audioFile.resourceValues(forKeys: [.volumeUUIDStringKey]))?
+            .volumeUUIDString ?? "unknown-volume"
+
+        // Pre-populate with a row that has the file's true hash and
+        // size but a DIFFERENT (inode, volume_uuid) — i.e., the row
+        // describes the same content as it lived on a previous
+        // volume. Insert directly so the test doesn't depend on
+        // OperationEngine's mutation path.
+        let fakeInode: Int64 = 999_999_999
+        let fakeVolume = "stale-other-volume-uuid"
+        let stalePath = "/imaginary/old-volume/track.mp3"
+        let fileSizeOnDisk = Int64(statBuffer.st_size)
+
+        let fileId: Int64 = try await database.writer.write { db in
+            var record = FileRecord(
+                path: stalePath,
+                volumeUuid: fakeVolume,
+                inode: fakeInode,
+                fileSize: fileSizeOnDisk,
+                mtime: 1,
+                lightweightHash: realHash,
+                fingerprintStatus: .pending
+            )
+            try record.insert(db)
+            guard let identifier = record.id else {
+                XCTFail("insert did not return row id")
+                return 0
+            }
+            return identifier
+        }
+
+        // Fire the rename event for the file at its real location.
+        // The inode/volume lookup will miss (the row has a fake pair),
+        // so the coordinator should fall back to the hash lookup and
+        // recognize this as a cross-volume move.
+        let observation = FSEventsObservation(
+            path: audioFile.path, isFile: true, wasRenamed: true
+        )
+        await coordinator.handleObservations([observation])
+
+        let updated = try await database.writer.read { db in
+            try FileRecord.fetchOne(db, key: fileId)
+        }
+        XCTAssertEqual(updated?.path, audioFile.path,
+                       "cross-volume rename must rewrite path to the new disk location")
+        XCTAssertEqual(updated?.inode, realInode,
+                       "cross-volume rename must update inode to the new volume's value")
+        XCTAssertEqual(updated?.volumeUuid, realVolumeUuid,
+                       "cross-volume rename must update volume_uuid")
+
+        let fileCount = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(fileCount, 1,
+                       "cross-volume rename must not create a second row")
+    }
+
+    func testRenameOfUnknownFileIsIgnoredEvenWithHashAvailable() async throws {
+        // File exists on disk and has a hash, but no row in the DB
+        // matches the hash — confirms we don't accidentally claim
+        // arbitrary files in the watched folder.
+        let (coordinator, _, database) = try await MainActor.run { try makeCoordinator() }
+        let audioFile = try makeTemporaryAudioFile()
+        defer { try? FileManager.default.removeItem(at: audioFile) }
+
+        let observation = FSEventsObservation(
+            path: audioFile.path, isFile: true, wasRenamed: true
+        )
+        await coordinator.handleObservations([observation])
+
+        let fileCount = try await database.writer.read { db in
+            try FileRecord.fetchCount(db)
+        }
+        XCTAssertEqual(fileCount, 0)
+    }
+}

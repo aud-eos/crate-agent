@@ -67,7 +67,10 @@ public actor ImportCoordinator {
     private func importSingleFile(at fileUrl: URL) async -> Bool {
         let absolutePath = fileUrl.path
 
-        guard let fileMetadata = FileMetadataCollector.collect(at: absolutePath) else {
+        guard let fileMetadata = FileMetadataCollector.collect(
+            at: absolutePath,
+            includeLightweightHash: true
+        ) else {
             Self.logger.warning(
                 "could not stat \(absolutePath, privacy: .public); skipping import"
             )
@@ -90,6 +93,7 @@ public actor ImportCoordinator {
                     inode: fileMetadata.inode,
                     fileSize: fileMetadata.fileSize,
                     mtime: fileMetadata.mtime,
+                    lightweightHash: fileMetadata.lightweightHash,
                     metadata: seratoMetadata
                 )),
                 batchId: batchId

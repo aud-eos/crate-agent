@@ -499,18 +499,35 @@ public actor OperationEngine {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
         let originalPath = fileRecord.path
+        let originalVolumeUuid = fileRecord.volumeUuid
+        let originalInode = fileRecord.inode
+
         fileRecord.path = payload.newPath
+        if let newVolumeUuid = payload.newVolumeUuid {
+            fileRecord.volumeUuid = newVolumeUuid
+        }
+        if let newInode = payload.newInode {
+            fileRecord.inode = newInode
+        }
         try fileRecord.update(db)
 
         let forwardPayload = RenameFilePayload(
             fileId: payload.fileId,
             newPath: payload.newPath,
-            previousPath: originalPath
+            previousPath: originalPath,
+            newVolumeUuid: payload.newVolumeUuid,
+            newInode: payload.newInode,
+            previousVolumeUuid: payload.newVolumeUuid == nil ? nil : originalVolumeUuid,
+            previousInode: payload.newInode == nil ? nil : originalInode
         )
         let inversePayload = RenameFilePayload(
             fileId: payload.fileId,
             newPath: originalPath,
-            previousPath: payload.newPath
+            previousPath: payload.newPath,
+            newVolumeUuid: payload.newVolumeUuid == nil ? nil : originalVolumeUuid,
+            newInode: payload.newInode == nil ? nil : originalInode,
+            previousVolumeUuid: payload.newVolumeUuid,
+            previousInode: payload.newInode
         )
 
         let eventId = try insertEvent(
@@ -762,11 +779,32 @@ public struct RenameFilePayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public let newPath: String
     public let previousPath: String
+    /// Cross-volume rename: when the file moved to a different volume,
+    /// its `inode` and `volume_uuid` change. nil means same-volume
+    /// rename (engine leaves the identity fields alone). Engine fills
+    /// in `previousVolumeUuid` / `previousInode` from the existing
+    /// row at apply time — callers pass nil for those.
+    public let newVolumeUuid: String?
+    public let newInode: Int64?
+    public let previousVolumeUuid: String?
+    public let previousInode: Int64?
 
-    public init(fileId: Int64, newPath: String, previousPath: String = "") {
+    public init(
+        fileId: Int64,
+        newPath: String,
+        previousPath: String = "",
+        newVolumeUuid: String? = nil,
+        newInode: Int64? = nil,
+        previousVolumeUuid: String? = nil,
+        previousInode: Int64? = nil
+    ) {
         self.fileId = fileId
         self.newPath = newPath
         self.previousPath = previousPath
+        self.newVolumeUuid = newVolumeUuid
+        self.newInode = newInode
+        self.previousVolumeUuid = previousVolumeUuid
+        self.previousInode = previousInode
     }
 }
 
