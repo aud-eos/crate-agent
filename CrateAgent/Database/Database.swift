@@ -66,6 +66,7 @@ public final class LibraryDatabase {
         PivotToSeratoSourceOfTruthMigration.register(in: &migrator)
         AddSeratoMetadataToFilesMigration.register(in: &migrator)
         AddBitrateToFilesMigration.register(in: &migrator)
+        ResetFingerprintsForDurationCapMigration.register(in: &migrator)
         try migrator.migrate(writer)
     }
 }
