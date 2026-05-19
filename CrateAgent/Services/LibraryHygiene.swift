@@ -691,11 +691,15 @@ public actor LibraryHygieneRunner {
         return effectiveBatchId
     }
 
-    /// Shared mutation pair: setMetadata (DB) + commitMetadataToSerato
-    /// (Serato), both under the same batch so undo reverts together.
-    /// The Serato commit captures `previousMetadata` from the file's
-    /// pre-fix state so the batch is fully invertible — see PR #21's
-    /// engine extension.
+    /// Shared mutation triple: setMetadata (crate-agent DB) +
+    /// commitMetadataToSerato (Serato's database V2) + writeFileTags
+    /// (the audio file's embedded ID3v2.4 / Vorbis / iTunes tags).
+    /// All three under the same batch_id so a single Undo from
+    /// History reverts the file tags, the Serato snapshot, and the
+    /// DB row in lockstep.
+    ///
+    /// All three carry the pre-fix `previousMetadata` so each is
+    /// individually invertible — see the matching engine extensions.
     private func applyMergedMetadata(
         fileId: Int64,
         file: FileRecord,
@@ -719,6 +723,14 @@ public actor LibraryHygieneRunner {
         )
         try await operationEngine.apply(
             .commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                fileId: fileId,
+                metadata: merged,
+                previousMetadata: previousSnapshot
+            )),
+            batchId: batchId
+        )
+        try await operationEngine.apply(
+            .writeFileTags(WriteFileTagsPayload(
                 fileId: fileId,
                 metadata: merged,
                 previousMetadata: previousSnapshot

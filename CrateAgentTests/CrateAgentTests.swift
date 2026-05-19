@@ -71,7 +71,8 @@ final class OperationEngineTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database, locator)
     }
@@ -923,7 +924,8 @@ final class LibraryScannerTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         let scanner = LibraryScanner(
             operationEngine: engine,
@@ -1180,7 +1182,8 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         let coordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
@@ -1921,7 +1924,8 @@ final class EventHistoryQueryTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -2857,7 +2861,8 @@ final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3055,7 +3060,8 @@ final class LibraryHygieneCaseRunnerTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3222,7 +3228,8 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3357,7 +3364,8 @@ final class LibraryHygieneRunnerTests: XCTestCase {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
-            seratoLocator: locator
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3385,7 +3393,7 @@ final class LibraryHygieneRunnerTests: XCTestCase {
         XCTAssertEqual(cleaned.first?.title, "Title")
     }
 
-    func testApplyJournalsBothMutationsUnderSameBatchId() async throws {
+    func testApplyJournalsAllThreeMutationsUnderSameBatchId() async throws {
         let (engine, database) = try await MainActor.run { try makeEngine() }
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
             path: "/Music/A/track.mp3",
@@ -3406,10 +3414,10 @@ final class LibraryHygieneRunnerTests: XCTestCase {
                 .order(Column("event_id").asc)
                 .fetchAll(db)
         }
-        XCTAssertEqual(batchEvents.count, 2,
-                       "one setMetadata + one commitMetadataToSerato per affected file")
+        XCTAssertEqual(batchEvents.count, 3,
+                       "setMetadata + commitMetadataToSerato + writeFileTags per affected file")
         XCTAssertEqual(batchEvents.map(\.eventType),
-                       [.metadataSet, .metadataCommittedToSerato])
+                       [.metadataSet, .metadataCommittedToSerato, .fileTagsWritten])
     }
 
     func testHygieneBatchIsFullyUndoable() async throws {
@@ -3445,5 +3453,155 @@ final class LibraryHygieneRunnerTests: XCTestCase {
         XCTAssertEqual(postUndo.artist, " Aphex Twin ",
                        "undo of hygiene must restore the original whitespace")
         XCTAssertEqual(postUndo.title, "Windowlicker ")
+    }
+}
+
+final class WriteFileTagsMutationTests: XCTestCase {
+
+    /// Captures calls from the injected fileTagWriter so the test
+    /// can assert what would have been written to disk.
+    private final class FileTagWriterRecorder: @unchecked Sendable {
+        struct Call: Sendable, Equatable {
+            let path: String
+            let update: AudioTagUpdate
+        }
+        private let lock = NSLock()
+        private var _calls: [Call] = []
+        var calls: [Call] {
+            lock.lock(); defer { lock.unlock() }
+            return _calls
+        }
+        func record(_ path: String, _ update: AudioTagUpdate) {
+            lock.lock(); defer { lock.unlock() }
+            _calls.append(Call(path: path, update: update))
+        }
+    }
+
+    @MainActor
+    private func makeEngine(
+        recorder: FileTagWriterRecorder = FileTagWriterRecorder(),
+        seratoIsRunning: Bool = false
+    ) throws -> (OperationEngine, LibraryDatabase, FileTagWriterRecorder) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: {
+            seratoIsRunning ? ["com.serato.djpro"] : []
+        })
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator,
+            fileTagWriter: { path, update in
+                recorder.record(path, update)
+            }
+        )
+        return (engine, database, recorder)
+    }
+
+    func testWriteFileTagsInvokesWriterWithResolvedPath() async throws {
+        let (engine, database, recorder) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/track.mp3"])
+        }!
+
+        try await engine.apply(.writeFileTags(WriteFileTagsPayload(
+            fileId: fileId,
+            metadata: SeratoMetadata(artist: "New Artist", title: "New Title"),
+            previousMetadata: SeratoMetadata()
+        )))
+
+        XCTAssertEqual(recorder.calls.count, 1)
+        XCTAssertEqual(recorder.calls.first?.path, "/Music/A/track.mp3")
+        XCTAssertEqual(recorder.calls.first?.update.artist, "New Artist")
+        XCTAssertEqual(recorder.calls.first?.update.title, "New Title")
+    }
+
+    func testWriteFileTagsQueuesWhileSeratoIsRunning() async throws {
+        let (engine, database, recorder) = try await MainActor.run {
+            try makeEngine(seratoIsRunning: true)
+        }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/track.mp3"])
+        }!
+
+        try await engine.apply(.writeFileTags(WriteFileTagsPayload(
+            fileId: fileId,
+            metadata: SeratoMetadata(artist: "Edited"),
+            previousMetadata: SeratoMetadata()
+        )))
+
+        XCTAssertEqual(recorder.calls.count, 0,
+                       "writer must NOT fire while Serato is running — Serato may have the file mmapped")
+        let queueDepth = await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queueDepth, 1,
+                       "file tag write must be queued alongside other Serato-gated writes")
+    }
+
+    func testWriteFileTagsUndoableViaBatch() async throws {
+        let (engine, database, recorder) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/track.mp3"])
+        }!
+
+        let batchId = "test-tag-write"
+        try await engine.apply(
+            .writeFileTags(WriteFileTagsPayload(
+                fileId: fileId,
+                metadata: SeratoMetadata(artist: "After"),
+                previousMetadata: SeratoMetadata(artist: "Before")
+            )),
+            batchId: batchId
+        )
+        XCTAssertEqual(recorder.calls.last?.update.artist, "After")
+
+        _ = try await engine.undoBatch(batchId)
+        // Undo should have invoked the writer again with the
+        // previous-state values.
+        XCTAssertEqual(recorder.calls.count, 2)
+        XCTAssertEqual(recorder.calls.last?.update.artist, "Before",
+                       "undo of writeFileTags must re-issue the writer with previousMetadata")
+    }
+
+    func testUndoRejectsWriteFileTagsLackingPreviousMetadata() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/track.mp3"])
+        }!
+
+        let batchId = "no-previous-state"
+        try await engine.apply(
+            .writeFileTags(WriteFileTagsPayload(
+                fileId: fileId,
+                metadata: SeratoMetadata(artist: "After")
+                // previousMetadata omitted → nil → un-undoable
+            )),
+            batchId: batchId
+        )
+        do {
+            _ = try await engine.undoBatch(batchId)
+            XCTFail("expected undoNotSupported for writeFileTags without previousMetadata")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .undoNotSupported(eventType: .fileTagsWritten))
+        }
     }
 }

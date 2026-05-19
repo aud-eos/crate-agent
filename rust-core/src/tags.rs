@@ -16,10 +16,11 @@
 
 use std::path::Path;
 
-use lofty::file::TaggedFileExt;
+use lofty::config::WriteOptions;
+use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::*;
 use lofty::probe::Probe;
-use lofty::tag::ItemKey;
+use lofty::tag::{ItemKey, Tag};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -30,6 +31,8 @@ pub enum TagError {
     Probe(String),
     #[error("could not read tags: {0}")]
     Read(String),
+    #[error("could not write tags: {0}")]
+    Write(String),
 }
 
 /// Tag fields extracted from an audio file. All fields are optional —
@@ -75,6 +78,88 @@ pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
     }
 
     Ok(tags)
+}
+
+/// Patch to apply to an audio file's primary tag. Mirrors the
+/// `SeratoMetadata` Swift struct field-for-field so the FFI binding
+/// is a direct pass-through; the runner doesn't translate fields.
+/// Every value is optional — `None` leaves the existing tag content
+/// alone, `Some(value)` overwrites (empty string overwrites with
+/// empty).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AudioTagUpdate {
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub bpm: Option<String>,
+    pub musical_key: Option<String>,
+    pub comment: Option<String>,
+    pub label: Option<String>,
+}
+
+/// Write the supplied fields to the audio file's primary tag. For
+/// MP3, Lofty's default `WriteOptions` writes **ID3v2.4** (the
+/// current spec — UTF-8 support, sync-safe sizes); calling
+/// `remove_others(true)` strips any legacy tags (ID3v1, APE) that
+/// would otherwise lie on top of the v2.4 tag with stale values.
+///
+/// FLAC files get Vorbis comments, M4A gets iTunes atoms, etc. —
+/// Lofty's `primary_tag_mut` dispatches on the file type.
+///
+/// If the file has no tag at all, one is created in the file's
+/// natural primary type before fields are set.
+pub fn write_tags(path: impl AsRef<Path>, update: &AudioTagUpdate) -> Result<(), TagError> {
+    let path_ref = path.as_ref();
+    let probe = Probe::open(path_ref).map_err(|err| TagError::Probe(err.to_string()))?;
+    let mut tagged_file = probe.read().map_err(|err| TagError::Read(err.to_string()))?;
+
+    if tagged_file.primary_tag().is_none() {
+        let primary_type = tagged_file.primary_tag_type();
+        tagged_file.insert_tag(Tag::new(primary_type));
+    }
+
+    let tag = tagged_file
+        .primary_tag_mut()
+        .expect("primary tag was inserted above if it didn't exist");
+
+    apply_update_to_tag(tag, update);
+
+    let opts = WriteOptions::new().remove_others(true);
+    tagged_file
+        .save_to_path(path_ref, opts)
+        .map_err(|err| TagError::Write(err.to_string()))?;
+
+    Ok(())
+}
+
+/// Pull-out so the apply logic is unit-testable against a free-
+/// standing `Tag` without needing real file I/O.
+fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) {
+    if let Some(value) = &update.artist {
+        tag.set_artist(value.clone());
+    }
+    if let Some(value) = &update.title {
+        tag.set_title(value.clone());
+    }
+    if let Some(value) = &update.album {
+        tag.set_album(value.clone());
+    }
+    if let Some(value) = &update.genre {
+        tag.set_genre(value.clone());
+    }
+    if let Some(value) = &update.comment {
+        tag.set_comment(value.clone());
+    }
+    if let Some(value) = &update.bpm {
+        tag.insert_text(ItemKey::Bpm, value.clone());
+    }
+    if let Some(value) = &update.musical_key {
+        tag.insert_text(ItemKey::InitialKey, value.clone());
+    }
+    if let Some(value) = &update.label {
+        tag.insert_text(ItemKey::Label, value.clone());
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +262,112 @@ mod tests {
     fn returns_probe_error_for_nonexistent_file() {
         let result = read_tags("/nonexistent/path/to/audio.mp3");
         assert!(matches!(result, Err(TagError::Probe(_))));
+    }
+
+    #[test]
+    fn write_tags_round_trips_text_fields_into_existing_tag() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-write-roundtrip");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("write.wav");
+        write_silent_wav(&path, 2).unwrap();
+
+        // Seed the file with one set of values so we can confirm the
+        // update overwrites rather than appending.
+        let update_initial = AudioTagUpdate {
+            artist: Some("Old Artist".to_string()),
+            title: Some("Old Title".to_string()),
+            ..Default::default()
+        };
+        write_tags(&path, &update_initial).unwrap();
+
+        let update = AudioTagUpdate {
+            artist: Some("New Artist".to_string()),
+            title: Some("New Title".to_string()),
+            album: Some("New Album".to_string()),
+            genre: Some("House".to_string()),
+            comment: Some("Edited via crate-agent".to_string()),
+            // bpm / musical_key / label are intentionally passed
+            // through here even though WAV's RIFF INFO doesn't have
+            // mappings for them — proves write_tags doesn't error
+            // on unsupported keys (Lofty silently drops them in the
+            // RIFF INFO case). Round-trip of these fields is
+            // exercised against real-format fixtures in higher-
+            // fidelity tests.
+            bpm: Some("128.000".to_string()),
+            musical_key: Some("Am".to_string()),
+            label: Some("Test Label".to_string()),
+        };
+        write_tags(&path, &update).unwrap();
+
+        let read_back = read_tags(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back.artist.as_deref(), Some("New Artist"));
+        assert_eq!(read_back.title.as_deref(), Some("New Title"));
+        assert_eq!(read_back.album.as_deref(), Some("New Album"));
+        assert_eq!(read_back.genre.as_deref(), Some("House"));
+        assert_eq!(read_back.comment.as_deref(), Some("Edited via crate-agent"));
+    }
+
+    #[test]
+    fn write_tags_leaves_unspecified_fields_alone() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-write-partial");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("partial.wav");
+        write_silent_wav(&path, 2).unwrap();
+
+        // Seed.
+        write_tags(
+            &path,
+            &AudioTagUpdate {
+                artist: Some("Keep Me".to_string()),
+                title: Some("Keep Me Too".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Update only `artist`. `title` must survive untouched.
+        write_tags(
+            &path,
+            &AudioTagUpdate {
+                artist: Some("Updated".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let read_back = read_tags(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back.artist.as_deref(), Some("Updated"));
+        assert_eq!(
+            read_back.title.as_deref(),
+            Some("Keep Me Too"),
+            "fields with None in the update must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn write_tags_creates_tag_when_file_has_none() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-write-no-tag");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("no-tag.wav");
+        write_silent_wav(&path, 2).unwrap();
+
+        // No tag was written above. The function should create one.
+        write_tags(
+            &path,
+            &AudioTagUpdate {
+                artist: Some("Fresh Artist".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let read_back = read_tags(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back.artist.as_deref(), Some("Fresh Artist"));
     }
 }

@@ -70,4 +70,5 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case metadataSet = "metadata_set"
     case metadataCommittedToSerato = "metadata_committed_to_serato"
     case trackAddedToSerato = "track_added_to_serato"
+    case fileTagsWritten = "file_tags_written"
 }

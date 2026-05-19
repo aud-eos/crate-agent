@@ -137,6 +137,8 @@ public enum EventHistoryQuery {
             return "Updated metadata for \(count) file\(pluralS)"
         case .metadataCommittedToSerato:
             return "Committed metadata to Serato for \(count) file\(pluralS)"
+        case .fileTagsWritten:
+            return "Wrote audio tags on \(count) file\(pluralS)"
         case .trackAddedToSerato:
             return "Added \(count) track\(pluralS) to Serato"
         }

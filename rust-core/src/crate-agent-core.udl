@@ -91,6 +91,22 @@ namespace crate_agent_core {
   // regardless of whether the file carries tags.
   [Throws=CoreError]
   AudioTags read_audio_tags(string file_path);
+
+  // Write metadata tags into the audio file at `file_path`. Each
+  // field in `update` is independently optional: `null` leaves the
+  // existing tag value alone; a value (including the empty string)
+  // overwrites the tag. For MP3 the write is **ID3v2.4** with
+  // ID3v1 stripped; FLAC writes Vorbis comments; M4A writes iTunes
+  // atoms. Fields with no equivalent in a given tag format (e.g.,
+  // BPM in WAV's RIFF INFO) are silently skipped — write succeeds
+  // and the file's other fields land normally.
+  //
+  // Called from the hygiene runner after `setMetadata` +
+  // `commitMetadataToSerato`, under the same batch_id, so a single
+  // Undo on the History view reverts the file tags alongside the
+  // Serato and crate-agent DB writes.
+  [Throws=CoreError]
+  void write_audio_tags(string file_path, AudioTagUpdate update);
 };
 
 // Full track-level metadata extracted from a Serato `database V2`
@@ -130,6 +146,24 @@ dictionary SeratoMetadataUpdate {
   string? key;
   string? comment;
   string? length;
+  string? label;
+};
+
+// Patch applied to an audio file's primary tag by
+// `write_audio_tags`. Mirrors `SeratoMetadata` field-for-field so
+// the hygiene runner passes the merged snapshot through verbatim.
+// `musical_key` becomes ID3v2 TKEY / Vorbis comment INITIALKEY;
+// `label` becomes ID3v2 TPUB / Vorbis comment LABEL. `length` is
+// accepted for symmetry but isn't written today (ID3v2 TLEN
+// expects milliseconds, not Serato's "MM:SS" string).
+dictionary AudioTagUpdate {
+  string? artist;
+  string? title;
+  string? album;
+  string? genre;
+  string? bpm;
+  string? musical_key;
+  string? comment;
   string? label;
 };
 

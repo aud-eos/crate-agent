@@ -34,9 +34,16 @@ import GRDB
 ///                                   import). Gated by SeratoWatchdog.
 public actor OperationEngine {
 
+    /// Injectable audio-file tag writer. Production wires in the
+    /// Rust `writeAudioTags` FFI; tests inject a no-op (or recording)
+    /// closure so they can exercise the mutation pipeline without
+    /// real audio files on disk.
+    public typealias FileTagWriter = @Sendable (String, AudioTagUpdate) throws -> Void
+
     private let database: LibraryDatabase
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
+    private let fileTagWriter: FileTagWriter
 
     /// Pending writes to Serato library files. Either a path
     /// rewrite or a metadata update. Drained when Serato exits via
@@ -66,11 +73,15 @@ public actor OperationEngine {
     public init(
         database: LibraryDatabase,
         seratoWatchdog: SeratoWatchdog,
-        seratoLocator: SeratoLibraryLocator
+        seratoLocator: SeratoLibraryLocator,
+        fileTagWriter: @escaping FileTagWriter = { path, update in
+            try writeAudioTags(filePath: path, update: update)
+        }
     ) {
         self.database = database
         self.seratoWatchdog = seratoWatchdog
         self.seratoLocator = seratoLocator
+        self.fileTagWriter = fileTagWriter
     }
 
     /// Apply a mutation with an auto-generated batch identifier. Use
@@ -191,6 +202,16 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
+        case .fileTagsWritten:
+            // Undoable when previousMetadata was captured at forward
+            // time. Same gate as commitMetadataToSerato.
+            let payload = try decoder.decode(
+                WriteFileTagsPayload.self, from: inverseJsonData
+            )
+            if payload.previousMetadata == nil {
+                throw OperationEngineError.undoNotSupported(eventType: event.eventType)
+            }
+            return .writeFileTags(payload)
         }
     }
 
@@ -214,6 +235,29 @@ public actor OperationEngine {
             try await applySeratoMetadataUpdate(update)
         case .addTrack(let add):
             try await applySeratoAddTrack(add)
+        case .fileTagWrite(let write):
+            try await applyFileTagWrite(write)
+        }
+    }
+
+    private func applyFileTagWrite(_ write: SeratoPendingFileTagWrite) async throws {
+        let update = AudioTagUpdate(
+            artist: write.metadata.artist,
+            title: write.metadata.title,
+            album: write.metadata.album,
+            genre: write.metadata.genre,
+            bpm: write.metadata.bpm,
+            musicalKey: write.metadata.musicalKey,
+            comment: write.metadata.comment,
+            label: write.metadata.label
+        )
+        do {
+            try fileTagWriter(write.absolutePath, update)
+        } catch {
+            throw OperationEngineError.fileTagWriteFailed(
+                path: write.absolutePath,
+                underlying: String(describing: error)
+            )
         }
     }
 
@@ -482,6 +526,14 @@ public actor OperationEngine {
             return ExecutionResult(
                 eventId: eventId,
                 seratoWrite: .addTrack(seratoAdd)
+            )
+        case .writeFileTags(let payload):
+            let (eventId, fileTagWrite) = try applyWriteFileTags(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(
+                eventId: eventId,
+                seratoWrite: .fileTagWrite(fileTagWrite)
             )
         }
     }
@@ -758,6 +810,44 @@ public actor OperationEngine {
         return (eventId, pending)
     }
 
+    private static func applyWriteFileTags(
+        _ payload: WriteFileTagsPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, SeratoPendingFileTagWrite) {
+        guard let fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+
+        // Mirror commitMetadataToSerato's inverse pattern: when the
+        // caller supplied `previousMetadata`, the inverse swaps
+        // metadata ↔ previousMetadata. Without it, the inverse
+        // mirrors the forward and the event is rejected by
+        // decodeInverseMutation (callers without prior state forfeit
+        // undo for this event).
+        let inversePayload = WriteFileTagsPayload(
+            fileId: payload.fileId,
+            metadata: payload.previousMetadata ?? payload.metadata,
+            previousMetadata: payload.previousMetadata == nil ? nil : payload.metadata
+        )
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .fileTagsWritten,
+            forwardPayload: payload,
+            inversePayload: inversePayload,
+            in: db
+        )
+
+        let pending = SeratoPendingFileTagWrite(
+            absolutePath: fileRecord.path,
+            metadata: payload.metadata
+        )
+        return (eventId, pending)
+    }
+
     private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
         batchId: String,
         timestamp: Int64,
@@ -804,6 +894,34 @@ public enum TrackMutation: Sendable {
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)
     case addTrackToSerato(AddTrackToSeratoPayload)
+    case writeFileTags(WriteFileTagsPayload)
+}
+
+/// Writes metadata into the audio file's primary tag (ID3v2.4 for
+/// MP3, Vorbis comments for FLAC, iTunes atoms for M4A — Lofty
+/// dispatches by format). Captures `previousMetadata` so the
+/// reverse mutation can rewrite the file's tags back to their
+/// prior state, making the event fully undoable.
+///
+/// Gated by `SeratoWatchdog` the same way Serato library writes
+/// are: Serato may have a file mmapped during playback or analysis,
+/// and writing tags underneath it can corrupt the read. The
+/// pending-writes queue ensures crate-agent's file writes happen
+/// only while Serato is closed.
+public struct WriteFileTagsPayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public let metadata: SeratoMetadata
+    public let previousMetadata: SeratoMetadata?
+
+    public init(
+        fileId: Int64,
+        metadata: SeratoMetadata,
+        previousMetadata: SeratoMetadata? = nil
+    ) {
+        self.fileId = fileId
+        self.metadata = metadata
+        self.previousMetadata = previousMetadata
+    }
 }
 
 /// Inserts a new otrk entry into Serato's database V2 for the file
@@ -982,13 +1100,24 @@ public struct RemoveFilePayload: Codable, Sendable, Equatable {
 
 // MARK: - Queue types
 
-/// A Serato library write that's queued because Serato was running
-/// at the time the mutation was applied. Drained by
-/// `drainPendingSeratoUpdates` when Serato exits.
+/// A write that's deferred while Serato is running. Originally
+/// only Serato library files (`.crate`, `database V2`); SP-1.5
+/// expanded the queue to also gate audio-file tag writes, because
+/// Serato may have audio files mmapped during playback or analysis
+/// and writing tags underneath could corrupt the read.
 enum SeratoPendingWrite: Sendable, Equatable {
     case rename(SeratoPendingRename)
     case metadataUpdate(SeratoPendingMetadataUpdate)
     case addTrack(SeratoPendingAddTrack)
+    case fileTagWrite(SeratoPendingFileTagWrite)
+}
+
+/// File-tag write deferred by the SeratoWatchdog. Carries the
+/// absolute path resolved from the FileRecord plus the metadata
+/// snapshot to write.
+struct SeratoPendingFileTagWrite: Sendable, Equatable {
+    let absolutePath: String
+    let metadata: SeratoMetadata
 }
 
 /// A Serato-side rewrite scheduled by `renameFile`. Carries absolute
@@ -1024,6 +1153,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case payloadEncodingFailed
     case seratoEnumerationFailed(directory: String, underlying: String)
     case seratoRewriteFailed(path: String, underlying: String)
+    case fileTagWriteFailed(path: String, underlying: String)
     case batchNotFound(batchId: String)
     case undoNotSupported(eventType: EventType)
 
@@ -1039,6 +1169,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Failed to enumerate Serato crate files in \(directory): \(underlying)"
         case .seratoRewriteFailed(let path, let underlying):
             return "Failed to rewrite Serato library file \(path): \(underlying)"
+        case .fileTagWriteFailed(let path, let underlying):
+            return "Failed to write audio tags to \(path): \(underlying)"
         case .batchNotFound(let batchId):
             return "No events were found for batch \(batchId); nothing to undo."
         case .undoNotSupported(let eventType):
