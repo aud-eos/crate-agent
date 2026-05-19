@@ -2,38 +2,36 @@ import Foundation
 import GRDB
 import os.log
 
-/// Hydrates the local files table from Serato's library. Serato is
-/// the source of truth — crate-agent only knows about tracks Serato
-/// references. The scanner reads `database V2` plus every `.crate`,
-/// diffs against the current `files` table, and indexes the set of
-/// paths Serato has that crate-agent doesn't yet.
+/// Mirrors Serato's library into crate-agent's local DB.
 ///
-/// Adding tracks to crate-agent's library means adding them to
-/// Serato's library first (either via Serato directly or via the
-/// drag-drop import flow, landing in a follow-up PR). The scanner
-/// itself never walks the filesystem looking for arbitrary audio
-/// files.
+/// Reads `database V2` + every `.crate`, decodes the full per-track
+/// records (path + artist/title/album/genre/bpm/key/comment/length/
+/// label), then for each record:
+///   • if crate-agent has no file row at that path → `indexNewFile`
+///   • if crate-agent has the path but Serato's metadata differs from
+///     the stored snapshot → `setMetadata`
+///   • otherwise → no-op
 ///
-/// Idempotent: running the scanner repeatedly only inserts newly-
-/// appearing Serato references. Tracks Serato has removed are not
-/// (yet) removed from the local table — that's a sync-direction
-/// question for a later refinement.
+/// Tracks Serato has removed are NOT yet pruned from the local table
+/// (the `removeFile` mutation hasn't landed). They'd just sit there
+/// orphaned until that ships.
+///
+/// Used by AppServices on launch and by SeratoSyncCoordinator when
+/// Serato quits — same operation in both contexts.
 public actor LibraryScanner {
 
     public struct ScanProgress: Sendable, Equatable {
-        /// Total paths Serato references in its library.
         public let seratoReferenceCount: Int
-        /// Paths newly inserted into the local DB this scan.
         public let filesIndexed: Int
-        /// Paths Serato references that are missing on disk or
-        /// couldn't be stat'd; logged but otherwise skipped.
+        public let filesMetadataUpdated: Int
         public let filesSkipped: Int
-        public let lastIndexedPath: String?
+        public let lastChangedPath: String?
     }
 
     public struct ScanResult: Sendable, Equatable {
         public let seratoReferenceCount: Int
         public let filesIndexed: Int
+        public let filesMetadataUpdated: Int
         public let filesSkipped: Int
     }
 
@@ -58,43 +56,49 @@ public actor LibraryScanner {
         self.seratoLocator = seratoLocator
     }
 
-    /// Read Serato's library, diff against the local DB, and index
-    /// any newly-referenced tracks. The optional `progress` callback
-    /// fires every 50 indexed files plus once at the end.
-    ///
-    /// Throws only on catastrophic failure (DB unavailable, Serato
-    /// library unreadable). Per-file errors are logged and the scan
-    /// continues so a single broken file doesn't abort the whole run.
     @discardableResult
     public func scan(progress: ProgressHandler? = nil) async throws -> ScanResult {
         Self.logger.info("Starting Serato library scan")
 
-        let referenceSet = try await SeratoLibraryReferenceSet.collectInBackground(
-            from: seratoLocator
-        )
+        let seratoRecords = try await loadSeratoRecords()
         Self.logger.info(
-            "Serato references \(referenceSet.paths.count, privacy: .public) paths"
+            "Serato references \(seratoRecords.count, privacy: .public) tracks"
         )
 
-        let knownPaths: Set<String> = try await database.writer.read { db in
-            let paths = try String.fetchAll(db, sql: "SELECT path FROM files")
-            return Set(paths)
-        }
-
-        // Paths Serato has but crate-agent doesn't — the work to do.
-        // Sorted so iteration order is stable across runs (helps with
-        // debug log readability and progress monotonicity).
-        let pathsToIndex = referenceSet.paths
-            .subtracting(knownPaths)
-            .sorted()
+        let knownFilesByPath = try await loadKnownFilesByPath()
 
         var filesIndexed = 0
+        var filesMetadataUpdated = 0
         var filesSkipped = 0
+        var lastChangedPath: String?
 
-        for filePath in pathsToIndex {
-            guard let metadata = FileMetadataCollector.collect(at: filePath) else {
+        for (absolutePath, record) in seratoRecords {
+            if let existingFile = knownFilesByPath[absolutePath],
+               let fileId = existingFile.id {
+                let seratoMetadata = makeSeratoMetadata(fromRecord: record)
+                let storedMetadata = makeSeratoMetadata(fromFileRecord: existingFile)
+                if seratoMetadata == storedMetadata {
+                    continue
+                }
+                do {
+                    try await operationEngine.apply(.setMetadata(SetMetadataPayload(
+                        fileId: fileId,
+                        metadata: seratoMetadata
+                    )))
+                    filesMetadataUpdated += 1
+                    lastChangedPath = absolutePath
+                } catch {
+                    Self.logger.error(
+                        "Metadata update for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    )
+                    filesSkipped += 1
+                }
+                continue
+            }
+
+            guard let metadata = FileMetadataCollector.collect(at: absolutePath) else {
                 Self.logger.warning(
-                    "Serato references \(filePath, privacy: .public) but the file is missing or unreadable; skipping"
+                    "Serato references \(absolutePath, privacy: .public) but the file is missing or unreadable; skipping"
                 )
                 filesSkipped += 1
                 continue
@@ -106,41 +110,100 @@ public actor LibraryScanner {
                     volumeUuid: metadata.volumeUuid,
                     inode: metadata.inode,
                     fileSize: metadata.fileSize,
-                    mtime: metadata.mtime
+                    mtime: metadata.mtime,
+                    metadata: makeSeratoMetadata(fromRecord: record)
                 )))
                 filesIndexed += 1
+                lastChangedPath = absolutePath
             } catch {
                 Self.logger.error(
-                    "Index of \(filePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    "Index of \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 filesSkipped += 1
                 continue
             }
 
-            if filesIndexed % 50 == 0 {
+            if (filesIndexed + filesMetadataUpdated) % 50 == 0 {
                 progress?(ScanProgress(
-                    seratoReferenceCount: referenceSet.paths.count,
+                    seratoReferenceCount: seratoRecords.count,
                     filesIndexed: filesIndexed,
+                    filesMetadataUpdated: filesMetadataUpdated,
                     filesSkipped: filesSkipped,
-                    lastIndexedPath: filePath
+                    lastChangedPath: lastChangedPath
                 ))
             }
         }
 
         progress?(ScanProgress(
-            seratoReferenceCount: referenceSet.paths.count,
+            seratoReferenceCount: seratoRecords.count,
             filesIndexed: filesIndexed,
+            filesMetadataUpdated: filesMetadataUpdated,
             filesSkipped: filesSkipped,
-            lastIndexedPath: nil
+            lastChangedPath: nil
         ))
 
         Self.logger.info(
-            "Library scan complete: \(filesIndexed) newly indexed, \(filesSkipped) skipped, \(referenceSet.paths.count) Serato references total"
+            "Library scan complete: \(filesIndexed) indexed, \(filesMetadataUpdated) metadata updated, \(filesSkipped) skipped, \(seratoRecords.count) Serato references"
         )
         return ScanResult(
-            seratoReferenceCount: referenceSet.paths.count,
+            seratoReferenceCount: seratoRecords.count,
             filesIndexed: filesIndexed,
+            filesMetadataUpdated: filesMetadataUpdated,
             filesSkipped: filesSkipped
+        )
+    }
+
+    // MARK: - Helpers
+
+    /// Read Serato's database V2 and return the records keyed by
+    /// absolute path. Off the actor's isolation domain because the
+    /// FFI call can take a while on a 25MB database.
+    private func loadSeratoRecords() async throws -> [(String, SeratoTrackRecord)] {
+        let databaseV2Path = seratoLocator.databaseV2Url.path
+        guard FileManager.default.fileExists(atPath: databaseV2Path) else {
+            return []
+        }
+        let records = try await Task.detached(priority: .userInitiated) {
+            try readDatabaseRecords(databasePath: databaseV2Path)
+        }.value
+        return records.map { record in
+            let absolutePath = record.path.hasPrefix("/") ? record.path : "/" + record.path
+            return (absolutePath, record)
+        }
+    }
+
+    private func loadKnownFilesByPath() async throws -> [String: FileRecord] {
+        let allFiles: [FileRecord] = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        return Dictionary(uniqueKeysWithValues: allFiles.map { ($0.path, $0) })
+    }
+
+    private func makeSeratoMetadata(fromRecord record: SeratoTrackRecord) -> SeratoMetadata {
+        SeratoMetadata(
+            artist: record.artist,
+            title: record.title,
+            album: record.album,
+            genre: record.genre,
+            bpm: record.bpm,
+            musicalKey: record.key,
+            comment: record.comment,
+            length: record.length,
+            label: record.label
+        )
+    }
+
+    private func makeSeratoMetadata(fromFileRecord file: FileRecord) -> SeratoMetadata {
+        SeratoMetadata(
+            artist: file.artist,
+            title: file.title,
+            album: file.album,
+            genre: file.genre,
+            bpm: file.bpm,
+            musicalKey: file.musicalKey,
+            comment: file.comment,
+            length: file.length,
+            label: file.label
         )
     }
 }

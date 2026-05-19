@@ -83,21 +83,25 @@ public final class AppServices: ObservableObject {
         )
         self.operationEngine = engine
 
-        self.seratoSyncCoordinator = SeratoSyncCoordinator(
-            operationEngine: engine,
-            seratoWatchdog: seratoWatchdog
-        )
-
         let filesystemCoordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
             database: database
         )
         self.filesystemSyncCoordinator = filesystemCoordinator
 
-        self.libraryScanner = LibraryScanner(
+        let scanner = LibraryScanner(
             operationEngine: engine,
             database: database,
             seratoLocator: seratoLocator
+        )
+        self.libraryScanner = scanner
+
+        // Coordinator needs the scanner to trigger reload-on-exit;
+        // wire it last so all upstream deps are constructed.
+        self.seratoSyncCoordinator = SeratoSyncCoordinator(
+            operationEngine: engine,
+            libraryScanner: scanner,
+            seratoWatchdog: seratoWatchdog
         )
 
         // Resume from the last seen event ID if we have one for this

@@ -67,4 +67,5 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case trackImported = "track_imported"
     case fileRenamed = "file_renamed"
     case fileRemoved = "file_removed"
+    case metadataSet = "metadata_set"
 }
