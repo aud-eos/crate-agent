@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 
 /// Thin wrapper over UserDefaults for the small set of preferences
@@ -46,7 +47,30 @@ public enum UserPreferences {
         )
     }
 
+    /// Last FSEvents event ID we successfully processed for the
+    /// given watched-folder path. Used as the `sinceWhen` argument on
+    /// next launch so events that fire while crate-agent is closed
+    /// are replayed rather than silently lost. Keyed by path so that
+    /// changing the watched folder doesn't replay events from the
+    /// old folder against the new one.
+    public static func lastFSEventId(forWatchedPath path: String) -> FSEventStreamEventId? {
+        let key = Key.lastFSEventIdPrefix + path
+        guard let stored = UserDefaults.standard.object(forKey: key) as? UInt64 else {
+            return nil
+        }
+        return FSEventStreamEventId(stored)
+    }
+
+    public static func setLastFSEventId(
+        _ eventId: FSEventStreamEventId,
+        forWatchedPath path: String
+    ) {
+        let key = Key.lastFSEventIdPrefix + path
+        UserDefaults.standard.set(UInt64(eventId), forKey: key)
+    }
+
     enum Key {
         static let watchedMusicFolderPath = "WatchedMusicFolderPath"
+        static let lastFSEventIdPrefix = "LastFSEventId:"
     }
 }

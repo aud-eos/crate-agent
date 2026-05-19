@@ -20,26 +20,39 @@ import Foundation
 /// needs it.
 public final class FSEventsWatcher {
     public typealias Handler = @Sendable ([FSEventsObservation]) -> Void
+    public typealias EventIdCheckpointHandler = @Sendable (FSEventStreamEventId) -> Void
 
     /// Time window in seconds for the kernel to coalesce events
     /// before delivering them to our callback. Higher values smooth
     /// bursty filesystem activity at the cost of perceived latency.
     public static let defaultEventCoalescingLatency: CFTimeInterval = 0.5
 
+    /// Sentinel value meaning "start the stream from now; ignore
+    /// historical events." Equivalent to FSEvents' built-in constant
+    /// but with a Swift-friendly name and type.
+    public static let sinceNow: FSEventStreamEventId =
+        FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+
     private let watchedPaths: [String]
     private let handler: Handler
+    private let eventIdCheckpointHandler: EventIdCheckpointHandler?
+    private let sinceWhen: FSEventStreamEventId
     private let dispatchQueue: DispatchQueue
     private let coalescingLatency: CFTimeInterval
     private var stream: FSEventStreamRef?
 
     public init(
         watchedPaths: [String],
+        sinceWhen: FSEventStreamEventId = FSEventsWatcher.sinceNow,
         coalescingLatency: CFTimeInterval = FSEventsWatcher.defaultEventCoalescingLatency,
-        handler: @escaping Handler
+        handler: @escaping Handler,
+        onEventIdCheckpoint: EventIdCheckpointHandler? = nil
     ) {
         self.watchedPaths = watchedPaths
+        self.sinceWhen = sinceWhen
         self.coalescingLatency = coalescingLatency
         self.handler = handler
+        self.eventIdCheckpointHandler = onEventIdCheckpoint
         self.dispatchQueue = DispatchQueue(
             label: "com.crateagent.fsevents",
             qos: .utility
@@ -77,7 +90,7 @@ public final class FSEventsWatcher {
             FSEventsWatcher.callbackTrampoline,
             context,
             watchedPaths as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            sinceWhen,
             coalescingLatency,
             flags
         ) else {
@@ -101,20 +114,22 @@ public final class FSEventsWatcher {
     /// capture state, so the caller installs an opaque pointer to
     /// `self` in the context info; we cast it back here.
     private static let callbackTrampoline: FSEventStreamCallback = {
-        _, contextInfo, numberOfEvents, eventPaths, eventFlags, _ in
+        _, contextInfo, numberOfEvents, eventPaths, eventFlags, eventIds in
         guard let contextInfo else { return }
         let watcher = Unmanaged<FSEventsWatcher>.fromOpaque(contextInfo).takeUnretainedValue()
         watcher.dispatchEvents(
             count: numberOfEvents,
             pathsOpaquePointer: eventPaths,
-            flags: eventFlags
+            flags: eventFlags,
+            ids: eventIds
         )
     }
 
     private func dispatchEvents(
         count: Int,
         pathsOpaquePointer: UnsafeRawPointer,
-        flags: UnsafePointer<FSEventStreamEventFlags>
+        flags: UnsafePointer<FSEventStreamEventFlags>,
+        ids: UnsafePointer<FSEventStreamEventId>
     ) {
         // With kFSEventStreamCreateFlagUseCFTypes set, eventPaths is
         // a CFArray of CFString.
@@ -122,6 +137,7 @@ public final class FSEventsWatcher {
             .takeUnretainedValue()
 
         let flagsBuffer = UnsafeBufferPointer(start: flags, count: count)
+        let idsBuffer = UnsafeBufferPointer(start: ids, count: count)
 
         var observations: [FSEventsObservation] = []
         observations.reserveCapacity(count)
@@ -140,6 +156,14 @@ public final class FSEventsWatcher {
         }
 
         handler(observations)
+
+        // Checkpoint the highest event ID we just processed so a
+        // restart can resume from this point. The max may be a
+        // historical-replay ID or a live event ID — either is
+        // correct as a "next sinceWhen."
+        if let highestEventId = idsBuffer.max(), highestEventId != 0 {
+            eventIdCheckpointHandler?(highestEventId)
+        }
     }
 }
 
