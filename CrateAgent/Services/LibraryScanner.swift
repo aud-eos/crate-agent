@@ -228,7 +228,35 @@ public actor LibraryScanner {
         let allFiles: [FileRecord] = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
-        return Dictionary(uniqueKeysWithValues: allFiles.map { ($0.path, $0) })
+        let indexed = Self.buildPathIndex(allFiles)
+        if indexed.duplicatePathCount > 0 {
+            Self.logger.warning(
+                "loadKnownFilesByPath: \(indexed.duplicatePathCount, privacy: .public) duplicate path(s) in files table (likely Unicode normalization or symlink-resolution mismatches). Last-seen wins. Investigate via #35 if this recurs."
+            )
+        }
+        return indexed.byPath
+    }
+
+    /// Build the path → FileRecord lookup map used by `scan`.
+    /// Defensive: the `files.path` column has a UNIQUE constraint, so
+    /// duplicates "shouldn't" exist. In practice large libraries can
+    /// carry bytewise-distinct paths that pass the SQL constraint but
+    /// COLLIDE on Swift's `String == String` (Unicode normalization
+    /// — NFC vs NFD "Café.mp3" produces different SQLite UTF-8 byte
+    /// sequences but identical Swift strings). `Dictionary(uniqueKeysWithValues:)`
+    /// traps on collision; `buildPathIndex` is the tolerant
+    /// alternative — last-write-wins, surfaces a count for logging.
+    static func buildPathIndex(
+        _ files: [FileRecord]
+    ) -> (byPath: [String: FileRecord], duplicatePathCount: Int) {
+        var byPath: [String: FileRecord] = [:]
+        byPath.reserveCapacity(files.count)
+        var duplicatePathCount = 0
+        for file in files {
+            if byPath[file.path] != nil { duplicatePathCount += 1 }
+            byPath[file.path] = file
+        }
+        return (byPath, duplicatePathCount)
     }
 
     private func makeSeratoMetadata(fromRecord record: SeratoTrackRecord) -> SeratoMetadata {
