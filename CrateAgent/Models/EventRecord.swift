@@ -68,4 +68,5 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case fileRenamed = "file_renamed"
     case fileRemoved = "file_removed"
     case metadataSet = "metadata_set"
+    case metadataCommittedToSerato = "metadata_committed_to_serato"
 }

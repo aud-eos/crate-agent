@@ -48,6 +48,23 @@ namespace crate_agent_core {
   [Throws=CoreError]
   sequence<SeratoTrackRecord> read_database_records(string database_path);
 
+  // Update Serato's metadata for a single track inside `database V2`.
+  // For each `Some(...)` field in `update`, the corresponding `t*`
+  // record in the matching `otrk` is set (creating it if absent);
+  // `None` fields leave the existing record alone. Returns 1 if the
+  // matching otrk was found and updated, 0 otherwise. Writes the
+  // file back if any update happened.
+  //
+  // Must be called only while Serato is NOT running — Serato caches
+  // its library in memory and overwrites the disk version on save.
+  // The Swift caller gates this via SeratoWatchdog.
+  [Throws=CoreError]
+  u32 update_database_record(
+    string database_path,
+    string track_path,
+    SeratoMetadataUpdate update
+  );
+
   // Decode an audio file and return its Chromaprint perceptual
   // fingerprint as a sequence of 32-bit hashes. Stable across
   // re-encodings of the same recording within Chromaprint's tolerance.
@@ -73,6 +90,24 @@ namespace crate_agent_core {
 // "03:24"). Lossless on the FFI boundary; callers parse as needed.
 dictionary SeratoTrackRecord {
   string path;
+  string? artist;
+  string? title;
+  string? album;
+  string? genre;
+  string? bpm;
+  string? key;
+  string? comment;
+  string? length;
+  string? label;
+};
+
+// Field-by-field update payload for `update_database_record`. Each
+// field is independently optional: `null` means "leave the existing
+// tag alone"; a value means "set the tag to this value (creating
+// it if absent)". An empty string writes a blank field; truly
+// deleting a tag is not supported (Serato handles blank fields fine
+// and that's the common case).
+dictionary SeratoMetadataUpdate {
   string? artist;
   string? title;
   string? album;

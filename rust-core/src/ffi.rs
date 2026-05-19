@@ -6,7 +6,7 @@ use crate::fingerprint;
 use crate::serato;
 use crate::tags;
 
-pub use crate::serato::SeratoTrackRecord;
+pub use crate::serato::{SeratoMetadataUpdate, SeratoTrackRecord};
 pub use crate::tags::AudioTags;
 
 #[derive(Debug, Error)]
@@ -122,6 +122,20 @@ pub fn read_database_records(database_path: String) -> Result<Vec<SeratoTrackRec
     let path = PathBuf::from(database_path);
     let database = serato::DatabaseV2::read_from_path(&path)?;
     Ok(database.track_records())
+}
+
+pub fn update_database_record(
+    database_path: String,
+    track_path: String,
+    update: SeratoMetadataUpdate,
+) -> Result<u32, CoreError> {
+    let path = PathBuf::from(database_path);
+    let mut database = serato::DatabaseV2::read_from_path(&path)?;
+    let count = database.update_track_metadata(&track_path, &update);
+    if count > 0 {
+        database.write_to_path(&path)?;
+    }
+    Ok(u32::try_from(count).expect("update count exceeded u32"))
 }
 
 pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> {

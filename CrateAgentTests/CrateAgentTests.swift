@@ -210,7 +210,7 @@ final class OperationEngineTests: XCTestCase {
         let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
         XCTAssertEqual(updatedPaths, ["Users/testuser/Music/A/new.mp3"])
 
-        let queueDepth = await engine.pendingSeratoRenameCount
+        let queueDepth = await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 0, "no queueing should occur when Serato is closed")
     }
 
@@ -241,7 +241,7 @@ final class OperationEngineTests: XCTestCase {
         let crateContents = try readCratePaths(cratePath: crateFileUrl.path)
         XCTAssertEqual(crateContents, ["Users/testuser/Music/A/old.mp3"])
 
-        let queueDepth = await engine.pendingSeratoRenameCount
+        let queueDepth = await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 1, "the rewrite must be queued, not applied")
     }
 
@@ -292,6 +292,89 @@ final class OperationEngineTests: XCTestCase {
                        "queue should be empty after drain; got \(snapshot)")
     }
 
+    func testCommitMetadataToSeratoWritesDatabaseV2WhenSeratoClosed() async throws {
+        // Set up a real database V2 with one track, then drive a
+        // commitMetadataToSerato mutation and verify the file on
+        // disk has the new metadata.
+        let (seratoDirectoryUrl, databaseV2Url) = try Self.makeTemporarySeratoDatabase(
+            withTrack: "Users/testuser/Music/A/track.mp3"
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: false)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/track.mp3"])
+        }!
+
+        let newMetadata = SeratoMetadata(
+            artist: "Brand New Artist",
+            bpm: "128.000"
+        )
+        try await engine.apply(.commitMetadataToSerato(CommitMetadataToSeratoPayload(
+            fileId: fileId, metadata: newMetadata
+        )))
+
+        let serataRecords = try readDatabaseRecords(databasePath: databaseV2Url.path)
+        XCTAssertEqual(serataRecords.count, 1)
+        XCTAssertEqual(serataRecords.first?.artist, "Brand New Artist")
+        XCTAssertEqual(serataRecords.first?.bpm, "128.000")
+
+        let queueDepth = await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queueDepth, 0, "Serato closed → write applies immediately, queue empty")
+    }
+
+    func testCommitMetadataToSeratoQueuesWhenSeratoRunning() async throws {
+        let (seratoDirectoryUrl, databaseV2Url) = try Self.makeTemporarySeratoDatabase(
+            withTrack: "Users/testuser/Music/A/track.mp3"
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: true)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/track.mp3"])
+        }!
+
+        let newMetadata = SeratoMetadata(artist: "Queued Artist", bpm: "130.000")
+        try await engine.apply(.commitMetadataToSerato(CommitMetadataToSeratoPayload(
+            fileId: fileId, metadata: newMetadata
+        )))
+
+        // Database V2 on disk should still hold the ORIGINAL state
+        // (we haven't drained yet — Serato is "running").
+        let preDrainRecords = try readDatabaseRecords(databasePath: databaseV2Url.path)
+        XCTAssertNotEqual(preDrainRecords.first?.artist, "Queued Artist")
+
+        let queueDepth = await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queueDepth, 1, "metadata update must be queued")
+
+        // Now drain — verifies the same drain path handles both
+        // rename and metadata writes.
+        try await engine.drainPendingSeratoUpdates()
+
+        let postDrainRecords = try readDatabaseRecords(databasePath: databaseV2Url.path)
+        XCTAssertEqual(postDrainRecords.first?.artist, "Queued Artist")
+        XCTAssertEqual(postDrainRecords.first?.bpm, "130.000")
+
+        let queueDepthAfter = await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queueDepthAfter, 0)
+    }
+
     func testDrainAppliesQueuedRewrites() async throws {
         let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
@@ -320,11 +403,31 @@ final class OperationEngineTests: XCTestCase {
         let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
         XCTAssertEqual(updatedPaths, ["Users/testuser/Music/A/new.mp3"])
 
-        let queueDepthAfterDrain = await engine.pendingSeratoRenameCount
+        let queueDepthAfterDrain = await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepthAfterDrain, 0)
     }
 
     // MARK: - Synthetic Serato fixture helpers
+
+    /// Build a temporary `_Serato_/database V2` containing a single
+    /// otrk for the supplied path. Used by commitMetadataToSerato
+    /// tests that need a real database V2 file the FFI can update.
+    static func makeTemporarySeratoDatabase(
+        withTrack seratoRelativePath: String
+    ) throws -> (seratoDirectoryUrl: URL, databaseV2Url: URL) {
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: seratoDirectory, withIntermediateDirectories: true
+        )
+        let databaseV2Url = seratoDirectory.appendingPathComponent("database V2")
+        let bytes = OperationEngineTests.synthesizeDatabaseV2BytesForTest(
+            withTrackPaths: [seratoRelativePath]
+        )
+        try bytes.write(to: databaseV2Url)
+        return (seratoDirectory, databaseV2Url)
+    }
 
     /// Build a temporary `_Serato_/Subcrates/Test.crate` containing the
     /// supplied Serato-relative paths. Returns the `_Serato_`

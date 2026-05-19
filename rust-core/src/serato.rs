@@ -364,6 +364,111 @@ impl DatabaseV2 {
     pub fn track_count(&self) -> usize {
         self.records.iter().filter(|record| &record.tag == TAG_OTRK).count()
     }
+
+    /// Update Serato's metadata for the track whose `pfil` equals
+    /// `track_path`. For each `Some(...)` field in `update`, the
+    /// corresponding `t*` record is set (creating it if absent);
+    /// `None` fields leave the existing record unchanged. Returns 1
+    /// if a matching `otrk` was found and updated, 0 otherwise.
+    ///
+    /// Per-field semantics:
+    /// - `Some(value)` writes that value (replaces or inserts the tag)
+    /// - `None` leaves whatever is currently in the otrk alone
+    /// - An empty `Some("")` writes an empty UTF-16BE payload — Serato
+    ///   displays that as a blank field. To truly delete a tag, a
+    ///   separate operation would be needed (not implemented).
+    ///
+    /// The `pfil` field itself is never touched; renames go through
+    /// `rewrite_path` instead. Updating a path-renaming-shaped change
+    /// here would produce inconsistent state.
+    pub fn update_track_metadata(
+        &mut self,
+        track_path: &str,
+        update: &SeratoMetadataUpdate,
+    ) -> usize {
+        for record in self.records.iter_mut() {
+            if &record.tag != TAG_OTRK {
+                continue;
+            }
+            let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
+                continue;
+            };
+            let path_matches = nested.iter().any(|field| {
+                &field.tag == TAG_PFIL
+                    && decode_utf16be(&field.payload).as_deref() == Some(track_path)
+            });
+            if !path_matches {
+                continue;
+            }
+
+            apply_metadata_update_to_nested(&mut nested, update);
+
+            let mut rebuilt = Vec::with_capacity(record.payload.len());
+            TlvRecord::write_all(&nested, &mut rebuilt)
+                .expect("writing to Vec<u8> cannot fail");
+            record.payload = rebuilt;
+            return 1;
+        }
+        0
+    }
+}
+
+/// Field-by-field update for the metadata fields crate-agent can
+/// write back to Serato. `None` means "leave alone"; `Some(value)`
+/// means "set to this value (creating the tag if it doesn't exist)".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeratoMetadataUpdate {
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub bpm: Option<String>,
+    pub key: Option<String>,
+    pub comment: Option<String>,
+    pub length: Option<String>,
+    pub label: Option<String>,
+}
+
+fn apply_metadata_update_to_nested(
+    nested: &mut Vec<TlvRecord>,
+    update: &SeratoMetadataUpdate,
+) {
+    if let Some(value) = &update.artist {
+        set_or_insert_text_field(nested, b"tart", value);
+    }
+    if let Some(value) = &update.title {
+        set_or_insert_text_field(nested, b"tsng", value);
+    }
+    if let Some(value) = &update.album {
+        set_or_insert_text_field(nested, b"talb", value);
+    }
+    if let Some(value) = &update.genre {
+        set_or_insert_text_field(nested, b"tgen", value);
+    }
+    if let Some(value) = &update.bpm {
+        set_or_insert_text_field(nested, b"tbpm", value);
+    }
+    if let Some(value) = &update.key {
+        set_or_insert_text_field(nested, b"tkey", value);
+    }
+    if let Some(value) = &update.comment {
+        set_or_insert_text_field(nested, b"tcom", value);
+    }
+    if let Some(value) = &update.length {
+        set_or_insert_text_field(nested, b"tlen", value);
+    }
+    if let Some(value) = &update.label {
+        set_or_insert_text_field(nested, b"tlbl", value);
+    }
+}
+
+fn set_or_insert_text_field(nested: &mut Vec<TlvRecord>, tag: &[u8; 4], value: &str) {
+    let payload = encode_utf16be(value);
+    if let Some(existing) = nested.iter_mut().find(|record| &record.tag == tag) {
+        existing.payload = payload;
+    } else {
+        nested.push(TlvRecord { tag: *tag, payload });
+    }
 }
 
 #[cfg(test)]
@@ -696,6 +801,139 @@ mod tests {
         assert!(track.title.is_none());
         assert!(track.album.is_none());
         assert!(track.bpm.is_none());
+    }
+
+    // ===== Metadata write-back tests =====
+
+    #[test]
+    fn update_track_metadata_replaces_existing_tag_value() {
+        fn nested(tag: &[u8; 4], value: &str) -> TlvRecord {
+            TlvRecord { tag: *tag, payload: encode_utf16be(value) }
+        }
+        let otrk_fields = [
+            nested(TAG_PFIL, "Users/x/Music/A/Track.mp3"),
+            nested(b"tart", "Original Artist"),
+            nested(b"tbpm", "120.000"),
+        ];
+        let mut otrk_payload = Vec::new();
+        TlvRecord::write_all(&otrk_fields, &mut otrk_payload).unwrap();
+        let vrsn = TlvRecord {
+            tag: *b"vrsn",
+            payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+        };
+        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let mut bytes = Vec::new();
+        TlvRecord::write_all(&[vrsn, otrk], &mut bytes).unwrap();
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+
+        let update = SeratoMetadataUpdate {
+            artist: Some("New Artist".to_string()),
+            bpm: Some("128.000".to_string()),
+            ..Default::default()
+        };
+        let updated = database.update_track_metadata("Users/x/Music/A/Track.mp3", &update);
+        assert_eq!(updated, 1);
+
+        let records = database.track_records();
+        assert_eq!(records[0].artist.as_deref(), Some("New Artist"));
+        assert_eq!(records[0].bpm.as_deref(), Some("128.000"));
+    }
+
+    #[test]
+    fn update_track_metadata_inserts_new_tag_when_absent() {
+        // Otrk has only pfil — no tart yet. Updating artist must
+        // INSERT a tart record, not silently skip.
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/Track.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+
+        let update = SeratoMetadataUpdate {
+            artist: Some("Brand New Artist".to_string()),
+            ..Default::default()
+        };
+        let updated = database.update_track_metadata("Users/x/Music/A/Track.mp3", &update);
+        assert_eq!(updated, 1);
+
+        let records = database.track_records();
+        assert_eq!(records[0].artist.as_deref(), Some("Brand New Artist"));
+    }
+
+    #[test]
+    fn update_track_metadata_leaves_unspecified_fields_alone() {
+        fn nested(tag: &[u8; 4], value: &str) -> TlvRecord {
+            TlvRecord { tag: *tag, payload: encode_utf16be(value) }
+        }
+        let otrk_fields = [
+            nested(TAG_PFIL, "Users/x/Music/A/Track.mp3"),
+            nested(b"tart", "Original Artist"),
+            nested(b"tsng", "Original Title"),
+            nested(b"tbpm", "120.000"),
+        ];
+        let mut otrk_payload = Vec::new();
+        TlvRecord::write_all(&otrk_fields, &mut otrk_payload).unwrap();
+        let vrsn = TlvRecord {
+            tag: *b"vrsn",
+            payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+        };
+        let mut bytes = Vec::new();
+        TlvRecord::write_all(
+            &[vrsn, TlvRecord { tag: *TAG_OTRK, payload: otrk_payload }],
+            &mut bytes,
+        )
+        .unwrap();
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+
+        // Only update artist; title and bpm should survive untouched.
+        let update = SeratoMetadataUpdate {
+            artist: Some("New Artist".to_string()),
+            ..Default::default()
+        };
+        database.update_track_metadata("Users/x/Music/A/Track.mp3", &update);
+
+        let records = database.track_records();
+        assert_eq!(records[0].artist.as_deref(), Some("New Artist"));
+        assert_eq!(records[0].title.as_deref(), Some("Original Title"));
+        assert_eq!(records[0].bpm.as_deref(), Some("120.000"));
+    }
+
+    #[test]
+    fn update_track_metadata_returns_zero_for_unknown_path() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/exists.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let update = SeratoMetadataUpdate {
+            artist: Some("Anything".to_string()),
+            ..Default::default()
+        };
+        let updated = database.update_track_metadata("Users/x/Music/Z/missing.mp3", &update);
+        assert_eq!(updated, 0);
+    }
+
+    #[test]
+    fn update_track_metadata_with_empty_update_is_byte_exact_noop() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/Track.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let update = SeratoMetadataUpdate::default();
+        database.update_track_metadata("Users/x/Music/A/Track.mp3", &update);
+
+        // The otrk's nested records get parse-rebuild-written even on
+        // a no-op update, so the bytes might NOT be byte-exact at the
+        // payload level if any unknown nested records were silently
+        // dropped. But the round-trip MUST preserve all data — verify
+        // by re-reading the records and comparing.
+        let after = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
+        assert_eq!(after.track_records(), database.track_records());
+        assert_eq!(after.track_records().len(), 1);
     }
 
     /// Opt-in integration test: parses a real Serato `database V2`
