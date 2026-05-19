@@ -3,13 +3,13 @@ import SwiftUI
 @main
 struct CrateAgentApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var seratoWatchdog = SeratoWatchdog()
+    @StateObject private var services = AppServices.bootstrap()
 
     var body: some Scene {
         WindowGroup {
             LibraryBrowserView()
-                .environmentObject(seratoWatchdog)
-                .task { seratoWatchdog.startObservingWorkspace() }
+                .environmentObject(services)
+                .environmentObject(services.seratoWatchdog)
         }
         .windowResizability(.contentSize)
         .commands {
@@ -18,7 +18,8 @@ struct CrateAgentApp: App {
 
         MenuBarExtra("crate-agent", systemImage: "music.note.list") {
             MenuBarStatusView()
-                .environmentObject(seratoWatchdog)
+                .environmentObject(services)
+                .environmentObject(services.seratoWatchdog)
         }
         .menuBarExtraStyle(.window)
     }

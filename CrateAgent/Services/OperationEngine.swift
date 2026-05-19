@@ -7,23 +7,34 @@ import GRDB
 ///   1. mutations apply atomically (SQLite transaction)
 ///   2. every mutation produces a journal event with both forward
 ///      payload and inverse payload (enables undo + per-file history)
-///   3. mutations that touch Serato library files can be gated on
-///      SeratoWatchdog (added when Serato file rewrites land)
+///   3. writes to Serato library files are gated on
+///      `seratoWatchdog.isSeratoRunning` — when Serato is running, the
+///      Serato-side write is queued and replayed when Serato exits.
+///      Database state is updated immediately either way, so the UI
+///      always reflects the user's intent even when Serato hasn't
+///      seen the change yet.
 ///
-/// SP-1 v1 implements indexNewFile and renameFile as database-only
-/// operations. The Serato library rewrite path (FFI calls to
-/// rewriteCratePath / rewriteDatabasePath, deferred while
-/// `seratoWatchdog.isSeratoRunning`) lands in the next iteration.
-/// The watchdog is wired in now so callers can already pass it and
-/// the integration point is reserved.
+/// Mutations supported in SP-1 v2:
+///   - `indexNewFile`  : insert a file row, log event (no Serato write)
+///   - `renameFile`    : update file's path, log event, rewrite every
+///                       `.crate` referencing the old path, plus the
+///                       `database V2` file. Serato writes use the FFI
+///                       functions exposed by the Rust core.
 public actor OperationEngine {
 
     private let database: LibraryDatabase
     private let seratoWatchdog: SeratoWatchdog
+    private let seratoLocator: SeratoLibraryLocator
+    private var pendingSeratoRenames: [SeratoPendingRename] = []
 
-    public init(database: LibraryDatabase, seratoWatchdog: SeratoWatchdog) {
+    public init(
+        database: LibraryDatabase,
+        seratoWatchdog: SeratoWatchdog,
+        seratoLocator: SeratoLibraryLocator
+    ) {
         self.database = database
         self.seratoWatchdog = seratoWatchdog
+        self.seratoLocator = seratoLocator
     }
 
     /// Apply a mutation with an auto-generated batch identifier. Use
@@ -39,26 +50,113 @@ public actor OperationEngine {
     /// transaction for undo purposes.
     @discardableResult
     public func apply(_ mutation: TrackMutation, batchId: String) async throws -> Int64 {
-        try await database.writer.write { db in
+        let executionResult: ExecutionResult = try await database.writer.write { db in
             try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
+        }
+
+        if let seratoRename = executionResult.seratoRename {
+            let isSeratoRunning = await seratoWatchdog.isSeratoRunning
+            if isSeratoRunning {
+                pendingSeratoRenames.append(seratoRename)
+            } else {
+                try await applySeratoRename(seratoRename)
+            }
+        }
+
+        return executionResult.eventId
+    }
+
+    /// Number of Serato-side rewrites queued because Serato was
+    /// running at apply time. Surfaced for UI ("M changes pending").
+    public var pendingSeratoRenameCount: Int {
+        pendingSeratoRenames.count
+    }
+
+    /// Apply every queued Serato rewrite. Call this when Serato has
+    /// just exited (the SeratoSyncCoordinator drives this). Drains
+    /// the queue oldest-first and stops at the first failure, leaving
+    /// the remaining entries queued for retry.
+    public func drainPendingSeratoUpdates() async throws {
+        while let next = pendingSeratoRenames.first {
+            try await applySeratoRename(next)
+            pendingSeratoRenames.removeFirst()
         }
     }
 
-    /// Synchronous core of the engine — runs inside the GRDB write
-    /// transaction. Static so the actor's self capture stays out of
-    /// the closure body (which would force the closure to await
-    /// reentrantly).
+    private func applySeratoRename(_ rename: SeratoPendingRename) async throws {
+        let oldSeratoPath = SeratoLibraryLocator.seratoRelativePath(
+            fromAbsolute: rename.oldAbsolutePath
+        )
+        let newSeratoPath = SeratoLibraryLocator.seratoRelativePath(
+            fromAbsolute: rename.newAbsolutePath
+        )
+
+        let crateFiles: [URL]
+        do {
+            crateFiles = try seratoLocator.enumerateCrateFiles()
+        } catch {
+            throw OperationEngineError.seratoEnumerationFailed(
+                directory: seratoLocator.subcratesDirectoryUrl.path,
+                underlying: String(describing: error)
+            )
+        }
+
+        for crateFile in crateFiles {
+            do {
+                _ = try rewriteCratePath(
+                    cratePath: crateFile.path,
+                    oldPath: oldSeratoPath,
+                    newPath: newSeratoPath
+                )
+            } catch {
+                throw OperationEngineError.seratoRewriteFailed(
+                    path: crateFile.path,
+                    underlying: String(describing: error)
+                )
+            }
+        }
+
+        let databaseV2Path = seratoLocator.databaseV2Url.path
+        if FileManager.default.fileExists(atPath: databaseV2Path) {
+            do {
+                _ = try rewriteDatabasePath(
+                    databasePath: databaseV2Path,
+                    oldPath: oldSeratoPath,
+                    newPath: newSeratoPath
+                )
+            } catch {
+                throw OperationEngineError.seratoRewriteFailed(
+                    path: databaseV2Path,
+                    underlying: String(describing: error)
+                )
+            }
+        }
+    }
+
+    // MARK: - Synchronous SQL apply
+
+    private struct ExecutionResult: Sendable {
+        let eventId: Int64
+        let seratoRename: SeratoPendingRename?
+    }
+
     private static func executeAndLog(
         mutation: TrackMutation,
         batchId: String,
         in db: GRDB.Database
-    ) throws -> Int64 {
+    ) throws -> ExecutionResult {
         let timestampMillis = Int64(Date().timeIntervalSince1970 * 1000)
         switch mutation {
         case .indexNewFile(let payload):
-            return try applyIndexNewFile(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            let eventId = try applyIndexNewFile(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(eventId: eventId, seratoRename: nil)
         case .renameFile(let payload):
-            return try applyRenameFile(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            let (eventId, seratoRename) = try applyRenameFile(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(eventId: eventId, seratoRename: seratoRename)
         }
     }
 
@@ -82,23 +180,13 @@ public actor OperationEngine {
             throw OperationEngineError.insertDidNotReturnRowId
         }
 
-        let forwardPayload = IndexNewFilePayload(
-            path: payload.path,
-            volumeUuid: payload.volumeUuid,
-            inode: payload.inode,
-            fileSize: payload.fileSize,
-            mtime: payload.mtime,
-            lightweightHash: payload.lightweightHash
-        )
-        let inversePayload = RemoveFilePayload(fileId: fileId)
-
         return try insertEvent(
             batchId: batchId,
             timestamp: timestamp,
             fileId: fileId,
             eventType: .trackImported,
-            forwardPayload: forwardPayload,
-            inversePayload: inversePayload,
+            forwardPayload: payload,
+            inversePayload: RemoveFilePayload(fileId: fileId),
             in: db
         )
     }
@@ -108,7 +196,7 @@ public actor OperationEngine {
         batchId: String,
         timestamp: Int64,
         in db: GRDB.Database
-    ) throws -> Int64 {
+    ) throws -> (Int64, SeratoPendingRename) {
         guard var fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
@@ -127,7 +215,7 @@ public actor OperationEngine {
             previousPath: payload.newPath
         )
 
-        return try insertEvent(
+        let eventId = try insertEvent(
             batchId: batchId,
             timestamp: timestamp,
             fileId: payload.fileId,
@@ -136,6 +224,11 @@ public actor OperationEngine {
             inversePayload: inversePayload,
             in: db
         )
+        let seratoRename = SeratoPendingRename(
+            oldAbsolutePath: originalPath,
+            newAbsolutePath: payload.newPath
+        )
+        return (eventId, seratoRename)
     }
 
     private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
@@ -177,19 +270,11 @@ public actor OperationEngine {
 
 // MARK: - Mutation types
 
-/// Every state-changing operation in crate-agent is one of these
-/// cases. SP-1 v1 covers indexing new files and renaming files; later
-/// sub-projects add setTagField (SP-1.5), applyMusicBrainzMatch (SP-2),
-/// replaceFile (Pillar F), etc.
 public enum TrackMutation: Sendable {
     case indexNewFile(IndexNewFilePayload)
     case renameFile(RenameFilePayload)
 }
 
-/// Payload for indexing a newly-discovered file. `lightweightHash` is
-/// the first-1MB + last-1MB SHA-256 used for cross-volume move
-/// detection; the full Chromaprint fingerprint lands later from the
-/// background fingerprinting worker.
 public struct IndexNewFilePayload: Codable, Sendable, Equatable {
     public let path: String
     public let volumeUuid: String
@@ -215,11 +300,6 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
     }
 }
 
-/// Payload for renaming/moving a known file. `previousPath` is set to
-/// the file's current path at apply time so the journal entry is
-/// self-contained (history rendering doesn't need a back-reference to
-/// the row at journal-write time). Callers pass `previousPath = ""`
-/// for forward invocation; the engine populates it before journaling.
 public struct RenameFilePayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public let newPath: String
@@ -232,9 +312,6 @@ public struct RenameFilePayload: Codable, Sendable, Equatable {
     }
 }
 
-/// Inverse-only payload used by IndexNewFile's journal entry. Not yet
-/// exposed as a public mutation in SP-1 v1 — added when the FSEvents
-/// watcher needs to handle real delete events.
 public struct RemoveFilePayload: Codable, Sendable, Equatable {
     public let fileId: Int64
 
@@ -243,12 +320,23 @@ public struct RemoveFilePayload: Codable, Sendable, Equatable {
     }
 }
 
+/// A Serato-side rewrite scheduled by `renameFile`. Carries absolute
+/// paths; `applySeratoRename` converts them to the Serato-relative
+/// form (`/Users/x/Music/...` → `Users/x/Music/...`) before calling
+/// the FFI rewrite functions.
+struct SeratoPendingRename: Sendable, Equatable {
+    let oldAbsolutePath: String
+    let newAbsolutePath: String
+}
+
 // MARK: - Errors
 
 public enum OperationEngineError: LocalizedError, Equatable {
     case fileNotFound(fileId: Int64)
     case insertDidNotReturnRowId
     case payloadEncodingFailed
+    case seratoEnumerationFailed(directory: String, underlying: String)
+    case seratoRewriteFailed(path: String, underlying: String)
 
     public var errorDescription: String? {
         switch self {
@@ -258,6 +346,10 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Database insert did not produce a row id — schema or driver invariant broken."
         case .payloadEncodingFailed:
             return "Could not encode mutation payload as UTF-8 JSON."
+        case .seratoEnumerationFailed(let directory, let underlying):
+            return "Failed to enumerate Serato crate files in \(directory): \(underlying)"
+        case .seratoRewriteFailed(let path, let underlying):
+            return "Failed to rewrite Serato library file \(path): \(underlying)"
         }
     }
 }
