@@ -92,6 +92,12 @@ struct LibraryBrowserView: View {
                 Text("Syncing from Serato… \(progress.filesIndexed) new, \(progress.filesMetadataUpdated) updated, of \(progress.seratoReferenceCount)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+            } else if let fingerprintProgress = services.fingerprintProgress,
+                      fingerprintProgress.totalPending > 0 {
+                ProgressView().controlSize(.small)
+                Text("Fingerprinting… \(fingerprintProgress.totalDone) done, \(fingerprintProgress.totalPending) pending")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             } else if services.initialScanComplete {
                 Image(systemName: "checkmark.circle")
                     .foregroundStyle(.green)

@@ -29,6 +29,7 @@ public final class AppServices: ObservableObject {
     public let filesystemSyncCoordinator: FilesystemSyncCoordinator
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
+    public let fingerprintWorker: FingerprintWorker
 
     /// Latest progress from the running initial scan, or nil when no
     /// scan is in flight. Views observe via @Published.
@@ -43,6 +44,10 @@ public final class AppServices: ObservableObject {
     /// Serato is running. Fed by `OperationEngine.queueDepthPublisher`
     /// so the menu bar reflects state changes immediately.
     @Published public private(set) var pendingSeratoQueueDepth: Int = 0
+
+    /// Latest progress from the fingerprinting worker. Views observe
+    /// via @Published; nil before the worker has emitted anything.
+    @Published public private(set) var fingerprintProgress: FingerprintWorker.Progress?
 
     private let seratoSyncCoordinator: SeratoSyncCoordinator
     private let fsEventsWatcher: FSEventsWatcher
@@ -102,6 +107,8 @@ public final class AppServices: ObservableObject {
             database: database
         )
 
+        self.fingerprintWorker = FingerprintWorker(database: database)
+
         // Coordinator needs the scanner to trigger reload-on-exit;
         // wire it last so all upstream deps are constructed.
         self.seratoSyncCoordinator = SeratoSyncCoordinator(
@@ -159,10 +166,25 @@ public final class AppServices: ObservableObject {
         Task { @MainActor in
             await runInitialScan()
         }
+
+        // Start the background fingerprinter. It self-paces against
+        // the `files.fingerprint_status = pending` queue, so it's
+        // safe to start before the initial scan finishes — every
+        // freshly-indexed file will be picked up on the next sweep.
+        let worker = fingerprintWorker
+        Task { @MainActor [weak self] in
+            await worker.start { progressSnapshot in
+                Task { @MainActor in
+                    self?.fingerprintProgress = progressSnapshot
+                }
+            }
+        }
     }
 
     deinit {
         fsEventsWatcher.stop()
+        let worker = fingerprintWorker
+        Task { await worker.stop() }
     }
 
     private func runInitialScan() async {

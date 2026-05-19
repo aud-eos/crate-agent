@@ -2028,3 +2028,205 @@ final class EventHistoryQueryTests: XCTestCase {
         XCTAssertEqual(limited.count, 2)
     }
 }
+
+final class FingerprintWorkerTests: XCTestCase {
+
+    /// Insert a pending file row without going through OperationEngine
+    /// — the worker doesn't care how rows arrive, only that they're
+    /// pending. Avoids dragging engine setup into the fixture.
+    @discardableResult
+    private func insertPendingFile(
+        path: String,
+        in database: LibraryDatabase,
+        inode: Int64 = 1
+    ) async throws -> Int64 {
+        try await database.writer.write { db in
+            var record = FileRecord(
+                path: path,
+                volumeUuid: "v1",
+                inode: inode,
+                fileSize: 1024,
+                mtime: 1_700_000_000,
+                fingerprintStatus: .pending
+            )
+            try record.insert(db)
+            return record.id!
+        }
+    }
+
+    func testSerializeAndDeserializeRoundTripsHashes() {
+        let original: [UInt32] = [0xDEAD_BEEF, 0x1234_5678, 0, UInt32.max]
+        let bytes = FingerprintWorker.serializeHashesToBytes(original)
+        XCTAssertEqual(bytes.count, original.count * 4)
+        let decoded = FingerprintWorker.deserializeHashesFromBytes(bytes)
+        XCTAssertEqual(decoded, original)
+    }
+
+    func testSerializeUsesLittleEndian() {
+        // Pin the byte order so the on-disk format is documented:
+        // 0x01020304 → 04 03 02 01.
+        let bytes = FingerprintWorker.serializeHashesToBytes([0x01020304])
+        XCTAssertEqual(Array(bytes), [0x04, 0x03, 0x02, 0x01])
+    }
+
+    func testProcessAllPendingOnceFingerprintsEveryPendingRow() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        let id1 = try await insertPendingFile(path: "/Music/A/one.mp3", in: database, inode: 1)
+        let id2 = try await insertPendingFile(path: "/Music/A/two.mp3", in: database, inode: 2)
+
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { path in
+            // Stable per-path output so we can verify the right hash
+            // lands on the right row.
+            return [UInt32(path.count), 0xCAFE]
+        }
+
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 2,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        let rows = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        XCTAssertEqual(rows.count, 2)
+        for row in rows {
+            XCTAssertEqual(row.fingerprintStatus, .done,
+                           "every pending row must transition to .done")
+            XCTAssertNotNil(row.chromaprintFingerprint)
+            let decoded = FingerprintWorker.deserializeHashesFromBytes(row.chromaprintFingerprint!)
+            XCTAssertEqual(decoded.count, 2)
+            XCTAssertEqual(decoded[0], UInt32(row.path.count))
+            XCTAssertEqual(decoded[1], 0xCAFE)
+        }
+        XCTAssertNotEqual(id1, id2)  // sanity on the fixture
+    }
+
+    func testFailingFingerprintMarksRowFailedWithoutBlockingOtherFiles() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        try await insertPendingFile(path: "/Music/A/good.mp3", in: database, inode: 1)
+        try await insertPendingFile(path: "/Music/A/bad.mp3", in: database, inode: 2)
+
+        struct FingerprintError: Error {}
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { path in
+            if path.hasSuffix("bad.mp3") { throw FingerprintError() }
+            return [42, 43]
+        }
+
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 2,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        let good = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/good.mp3").fetchOne(db)!
+        }
+        let bad = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/bad.mp3").fetchOne(db)!
+        }
+        XCTAssertEqual(good.fingerprintStatus, .done)
+        XCTAssertNotNil(good.chromaprintFingerprint)
+        XCTAssertEqual(bad.fingerprintStatus, .failed)
+        XCTAssertNil(bad.chromaprintFingerprint,
+                     "failed rows must not carry a stale hash blob")
+    }
+
+    func testWorkerSkipsAlreadyDoneRows() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        // Pre-mark one row as already fingerprinted; the worker must
+        // not touch it. The other row is genuinely pending.
+        try await database.writer.write { db in
+            var done = FileRecord(
+                path: "/Music/A/already.mp3",
+                volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+                chromaprintFingerprint: Data([0xBE, 0xEF]),
+                fingerprintStatus: .done
+            )
+            try done.insert(db)
+        }
+        try await insertPendingFile(path: "/Music/A/fresh.mp3", in: database, inode: 2)
+
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { _ in [99] }
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 1,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        let untouched = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/already.mp3").fetchOne(db)!
+        }
+        XCTAssertEqual(untouched.chromaprintFingerprint, Data([0xBE, 0xEF]),
+                       "already-done rows must keep their existing hash")
+
+        let processed = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/fresh.mp3").fetchOne(db)!
+        }
+        XCTAssertEqual(processed.fingerprintStatus, .done)
+        XCTAssertEqual(
+            FingerprintWorker.deserializeHashesFromBytes(processed.chromaprintFingerprint!),
+            [99]
+        )
+    }
+
+    func testWorkerHonorsConcurrencyLimit() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        for index in 0..<8 {
+            try await insertPendingFile(
+                path: "/Music/A/track-\(index).mp3",
+                in: database,
+                inode: Int64(index + 1)
+            )
+        }
+
+        // The mock counts simultaneously-running fingerprint calls
+        // and asserts the count never exceeds the configured cap.
+        let counter = ConcurrencyCounter()
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { _ in
+            counter.enter()
+            // Give the scheduler a chance to start sibling tasks
+            // before we exit — without a yield, single-threaded
+            // execution can hide a bounded-concurrency bug.
+            Thread.sleep(forTimeInterval: 0.01)
+            counter.leave()
+            return [1]
+        }
+
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 3,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        XCTAssertLessThanOrEqual(counter.peak, 3,
+                                 "no more than `concurrency` fingerprint calls may run simultaneously")
+        XCTAssertEqual(counter.totalEntered, 8)
+    }
+}
+
+/// Thread-safe peak-concurrency tracker for the worker concurrency test.
+private final class ConcurrencyCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var running: Int = 0
+    private(set) var peak: Int = 0
+    private(set) var totalEntered: Int = 0
+
+    func enter() {
+        lock.lock()
+        defer { lock.unlock() }
+        running += 1
+        totalEntered += 1
+        if running > peak { peak = running }
+    }
+
+    func leave() {
+        lock.lock()
+        defer { lock.unlock() }
+        running -= 1
+    }
+}
