@@ -2,10 +2,11 @@ import GRDB
 import SwiftUI
 
 /// SP-1.5's library cleanup surface. TabView containing per-feature
-/// panels — Whitespace (trim leading/trailing), Find & Replace (
-/// substring rewrite across selected fields). Both panels share the
-/// scan → preview → apply skeleton: an analyzer in `LibraryHygiene`
-/// derives a structured issue list, the sheet renders a preview, and
+/// panels — Whitespace (trim leading/trailing), Find & Replace
+/// (substring rewrite), Case (collapse inconsistent capitalizations
+/// onto a canonical spelling). All panels share the scan → preview
+/// → apply skeleton: an analyzer in `LibraryHygiene` derives a
+/// structured issue list, the sheet renders a preview, and
 /// `LibraryHygieneRunner` batches every fix under a single `batch_id`
 /// so a single Undo on History reverts the entire cleanup.
 struct LibraryHygieneView: View {
@@ -20,6 +21,9 @@ struct LibraryHygieneView: View {
 
                 FindReplacePanel()
                     .tabItem { Label("Find & Replace", systemImage: "text.magnifyingglass") }
+
+                CaseConsistencyPanel()
+                    .tabItem { Label("Case", systemImage: "textformat") }
             }
             .navigationTitle("Library Cleanup")
             .toolbar {
@@ -325,6 +329,200 @@ private struct FindReplacePanel: View {
             _ = try await runner.applyFindAndReplaceFixes(selectedMatches, files: files)
             lastResult = "Replaced text in \(initialCount) field\(initialCount == 1 ? "" : "s")"
             await loadFiles()
+        } catch {
+            actionError = "Apply failed: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Case consistency panel
+
+private struct CaseConsistencyPanel: View {
+    @EnvironmentObject private var services: AppServices
+
+    @State private var files: [FileRecord] = []
+    @State private var groups: [LibraryHygiene.CaseInconsistencyGroup] = []
+    /// Per-group resolution: nil = leave alone, non-nil = user
+    /// picked this variant as canonical. Keyed by group id so
+    /// switching tabs / rescanning doesn't lose the user's picks
+    /// for groups still present.
+    @State private var resolutions: [String: String?] = [:]
+    @State private var isScanning: Bool = false
+    @State private var isApplying: Bool = false
+    @State private var actionError: String?
+    @State private var lastResult: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            groupListSection
+            Divider()
+            footer
+        }
+        .task { await rescan() }
+    }
+
+    @ViewBuilder
+    private var groupListSection: some View {
+        if isScanning && groups.isEmpty {
+            ProgressView("Scanning library…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if groups.isEmpty {
+            placeholderView(
+                icon: "checkmark.seal",
+                color: .green,
+                headline: "Case is consistent",
+                detail: "No field has the same value spelled with multiple capitalizations."
+            )
+        } else {
+            List(groups) { group in
+                groupRow(group)
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    @ViewBuilder
+    private func groupRow(_ group: LibraryHygiene.CaseInconsistencyGroup) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(group.field.displayName)
+                    .font(.caption.smallCaps())
+                    .foregroundStyle(.tint)
+                Text("\(group.totalFiles) file\(group.totalFiles == 1 ? "" : "s")")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(group.variants, id: \.value) { variant in
+                let isChosen = resolvedCanonical(for: group) == variant.value
+                HStack(spacing: 8) {
+                    Image(systemName: isChosen ? "largecircle.fill.circle" : "circle")
+                        .foregroundStyle(isChosen ? Color.accentColor : Color.secondary)
+                        .onTapGesture {
+                            resolutions[group.id] = .some(variant.value)
+                        }
+                    Text("«\(variant.value)»")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(isChosen ? Color.primary : Color.secondary)
+                    Spacer()
+                    Text("\(variant.count) file\(variant.count == 1 ? "" : "s")")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(Color.secondary)
+                }
+            }
+            HStack(spacing: 8) {
+                Button("Skip this group") {
+                    resolutions[group.id] = .some("")
+                }
+                .controlSize(.small)
+                .disabled(resolvedCanonical(for: group) == nil)
+                Button("Reset") {
+                    resolutions[group.id] = nil
+                }
+                .controlSize(.small)
+                .disabled(resolutions[group.id] == nil)
+                Spacer()
+                if resolvedCanonical(for: group) == nil {
+                    Text("Skipped")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if let actionError {
+                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            } else if let lastResult {
+                Label(lastResult, systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            } else {
+                Text("\(activeGroupCount) of \(groups.count) group\(groups.count == 1 ? "" : "s") will apply")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                Task { await rescan() }
+            } label: {
+                Label("Rescan", systemImage: "arrow.clockwise")
+            }
+            .disabled(isScanning || isApplying)
+            Button("Apply Selections") {
+                Task { await applySelections() }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(activeGroupCount == 0 || isApplying)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    /// The canonical the user has chosen (or the analyzer suggested)
+    /// for a group. Nil means "leave alone" (skipped).
+    private func resolvedCanonical(for group: LibraryHygiene.CaseInconsistencyGroup) -> String? {
+        // Three states layered:
+        //   1. resolutions[id] absent → analyzer's suggested
+        //      canonical (default)
+        //   2. resolutions[id] = .some("") → skipped (we encode
+        //      "skip" as empty string in the Optional<String>)
+        //   3. resolutions[id] = .some(value) → user picked value
+        if let entry = resolutions[group.id] {
+            if let value = entry, !value.isEmpty {
+                return value
+            }
+            return nil  // skip
+        }
+        return group.suggestedCanonical
+    }
+
+    private var activeGroupCount: Int {
+        groups.filter { resolvedCanonical(for: $0) != nil }.count
+    }
+
+    private func rescan() async {
+        isScanning = true
+        defer { isScanning = false }
+        actionError = nil
+        do {
+            files = try await services.database.writer.read { db in
+                try FileRecord.fetchAll(db)
+            }
+            groups = LibraryHygiene.findCaseInconsistencies(in: files)
+            // Drop resolutions for groups that no longer exist.
+            let currentIds = Set(groups.map(\.id))
+            resolutions = resolutions.filter { currentIds.contains($0.key) }
+        } catch {
+            actionError = "Couldn't scan library: \(error.localizedDescription)"
+        }
+    }
+
+    private func applySelections() async {
+        isApplying = true
+        defer { isApplying = false }
+        actionError = nil
+        lastResult = nil
+        let fixes = LibraryHygiene.caseFixes(
+            forGroups: groups,
+            canonicalFor: { group in resolvedCanonical(for: group) },
+            in: files
+        )
+        guard !fixes.isEmpty else {
+            lastResult = "Nothing to do — every active group is already on its canonical."
+            return
+        }
+        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
+        do {
+            _ = try await runner.applyCaseFixes(fixes, files: files)
+            lastResult = "Normalized case for \(fixes.count) field\(fixes.count == 1 ? "" : "s")"
+            await rescan()
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
         }
