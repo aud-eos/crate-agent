@@ -11,7 +11,7 @@ import GRDB
 /// same path — populated on initial scan and refreshed when Serato
 /// quits (via SeratoSyncCoordinator's reload hook).
 public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
-    Hashable, Identifiable {
+    Hashable, Identifiable, Sendable {
 
     public static let databaseTableName = "files"
     public static let databaseColumnDecodingStrategy =

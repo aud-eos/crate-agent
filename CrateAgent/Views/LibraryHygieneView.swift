@@ -27,6 +27,9 @@ struct LibraryHygieneView: View {
 
                 MissingFieldsPanel()
                     .tabItem { Label("Missing", systemImage: "exclamationmark.bubble") }
+
+                DuplicatesPanel()
+                    .tabItem { Label("Duplicates", systemImage: "square.on.square") }
             }
             .navigationTitle("Library Cleanup")
             .toolbar {
@@ -759,6 +762,202 @@ private struct MissingFieldsPanel: View {
             await rescan()
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Duplicates panel
+
+private struct DuplicatesPanel: View {
+    @EnvironmentObject private var services: AppServices
+
+    @State private var mode: DuplicateFinder.Mode = .byteLevel
+    @State private var files: [FileRecord] = []
+    @State private var groups: [DuplicateFinder.DuplicateGroup] = []
+    @State private var isScanning: Bool = false
+    @State private var actionError: String?
+
+    private static let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            modeBar
+            Divider()
+            groupListSection
+            Divider()
+            footer
+        }
+        .task { await rescan() }
+    }
+
+    @ViewBuilder
+    private var modeBar: some View {
+        HStack(spacing: 12) {
+            Picker("Mode", selection: $mode) {
+                ForEach(DuplicateFinder.Mode.allCases, id: \.rawValue) { entry in
+                    Text(entry.displayName).tag(entry)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 320)
+            .onChange(of: mode) { _, _ in
+                groups = DuplicateFinder.findDuplicates(in: files, mode: mode)
+            }
+            Spacer()
+            if mode == .perceptual {
+                let coverage = DuplicateFinder.fingerprintCoverage(in: files)
+                Text("\(coverage.done) of \(coverage.total) fingerprinted")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("Perceptual matching needs Chromaprint fingerprints. Files still being fingerprinted in the background can't be matched yet — results improve as the fingerprint worker progresses.")
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private var groupListSection: some View {
+        if isScanning && groups.isEmpty {
+            ProgressView("Scanning library…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if groups.isEmpty {
+            placeholderView(
+                icon: "checkmark.seal",
+                color: .green,
+                headline: "No duplicates found",
+                detail: modeEmptyDetail
+            )
+        } else {
+            List {
+                ForEach(groups) { group in
+                    Section {
+                        ForEach(group.files, id: \.id) { file in
+                            duplicateRow(file: file, mode: group.mode)
+                        }
+                    } header: {
+                        Text("\(group.size) copies · \(modeHeader(for: group))")
+                            .font(.caption.smallCaps())
+                    }
+                }
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    private var modeEmptyDetail: String {
+        switch mode {
+        case .byteLevel:
+            return "No two files share the same content hash. (Byte-level duplicates would be the same file copied to two locations.)"
+        case .perceptual:
+            return "No two fingerprinted files match each other. (Perceptual duplicates would be the same recording at different bitrates or in different formats.)"
+        }
+    }
+
+    private func modeHeader(for group: DuplicateFinder.DuplicateGroup) -> String {
+        switch group.mode {
+        case .byteLevel:
+            let first = group.files.first
+            let size = first.map { Self.byteCountFormatter.string(fromByteCount: $0.fileSize) } ?? ""
+            return "byte-level, \(size) each"
+        case .perceptual:
+            return "perceptual match"
+        }
+    }
+
+    @ViewBuilder
+    private func duplicateRow(file: FileRecord, mode: DuplicateFinder.Mode) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(file.path)
+                    .font(.caption.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                HStack(spacing: 12) {
+                    Text(Self.byteCountFormatter.string(fromByteCount: file.fileSize))
+                        .foregroundStyle(.secondary)
+                    Text((file.path as NSString).pathExtension.uppercased())
+                        .foregroundStyle(.tertiary)
+                    if mode == .perceptual {
+                        statusBadge(file.fingerprintStatus)
+                    }
+                }
+                .font(.caption2.monospacedDigit())
+            }
+            Spacer()
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting(
+                    [URL(fileURLWithPath: file.path)]
+                )
+            } label: {
+                Label("Reveal", systemImage: "magnifyingglass")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .help("Show this file in Finder so you can review or delete it manually.")
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func statusBadge(_ status: FingerprintStatus) -> some View {
+        switch status {
+        case .done:
+            EmptyView()
+        case .pending:
+            Text("pending fingerprint")
+                .foregroundStyle(.orange)
+        case .failed:
+            Text("fingerprint failed")
+                .foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if let actionError {
+                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            } else {
+                Text("\(groups.count) duplicate group\(groups.count == 1 ? "" : "s") · \(totalDuplicateFiles) file\(totalDuplicateFiles == 1 ? "" : "s")")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                Task { await rescan() }
+            } label: {
+                Label("Rescan", systemImage: "arrow.clockwise")
+            }
+            .disabled(isScanning)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private var totalDuplicateFiles: Int {
+        groups.reduce(0) { $0 + $1.size }
+    }
+
+    private func rescan() async {
+        isScanning = true
+        defer { isScanning = false }
+        actionError = nil
+        do {
+            files = try await services.database.writer.read { db in
+                try FileRecord.fetchAll(db)
+            }
+            groups = DuplicateFinder.findDuplicates(in: files, mode: mode)
+        } catch {
+            actionError = "Couldn't scan library: \(error.localizedDescription)"
         }
     }
 }
