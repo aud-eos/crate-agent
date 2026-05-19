@@ -1,3 +1,4 @@
+import Combine
 import GRDB
 import XCTest
 @testable import CrateAgent
@@ -242,6 +243,53 @@ final class OperationEngineTests: XCTestCase {
 
         let queueDepth = await engine.pendingSeratoRenameCount
         XCTAssertEqual(queueDepth, 1, "the rewrite must be queued, not applied")
+    }
+
+    func testQueueDepthPublisherEmitsOnEnqueueAndDrain() async throws {
+        let (seratoDirectoryUrl, _) = try Self.makeTemporarySeratoLibrary(
+            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: true)
+        }
+
+        let emissionsLock = NSLock()
+        var emissions: [Int] = []
+        let cancellable = engine.queueDepthPublisher.sink { depth in
+            emissionsLock.lock()
+            emissions.append(depth)
+            emissionsLock.unlock()
+        }
+        defer { cancellable.cancel() }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/old.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+
+        try await engine.apply(.renameFile(RenameFilePayload(
+            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+        )))
+        try await engine.drainPendingSeratoUpdates()
+
+        emissionsLock.lock()
+        let snapshot = emissions
+        emissionsLock.unlock()
+
+        // CurrentValueSubject replays the initial 0 on subscribe;
+        // then we expect at least one emission of 1 (after enqueue)
+        // and a final 0 (after drain).
+        XCTAssertEqual(snapshot.first, 0, "initial subscribe value should be 0")
+        XCTAssertTrue(snapshot.contains(1),
+                      "expected an emission of 1 after enqueue; got \(snapshot)")
+        XCTAssertEqual(snapshot.last, 0,
+                       "queue should be empty after drain; got \(snapshot)")
     }
 
     func testDrainAppliesQueuedRewrites() async throws {
