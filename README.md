@@ -20,29 +20,43 @@ The full design is at [`design-plan.md`](./design-plan.md) (copied from the orig
 
 ## Setup
 
-### Prerequisites
+Common operations are wrapped in the [`Makefile`](./Makefile). Run `make` with no arguments to see the full list.
 
-```
-# Rust toolchain (for the rust-core crate)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+### One-time setup
 
-# XcodeGen (regenerates CrateAgent.xcodeproj from project.yml)
-brew install xcodegen
-
-# Xcode 15 or later (for the Swift app build)
+```sh
+make install-deps   # Rust toolchain, xcodegen, swiftformat
+make doctor         # Verify everything's on PATH
 ```
 
-### Build
+Xcode itself must be installed via the App Store separately; after install, point `xcode-select` at it:
 
+```sh
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+sudo xcodebuild -license accept
 ```
-# 1. Build the Rust core as a universal static library
-./scripts/build-rust.sh
 
-# 2. Generate the Xcode project from project.yml
-xcodegen generate
+### Build & run
 
-# 3. Open in Xcode and build
-open CrateAgent.xcodeproj
+```sh
+make build          # Rust core + Xcode project + app (Debug)
+make run            # Open the built CrateAgent.app
+```
+
+### Test
+
+```sh
+make test           # All tests (Rust + Swift)
+make test-rust      # Only Rust core
+make test-swift     # Only Swift app
+```
+
+### Iterate
+
+```sh
+make format         # cargo fmt + swiftformat
+make lint           # cargo clippy
+make clean          # Remove all generated artifacts (target/, build-output/, etc.)
 ```
 
 ## Project layout

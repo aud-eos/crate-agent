@@ -11,6 +11,14 @@
 
 set -euo pipefail
 
+# Ensure cargo is on PATH even when this script is invoked from a
+# context that doesn't source the user's shell init (e.g., `make`,
+# CI runners). The cargo env file is created by rustup-init.
+if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$REPO_ROOT/rust-core"
 OUTPUT_DIR="$REPO_ROOT/build-output"
