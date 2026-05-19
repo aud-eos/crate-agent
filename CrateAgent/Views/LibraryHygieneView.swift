@@ -24,6 +24,9 @@ struct LibraryHygieneView: View {
 
                 CaseConsistencyPanel()
                     .tabItem { Label("Case", systemImage: "textformat") }
+
+                MissingFieldsPanel()
+                    .tabItem { Label("Missing", systemImage: "exclamationmark.bubble") }
             }
             .navigationTitle("Library Cleanup")
             .toolbar {
@@ -522,6 +525,237 @@ private struct CaseConsistencyPanel: View {
         do {
             _ = try await runner.applyCaseFixes(fixes, files: files)
             lastResult = "Normalized case for \(fixes.count) field\(fixes.count == 1 ? "" : "s")"
+            await rescan()
+        } catch {
+            actionError = "Apply failed: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Missing fields panel
+
+private struct MissingFieldsPanel: View {
+    @EnvironmentObject private var services: AppServices
+
+    @State private var files: [FileRecord] = []
+    @State private var summaries: [LibraryHygiene.MissingFieldSummary] = []
+    @State private var selectedField: SeratoMetadataField = .artist
+    @State private var fillValue: String = ""
+    @State private var entries: [LibraryHygiene.MissingFieldEntry] = []
+    @State private var selectedEntryIds: Set<String> = []
+    @State private var isScanning: Bool = false
+    @State private var isApplying: Bool = false
+    @State private var actionError: String?
+    @State private var lastResult: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            summaryBar
+            Divider()
+            fillForm
+            Divider()
+            entryListSection
+            Divider()
+            footer
+        }
+        .task { await rescan() }
+    }
+
+    @ViewBuilder
+    private var summaryBar: some View {
+        if summaries.isEmpty {
+            placeholderView(
+                icon: "checkmark.seal",
+                color: .green,
+                headline: "No gaps detected",
+                detail: "Every text field on every track has a value."
+            )
+            .frame(maxHeight: 140)
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(summaries) { summary in
+                        Button {
+                            selectedField = summary.field
+                            recomputeEntries()
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(summary.field.displayName)
+                                    .font(.caption.smallCaps())
+                                Text("\(summary.count) missing")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .strokeBorder(
+                                        summary.field == selectedField
+                                            ? Color.accentColor
+                                            : Color.secondary.opacity(0.3),
+                                        lineWidth: summary.field == selectedField ? 2 : 1
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            }
+            .background(Color.secondary.opacity(0.05))
+        }
+    }
+
+    @ViewBuilder
+    private var fillForm: some View {
+        Form {
+            Section {
+                Picker("Field", selection: $selectedField) {
+                    ForEach(SeratoMetadataField.allCases, id: \.rawValue) { field in
+                        Text(field.displayName).tag(field)
+                    }
+                }
+                .onChange(of: selectedField) { _, _ in recomputeEntries() }
+                TextField("Value to fill in", text: $fillValue)
+                    .font(.body.monospaced())
+            } header: {
+                Text("Bulk Fill")
+            } footer: {
+                Text("Sets the chosen field on every selected file to the supplied value. Rows already populated since the last scan are skipped at apply time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private var entryListSection: some View {
+        if isScanning && entries.isEmpty {
+            ProgressView("Scanning…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if entries.isEmpty {
+            placeholderView(
+                icon: "checkmark.circle",
+                color: .green,
+                headline: "Nothing missing for \(selectedField.displayName)",
+                detail: "Pick a different field above, or your library is clean for this one."
+            )
+        } else {
+            List(entries) { entry in
+                HStack(spacing: 10) {
+                    Toggle(isOn: Binding(
+                        get: { selectedEntryIds.contains(entry.id) },
+                        set: { include in
+                            if include { selectedEntryIds.insert(entry.id) }
+                            else { selectedEntryIds.remove(entry.id) }
+                        }
+                    )) { EmptyView() }
+                    .toggleStyle(.checkbox)
+                    .labelsHidden()
+                    Text((entry.path as NSString).lastPathComponent)
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Text(entry.field.displayName)
+                        .font(.caption2.smallCaps())
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.vertical, 2)
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if let actionError {
+                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            } else if let lastResult {
+                Label(lastResult, systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            } else if !entries.isEmpty {
+                Text("\(selectedEntryIds.count) of \(entries.count) selected")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                Task { await rescan() }
+            } label: {
+                Label("Rescan", systemImage: "arrow.clockwise")
+            }
+            .disabled(isScanning || isApplying)
+            Button("Select All") {
+                selectedEntryIds = Set(entries.map(\.id))
+            }
+            .controlSize(.small)
+            .disabled(entries.isEmpty)
+            Button("Apply Fill") {
+                Task { await applyFill() }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(canApply == false || isApplying)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private var canApply: Bool {
+        !selectedEntryIds.isEmpty
+            && !fillValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func rescan() async {
+        isScanning = true
+        defer { isScanning = false }
+        actionError = nil
+        do {
+            files = try await services.database.writer.read { db in
+                try FileRecord.fetchAll(db)
+            }
+            summaries = LibraryHygiene.missingFieldSummaries(in: files)
+            // If the previously-selected field has no gaps anymore,
+            // jump to whichever field does. Avoids the user staring
+            // at "Nothing missing" indefinitely.
+            if !summaries.contains(where: { $0.field == selectedField }),
+               let first = summaries.first?.field {
+                selectedField = first
+            }
+            recomputeEntries()
+        } catch {
+            actionError = "Couldn't scan library: \(error.localizedDescription)"
+        }
+    }
+
+    private func recomputeEntries() {
+        entries = LibraryHygiene.missingFieldEntries(forField: selectedField, in: files)
+        selectedEntryIds = Set(entries.map(\.id))
+    }
+
+    private func applyFill() async {
+        isApplying = true
+        defer { isApplying = false }
+        actionError = nil
+        lastResult = nil
+        let fileIds = entries.filter { selectedEntryIds.contains($0.id) }.map(\.fileId)
+        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
+        do {
+            _ = try await runner.applyMissingFieldFill(
+                field: selectedField,
+                value: fillValue,
+                fileIds: fileIds,
+                files: files
+            )
+            lastResult = "Filled \(selectedField.displayName) on \(fileIds.count) track\(fileIds.count == 1 ? "" : "s")"
             await rescan()
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
