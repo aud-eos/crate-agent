@@ -2695,6 +2695,246 @@ final class LibraryHygieneAnalyzerTests: XCTestCase {
     }
 }
 
+final class LibraryHygieneFindReplaceTests: XCTestCase {
+
+    private func makeFile(
+        id: Int64 = 1,
+        path: String = "/Music/A/track.mp3",
+        artist: String? = nil,
+        title: String? = nil,
+        album: String? = nil
+    ) -> FileRecord {
+        FileRecord(
+            id: id,
+            path: path,
+            volumeUuid: "v1",
+            inode: id, fileSize: 1, mtime: 1,
+            artist: artist, title: title, album: album
+        )
+    }
+
+    func testEmptyFindStringYieldsNoMatches() {
+        let query = LibraryHygiene.FindAndReplaceQuery(
+            find: "",
+            replace: "X",
+            fields: Set(SeratoMetadataField.allCases),
+            caseSensitive: false
+        )
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: [makeFile(artist: "Anything")],
+            query: query
+        )
+        XCTAssertEqual(matches.count, 0,
+                       "empty find string must not flag every row as a match")
+    }
+
+    func testCaseInsensitiveMatchAndReplaceWorks() {
+        // Substring substitution: only the matched chars change.
+        // "the strokes" → "The strokes" (the 's' in 'strokes' stays
+        // lowercase — title-casing the whole string is not part of
+        // find/replace, that's a future case-normalization tool).
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: [
+                makeFile(id: 1, artist: "the strokes", album: "Is This It"),
+                makeFile(id: 2, artist: "THE doors", title: "Light My Fire"),
+            ],
+            query: LibraryHygiene.FindAndReplaceQuery(
+                find: "the",
+                replace: "The",
+                fields: [.artist],
+                caseSensitive: false
+            )
+        )
+        XCTAssertEqual(matches.count, 2)
+        XCTAssertEqual(matches.first(where: { $0.fileId == 1 })?.newValue, "The strokes")
+        XCTAssertEqual(matches.first(where: { $0.fileId == 2 })?.newValue, "The doors")
+    }
+
+    func testCaseSensitiveMatchSkipsCaseMismatches() {
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: [
+                makeFile(id: 1, artist: "the strokes"),
+                makeFile(id: 2, artist: "The Strokes"),
+            ],
+            query: LibraryHygiene.FindAndReplaceQuery(
+                find: "the",
+                replace: "THE",
+                fields: [.artist],
+                caseSensitive: true
+            )
+        )
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches.first?.fileId, 1,
+                       "case-sensitive find must skip 'The' but match 'the'")
+        XCTAssertEqual(matches.first?.newValue, "THE strokes")
+    }
+
+    func testReplacementSkipsFieldsNotInSelection() {
+        // Find string "demo" appears in both artist and album; only
+        // album is selected → only album matches.
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: [makeFile(artist: "demo artist", title: "Track", album: "demo album")],
+            query: LibraryHygiene.FindAndReplaceQuery(
+                find: "demo",
+                replace: "DEMO",
+                fields: [.album],
+                caseSensitive: false
+            )
+        )
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches.first?.field, .album)
+        XCTAssertEqual(matches.first?.newValue, "DEMO album")
+    }
+
+    func testNoMatchYieldsEmpty() {
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: [makeFile(artist: "Aphex Twin")],
+            query: LibraryHygiene.FindAndReplaceQuery(
+                find: "completely-absent",
+                replace: "X",
+                fields: [.artist],
+                caseSensitive: false
+            )
+        )
+        XCTAssertEqual(matches.count, 0)
+    }
+
+    func testApplyReplacementHelperIsCaseAware() {
+        XCTAssertEqual(
+            LibraryHygiene.applyReplacement(
+                to: "Aphex twin", find: "twin", replace: "Twin",
+                caseSensitive: true
+            ),
+            "Aphex Twin"
+        )
+        XCTAssertEqual(
+            LibraryHygiene.applyReplacement(
+                to: "Aphex twin", find: "Twin", replace: "Twin",
+                caseSensitive: true
+            ),
+            "Aphex twin",
+            "case-sensitive find of 'Twin' must not match 'twin'"
+        )
+        XCTAssertEqual(
+            LibraryHygiene.applyReplacement(
+                to: "Aphex twin", find: "Twin", replace: "Twin",
+                caseSensitive: false
+            ),
+            "Aphex Twin"
+        )
+    }
+
+    func testMergedFindReplaceMetadataBuildsCorrectPayload() {
+        let file = makeFile(
+            artist: "demo artist",
+            title: "Track",
+            album: "demo album"
+        )
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: [file],
+            query: LibraryHygiene.FindAndReplaceQuery(
+                find: "demo",
+                replace: "production",
+                fields: [.artist, .album],
+                caseSensitive: false
+            )
+        )
+        let merged = LibraryHygiene.mergedFindReplaceMetadata(forFile: file, matches: matches)
+        XCTAssertEqual(merged.artist, "production artist")
+        XCTAssertEqual(merged.album, "production album")
+        XCTAssertEqual(merged.title, "Track",
+                       "unselected field must keep its original value")
+    }
+}
+
+final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
+
+    @MainActor
+    private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator
+        )
+        return (engine, database)
+    }
+
+    func testApplyReplacesValuesAcrossSelectedFields() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "the strokes", album: "Is This It")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: files,
+            query: LibraryHygiene.FindAndReplaceQuery(
+                find: "the",
+                replace: "The",
+                fields: [.artist],
+                caseSensitive: false
+            )
+        )
+
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        _ = try await runner.applyFindAndReplaceFixes(matches, files: files)
+
+        let updated = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).first!
+        }
+        // Substring sub only — "the strokes" → "The strokes". The
+        // 's' stays lowercase. Title-casing is a separate tool.
+        XCTAssertEqual(updated.artist, "The strokes")
+        XCTAssertEqual(updated.album, "Is This It",
+                       "field not in query must be untouched")
+    }
+
+    func testFindReplaceBatchIsFullyUndoable() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "demo artist")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let matches = LibraryHygiene.findAndReplaceMatches(
+            in: files,
+            query: LibraryHygiene.FindAndReplaceQuery(
+                find: "demo",
+                replace: "production",
+                fields: [.artist],
+                caseSensitive: false
+            )
+        )
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        let batchId = try await runner.applyFindAndReplaceFixes(matches, files: files)
+
+        // Sanity post-apply.
+        let postFix = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).first!
+        }
+        XCTAssertEqual(postFix.artist, "production artist")
+
+        // Undo the entire batch — both setMetadata and the commit
+        // event must roundtrip, same as the whitespace path.
+        _ = try await engine.undoBatch(batchId)
+
+        let postUndo = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).first!
+        }
+        XCTAssertEqual(postUndo.artist, "demo artist",
+                       "undo of find/replace must restore the pre-replace value")
+    }
+}
+
 final class LibraryHygieneRunnerTests: XCTestCase {
 
     @MainActor

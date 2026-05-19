@@ -53,6 +53,131 @@ public enum LibraryHygiene {
         return issues
     }
 
+    // MARK: - Find and replace
+
+    /// One in-place substitution found by a find/replace scan. Same
+    /// scan → preview → apply skeleton as whitespace issues; the
+    /// difference is the *user* supplies the rewrite rule rather than
+    /// the analyzer deriving it.
+    public struct FindAndReplaceMatch: Sendable, Equatable, Identifiable {
+        public let fileId: Int64
+        public let path: String
+        public let field: SeratoMetadataField
+        public let oldValue: String
+        public let newValue: String
+
+        public var id: String { "\(fileId):\(field.rawValue)" }
+    }
+
+    /// Parameters for a find/replace scan. Bundled together so the
+    /// pure function signature stays compact and so the parameters
+    /// can flow as one Sendable value through the runner.
+    public struct FindAndReplaceQuery: Sendable, Equatable {
+        public let find: String
+        public let replace: String
+        public let fields: Set<SeratoMetadataField>
+        public let caseSensitive: Bool
+
+        public init(
+            find: String,
+            replace: String,
+            fields: Set<SeratoMetadataField>,
+            caseSensitive: Bool
+        ) {
+            self.find = find
+            self.replace = replace
+            self.fields = fields
+            self.caseSensitive = caseSensitive
+        }
+    }
+
+    /// Scan the file list for matches against `query`. The match
+    /// list is suitable for direct rendering as a preview pane —
+    /// each entry already carries the rewritten value so the UI
+    /// shows the user exactly what will land if they apply.
+    /// Empty find string returns no matches (avoids the "match
+    /// everything, rewrite to nothing" footgun).
+    public static func findAndReplaceMatches(
+        in files: [FileRecord],
+        query: FindAndReplaceQuery
+    ) -> [FindAndReplaceMatch] {
+        guard !query.find.isEmpty else { return [] }
+        var matches: [FindAndReplaceMatch] = []
+        for file in files {
+            guard let fileId = file.id else { continue }
+            for field in query.fields {
+                guard let raw = field.read(from: file), !raw.isEmpty else { continue }
+                let replaced = applyReplacement(
+                    to: raw,
+                    find: query.find,
+                    replace: query.replace,
+                    caseSensitive: query.caseSensitive
+                )
+                if replaced != raw {
+                    matches.append(FindAndReplaceMatch(
+                        fileId: fileId,
+                        path: file.path,
+                        field: field,
+                        oldValue: raw,
+                        newValue: replaced
+                    ))
+                }
+            }
+        }
+        return matches
+    }
+
+    /// Composes a SeratoMetadata snapshot for a single file given
+    /// the find/replace matches that apply to it. Mirrors
+    /// `mergedTrimmedMetadata` so the runner reuses one mutation
+    /// per file regardless of how many fields matched.
+    public static func mergedFindReplaceMetadata(
+        forFile file: FileRecord,
+        matches: [FindAndReplaceMatch]
+    ) -> SeratoMetadata {
+        var artist = file.artist
+        var title = file.title
+        var album = file.album
+        var genre = file.genre
+        var bpm = file.bpm
+        var musicalKey = file.musicalKey
+        var comment = file.comment
+        var length = file.length
+        var label = file.label
+        for match in matches where match.fileId == file.id {
+            switch match.field {
+            case .artist: artist = match.newValue
+            case .title: title = match.newValue
+            case .album: album = match.newValue
+            case .genre: genre = match.newValue
+            case .bpm: bpm = match.newValue
+            case .musicalKey: musicalKey = match.newValue
+            case .comment: comment = match.newValue
+            case .length: length = match.newValue
+            case .label: label = match.newValue
+            }
+        }
+        return SeratoMetadata(
+            artist: artist, title: title, album: album, genre: genre,
+            bpm: bpm, musicalKey: musicalKey, comment: comment,
+            length: length, label: label
+        )
+    }
+
+    /// Internal: case-aware substring replace. Foundation's
+    /// `String.replacingOccurrences(of:with:options:)` does the heavy
+    /// lifting; we route through here so the call site is uniform
+    /// and so the test surface for case-handling is one function.
+    static func applyReplacement(
+        to subject: String,
+        find: String,
+        replace: String,
+        caseSensitive: Bool
+    ) -> String {
+        let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+        return subject.replacingOccurrences(of: find, with: replace, options: options)
+    }
+
     /// Build the trimmed SeratoMetadata snapshot for a single file
     /// given the issues against it. Used by the runner to compose
     /// one `setMetadata` payload per file regardless of how many
@@ -176,37 +301,82 @@ public actor LibraryHygieneRunner {
                 forFile: file,
                 issues: fileIssues
             )
-            // The pre-hygiene snapshot — needed as `previousMetadata`
-            // on the Serato commit so undo can re-issue the commit
-            // with the un-trimmed values. Read straight from the
-            // FileRecord we have in hand; the row reflects the
-            // state Serato also holds at this moment because the
-            // bi-directional sync keeps them aligned.
-            let previousSnapshot = SeratoMetadata(
-                artist: file.artist,
-                title: file.title,
-                album: file.album,
-                genre: file.genre,
-                bpm: file.bpm,
-                musicalKey: file.musicalKey,
-                comment: file.comment,
-                length: file.length,
-                label: file.label
-            )
-            try await operationEngine.apply(
-                .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged)),
-                batchId: effectiveBatchId
-            )
-            try await operationEngine.apply(
-                .commitMetadataToSerato(CommitMetadataToSeratoPayload(
-                    fileId: fileId,
-                    metadata: merged,
-                    previousMetadata: previousSnapshot
-                )),
+            try await applyMergedMetadata(
+                fileId: fileId,
+                file: file,
+                merged: merged,
                 batchId: effectiveBatchId
             )
         }
 
         return effectiveBatchId
+    }
+
+    @discardableResult
+    public func applyFindAndReplaceFixes(
+        _ matches: [LibraryHygiene.FindAndReplaceMatch],
+        files: [FileRecord],
+        batchId: String? = nil
+    ) async throws -> String {
+        guard !matches.isEmpty else { return batchId ?? "" }
+
+        let effectiveBatchId = batchId ?? "hygiene-find-replace-\(UUID().uuidString)"
+        let matchesByFileId = Dictionary(grouping: matches, by: \.fileId)
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+            guard let identifier = file.id else { return nil }
+            return (identifier, file)
+        })
+
+        for (fileId, fileMatches) in matchesByFileId {
+            guard let file = filesById[fileId] else { continue }
+            let merged = LibraryHygiene.mergedFindReplaceMetadata(
+                forFile: file,
+                matches: fileMatches
+            )
+            try await applyMergedMetadata(
+                fileId: fileId,
+                file: file,
+                merged: merged,
+                batchId: effectiveBatchId
+            )
+        }
+
+        return effectiveBatchId
+    }
+
+    /// Shared mutation pair: setMetadata (DB) + commitMetadataToSerato
+    /// (Serato), both under the same batch so undo reverts together.
+    /// The Serato commit captures `previousMetadata` from the file's
+    /// pre-fix state so the batch is fully invertible — see PR #21's
+    /// engine extension.
+    private func applyMergedMetadata(
+        fileId: Int64,
+        file: FileRecord,
+        merged: SeratoMetadata,
+        batchId: String
+    ) async throws {
+        let previousSnapshot = SeratoMetadata(
+            artist: file.artist,
+            title: file.title,
+            album: file.album,
+            genre: file.genre,
+            bpm: file.bpm,
+            musicalKey: file.musicalKey,
+            comment: file.comment,
+            length: file.length,
+            label: file.label
+        )
+        try await operationEngine.apply(
+            .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged)),
+            batchId: batchId
+        )
+        try await operationEngine.apply(
+            .commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                fileId: fileId,
+                metadata: merged,
+                previousMetadata: previousSnapshot
+            )),
+            batchId: batchId
+        )
     }
 }
