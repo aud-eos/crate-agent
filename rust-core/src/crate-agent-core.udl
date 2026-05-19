@@ -65,6 +65,20 @@ namespace crate_agent_core {
     SeratoMetadataUpdate update
   );
 
+  // Append a new track to Serato's `database V2`. Used by crate-
+  // agent's drag-drop import flow to register a file with Serato
+  // without going through Serato's own UI. Returns 1 if the track
+  // was added, 0 if Serato already has it. Writes the file back if
+  // an add happened.
+  //
+  // Same SeratoWatchdog gating as update_database_record.
+  [Throws=CoreError]
+  u32 add_track_to_database(
+    string database_path,
+    string track_path,
+    SeratoMetadataUpdate metadata
+  );
+
   // Decode an audio file and return its Chromaprint perceptual
   // fingerprint as a sequence of 32-bit hashes. Stable across
   // re-encodings of the same recording within Chromaprint's tolerance.

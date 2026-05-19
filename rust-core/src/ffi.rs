@@ -138,6 +138,20 @@ pub fn update_database_record(
     Ok(u32::try_from(count).expect("update count exceeded u32"))
 }
 
+pub fn add_track_to_database(
+    database_path: String,
+    track_path: String,
+    metadata: SeratoMetadataUpdate,
+) -> Result<u32, CoreError> {
+    let path = PathBuf::from(database_path);
+    let mut database = serato::DatabaseV2::read_from_path(&path)?;
+    let added = database.add_track(&track_path, &metadata);
+    if added {
+        database.write_to_path(&path)?;
+    }
+    Ok(if added { 1 } else { 0 })
+}
+
 pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> {
     let path = PathBuf::from(file_path);
     Ok(fingerprint::fingerprint_file(&path)?)

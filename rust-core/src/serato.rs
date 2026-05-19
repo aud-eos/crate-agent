@@ -365,6 +365,55 @@ impl DatabaseV2 {
         self.records.iter().filter(|record| &record.tag == TAG_OTRK).count()
     }
 
+    /// Append a new `otrk` for `track_path` with the supplied
+    /// metadata fields. Used by crate-agent's drag-drop import flow
+    /// to register a file with Serato without going through Serato's
+    /// own UI.
+    ///
+    /// Returns `true` if the track was added, `false` if Serato
+    /// already has an otrk for this path (no-op — Serato dedupes
+    /// itself, but we mirror that behavior to keep the file size
+    /// from drifting on repeated imports).
+    ///
+    /// Like `update_track_metadata`, must only be called while
+    /// Serato is NOT running. The Swift caller gates via
+    /// SeratoWatchdog.
+    pub fn add_track(
+        &mut self,
+        track_path: &str,
+        metadata: &SeratoMetadataUpdate,
+    ) -> bool {
+        let already_present = self.records.iter().any(|record| {
+            if &record.tag != TAG_OTRK {
+                return false;
+            }
+            let Ok(nested) = TlvRecord::parse_all(&record.payload) else {
+                return false;
+            };
+            nested.iter().any(|field| {
+                &field.tag == TAG_PFIL
+                    && decode_utf16be(&field.payload).as_deref() == Some(track_path)
+            })
+        });
+        if already_present {
+            return false;
+        }
+
+        let mut nested = vec![TlvRecord {
+            tag: *TAG_PFIL,
+            payload: encode_utf16be(track_path),
+        }];
+        apply_metadata_update_to_nested(&mut nested, metadata);
+
+        let mut payload = Vec::with_capacity(nested.iter().map(|r| 8 + r.payload.len()).sum());
+        TlvRecord::write_all(&nested, &mut payload).expect("writing to Vec<u8> cannot fail");
+        self.records.push(TlvRecord {
+            tag: *TAG_OTRK,
+            payload,
+        });
+        true
+    }
+
     /// Update Serato's metadata for the track whose `pfil` equals
     /// `track_path`. For each `Some(...)` field in `update`, the
     /// corresponding `t*` record is set (creating it if absent);
@@ -913,6 +962,86 @@ mod tests {
         };
         let updated = database.update_track_metadata("Users/x/Music/Z/missing.mp3", &update);
         assert_eq!(updated, 0);
+    }
+
+    // ===== add_track tests =====
+
+    #[test]
+    fn add_track_appends_new_otrk_with_path_and_metadata() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/existing.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        assert_eq!(database.track_count(), 1);
+
+        let metadata = SeratoMetadataUpdate {
+            artist: Some("New Artist".to_string()),
+            title: Some("New Title".to_string()),
+            bpm: Some("128.000".to_string()),
+            ..Default::default()
+        };
+        let added = database.add_track("Users/x/Music/A/new.mp3", &metadata);
+        assert!(added, "should report added");
+        assert_eq!(database.track_count(), 2);
+
+        // Re-parse to verify both tracks are addressable as records.
+        let serialized = database.to_bytes().unwrap();
+        let reparsed = DatabaseV2::from_bytes(&serialized).unwrap();
+        let records = reparsed.track_records();
+        assert_eq!(records.len(), 2);
+
+        let new_record = records.iter().find(|r| r.path == "Users/x/Music/A/new.mp3");
+        let new_record = new_record.expect("new track present in re-parsed database");
+        assert_eq!(new_record.artist.as_deref(), Some("New Artist"));
+        assert_eq!(new_record.title.as_deref(), Some("New Title"));
+        assert_eq!(new_record.bpm.as_deref(), Some("128.000"));
+    }
+
+    #[test]
+    fn add_track_is_idempotent_for_existing_path() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/dup.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let metadata = SeratoMetadataUpdate {
+            artist: Some("Ignored".to_string()),
+            ..Default::default()
+        };
+        let added = database.add_track("Users/x/Music/A/dup.mp3", &metadata);
+        assert!(!added, "duplicate add must be a no-op");
+        assert_eq!(database.track_count(), 1);
+
+        // The pre-existing otrk's metadata should be unchanged —
+        // add_track only handles inserts, not updates. The
+        // existing entry had no `tart`, so it should still have none.
+        let records = database.track_records();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].artist.is_none(), "existing entry's metadata is untouched");
+    }
+
+    #[test]
+    fn add_track_with_no_metadata_writes_only_pfil() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/existing.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let added = database.add_track(
+            "Users/x/Music/A/bare.mp3",
+            &SeratoMetadataUpdate::default(),
+        );
+        assert!(added);
+
+        let records = database.track_records();
+        let bare = records.iter().find(|r| r.path == "Users/x/Music/A/bare.mp3").unwrap();
+        assert!(bare.artist.is_none());
+        assert!(bare.title.is_none());
+        assert!(bare.bpm.is_none());
     }
 
     #[test]

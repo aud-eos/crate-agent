@@ -375,6 +375,77 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(queueDepthAfter, 0)
     }
 
+    func testAddTrackToSeratoAppendsOtrkWhenSeratoClosed() async throws {
+        let (seratoDirectoryUrl, databaseV2Url) = try Self.makeTemporarySeratoDatabase(
+            withTrack: "Users/testuser/Music/Existing.mp3"
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: false)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/newly-dropped.mp3",
+            volumeUuid: "v1", inode: 99, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "Drop Artist", title: "Drop Title")
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/newly-dropped.mp3"])
+        }!
+
+        try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
+            fileId: fileId,
+            metadata: SeratoMetadata(artist: "Drop Artist", title: "Drop Title")
+        )))
+
+        let records = try readDatabaseRecords(databasePath: databaseV2Url.path)
+        XCTAssertEqual(records.count, 2, "should have both the original and the newly-added track")
+        let droppedRecord = records.first { $0.path == "Users/testuser/Music/A/newly-dropped.mp3" }
+        XCTAssertNotNil(droppedRecord)
+        XCTAssertEqual(droppedRecord?.artist, "Drop Artist")
+        XCTAssertEqual(droppedRecord?.title, "Drop Title")
+    }
+
+    func testAddTrackToSeratoBootstrapsDatabaseV2IfMissing() async throws {
+        // Serato has never run on this machine → no database V2.
+        // The mutation should create a fresh one with our otrk.
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-bootstrap-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectoryUrl = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        // Note: don't create the _Serato_ directory — applySeratoAddTrack
+        // creates it on demand.
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: false)
+        }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/first.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "First")
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/first.mp3"])
+        }!
+        try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
+            fileId: fileId,
+            metadata: SeratoMetadata(artist: "First")
+        )))
+
+        let databaseV2Url = seratoDirectoryUrl.appendingPathComponent("database V2")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: databaseV2Url.path),
+            "database V2 should have been bootstrapped"
+        )
+        let records = try readDatabaseRecords(databasePath: databaseV2Url.path)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records[0].path, "Users/testuser/Music/A/first.mp3")
+        XCTAssertEqual(records[0].artist, "First")
+    }
+
     func testDrainAppliesQueuedRewrites() async throws {
         let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
