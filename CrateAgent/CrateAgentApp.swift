@@ -3,13 +3,11 @@ import SwiftUI
 @main
 struct CrateAgentApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var services = AppServices.bootstrap()
+    @StateObject private var launcher = AppLauncher()
 
     var body: some Scene {
         WindowGroup {
-            LibraryBrowserView()
-                .environmentObject(services)
-                .environmentObject(services.seratoWatchdog)
+            rootView
         }
         .windowResizability(.contentSize)
         .commands {
@@ -17,13 +15,68 @@ struct CrateAgentApp: App {
         }
 
         MenuBarExtra("crate-agent", systemImage: "music.note.list") {
-            MenuBarStatusView()
-                .environmentObject(services)
-                .environmentObject(services.seratoWatchdog)
+            menuBarContent
         }
         .menuBarExtraStyle(.window)
 
         Settings {
+            settingsContent
+        }
+    }
+
+    @ViewBuilder
+    private var rootView: some View {
+        switch launcher.state {
+        case .needsOnboarding:
+            OnboardingView { pickedFolder in
+                launcher.completeOnboarding(withFolder: pickedFolder)
+            }
+        case .ready(let services):
+            LibraryBrowserView()
+                .environmentObject(services)
+                .environmentObject(services.seratoWatchdog)
+        }
+    }
+
+    /// MenuBarExtra and Settings can't be conditional scenes here —
+    /// SwiftUI's SceneBuilder type-checking breaks on a mix of
+    /// `WindowGroup` (with modifiers) and `if case`-guarded
+    /// `MenuBarExtra` / `Settings`. Putting the conditional inside
+    /// the View body sidesteps that.
+    @ViewBuilder
+    private var menuBarContent: some View {
+        switch launcher.state {
+        case .needsOnboarding:
+            VStack(alignment: .leading, spacing: 6) {
+                Text("crate-agent")
+                    .font(.headline)
+                Text("Finish setup to start watching.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .frame(width: 220)
+        case .ready(let services):
+            MenuBarStatusView()
+                .environmentObject(services)
+                .environmentObject(services.seratoWatchdog)
+        }
+    }
+
+    @ViewBuilder
+    private var settingsContent: some View {
+        switch launcher.state {
+        case .needsOnboarding:
+            VStack(spacing: 8) {
+                Image(systemName: "gear.badge.questionmark")
+                    .font(.largeTitle)
+                    .foregroundStyle(.tertiary)
+                Text("Finish setup to configure crate-agent.")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 360, height: 200)
+        case .ready(let services):
             SettingsView()
                 .environmentObject(services)
         }
