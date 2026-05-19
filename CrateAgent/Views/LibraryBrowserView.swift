@@ -11,6 +11,7 @@ struct LibraryBrowserView: View {
     @State private var showRestartAlert: Bool = false
     @State private var isDropTargeted: Bool = false
     @State private var lastImportSummary: String?
+    @State private var showHistorySheet: Bool = false
 
     private var filteredSortedFiles: [FileRecord] {
         let filtered: [FileRecord]
@@ -60,6 +61,10 @@ struct LibraryBrowserView: View {
         } isTargeted: { targeted in
             isDropTargeted = targeted
         }
+        .sheet(isPresented: $showHistorySheet) {
+            HistoryView()
+                .environmentObject(services)
+        }
     }
 
     @ViewBuilder
@@ -102,6 +107,14 @@ struct LibraryBrowserView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            Button {
+                showHistorySheet = true
+            } label: {
+                Label("History", systemImage: "clock.arrow.circlepath")
+            }
+            .controlSize(.small)
+            .help("Review recent changes crate-agent has made and undo individual batches.")
 
             FolderPickerButton(
                 title: "Change…",
