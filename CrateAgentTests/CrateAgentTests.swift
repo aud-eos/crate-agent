@@ -660,6 +660,52 @@ final class FSEventsWatcherTests: XCTestCase {
         XCTAssertTrue(observation.isFile)
     }
 
+    func testEventIdCheckpointFiresWithMonotonicMaxId() throws {
+        let watchedDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-fsevents-checkpoint-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: watchedDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: watchedDirectory) }
+
+        let checkpointExpectation = expectation(description: "checkpoint fired")
+        checkpointExpectation.assertForOverFulfill = false
+
+        let lock = NSLock()
+        var receivedCheckpoints: [FSEventStreamEventId] = []
+
+        let watcher = FSEventsWatcher(
+            watchedPaths: [watchedDirectory.path],
+            coalescingLatency: 0.05,
+            handler: { _ in },
+            onEventIdCheckpoint: { eventId in
+                lock.lock()
+                receivedCheckpoints.append(eventId)
+                lock.unlock()
+                checkpointExpectation.fulfill()
+            }
+        )
+        watcher.start()
+        defer { watcher.stop() }
+
+        Thread.sleep(forTimeInterval: 0.2)
+        try Data("test".utf8).write(
+            to: watchedDirectory.appendingPathComponent("checkpoint-test.mp3")
+        )
+
+        wait(for: [checkpointExpectation], timeout: 3.0)
+
+        lock.lock()
+        let snapshot = receivedCheckpoints
+        lock.unlock()
+
+        XCTAssertFalse(snapshot.isEmpty, "expected at least one checkpoint")
+        XCTAssertGreaterThan(snapshot.first!, 0, "event ID 0 means no events; we should have received real IDs")
+        // Each subsequent checkpoint must be >= the previous one,
+        // matching FSEvents' monotonic event ID ordering.
+        for index in 1..<snapshot.count {
+            XCTAssertGreaterThanOrEqual(snapshot[index], snapshot[index - 1])
+        }
+    }
+
     func testWatchedDirectoryEmitsCreateEventForNewFile() throws {
         let watchedDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("crate-agent-test-fsevents-\(UUID().uuidString)", isDirectory: true)
@@ -710,6 +756,58 @@ final class FSEventsWatcherTests: XCTestCase {
             observationLock.unlock()
             XCTFail("expected create observation for new-track.mp3; got \(snapshot.count) observations: \(snapshot.map { "\($0.path) file=\($0.isFile) created=\($0.wasCreated)" })")
         }
+    }
+}
+
+final class UserPreferencesTests: XCTestCase {
+
+    private static let testPathA = "/test/path/A-\(UUID().uuidString)"
+    private static let testPathB = "/test/path/B-\(UUID().uuidString)"
+
+    override func tearDown() {
+        // Avoid polluting subsequent test runs with the per-path keys.
+        UserDefaults.standard.removeObject(
+            forKey: "LastFSEventId:" + Self.testPathA
+        )
+        UserDefaults.standard.removeObject(
+            forKey: "LastFSEventId:" + Self.testPathB
+        )
+        super.tearDown()
+    }
+
+    func testFSEventIdStorageRoundTripsForOneWatchedPath() {
+        UserPreferences.setLastFSEventId(
+            FSEventStreamEventId(42_424_242),
+            forWatchedPath: Self.testPathA
+        )
+        let readBack = UserPreferences.lastFSEventId(forWatchedPath: Self.testPathA)
+        XCTAssertEqual(readBack, FSEventStreamEventId(42_424_242))
+    }
+
+    func testFSEventIdStorageIsKeyedSeparatelyPerPath() {
+        UserPreferences.setLastFSEventId(
+            FSEventStreamEventId(111),
+            forWatchedPath: Self.testPathA
+        )
+        UserPreferences.setLastFSEventId(
+            FSEventStreamEventId(222),
+            forWatchedPath: Self.testPathB
+        )
+        XCTAssertEqual(
+            UserPreferences.lastFSEventId(forWatchedPath: Self.testPathA),
+            FSEventStreamEventId(111),
+            "writing path B must not clobber path A"
+        )
+        XCTAssertEqual(
+            UserPreferences.lastFSEventId(forWatchedPath: Self.testPathB),
+            FSEventStreamEventId(222)
+        )
+    }
+
+    func testFSEventIdReturnsNilForUnseenPath() {
+        XCTAssertNil(
+            UserPreferences.lastFSEventId(forWatchedPath: "/never-stored-\(UUID().uuidString)")
+        )
     }
 }
 

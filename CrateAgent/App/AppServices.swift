@@ -92,14 +92,30 @@ public final class AppServices: ObservableObject {
             database: database
         )
 
+        // Resume from the last seen event ID if we have one for this
+        // exact watched path — events that happened while crate-agent
+        // was closed get replayed. First launch (no stored ID) starts
+        // from "now."
+        let watchedFolderPath = watchedMusicFolder.path
+        let resumeFromEventId = UserPreferences.lastFSEventId(
+            forWatchedPath: watchedFolderPath
+        ) ?? FSEventsWatcher.sinceNow
+
         // FSEventsWatcher hands the coordinator each batched event
         // group via a detached Task; the watcher's dispatch queue
-        // stays free for the next callback.
+        // stays free for the next callback. The checkpoint callback
+        // persists the highest event ID we've processed so the next
+        // launch's `sinceWhen` picks up exactly where we left off.
         self.fsEventsWatcher = FSEventsWatcher(
-            watchedPaths: [watchedMusicFolder.path]
-        ) { observations in
-            Task { await filesystemCoordinator.handleObservations(observations) }
-        }
+            watchedPaths: [watchedFolderPath],
+            sinceWhen: resumeFromEventId,
+            handler: { observations in
+                Task { await filesystemCoordinator.handleObservations(observations) }
+            },
+            onEventIdCheckpoint: { eventId in
+                UserPreferences.setLastFSEventId(eventId, forWatchedPath: watchedFolderPath)
+            }
+        )
 
         // All stored properties are now assigned; start lifecycle.
         seratoWatchdog.startObservingWorkspace()
