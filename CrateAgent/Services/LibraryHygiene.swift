@@ -178,6 +178,168 @@ public enum LibraryHygiene {
         return subject.replacingOccurrences(of: find, with: replace, options: options)
     }
 
+    // MARK: - Case consistency
+
+    /// A group of files whose value in a single field collapses to
+    /// the same lowercased string but is spelled with different
+    /// cases ("the strokes" vs "The Strokes"). The hygiene UI
+    /// presents one group per row with the user picking the
+    /// canonical spelling.
+    public struct CaseInconsistencyGroup: Sendable, Equatable, Identifiable {
+        public let field: SeratoMetadataField
+        public let canonicalKey: String  // lowercased identity
+        /// All distinct cased spellings observed in this group,
+        /// sorted by descending count then alphabetical for
+        /// deterministic UI rendering.
+        public let variants: [CaseVariant]
+        /// Suggested canonical spelling — the most-common variant,
+        /// alphabetical tiebreak. Pre-selected in the UI; the user
+        /// can override by picking a different variant.
+        public let suggestedCanonical: String
+        public let totalFiles: Int
+
+        public var id: String { "\(field.rawValue):\(canonicalKey)" }
+    }
+
+    public struct CaseVariant: Sendable, Equatable {
+        public let value: String       // the cased spelling
+        public let count: Int          // how many files use it
+        public let fileIds: [Int64]    // files using this variant
+    }
+
+    /// Scan for groups where the same field has 2+ different
+    /// casings. Returns one CaseInconsistencyGroup per field × per
+    /// case-insensitive value with >1 variant; groups with a single
+    /// consistent spelling are not reported (nothing to fix).
+    public static func findCaseInconsistencies(
+        in files: [FileRecord]
+    ) -> [CaseInconsistencyGroup] {
+        var groups: [CaseInconsistencyGroup] = []
+        for field in SeratoMetadataField.allCases {
+            // (lowercased key) -> (cased spelling -> [fileId])
+            var bucketed: [String: [String: [Int64]]] = [:]
+            for file in files {
+                guard let fileId = file.id else { continue }
+                guard let raw = field.read(from: file), !raw.isEmpty else { continue }
+                let key = raw.lowercased()
+                bucketed[key, default: [:]][raw, default: []].append(fileId)
+            }
+
+            for (key, variantsByCasing) in bucketed where variantsByCasing.count > 1 {
+                let variants = variantsByCasing
+                    .map { CaseVariant(value: $0.key, count: $0.value.count, fileIds: $0.value) }
+                    .sorted { lhs, rhs in
+                        if lhs.count != rhs.count { return lhs.count > rhs.count }
+                        return lhs.value < rhs.value
+                    }
+                let totalFiles = variants.reduce(0) { $0 + $1.count }
+                let suggestedCanonical = variants.first?.value ?? ""
+                groups.append(CaseInconsistencyGroup(
+                    field: field,
+                    canonicalKey: key,
+                    variants: variants,
+                    suggestedCanonical: suggestedCanonical,
+                    totalFiles: totalFiles
+                ))
+            }
+        }
+        // Stable cross-field ordering: alphabetical by field then by
+        // canonicalKey. Avoids "the row jumped" surprises across
+        // re-renders.
+        return groups.sorted { lhs, rhs in
+            if lhs.field.rawValue != rhs.field.rawValue {
+                return lhs.field.rawValue < rhs.field.rawValue
+            }
+            return lhs.canonicalKey < rhs.canonicalKey
+        }
+    }
+
+    /// Project a user's resolution (group → chosen canonical value)
+    /// onto a flat list of per-file fixes. Returns one entry per
+    /// file whose current variant differs from the chosen canonical;
+    /// files already using the canonical aren't included.
+    public struct CaseFix: Sendable, Equatable, Identifiable {
+        public let fileId: Int64
+        public let field: SeratoMetadataField
+        public let oldValue: String
+        public let newValue: String
+
+        public var id: String { "\(fileId):\(field.rawValue)" }
+    }
+
+    /// Project per-group canonical choices onto a flat list of
+    /// per-file fixes. `canonicalFor` returns the chosen spelling
+    /// for a group, or nil if the user opted to leave it alone.
+    /// Skips files already on the canonical and files whose live
+    /// value has drifted from the variant snapshot (rare but
+    /// possible if the user edits in another flow between scan
+    /// and apply).
+    public static func caseFixes(
+        forGroups groups: [CaseInconsistencyGroup],
+        canonicalFor: (CaseInconsistencyGroup) -> String?,
+        in files: [FileRecord]
+    ) -> [CaseFix] {
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+            guard let identifier = file.id else { return nil }
+            return (identifier, file)
+        })
+        var fixes: [CaseFix] = []
+        for group in groups {
+            guard let canonical = canonicalFor(group) else { continue }
+            for variant in group.variants where variant.value != canonical {
+                for fileId in variant.fileIds {
+                    guard let file = filesById[fileId] else { continue }
+                    guard let raw = group.field.read(from: file) else { continue }
+                    if raw == variant.value {
+                        fixes.append(CaseFix(
+                            fileId: fileId,
+                            field: group.field,
+                            oldValue: raw,
+                            newValue: canonical
+                        ))
+                    }
+                }
+            }
+        }
+        return fixes
+    }
+
+    /// Compose the SeratoMetadata snapshot for one file given the
+    /// case fixes against it. Same shape as the other mergedXxx
+    /// helpers so the runner can route through `applyMergedMetadata`.
+    public static func mergedCaseMetadata(
+        forFile file: FileRecord,
+        fixes: [CaseFix]
+    ) -> SeratoMetadata {
+        var artist = file.artist
+        var title = file.title
+        var album = file.album
+        var genre = file.genre
+        var bpm = file.bpm
+        var musicalKey = file.musicalKey
+        var comment = file.comment
+        var length = file.length
+        var label = file.label
+        for fix in fixes where fix.fileId == file.id {
+            switch fix.field {
+            case .artist: artist = fix.newValue
+            case .title: title = fix.newValue
+            case .album: album = fix.newValue
+            case .genre: genre = fix.newValue
+            case .bpm: bpm = fix.newValue
+            case .musicalKey: musicalKey = fix.newValue
+            case .comment: comment = fix.newValue
+            case .length: length = fix.newValue
+            case .label: label = fix.newValue
+            }
+        }
+        return SeratoMetadata(
+            artist: artist, title: title, album: album, genre: genre,
+            bpm: bpm, musicalKey: musicalKey, comment: comment,
+            length: length, label: label
+        )
+    }
+
     /// Build the trimmed SeratoMetadata snapshot for a single file
     /// given the issues against it. Used by the runner to compose
     /// one `setMetadata` payload per file regardless of how many
@@ -332,6 +494,38 @@ public actor LibraryHygieneRunner {
             let merged = LibraryHygiene.mergedFindReplaceMetadata(
                 forFile: file,
                 matches: fileMatches
+            )
+            try await applyMergedMetadata(
+                fileId: fileId,
+                file: file,
+                merged: merged,
+                batchId: effectiveBatchId
+            )
+        }
+
+        return effectiveBatchId
+    }
+
+    @discardableResult
+    public func applyCaseFixes(
+        _ fixes: [LibraryHygiene.CaseFix],
+        files: [FileRecord],
+        batchId: String? = nil
+    ) async throws -> String {
+        guard !fixes.isEmpty else { return batchId ?? "" }
+
+        let effectiveBatchId = batchId ?? "hygiene-case-\(UUID().uuidString)"
+        let fixesByFileId = Dictionary(grouping: fixes, by: \.fileId)
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+            guard let identifier = file.id else { return nil }
+            return (identifier, file)
+        })
+
+        for (fileId, fileFixes) in fixesByFileId {
+            guard let file = filesById[fileId] else { continue }
+            let merged = LibraryHygiene.mergedCaseMetadata(
+                forFile: file,
+                fixes: fileFixes
             )
             try await applyMergedMetadata(
                 fileId: fileId,

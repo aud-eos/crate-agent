@@ -2935,6 +2935,205 @@ final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
     }
 }
 
+final class LibraryHygieneCaseConsistencyTests: XCTestCase {
+
+    private func makeFile(
+        id: Int64,
+        artist: String? = nil,
+        title: String? = nil,
+        album: String? = nil
+    ) -> FileRecord {
+        FileRecord(
+            id: id,
+            path: "/Music/A/track-\(id).mp3",
+            volumeUuid: "v1", inode: id, fileSize: 1, mtime: 1,
+            artist: artist, title: title, album: album
+        )
+    }
+
+    func testFindNoGroupsWhenEveryFieldIsConsistent() {
+        let groups = LibraryHygiene.findCaseInconsistencies(in: [
+            makeFile(id: 1, artist: "Aphex Twin"),
+            makeFile(id: 2, artist: "Aphex Twin"),
+        ])
+        XCTAssertEqual(groups.count, 0,
+                       "no inconsistency means no group reported")
+    }
+
+    func testFindGroupsValuesByLowercaseKey() {
+        let groups = LibraryHygiene.findCaseInconsistencies(in: [
+            makeFile(id: 1, artist: "the strokes"),
+            makeFile(id: 2, artist: "The Strokes"),
+            makeFile(id: 3, artist: "The Strokes"),
+            makeFile(id: 4, artist: "THE STROKES"),
+        ])
+        XCTAssertEqual(groups.count, 1)
+        let group = groups.first!
+        XCTAssertEqual(group.field, .artist)
+        XCTAssertEqual(group.canonicalKey, "the strokes")
+        XCTAssertEqual(group.totalFiles, 4)
+        // Most-common-then-alphabetical: "The Strokes" (count 2),
+        // "THE STROKES" (count 1), "the strokes" (count 1)
+        XCTAssertEqual(group.variants.map(\.value),
+                       ["The Strokes", "THE STROKES", "the strokes"])
+        XCTAssertEqual(group.suggestedCanonical, "The Strokes")
+    }
+
+    func testFindGroupsAreScopedPerField() {
+        // Same casing inconsistency across artist AND album should
+        // produce two groups, not one merged group.
+        let groups = LibraryHygiene.findCaseInconsistencies(in: [
+            makeFile(id: 1, artist: "the doors", album: "the doors"),
+            makeFile(id: 2, artist: "The Doors", album: "The Doors"),
+        ])
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertEqual(Set(groups.map(\.field)), [.artist, .album])
+    }
+
+    func testGroupsAreSortedDeterministicallyAcrossFieldsAndKeys() {
+        let groups = LibraryHygiene.findCaseInconsistencies(in: [
+            makeFile(id: 1, artist: "zebra", album: "apple"),
+            makeFile(id: 2, artist: "Zebra", album: "Apple"),
+        ])
+        XCTAssertEqual(groups.map(\.field), [.album, .artist],
+                       "album sorts before artist alphabetically by field rawValue")
+    }
+
+    func testTiebreakIsAlphabeticalWhenCountsEqual() {
+        let groups = LibraryHygiene.findCaseInconsistencies(in: [
+            makeFile(id: 1, artist: "zebra"),
+            makeFile(id: 2, artist: "Zebra"),
+        ])
+        // Both variants have count 1 → alphabetical: "Zebra" (Z=0x5A)
+        // sorts before "zebra" (z=0x7A) in ASCII so "Zebra" wins
+        XCTAssertEqual(groups.first?.suggestedCanonical, "Zebra")
+    }
+
+    func testCaseFixesProjectChosenCanonicalOntoVariantsExcludingSelf() {
+        let files = [
+            makeFile(id: 1, artist: "the strokes"),
+            makeFile(id: 2, artist: "The Strokes"),
+            makeFile(id: 3, artist: "THE STROKES"),
+        ]
+        let groups = LibraryHygiene.findCaseInconsistencies(in: files)
+        let fixes = LibraryHygiene.caseFixes(
+            forGroups: groups,
+            canonicalFor: { _ in "The Strokes" },
+            in: files
+        )
+        XCTAssertEqual(fixes.count, 2,
+                       "files 1 and 3 need fixing; file 2 already matches")
+        XCTAssertEqual(Set(fixes.map(\.fileId)), [1, 3])
+        for fix in fixes {
+            XCTAssertEqual(fix.newValue, "The Strokes")
+        }
+    }
+
+    func testCaseFixesSkipsGroupsWithNilCanonical() {
+        let files = [
+            makeFile(id: 1, artist: "the strokes"),
+            makeFile(id: 2, artist: "The Strokes"),
+        ]
+        let groups = LibraryHygiene.findCaseInconsistencies(in: files)
+        let fixes = LibraryHygiene.caseFixes(
+            forGroups: groups,
+            canonicalFor: { _ in nil },  // skip everything
+            in: files
+        )
+        XCTAssertEqual(fixes.count, 0,
+                       "nil canonical must produce zero fixes for the group")
+    }
+}
+
+final class LibraryHygieneCaseRunnerTests: XCTestCase {
+
+    @MainActor
+    private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator
+        )
+        return (engine, database)
+    }
+
+    func testApplyCaseFixesNormalizesEveryNonCanonicalRow() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/one.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "the strokes")
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/two.mp3",
+            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "The Strokes")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let groups = LibraryHygiene.findCaseInconsistencies(in: files)
+        XCTAssertEqual(groups.count, 1)
+
+        let fixes = LibraryHygiene.caseFixes(
+            forGroups: groups,
+            canonicalFor: { _ in "The Strokes" },
+            in: files
+        )
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        _ = try await runner.applyCaseFixes(fixes, files: files)
+
+        let normalized = try await database.writer.read { db in
+            try String.fetchAll(
+                db,
+                sql: "SELECT artist FROM files ORDER BY id"
+            )
+        }
+        XCTAssertEqual(normalized, ["The Strokes", "The Strokes"])
+    }
+
+    func testApplyCaseFixesBatchIsFullyUndoable() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "the doors")
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/other.mp3",
+            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "The Doors")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let groups = LibraryHygiene.findCaseInconsistencies(in: files)
+        let fixes = LibraryHygiene.caseFixes(
+            forGroups: groups,
+            canonicalFor: { _ in "The Doors" },
+            in: files
+        )
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        let batchId = try await runner.applyCaseFixes(fixes, files: files)
+
+        let postFix = try await database.writer.read { db in
+            try FileRecord.filter(Column("inode") == 1).fetchOne(db)!
+        }
+        XCTAssertEqual(postFix.artist, "The Doors")
+
+        _ = try await engine.undoBatch(batchId)
+
+        let postUndo = try await database.writer.read { db in
+            try FileRecord.filter(Column("inode") == 1).fetchOne(db)!
+        }
+        XCTAssertEqual(postUndo.artist, "the doors",
+                       "undo of case normalization must restore the original casing")
+    }
+}
+
 final class LibraryHygieneRunnerTests: XCTestCase {
 
     @MainActor
