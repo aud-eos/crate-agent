@@ -1,18 +1,41 @@
 import GRDB
 import SwiftUI
 
-/// SP-1.5's library cleanup surface. Today: trim leading/trailing
-/// whitespace from any text metadata field across the library.
-/// Future tabs (case normalization, find-and-replace, missing
-/// fields) will hang off this same scan → preview → apply skeleton.
-///
-/// The view scans on appear, lists every detected issue (path + field
-/// + diff between old and new), and gives the user one "Fix All"
-/// action that batches every fix under a single `batch_id`. A
-/// single Undo on the History view reverts the entire cleanup.
+/// SP-1.5's library cleanup surface. TabView containing per-feature
+/// panels — Whitespace (trim leading/trailing), Find & Replace (
+/// substring rewrite across selected fields). Both panels share the
+/// scan → preview → apply skeleton: an analyzer in `LibraryHygiene`
+/// derives a structured issue list, the sheet renders a preview, and
+/// `LibraryHygieneRunner` batches every fix under a single `batch_id`
+/// so a single Undo on History reverts the entire cleanup.
 struct LibraryHygieneView: View {
     @EnvironmentObject private var services: AppServices
     @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            TabView {
+                WhitespacePanel()
+                    .tabItem { Label("Whitespace", systemImage: "scissors") }
+
+                FindReplacePanel()
+                    .tabItem { Label("Find & Replace", systemImage: "text.magnifyingglass") }
+            }
+            .navigationTitle("Library Cleanup")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+        .frame(minWidth: 680, minHeight: 480)
+    }
+}
+
+// MARK: - Whitespace panel
+
+private struct WhitespacePanel: View {
+    @EnvironmentObject private var services: AppServices
 
     @State private var files: [FileRecord] = []
     @State private var issues: [LibraryHygiene.WhitespaceIssue] = []
@@ -22,34 +45,12 @@ struct LibraryHygieneView: View {
     @State private var lastResult: String?
 
     var body: some View {
-        NavigationStack {
-            content
-                .navigationTitle("Library Cleanup")
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Close") { dismiss() }
-                    }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            Task { await rescan() }
-                        } label: {
-                            Label("Rescan", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(isScanning || isFixing)
-                    }
-                }
-        }
-        .frame(minWidth: 640, minHeight: 420)
-        .task { await rescan() }
-    }
-
-    @ViewBuilder
-    private var content: some View {
         VStack(spacing: 0) {
             issueListSection
             Divider()
             footer
         }
+        .task { await rescan() }
     }
 
     @ViewBuilder
@@ -58,59 +59,22 @@ struct LibraryHygieneView: View {
             ProgressView("Scanning library…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if issues.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "checkmark.seal")
-                    .font(.largeTitle)
-                    .foregroundStyle(.green)
-                Text("No whitespace issues found")
-                    .font(.headline)
-                Text("Every text field on every track is already trimmed.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            placeholderView(
+                icon: "checkmark.seal",
+                color: .green,
+                headline: "No whitespace issues found",
+                detail: "Every text field on every track is already trimmed."
+            )
         } else {
             List(issues) { issue in
-                issueRow(issue)
+                diffRow(
+                    fieldName: issue.field.displayName,
+                    path: issue.path,
+                    oldValue: issue.oldValue,
+                    newValue: issue.newValue
+                )
             }
             .listStyle(.inset)
-        }
-    }
-
-    @ViewBuilder
-    private func issueRow(_ issue: LibraryHygiene.WhitespaceIssue) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Text(issue.field.displayName)
-                    .font(.caption.smallCaps())
-                    .foregroundStyle(.tint)
-                Text((issue.path as NSString).lastPathComponent)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            HStack(alignment: .top, spacing: 8) {
-                diffLine(label: "From", value: issue.oldValue, color: .secondary)
-                Image(systemName: "arrow.right")
-                    .foregroundStyle(.tertiary)
-                diffLine(label: "To", value: issue.newValue, color: .primary)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    @ViewBuilder
-    private func diffLine(label: String, value: String, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label)
-                .font(.caption2.smallCaps())
-                .foregroundStyle(.tertiary)
-            // Surround with explicit guillemets so the user can see
-            // the leading/trailing whitespace difference at a glance.
-            Text("«\(value)»")
-                .font(.caption.monospaced())
-                .foregroundStyle(color)
         }
     }
 
@@ -131,9 +95,13 @@ struct LibraryHygieneView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-
             Spacer()
-
+            Button {
+                Task { await rescan() }
+            } label: {
+                Label("Rescan", systemImage: "arrow.clockwise")
+            }
+            .disabled(isScanning || isFixing)
             Button("Fix All Whitespace") {
                 Task { await fixAll() }
             }
@@ -163,15 +131,267 @@ struct LibraryHygieneView: View {
         defer { isFixing = false }
         actionError = nil
         lastResult = nil
-
+        let initialCount = issues.count
         let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
-        let initialIssueCount = issues.count
         do {
             _ = try await runner.applyWhitespaceFixes(issues, files: files)
-            lastResult = "Trimmed whitespace on \(initialIssueCount) field\(initialIssueCount == 1 ? "" : "s")"
+            lastResult = "Trimmed whitespace on \(initialCount) field\(initialCount == 1 ? "" : "s")"
             await rescan()
         } catch {
             actionError = "Fix failed: \(error.localizedDescription)"
         }
     }
+}
+
+// MARK: - Find & Replace panel
+
+private struct FindReplacePanel: View {
+    @EnvironmentObject private var services: AppServices
+
+    @State private var findText: String = ""
+    @State private var replaceText: String = ""
+    @State private var caseSensitive: Bool = false
+    @State private var selectedFields: Set<SeratoMetadataField> = [.artist, .title, .album]
+    @State private var files: [FileRecord] = []
+    @State private var matches: [LibraryHygiene.FindAndReplaceMatch] = []
+    @State private var selectedMatchIds: Set<String> = []
+    @State private var isApplying: Bool = false
+    @State private var actionError: String?
+    @State private var lastResult: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            queryForm
+            Divider()
+            matchesSection
+            Divider()
+            footer
+        }
+        .task { await loadFiles() }
+    }
+
+    @ViewBuilder
+    private var queryForm: some View {
+        Form {
+            Section {
+                TextField("Find", text: $findText)
+                    .font(.body.monospaced())
+                    .onChange(of: findText) { _, _ in recomputeMatches() }
+                TextField("Replace with", text: $replaceText)
+                    .font(.body.monospaced())
+                    .onChange(of: replaceText) { _, _ in recomputeMatches() }
+                Toggle("Match case", isOn: $caseSensitive)
+                    .onChange(of: caseSensitive) { _, _ in recomputeMatches() }
+            }
+            Section("Fields") {
+                fieldsRow
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private var fieldsRow: some View {
+        let columns = [
+            GridItem(.adaptive(minimum: 110, maximum: 160), alignment: .leading)
+        ]
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 4) {
+            ForEach(SeratoMetadataField.allCases, id: \.rawValue) { field in
+                Toggle(field.displayName, isOn: Binding(
+                    get: { selectedFields.contains(field) },
+                    set: { include in
+                        if include { selectedFields.insert(field) } else { selectedFields.remove(field) }
+                        recomputeMatches()
+                    }
+                ))
+                .toggleStyle(.checkbox)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var matchesSection: some View {
+        if findText.isEmpty {
+            placeholderView(
+                icon: "text.magnifyingglass",
+                color: .secondary,
+                headline: "Enter a search string above",
+                detail: "Replace text is substituted across every selected field. Toggle a row off to skip it."
+            )
+        } else if matches.isEmpty {
+            placeholderView(
+                icon: "checkmark.circle",
+                color: .green,
+                headline: "No matches",
+                detail: "Nothing in the selected fields contains the search string."
+            )
+        } else {
+            List(matches) { match in
+                HStack(alignment: .top, spacing: 10) {
+                    Toggle(isOn: Binding(
+                        get: { selectedMatchIds.contains(match.id) },
+                        set: { include in
+                            if include { selectedMatchIds.insert(match.id) }
+                            else { selectedMatchIds.remove(match.id) }
+                        }
+                    )) { EmptyView() }
+                    .toggleStyle(.checkbox)
+                    .labelsHidden()
+
+                    diffRow(
+                        fieldName: match.field.displayName,
+                        path: match.path,
+                        oldValue: match.oldValue,
+                        newValue: match.newValue
+                    )
+                }
+                .padding(.vertical, 4)
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if let actionError {
+                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            } else if let lastResult {
+                Label(lastResult, systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            } else if !matches.isEmpty {
+                Text("\(selectedMatchIds.count) of \(matches.count) selected")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Select All") {
+                selectedMatchIds = Set(matches.map(\.id))
+            }
+            .controlSize(.small)
+            .disabled(matches.isEmpty)
+            Button("Apply Selected") {
+                Task { await applySelected() }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(selectedMatchIds.isEmpty || isApplying)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private func loadFiles() async {
+        do {
+            files = try await services.database.writer.read { db in
+                try FileRecord.fetchAll(db)
+            }
+            recomputeMatches()
+        } catch {
+            actionError = "Couldn't load library: \(error.localizedDescription)"
+        }
+    }
+
+    private func recomputeMatches() {
+        let query = LibraryHygiene.FindAndReplaceQuery(
+            find: findText,
+            replace: replaceText,
+            fields: selectedFields,
+            caseSensitive: caseSensitive
+        )
+        matches = LibraryHygiene.findAndReplaceMatches(in: files, query: query)
+        // Default every match to selected when the query changes —
+        // the user can deselect rows before clicking Apply. Trying
+        // to "preserve" previous selections across query changes
+        // produced too many surprises (e.g., changing the find
+        // string and seeing some unrelated row stay deselected).
+        selectedMatchIds = Set(matches.map(\.id))
+    }
+
+    private func applySelected() async {
+        isApplying = true
+        defer { isApplying = false }
+        actionError = nil
+        lastResult = nil
+
+        let selectedMatches = matches.filter { selectedMatchIds.contains($0.id) }
+        let initialCount = selectedMatches.count
+        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
+        do {
+            _ = try await runner.applyFindAndReplaceFixes(selectedMatches, files: files)
+            lastResult = "Replaced text in \(initialCount) field\(initialCount == 1 ? "" : "s")"
+            await loadFiles()
+        } catch {
+            actionError = "Apply failed: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Shared
+
+@ViewBuilder
+private func diffRow(
+    fieldName: String,
+    path: String,
+    oldValue: String,
+    newValue: String
+) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+        HStack(spacing: 8) {
+            Text(fieldName)
+                .font(.caption.smallCaps())
+                .foregroundStyle(.tint)
+            Text((path as NSString).lastPathComponent)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("From")
+                    .font(.caption2.smallCaps())
+                    .foregroundStyle(.tertiary)
+                Text("«\(oldValue)»")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Image(systemName: "arrow.right")
+                .foregroundStyle(.tertiary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("To")
+                    .font(.caption2.smallCaps())
+                    .foregroundStyle(.tertiary)
+                Text("«\(newValue)»")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.primary)
+            }
+        }
+    }
+}
+
+@ViewBuilder
+private func placeholderView(
+    icon: String,
+    color: Color,
+    headline: String,
+    detail: String
+) -> some View {
+    VStack(spacing: 8) {
+        Image(systemName: icon)
+            .font(.largeTitle)
+            .foregroundStyle(color)
+        Text(headline)
+            .font(.headline)
+        Text(detail)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 40)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
 }
