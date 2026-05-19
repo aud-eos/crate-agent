@@ -54,15 +54,29 @@ final class SeratoWatchdogTests: XCTestCase {
 final class OperationEngineTests: XCTestCase {
 
     @MainActor
-    private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
+    private func makeEngine(
+        seratoDirectory: URL? = nil,
+        seratoIsRunning: Bool = false
+    ) throws -> (OperationEngine, LibraryDatabase, SeratoLibraryLocator) {
         let database = try LibraryDatabase.openInMemory()
-        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let engine = OperationEngine(database: database, seratoWatchdog: watchdog)
-        return (engine, database)
+        let watchdog = SeratoWatchdog(
+            runningBundleIdentifiersProvider: {
+                seratoIsRunning ? ["com.serato.djpro"] : []
+            }
+        )
+        let locator = SeratoLibraryLocator(
+            seratoDirectory: seratoDirectory ?? URL(fileURLWithPath: "/dev/null")
+        )
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator
+        )
+        return (engine, database, locator)
     }
 
     func testIndexNewFileInsertsFileRowAndLogsEvent() async throws {
-        let (engine, database) = try await MainActor.run { try makeEngine() }
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
         let mutation = TrackMutation.indexNewFile(IndexNewFilePayload(
             path: "/Music/A/Test.mp3",
             volumeUuid: "v1",
@@ -90,7 +104,7 @@ final class OperationEngineTests: XCTestCase {
     }
 
     func testRenameFileUpdatesPathAndRecordsInversePayload() async throws {
-        let (engine, database) = try await MainActor.run { try makeEngine() }
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
 
         let indexEventId = try await engine.apply(.indexNewFile(IndexNewFilePayload(
             path: "/Music/A/old.mp3",
@@ -138,7 +152,7 @@ final class OperationEngineTests: XCTestCase {
     }
 
     func testRenameFileThrowsForUnknownFileId() async throws {
-        let (engine, _) = try await MainActor.run { try makeEngine() }
+        let (engine, _, _) = try await MainActor.run { try makeEngine() }
         do {
             _ = try await engine.apply(.renameFile(RenameFilePayload(
                 fileId: 9_999, newPath: "/Music/A/nothing.mp3"
@@ -150,7 +164,7 @@ final class OperationEngineTests: XCTestCase {
     }
 
     func testBatchIdGroupsRelatedMutations() async throws {
-        let (engine, database) = try await MainActor.run { try makeEngine() }
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
         let batchId = "import-batch-1"
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
             path: "/Music/A/a.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
@@ -165,6 +179,210 @@ final class OperationEngineTests: XCTestCase {
                 .fetchCount(db)
             XCTAssertEqual(count, 2, "both mutations should share the batch id")
         }
+    }
+
+    // MARK: - Serato side effects
+
+    func testRenameFileRewritesSeratoCrateWhenSeratoClosed() async throws {
+        let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
+            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: false)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/old.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+
+        try await engine.apply(.renameFile(RenameFilePayload(
+            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+        )))
+
+        let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
+        XCTAssertEqual(updatedPaths, ["Users/testuser/Music/A/new.mp3"])
+
+        let queueDepth = await engine.pendingSeratoRenameCount
+        XCTAssertEqual(queueDepth, 0, "no queueing should occur when Serato is closed")
+    }
+
+    func testRenameFileQueuesRewriteWhenSeratoRunning() async throws {
+        let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
+            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: true)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/old.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+
+        try await engine.apply(.renameFile(RenameFilePayload(
+            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+        )))
+
+        // Crate file must still hold the original path while Serato is open.
+        let crateContents = try readCratePaths(cratePath: crateFileUrl.path)
+        XCTAssertEqual(crateContents, ["Users/testuser/Music/A/old.mp3"])
+
+        let queueDepth = await engine.pendingSeratoRenameCount
+        XCTAssertEqual(queueDepth, 1, "the rewrite must be queued, not applied")
+    }
+
+    func testDrainAppliesQueuedRewrites() async throws {
+        let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
+            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: true)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/old.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+
+        try await engine.apply(.renameFile(RenameFilePayload(
+            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+        )))
+
+        try await engine.drainPendingSeratoUpdates()
+
+        let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
+        XCTAssertEqual(updatedPaths, ["Users/testuser/Music/A/new.mp3"])
+
+        let queueDepthAfterDrain = await engine.pendingSeratoRenameCount
+        XCTAssertEqual(queueDepthAfterDrain, 0)
+    }
+
+    // MARK: - Synthetic Serato fixture helpers
+
+    /// Build a temporary `_Serato_/Subcrates/Test.crate` containing the
+    /// supplied Serato-relative paths. Returns the `_Serato_`
+    /// directory URL (for passing to SeratoLibraryLocator) and the
+    /// path to the crate file (for direct verification).
+    private static func makeTemporarySeratoLibrary(
+        withCratePaths cratePaths: [String]
+    ) throws -> (seratoDirectoryUrl: URL, crateFileUrl: URL) {
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: subcratesDirectory, withIntermediateDirectories: true
+        )
+        let crateFileUrl = subcratesDirectory.appendingPathComponent("Test.crate")
+        let crateBytes = synthesizeCrateBytes(withTrackPaths: cratePaths)
+        try crateBytes.write(to: crateFileUrl)
+        return (seratoDirectory, crateFileUrl)
+    }
+
+    /// TLV-format `.crate` file with a version header + one `otrk` per
+    /// path containing a UTF-16BE `ptrk` payload. Mirrors the Rust
+    /// `synthetic_library` test helper so behavior is consistent
+    /// across language boundaries.
+    private static func synthesizeCrateBytes(withTrackPaths trackPaths: [String]) -> Data {
+        var data = Data()
+
+        let versionPayload = utf16BeBytes(of: "1.0/Serato ScratchLive Crate")
+        appendTlvRecord(tag: "vrsn", payload: versionPayload, to: &data)
+
+        for trackPath in trackPaths {
+            let pathPayload = utf16BeBytes(of: trackPath)
+            var otrkPayload = Data()
+            appendTlvRecord(tag: "ptrk", payload: pathPayload, to: &otrkPayload)
+            appendTlvRecord(tag: "otrk", payload: otrkPayload, to: &data)
+        }
+
+        return data
+    }
+
+    private static func appendTlvRecord(tag: String, payload: Data, to data: inout Data) {
+        precondition(tag.utf8.count == 4, "Serato tags are 4 ASCII bytes")
+        data.append(contentsOf: tag.utf8)
+        data.append(contentsOf: uint32BigEndianBytes(of: UInt32(payload.count)))
+        data.append(payload)
+    }
+
+    private static func utf16BeBytes(of string: String) -> Data {
+        var data = Data()
+        for codeUnit in string.utf16 {
+            data.append(UInt8(codeUnit >> 8))
+            data.append(UInt8(codeUnit & 0xFF))
+        }
+        return data
+    }
+
+    private static func uint32BigEndianBytes(of value: UInt32) -> [UInt8] {
+        [
+            UInt8((value >> 24) & 0xFF),
+            UInt8((value >> 16) & 0xFF),
+            UInt8((value >> 8) & 0xFF),
+            UInt8(value & 0xFF),
+        ]
+    }
+}
+
+final class SeratoLibraryLocatorTests: XCTestCase {
+
+    func testSeratoRelativePathStripsLeadingSlash() {
+        XCTAssertEqual(
+            SeratoLibraryLocator.seratoRelativePath(fromAbsolute: "/Users/x/Music/A/Track.mp3"),
+            "Users/x/Music/A/Track.mp3"
+        )
+        XCTAssertEqual(
+            SeratoLibraryLocator.seratoRelativePath(fromAbsolute: "Users/x/Music/A/Track.mp3"),
+            "Users/x/Music/A/Track.mp3"
+        )
+    }
+
+    func testEnumerateCrateFilesReturnsEmptyForMissingSubcratesDirectory() throws {
+        let emptyDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-empty-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: emptyDirectory) }
+
+        let locator = SeratoLibraryLocator(seratoDirectory: emptyDirectory)
+        XCTAssertEqual(try locator.enumerateCrateFiles(), [])
+    }
+
+    func testEnumerateCrateFilesReturnsSortedCrateUrls() throws {
+        let seratoDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-locator-\(UUID().uuidString)", isDirectory: true)
+        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
+        try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: seratoDirectory) }
+
+        try Data().write(to: subcratesDirectory.appendingPathComponent("Zeta.crate"))
+        try Data().write(to: subcratesDirectory.appendingPathComponent("Alpha.crate"))
+        try Data().write(to: subcratesDirectory.appendingPathComponent("Beta.crate"))
+        // A non-.crate file in the same directory must be ignored.
+        try Data().write(to: subcratesDirectory.appendingPathComponent("Notes.txt"))
+
+        let locator = SeratoLibraryLocator(seratoDirectory: seratoDirectory)
+        let names = try locator.enumerateCrateFiles().map { $0.lastPathComponent }
+        XCTAssertEqual(names, ["Alpha.crate", "Beta.crate", "Zeta.crate"])
     }
 }
 
