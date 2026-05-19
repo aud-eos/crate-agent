@@ -3134,6 +3134,219 @@ final class LibraryHygieneCaseRunnerTests: XCTestCase {
     }
 }
 
+final class LibraryHygieneMissingFieldsTests: XCTestCase {
+
+    private func makeFile(
+        id: Int64,
+        artist: String? = nil,
+        title: String? = nil,
+        album: String? = nil,
+        genre: String? = nil
+    ) -> FileRecord {
+        FileRecord(
+            id: id,
+            path: "/Music/A/track-\(id).mp3",
+            volumeUuid: "v1", inode: id, fileSize: 1, mtime: 1,
+            artist: artist, title: title, album: album, genre: genre
+        )
+    }
+
+    func testIsMissingFlagsNilEmptyAndWhitespaceOnly() {
+        XCTAssertTrue(LibraryHygiene.isMissing(nil))
+        XCTAssertTrue(LibraryHygiene.isMissing(""))
+        XCTAssertTrue(LibraryHygiene.isMissing("   "))
+        XCTAssertTrue(LibraryHygiene.isMissing("\n"))
+        XCTAssertFalse(LibraryHygiene.isMissing("Aphex Twin"))
+        XCTAssertFalse(LibraryHygiene.isMissing(" Aphex Twin "),
+                       "non-empty after trim is not missing — whitespace cleanup is a separate analyzer")
+    }
+
+    func testMissingFieldSummariesCountPerField() {
+        let summaries = LibraryHygiene.missingFieldSummaries(in: [
+            makeFile(id: 1, artist: nil, title: "T", genre: "Rock"),
+            makeFile(id: 2, artist: "A", title: "T2", genre: nil),
+            makeFile(id: 3, artist: nil, title: nil, genre: nil),
+        ])
+        let counts = Dictionary(uniqueKeysWithValues: summaries.map { ($0.field, $0.count) })
+        XCTAssertEqual(counts[.artist], 2)
+        XCTAssertEqual(counts[.title], 1)
+        XCTAssertEqual(counts[.genre], 2)
+        XCTAssertEqual(counts[.album], 3,
+                       "every row missing album was counted")
+    }
+
+    func testSummariesSkipFieldsWithNoGaps() {
+        let summaries = LibraryHygiene.missingFieldSummaries(in: [
+            makeFile(id: 1, artist: "A", title: "T", album: "L", genre: "G"),
+        ])
+        XCTAssertFalse(summaries.contains(where: { $0.field == .artist }),
+                       "fully-populated fields must not appear in the summary list")
+        // Fields the file is missing (bpm, key, etc.) still appear.
+        XCTAssertTrue(summaries.contains(where: { $0.field == .bpm }))
+    }
+
+    func testMissingFieldEntriesAreSortedByPath() {
+        let entries = LibraryHygiene.missingFieldEntries(
+            forField: .artist,
+            in: [
+                makeFile(id: 3, artist: nil),
+                makeFile(id: 1, artist: nil),
+                makeFile(id: 2, artist: "Present"),
+            ]
+        )
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries.map(\.fileId), [1, 3],
+                       "entries should sort by path '/Music/A/track-1.mp3' before 'track-3.mp3'")
+    }
+
+    func testMergedMissingFieldMetadataSetsOnlyChosenField() {
+        let file = makeFile(id: 1, artist: nil, title: "Existing")
+        let merged = LibraryHygiene.mergedMissingFieldMetadata(
+            forFile: file,
+            field: .artist,
+            value: "New Artist"
+        )
+        XCTAssertEqual(merged.artist, "New Artist")
+        XCTAssertEqual(merged.title, "Existing",
+                       "untouched fields must preserve their original values")
+    }
+}
+
+final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
+
+    @MainActor
+    private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator
+        )
+        return (engine, database)
+    }
+
+    func testApplyFillSetsTheFieldOnAllChosenFiles() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/one.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "Existing", genre: nil)
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/two.mp3",
+            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: "Existing", genre: nil)
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        _ = try await runner.applyMissingFieldFill(
+            field: .genre,
+            value: "Hip-Hop",
+            fileIds: files.compactMap(\.id),
+            files: files
+        )
+
+        let updated = try await database.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT genre FROM files ORDER BY id")
+        }
+        XCTAssertEqual(updated, ["Hip-Hop", "Hip-Hop"])
+    }
+
+    func testApplyFillSkipsRowsWhoseFieldIsNoLongerMissing() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/missing.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(genre: nil)
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/already.mp3",
+            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(genre: "Existing")
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        // Both fileIds passed in even though one already has a value.
+        // The runner's live re-check should skip the already-populated one.
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        _ = try await runner.applyMissingFieldFill(
+            field: .genre,
+            value: "Hip-Hop",
+            fileIds: files.compactMap(\.id),
+            files: files
+        )
+
+        let updated = try await database.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT genre FROM files ORDER BY id")
+        }
+        XCTAssertEqual(updated, ["Hip-Hop", "Existing"],
+                       "fileId whose live value is non-missing must not be overwritten")
+    }
+
+    func testApplyFillRejectsWhitespaceOnlyValue() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(genre: nil)
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        _ = try await runner.applyMissingFieldFill(
+            field: .genre,
+            value: "   ",  // whitespace only
+            fileIds: files.compactMap(\.id),
+            files: files
+        )
+        // Should be a no-op — filling a missing field with all-whitespace
+        // would just trade one form of "missing" for another.
+        let genre = try await database.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT genre FROM files")
+        }
+        XCTAssertNil(genre, "whitespace-only fill value must be rejected")
+    }
+
+    func testFillBatchIsFullyUndoable() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(genre: nil)
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let runner = LibraryHygieneRunner(operationEngine: engine)
+        let batchId = try await runner.applyMissingFieldFill(
+            field: .genre,
+            value: "Hip-Hop",
+            fileIds: files.compactMap(\.id),
+            files: files
+        )
+
+        let postFill = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).first!
+        }
+        XCTAssertEqual(postFill.genre, "Hip-Hop")
+
+        _ = try await engine.undoBatch(batchId)
+
+        let postUndo = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).first!
+        }
+        XCTAssertNil(postUndo.genre,
+                     "undo of missing-field fill must restore the original (missing) state")
+    }
+}
+
 final class LibraryHygieneRunnerTests: XCTestCase {
 
     @MainActor

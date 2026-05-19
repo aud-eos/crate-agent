@@ -304,6 +304,110 @@ public enum LibraryHygiene {
         return fixes
     }
 
+    // MARK: - Missing fields
+
+    /// One file missing a value for a specific field. The fill-in
+    /// value isn't part of the entry — it's user-supplied at apply
+    /// time, the same way the canonical spelling is user-supplied
+    /// for case normalization.
+    public struct MissingFieldEntry: Sendable, Equatable, Identifiable {
+        public let fileId: Int64
+        public let path: String
+        public let field: SeratoMetadataField
+
+        public var id: String { "\(fileId):\(field.rawValue)" }
+    }
+
+    /// Per-field count of how many files have no value for that
+    /// field. Drives the dashboard / "you have N gaps" header in
+    /// the UI without paying for the full entry-list scan up-front.
+    public struct MissingFieldSummary: Sendable, Equatable, Identifiable {
+        public let field: SeratoMetadataField
+        public let count: Int
+
+        public var id: String { field.rawValue }
+    }
+
+    /// Empty-field detection: a row "is missing" a field when the
+    /// trimmed value is empty. Matches the whitespace analyzer's
+    /// canonical reading — `" "` counts as missing because it
+    /// trims to "".
+    static func isMissing(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Roll up the count of missing rows per field. One pass over
+    /// the file list; cheap enough to run on every tab activation.
+    public static func missingFieldSummaries(
+        in files: [FileRecord]
+    ) -> [MissingFieldSummary] {
+        var counts: [SeratoMetadataField: Int] = [:]
+        for file in files {
+            for field in SeratoMetadataField.allCases {
+                if isMissing(field.read(from: file)) {
+                    counts[field, default: 0] += 1
+                }
+            }
+        }
+        // Stable order matching SeratoMetadataField.allCases so the
+        // UI doesn't reorder between renders.
+        return SeratoMetadataField.allCases.compactMap { field in
+            guard let count = counts[field], count > 0 else { return nil }
+            return MissingFieldSummary(field: field, count: count)
+        }
+    }
+
+    /// Detailed list of every file missing the specified field.
+    /// Used to render the preview list once the user has picked a
+    /// field to fill. Sorted by path for deterministic UI ordering.
+    public static func missingFieldEntries(
+        forField field: SeratoMetadataField,
+        in files: [FileRecord]
+    ) -> [MissingFieldEntry] {
+        files.compactMap { file -> MissingFieldEntry? in
+            guard let fileId = file.id else { return nil }
+            guard isMissing(field.read(from: file)) else { return nil }
+            return MissingFieldEntry(fileId: fileId, path: file.path, field: field)
+        }
+        .sorted { $0.path < $1.path }
+    }
+
+    /// Compose the SeratoMetadata snapshot for one file when filling
+    /// in a missing field. Sets exactly one field on the otherwise-
+    /// preserved snapshot.
+    public static func mergedMissingFieldMetadata(
+        forFile file: FileRecord,
+        field: SeratoMetadataField,
+        value: String
+    ) -> SeratoMetadata {
+        var artist = file.artist
+        var title = file.title
+        var album = file.album
+        var genre = file.genre
+        var bpm = file.bpm
+        var musicalKey = file.musicalKey
+        var comment = file.comment
+        var length = file.length
+        var label = file.label
+        switch field {
+        case .artist: artist = value
+        case .title: title = value
+        case .album: album = value
+        case .genre: genre = value
+        case .bpm: bpm = value
+        case .musicalKey: musicalKey = value
+        case .comment: comment = value
+        case .length: length = value
+        case .label: label = value
+        }
+        return SeratoMetadata(
+            artist: artist, title: title, album: album, genre: genre,
+            bpm: bpm, musicalKey: musicalKey, comment: comment,
+            length: length, label: label
+        )
+    }
+
     /// Compose the SeratoMetadata snapshot for one file given the
     /// case fixes against it. Same shape as the other mergedXxx
     /// helpers so the runner can route through `applyMergedMetadata`.
@@ -526,6 +630,55 @@ public actor LibraryHygieneRunner {
             let merged = LibraryHygiene.mergedCaseMetadata(
                 forFile: file,
                 fixes: fileFixes
+            )
+            try await applyMergedMetadata(
+                fileId: fileId,
+                file: file,
+                merged: merged,
+                batchId: effectiveBatchId
+            )
+        }
+
+        return effectiveBatchId
+    }
+
+    /// Set the same value on `field` across every file in `fileIds`
+    /// — bulk fill for missing fields. The runner trims the
+    /// supplied value (whitespace-only fills would be a no-op), and
+    /// skips files whose live value is already non-missing (the
+    /// scan-vs-apply race could otherwise overwrite a real value
+    /// the user typed in elsewhere between scan and apply).
+    @discardableResult
+    public func applyMissingFieldFill(
+        field: SeratoMetadataField,
+        value: String,
+        fileIds: [Int64],
+        files: [FileRecord],
+        batchId: String? = nil
+    ) async throws -> String {
+        let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedValue.isEmpty, !fileIds.isEmpty else {
+            return batchId ?? ""
+        }
+
+        let effectiveBatchId = batchId ?? "hygiene-missing-\(UUID().uuidString)"
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+            guard let identifier = file.id else { return nil }
+            return (identifier, file)
+        })
+
+        for fileId in fileIds {
+            guard let file = filesById[fileId] else { continue }
+            guard LibraryHygiene.isMissing(field.read(from: file)) else {
+                // Field acquired a value since the scan (manual
+                // edit elsewhere, Serato exit reload, etc.). Skip
+                // rather than clobber.
+                continue
+            }
+            let merged = LibraryHygiene.mergedMissingFieldMetadata(
+                forFile: file,
+                field: field,
+                value: trimmedValue
             )
             try await applyMergedMetadata(
                 fileId: fileId,
