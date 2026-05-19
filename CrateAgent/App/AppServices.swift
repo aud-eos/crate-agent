@@ -142,9 +142,30 @@ public final class AppServices: ObservableObject {
     private func runInitialScan() async {
         let watchedFolder = watchedMusicFolder
         let scanner = libraryScanner
+        let locator = seratoLocator
+
+        // Collect Serato's referenced paths first so the scanner can
+        // index managed-library files that Serato depends on
+        // (Apple Music files in user crates, etc.) while skipping
+        // everything else under those managed roots.
+        let referenceSet: SeratoLibraryReferenceSet
+        do {
+            referenceSet = try await SeratoLibraryReferenceSet.collectInBackground(from: locator)
+            Self.logger.info(
+                "Serato reference set: \(referenceSet.paths.count, privacy: .public) paths"
+            )
+        } catch {
+            Self.logger.warning(
+                "Could not load Serato reference set; assuming empty. Error: \(error.localizedDescription, privacy: .public)"
+            )
+            referenceSet = .empty
+        }
 
         do {
-            _ = try await scanner.scan(watchedFolder) { [weak self] progress in
+            _ = try await scanner.scan(
+                watchedFolder,
+                seratoReferenceSet: referenceSet
+            ) { [weak self] progress in
                 Task { @MainActor in
                     self?.scanProgress = progress
                 }

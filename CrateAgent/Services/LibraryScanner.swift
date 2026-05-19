@@ -62,11 +62,18 @@ public actor LibraryScanner {
     /// startup scan — inode-based cross-volume detection happens via
     /// FSEvents during normal operation).
     ///
+    /// Files inside managed libraries (Apple Music, iTunes, Logic)
+    /// are skipped UNLESS the supplied `seratoReferenceSet` already
+    /// references them — in which case crate-agent needs to know
+    /// about them to keep Serato's pointers fresh when the managing
+    /// app renames the file.
+    ///
     /// Throws only on catastrophic failure (DB unavailable at start).
     /// Per-file errors are logged and the scan continues.
     @discardableResult
     public func scan(
         _ directoryUrl: URL,
+        seratoReferenceSet: SeratoLibraryReferenceSet = .empty,
         progress: ProgressHandler? = nil
     ) async throws -> ScanResult {
         Self.logger.info(
@@ -95,8 +102,18 @@ public actor LibraryScanner {
             let pathExtension = fileUrl.pathExtension.lowercased()
             guard audioExtensions.contains(pathExtension) else { continue }
 
-            filesEncountered += 1
             let filePath = fileUrl.path
+
+            // Apple Music / iTunes / Logic libraries are managed by
+            // other apps. Skip them UNLESS Serato references the file
+            // — in which case crate-agent needs to know about it so
+            // we can keep Serato's path pointers fresh if the
+            // managing app (Apple Music) renames the file later.
+            if ManagedLibraryDetector.isInsideManagedLibrary(filePath) {
+                guard seratoReferenceSet.contains(filePath) else { continue }
+            }
+
+            filesEncountered += 1
 
             if knownPaths.contains(filePath) {
                 filesSkipped += 1

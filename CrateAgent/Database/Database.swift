@@ -63,6 +63,7 @@ public final class LibraryDatabase {
         migrator.eraseDatabaseOnSchemaChange = false
         #endif
         InitialSchemaMigration.register(in: &migrator)
+        PurgeManagedLibraryRowsMigration.register(in: &migrator)
         try migrator.migrate(writer)
     }
 }

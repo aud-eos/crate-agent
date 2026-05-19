@@ -70,6 +70,7 @@ struct LibraryBrowserView: View {
                 showRestartAlert = true
             }
             .controlSize(.small)
+            .help("Apple Music and iTunes library folders are excluded unless Serato already references the files.")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)

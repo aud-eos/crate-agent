@@ -441,6 +441,49 @@ final class LibraryScannerTests: XCTestCase {
         XCTAssertEqual(totalRows, 2, "rescan must not duplicate rows")
     }
 
+    func testReferenceSetAllowsManagedLibraryFilesThatSeratoReferences() async throws {
+        // Construct paths that fall inside the *real* managed library
+        // root for the current user. ManagedLibraryDetector uses
+        // FileManager.default.homeDirectoryForCurrentUser by default,
+        // so we have to play in that namespace to exercise the filter.
+        let realHomeDirectory = FileManager.default.homeDirectoryForCurrentUser
+        let testRunDirectory = realHomeDirectory
+            .appendingPathComponent("Music/Music/Media", isDirectory: true)
+            .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
+
+        // If the user's home doesn't have a Music/Music/Media dir at
+        // all (machine without Apple Music) we skip the test rather
+        // than create one. The detector logic is exhaustively
+        // covered by ManagedLibraryDetectorTests above; this test is
+        // about scanner integration only.
+        let parent = realHomeDirectory.appendingPathComponent("Music/Music/Media", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: parent.path) else {
+            throw XCTSkip("Apple Music's Media folder not present on this machine; skipping integration test")
+        }
+
+        try FileManager.default.createDirectory(at: testRunDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRunDirectory) }
+
+        let inSeratoFile = testRunDirectory.appendingPathComponent("InSerato.mp3")
+        let notInSeratoFile = testRunDirectory.appendingPathComponent("NotInSerato.mp3")
+        try Data("audio".utf8).write(to: inSeratoFile)
+        try Data("audio".utf8).write(to: notInSeratoFile)
+
+        let referenceSet = SeratoLibraryReferenceSet(paths: [inSeratoFile.path])
+
+        let (scanner, _, database) = try await MainActor.run { try makeScanner() }
+        _ = try await scanner.scan(testRunDirectory, seratoReferenceSet: referenceSet)
+
+        let indexedPaths = try await database.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT path FROM files ORDER BY path")
+        }
+        XCTAssertEqual(
+            indexedPaths,
+            [inSeratoFile.path],
+            "Serato-referenced managed file is indexed; others under the same managed root are skipped"
+        )
+    }
+
     func testProgressCallbackFiresOnFinalBatchEvenForSmallScans() async throws {
         let (scanner, _, _) = try await MainActor.run { try makeScanner() }
         let libraryRoot = try makeTempLibrary(filesAtRelativePaths: [
@@ -756,6 +799,48 @@ final class FSEventsWatcherTests: XCTestCase {
             observationLock.unlock()
             XCTFail("expected create observation for new-track.mp3; got \(snapshot.count) observations: \(snapshot.map { "\($0.path) file=\($0.isFile) created=\($0.wasCreated)" })")
         }
+    }
+}
+
+final class ManagedLibraryDetectorTests: XCTestCase {
+
+    private let fakeHome = URL(fileURLWithPath: "/Users/testuser")
+
+    func testFlagsAppleMusicMediaPath() {
+        XCTAssertTrue(ManagedLibraryDetector.isInsideManagedLibrary(
+            "/Users/testuser/Music/Music/Media/Music/Artist/Track.mp3",
+            homeDirectory: fakeHome
+        ))
+    }
+
+    func testFlagsLegacyITunesMediaPath() {
+        XCTAssertTrue(ManagedLibraryDetector.isInsideManagedLibrary(
+            "/Users/testuser/Music/iTunes/iTunes Media/Music/Artist/Track.mp3",
+            homeDirectory: fakeHome
+        ))
+    }
+
+    func testFlagsLogicAudioMusicAppsPath() {
+        XCTAssertTrue(ManagedLibraryDetector.isInsideManagedLibrary(
+            "/Users/testuser/Music/Audio Music Apps/Sampler Loops/loop.wav",
+            homeDirectory: fakeHome
+        ))
+    }
+
+    func testDoesNotFlagUserDjLibrary() {
+        XCTAssertFalse(ManagedLibraryDetector.isInsideManagedLibrary(
+            "/Users/testuser/Music/MyDjLibrary/Artist/Track.mp3",
+            homeDirectory: fakeHome
+        ))
+    }
+
+    func testDoesNotFalseMatchSimilarPrefix() {
+        // `MediaTwo` should NOT match `Media` — the trailing-slash
+        // check in the detector is what prevents false positives.
+        XCTAssertFalse(ManagedLibraryDetector.isInsideManagedLibrary(
+            "/Users/testuser/Music/Music/MediaTwo/Track.mp3",
+            homeDirectory: fakeHome
+        ))
     }
 }
 

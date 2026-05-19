@@ -61,6 +61,30 @@ public actor FilesystemSyncCoordinator {
         let pathExtension = (observation.path as NSString).pathExtension.lowercased()
         guard audioExtensions.contains(pathExtension) else { return }
 
+        // Apple Music / iTunes / Logic libraries are managed by other
+        // apps. Skip events for files inside them UNLESS the file is
+        // already known to crate-agent's DB — meaning a previous scan
+        // indexed it because Serato references it. In that case we
+        // still process events so renames inside the managed library
+        // (e.g., Apple Music auto-organizing) propagate to Serato.
+        if ManagedLibraryDetector.isInsideManagedLibrary(observation.path) {
+            let isKnown: Bool
+            do {
+                isKnown = try await database.writer.read { db in
+                    let count = try FileRecord
+                        .filter(Column("path") == observation.path)
+                        .fetchCount(db)
+                    return count > 0
+                }
+            } catch {
+                Self.logger.error(
+                    "DB lookup for managed-library file failed: \(error.localizedDescription, privacy: .public)"
+                )
+                return
+            }
+            guard isKnown else { return }
+        }
+
         let fileExistsOnDisk = FileManager.default.fileExists(atPath: observation.path)
 
         if observation.wasRenamed && fileExistsOnDisk {
