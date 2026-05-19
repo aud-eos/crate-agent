@@ -1140,6 +1140,50 @@ final class LibraryScannerTests: XCTestCase {
         XCTAssertFalse(event?.inversePayloadJson.isEmpty ?? true)
     }
 
+    func testBuildPathIndexToleratesDuplicateSwiftStringPaths() {
+        // Regression for issue #35 / the crash on the user's real 32k
+        // library: two FileRecords with bytewise-distinct but Swift-
+        // String-equal paths (NFC vs NFD "Café.mp3" → different SQLite
+        // bytes pass the UNIQUE constraint, identical Swift strings
+        // collide in Dictionary keying). Pre-fix this crashed with a
+        // Swift trap inside `Dictionary(uniqueKeysWithValues:)` during
+        // launch's initial scan, blocking the user entirely.
+        //
+        // The two literals below are the same grapheme cluster ("Café")
+        // in NFC and NFD respectively, so `==` returns true.
+        let nfcPath = "Caf\u{00E9}.mp3"  // composed é
+        let nfdPath = "Cafe\u{0301}.mp3"  // e + combining acute
+        XCTAssertEqual(nfcPath, nfdPath, "Swift String compares grapheme clusters — these must be equal")
+
+        let recordOne = FileRecord(
+            id: 1, path: nfcPath,
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )
+        let recordTwo = FileRecord(
+            id: 2, path: nfdPath,
+            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+        )
+
+        let result = LibraryScanner.buildPathIndex([recordOne, recordTwo])
+        XCTAssertEqual(result.duplicatePathCount, 1,
+                       "the second record's path collides with the first in Swift's String hashing")
+        // Last-write-wins: record two clobbers record one.
+        XCTAssertEqual(result.byPath[nfcPath]?.id, 2,
+                       "later record must win the slot on collision")
+    }
+
+    func testBuildPathIndexCountsZeroDuplicatesOnCleanInput() {
+        let records = [
+            FileRecord(id: 1, path: "/Music/A/a.mp3",
+                       volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1),
+            FileRecord(id: 2, path: "/Music/A/b.mp3",
+                       volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1),
+        ]
+        let result = LibraryScanner.buildPathIndex(records)
+        XCTAssertEqual(result.duplicatePathCount, 0)
+        XCTAssertEqual(result.byPath.count, 2)
+    }
+
     func testRescanDoesNotDuplicateAlreadyKnownFiles() async throws {
         let scratchDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("crate-agent-test-rescan-\(UUID().uuidString)", isDirectory: true)
