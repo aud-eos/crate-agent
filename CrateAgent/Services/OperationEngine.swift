@@ -43,9 +43,15 @@ public actor OperationEngine {
     /// Backing subject for `queueDepthPublisher`. CurrentValueSubject
     /// emits the latest value on subscribe, so UI bindings render
     /// with the correct depth at mount time rather than waiting for
-    /// the next mutation. Safe to send to from the actor's isolation
-    /// domain.
-    private let queueDepthSubject = CurrentValueSubject<Int, Never>(0)
+    /// the next mutation.
+    ///
+    /// `nonisolated(unsafe)`: the subject is read from
+    /// `queueDepthPublisher` (a nonisolated computed property used by
+    /// SwiftUI) and written from inside the actor. Combine subjects
+    /// are internally thread-safe; `CurrentValueSubject` just doesn't
+    /// carry a `Sendable` conformance in the current SDK. Localized
+    /// opt-out is tighter than asserting Sendable on Apple's class.
+    private nonisolated(unsafe) let queueDepthSubject = CurrentValueSubject<Int, Never>(0)
 
     /// Observable stream of `pendingSeratoWrites.count`. Emits a new
     /// value after every enqueue and every drain step. UI subscribers
