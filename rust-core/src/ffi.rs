@@ -7,7 +7,7 @@ use crate::serato;
 use crate::tags;
 
 pub use crate::serato::{SeratoMetadataUpdate, SeratoTrackRecord};
-pub use crate::tags::AudioTags;
+pub use crate::tags::{AudioTagUpdate, AudioTags};
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -160,4 +160,10 @@ pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> 
 pub fn read_audio_tags(file_path: String) -> Result<AudioTags, CoreError> {
     let path = PathBuf::from(file_path);
     Ok(tags::read_tags(&path)?)
+}
+
+pub fn write_audio_tags(file_path: String, update: AudioTagUpdate) -> Result<(), CoreError> {
+    let path = PathBuf::from(file_path);
+    tags::write_tags(&path, &update)?;
+    Ok(())
 }
