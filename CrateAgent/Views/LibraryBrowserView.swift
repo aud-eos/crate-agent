@@ -9,6 +9,8 @@ struct LibraryBrowserView: View {
     ]
     @State private var searchText: String = ""
     @State private var showRestartAlert: Bool = false
+    @State private var isDropTargeted: Bool = false
+    @State private var lastImportSummary: String?
 
     private var filteredSortedFiles: [FileRecord] {
         let filtered: [FileRecord]
@@ -41,6 +43,40 @@ struct LibraryBrowserView: View {
         } message: {
             Text("crate-agent will start watching the new folder the next time it launches.")
         }
+        .overlay(alignment: .center) {
+            if isDropTargeted {
+                dropOverlay
+            }
+        }
+        .dropDestination(for: URL.self) { droppedUrls, _ in
+            let coordinator = services.importCoordinator
+            Task { @MainActor in
+                let result = await coordinator.importDroppedItems(droppedUrls)
+                lastImportSummary = result.filesImported == 0
+                    ? "Nothing imported (\(result.filesSkipped) skipped)"
+                    : "Imported \(result.filesImported) track\(result.filesImported == 1 ? "" : "s")"
+            }
+            return true
+        } isTargeted: { targeted in
+            isDropTargeted = targeted
+        }
+    }
+
+    @ViewBuilder
+    private var dropOverlay: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "music.note.list")
+                .font(.system(size: 36))
+            Text("Drop to import into Serato")
+                .font(.headline)
+        }
+        .padding(24)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+        )
+        .padding(40)
     }
 
     @ViewBuilder
@@ -139,6 +175,14 @@ struct LibraryBrowserView: View {
             Text("\(filteredSortedFiles.count.formatted()) of \(files.count.formatted()) files")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+            if let summary = lastImportSummary {
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
             Spacer()
             Text("Rust core v\(coreVersion())")
                 .font(.caption.monospaced())

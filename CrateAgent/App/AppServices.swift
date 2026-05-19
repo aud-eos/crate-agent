@@ -28,6 +28,7 @@ public final class AppServices: ObservableObject {
     public let operationEngine: OperationEngine
     public let filesystemSyncCoordinator: FilesystemSyncCoordinator
     public let libraryScanner: LibraryScanner
+    public let importCoordinator: ImportCoordinator
 
     /// Latest progress from the running initial scan, or nil when no
     /// scan is in flight. Views observe via @Published.
@@ -95,6 +96,11 @@ public final class AppServices: ObservableObject {
             seratoLocator: seratoLocator
         )
         self.libraryScanner = scanner
+
+        self.importCoordinator = ImportCoordinator(
+            operationEngine: engine,
+            database: database
+        )
 
         // Coordinator needs the scanner to trigger reload-on-exit;
         // wire it last so all upstream deps are constructed.

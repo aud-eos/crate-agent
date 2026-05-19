@@ -26,6 +26,9 @@ import GRDB
 ///                                   assumes DB is already current).
 ///                                   Gated by SeratoWatchdog like
 ///                                   renames.
+///   - `addTrackToSerato`          : insert a new otrk entry into
+///                                   Serato's database V2 (drag-drop
+///                                   import). Gated by SeratoWatchdog.
 public actor OperationEngine {
 
     private let database: LibraryDatabase
@@ -116,7 +119,135 @@ public actor OperationEngine {
             try await applySeratoRename(rename)
         case .metadataUpdate(let update):
             try await applySeratoMetadataUpdate(update)
+        case .addTrack(let add):
+            try await applySeratoAddTrack(add)
         }
+    }
+
+    private func applySeratoAddTrack(_ add: SeratoPendingAddTrack) async throws {
+        let databaseV2Path = seratoLocator.databaseV2Url.path
+        let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
+            fromAbsolute: add.absolutePath
+        )
+
+        // If Serato has never run on this machine there's no database
+        // V2 yet. We still want to register the import — write a fresh
+        // one with just our otrk. Subsequent Serato launches will
+        // augment it with the full analysis schema.
+        if !FileManager.default.fileExists(atPath: databaseV2Path) {
+            try FileManager.default.createDirectory(
+                at: seratoLocator.seratoDirectory,
+                withIntermediateDirectories: true
+            )
+            let bootstrapBytes = freshDatabaseV2Bytes(
+                withTrackPath: seratoRelativePath,
+                metadata: add.metadata
+            )
+            try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+            return
+        }
+
+        do {
+            _ = try addTrackToDatabase(
+                databasePath: databaseV2Path,
+                trackPath: seratoRelativePath,
+                metadata: SeratoMetadataUpdate(
+                    artist: add.metadata.artist,
+                    title: add.metadata.title,
+                    album: add.metadata.album,
+                    genre: add.metadata.genre,
+                    bpm: add.metadata.bpm,
+                    key: add.metadata.musicalKey,
+                    comment: add.metadata.comment,
+                    length: add.metadata.length,
+                    label: add.metadata.label
+                )
+            )
+        } catch {
+            throw OperationEngineError.seratoRewriteFailed(
+                path: databaseV2Path,
+                underlying: String(describing: error)
+            )
+        }
+    }
+
+    /// Build the byte layout of a brand-new `database V2` containing
+    /// exactly one otrk for the supplied path + metadata. Used when
+    /// a user drops a file but Serato has never run on this machine
+    /// (the database V2 file doesn't exist yet).
+    private func freshDatabaseV2Bytes(
+        withTrackPath seratoRelativePath: String,
+        metadata: SeratoMetadata
+    ) -> Data {
+        var bytes = Data()
+
+        // vrsn header: 4-byte tag + 4-byte BE length + UTF-16BE payload
+        let versionString = "2.0/Serato Scratch LIVE Database"
+        let versionPayload = utf16BeBytes(of: versionString)
+        bytes.append(contentsOf: "vrsn".utf8)
+        bytes.append(contentsOf: uint32BeBytes(of: UInt32(versionPayload.count)))
+        bytes.append(versionPayload)
+
+        // otrk container with pfil + any t* metadata fields
+        var otrkPayload = Data()
+        appendTlv(tag: "pfil", payload: utf16BeBytes(of: seratoRelativePath), to: &otrkPayload)
+        if let value = metadata.artist {
+            appendTlv(tag: "tart", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.title {
+            appendTlv(tag: "tsng", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.album {
+            appendTlv(tag: "talb", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.genre {
+            appendTlv(tag: "tgen", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.bpm {
+            appendTlv(tag: "tbpm", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.musicalKey {
+            appendTlv(tag: "tkey", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.comment {
+            appendTlv(tag: "tcom", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.length {
+            appendTlv(tag: "tlen", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+        if let value = metadata.label {
+            appendTlv(tag: "tlbl", payload: utf16BeBytes(of: value), to: &otrkPayload)
+        }
+
+        bytes.append(contentsOf: "otrk".utf8)
+        bytes.append(contentsOf: uint32BeBytes(of: UInt32(otrkPayload.count)))
+        bytes.append(otrkPayload)
+        return bytes
+    }
+
+    private func appendTlv(tag: String, payload: Data, to data: inout Data) {
+        precondition(tag.utf8.count == 4)
+        data.append(contentsOf: tag.utf8)
+        data.append(contentsOf: uint32BeBytes(of: UInt32(payload.count)))
+        data.append(payload)
+    }
+
+    private func utf16BeBytes(of string: String) -> Data {
+        var data = Data()
+        for codeUnit in string.utf16 {
+            data.append(UInt8(codeUnit >> 8))
+            data.append(UInt8(codeUnit & 0xFF))
+        }
+        return data
+    }
+
+    private func uint32BeBytes(of value: UInt32) -> [UInt8] {
+        [
+            UInt8((value >> 24) & 0xFF),
+            UInt8((value >> 16) & 0xFF),
+            UInt8((value >> 8) & 0xFF),
+            UInt8(value & 0xFF),
+        ]
     }
 
     private func applySeratoRename(_ rename: SeratoPendingRename) async throws {
@@ -245,6 +376,14 @@ public actor OperationEngine {
             return ExecutionResult(
                 eventId: eventId,
                 seratoWrite: .metadataUpdate(seratoUpdate)
+            )
+        case .addTrackToSerato(let payload):
+            let (eventId, seratoAdd) = try applyAddTrackToSerato(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(
+                eventId: eventId,
+                seratoWrite: .addTrack(seratoAdd)
             )
         }
     }
@@ -384,6 +523,33 @@ public actor OperationEngine {
         return (eventId, seratoRename)
     }
 
+    private static func applyAddTrackToSerato(
+        _ payload: AddTrackToSeratoPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, SeratoPendingAddTrack) {
+        guard let fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .trackAddedToSerato,
+            forwardPayload: payload,
+            inversePayload: payload,
+            in: db
+        )
+
+        let pending = SeratoPendingAddTrack(
+            absolutePath: fileRecord.path,
+            metadata: payload.metadata
+        )
+        return (eventId, pending)
+    }
+
     private static func applyCommitMetadataToSerato(
         _ payload: CommitMetadataToSeratoPayload,
         batchId: String,
@@ -464,6 +630,21 @@ public enum TrackMutation: Sendable {
     case renameFile(RenameFilePayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)
+    case addTrackToSerato(AddTrackToSeratoPayload)
+}
+
+/// Inserts a new otrk entry into Serato's database V2 for the file
+/// at `fileId`'s path. Used by the drag-drop import flow — after
+/// `indexNewFile` registers the file in crate-agent's DB, this
+/// mutation registers it with Serato. Gated by SeratoWatchdog.
+public struct AddTrackToSeratoPayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public let metadata: SeratoMetadata
+
+    public init(fileId: Int64, metadata: SeratoMetadata) {
+        self.fileId = fileId
+        self.metadata = metadata
+    }
 }
 
 public struct IndexNewFilePayload: Codable, Sendable, Equatable {
@@ -599,6 +780,7 @@ public struct RemoveFilePayload: Codable, Sendable, Equatable {
 enum SeratoPendingWrite: Sendable, Equatable {
     case rename(SeratoPendingRename)
     case metadataUpdate(SeratoPendingMetadataUpdate)
+    case addTrack(SeratoPendingAddTrack)
 }
 
 /// A Serato-side rewrite scheduled by `renameFile`. Carries absolute
@@ -614,6 +796,14 @@ struct SeratoPendingRename: Sendable, Equatable {
 /// `commitMetadataToSerato`. Carries the absolute path of the file
 /// and the new metadata to write into Serato's `database V2`.
 struct SeratoPendingMetadataUpdate: Sendable, Equatable {
+    let absolutePath: String
+    let metadata: SeratoMetadata
+}
+
+/// A Serato-side track-insert scheduled by `addTrackToSerato`.
+/// Carries the file's absolute path plus the metadata to embed in
+/// the new otrk entry.
+struct SeratoPendingAddTrack: Sendable, Equatable {
     let absolutePath: String
     let metadata: SeratoMetadata
 }
