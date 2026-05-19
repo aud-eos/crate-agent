@@ -173,10 +173,23 @@ public actor OperationEngine {
         case .fileRemoved:
             let payload = try decoder.decode(IndexNewFilePayload.self, from: inverseJsonData)
             return .indexNewFile(payload)
-        case .metadataCommittedToSerato, .trackAddedToSerato:
-            // Reversing these requires either reading Serato's current
-            // state (racy) or a `removeTrackFromSerato` FFI we don't
-            // have yet. Document as unsupported rather than half-undo.
+        case .metadataCommittedToSerato:
+            // Undoable when the original caller supplied
+            // `previousMetadata` (the values Serato held before the
+            // forward commit). Old / minimal callers that don't
+            // capture previous state journal an inverse with
+            // previousMetadata == nil and remain non-undoable.
+            let payload = try decoder.decode(
+                CommitMetadataToSeratoPayload.self, from: inverseJsonData
+            )
+            if payload.previousMetadata == nil {
+                throw OperationEngineError.undoNotSupported(eventType: event.eventType)
+            }
+            return .commitMetadataToSerato(payload)
+        case .trackAddedToSerato:
+            // Reversing this requires a `removeTrackFromSerato` FFI
+            // we don't have yet. Document as unsupported rather
+            // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
         }
     }
@@ -717,22 +730,24 @@ public actor OperationEngine {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
 
-        // The forward payload journals the metadata being pushed to
-        // Serato. There's no inverse "previous Serato state" we
-        // could capture here (we don't read Serato's current state
-        // during apply — and it would race against Serato's own
-        // writes anyway). The inverse payload is a copy of the
-        // forward payload as a placeholder; full undo of a
-        // commitMetadataToSerato is "re-issue with the user's
-        // previous metadata," and the previous metadata is recorded
-        // in the prior `setMetadata` event in the same batch.
+        // Inverse is the "re-issue this commit with previous and
+        // current swapped" mutation. Only meaningful when the caller
+        // supplied `previousMetadata`; otherwise the inverse mirrors
+        // the forward and the event is rejected by undoBatch
+        // (decodeInverseMutation gates on inverse.previousMetadata
+        // being non-nil).
+        let inversePayload = CommitMetadataToSeratoPayload(
+            fileId: payload.fileId,
+            metadata: payload.previousMetadata ?? payload.metadata,
+            previousMetadata: payload.previousMetadata == nil ? nil : payload.metadata
+        )
         let eventId = try insertEvent(
             batchId: batchId,
             timestamp: timestamp,
             fileId: payload.fileId,
             eventType: .metadataCommittedToSerato,
             forwardPayload: payload,
-            inversePayload: payload,
+            inversePayload: inversePayload,
             in: db
         )
 
@@ -900,13 +915,27 @@ public struct SetMetadataPayload: Codable, Sendable, Equatable {
 /// batch_id when the user edits metadata in crate-agent's UI: the
 /// setMetadata updates crate-agent's snapshot, the
 /// commitMetadataToSerato propagates the change to Serato.
+///
+/// `previousMetadata` carries the values Serato held immediately
+/// before this commit, supplied by the caller (the apply path
+/// can't read Serato's state — it would race with Serato's own
+/// writes). Non-nil here makes the event undoable: the inverse
+/// re-issues the commit with `previousMetadata` swapped in for
+/// `metadata`. Callers that don't know the previous state pass nil
+/// and forfeit undo for this event.
 public struct CommitMetadataToSeratoPayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public let metadata: SeratoMetadata
+    public let previousMetadata: SeratoMetadata?
 
-    public init(fileId: Int64, metadata: SeratoMetadata) {
+    public init(
+        fileId: Int64,
+        metadata: SeratoMetadata,
+        previousMetadata: SeratoMetadata? = nil
+    ) {
         self.fileId = fileId
         self.metadata = metadata
+        self.previousMetadata = previousMetadata
     }
 }
 
