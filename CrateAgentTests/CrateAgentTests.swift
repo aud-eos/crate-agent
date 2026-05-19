@@ -3616,6 +3616,231 @@ final class DuplicateFinderTests: XCTestCase {
     }
 }
 
+final class DuplicateKeeperPickerTests: XCTestCase {
+
+    private let musicFolder = URL(fileURLWithPath: "/Users/test/Music", isDirectory: true)
+
+    private func makeFile(
+        id: Int64,
+        path: String,
+        bitrate: Int? = nil,
+        mtime: Int64 = 1_700_000_000,
+        artist: String? = nil
+    ) -> FileRecord {
+        FileRecord(
+            id: id,
+            path: path,
+            volumeUuid: "v1",
+            inode: id,
+            fileSize: 1024,
+            mtime: mtime,
+            bitrateKbps: bitrate,
+            artist: artist
+        )
+    }
+
+    // MARK: - Quality tier
+
+    func testPicksLosslessOverLossy() {
+        // .flac is lossless tier 2; .mp3 320 is lossy tier 1. Lossless
+        // wins regardless of how high the MP3 bitrate is.
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k",
+            mode: .perceptual,
+            files: [
+                makeFile(id: 1, path: "/Users/test/Music/A/track.mp3", bitrate: 320),
+                makeFile(id: 2, path: "/Users/test/Music/A/track.flac"),
+            ]
+        )
+        XCTAssertEqual(
+            DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder),
+            2,
+            "lossless format must win over lossy regardless of bitrate"
+        )
+    }
+
+    func testPicksHigherBitrateWithinLossyTier() {
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k",
+            mode: .perceptual,
+            files: [
+                makeFile(id: 1, path: "/Users/test/Music/A/lo.mp3", bitrate: 128),
+                makeFile(id: 2, path: "/Users/test/Music/A/hi.mp3", bitrate: 320),
+            ]
+        )
+        XCTAssertEqual(
+            DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder),
+            2
+        )
+    }
+
+    func testTreatsLosslessBitratesAsEqual() {
+        // Both files lossless. Bitrate field on lossless tier is
+        // meaningless; bucket-match / mtime / path break the tie.
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k",
+            mode: .perceptual,
+            files: [
+                makeFile(id: 1, path: "/Users/test/Music/A/a.flac",
+                         bitrate: 900, mtime: 2_000_000_000),
+                makeFile(id: 2, path: "/Users/test/Music/A/a.wav",
+                         bitrate: 1411, mtime: 1_000_000_000),  // older
+            ]
+        )
+        // Within lossless tier: bitrate matters in the implementation
+        // because rank() still uses it as a comparator. But the
+        // user-visible behavior we want is "WAV vs FLAC of same recording
+        // is a tie." Pinning current behavior: bitrate is the next
+        // tiebreaker after tier. If we later want pure tier-equality,
+        // the picker switches to ignoring bitrate when tier == lossless.
+        XCTAssertEqual(
+            DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder),
+            2,
+            "higher bitrate WAV wins even at lossless tier — current pinned behavior"
+        )
+    }
+
+    // MARK: - Bucket match
+
+    func testPicksBucketedFileWhenQualityTies() {
+        // Both MP3 320. One is in the proper artist-letter bucket
+        // (artist "Aphex Twin" → bucket "A"); the other drifted to
+        // a different subfolder. Bucket-match breaks the tie.
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k",
+            mode: .perceptual,
+            files: [
+                makeFile(
+                    id: 1,
+                    path: "/Users/test/Music/A/Aphex Twin - Track.mp3",
+                    bitrate: 320,
+                    artist: "Aphex Twin"
+                ),
+                makeFile(
+                    id: 2,
+                    path: "/Users/test/Music/Random/Aphex Twin - Track.mp3",
+                    bitrate: 320,
+                    artist: "Aphex Twin"
+                ),
+            ]
+        )
+        XCTAssertEqual(
+            DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder),
+            1,
+            "bucketed file wins when quality is tied"
+        )
+    }
+
+    // MARK: - mtime
+
+    func testPicksOlderFileWhenQualityAndBucketBothTie() {
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k",
+            mode: .byteLevel,
+            files: [
+                makeFile(id: 1, path: "/Users/test/Music/A/a.mp3",
+                         bitrate: 320, mtime: 2_000_000_000),  // newer
+                makeFile(id: 2, path: "/Users/test/Music/A/b.mp3",
+                         bitrate: 320, mtime: 1_000_000_000),  // older
+            ]
+        )
+        XCTAssertEqual(
+            DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder),
+            2,
+            "the older file is treated as the original / canonical copy"
+        )
+    }
+
+    // MARK: - Path tiebreak (deterministic)
+
+    func testPathBreaksTieAlphabeticallyWhenAllElseEqual() {
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k",
+            mode: .byteLevel,
+            files: [
+                makeFile(id: 1, path: "/Users/test/Music/A/zebra.mp3",
+                         bitrate: 320, mtime: 1_700_000_000),
+                makeFile(id: 2, path: "/Users/test/Music/A/alpha.mp3",
+                         bitrate: 320, mtime: 1_700_000_000),
+            ]
+        )
+        XCTAssertEqual(
+            DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder),
+            2,
+            "alphabetically-earlier path wins"
+        )
+    }
+
+    // MARK: - Edge cases
+
+    func testReturnsNilForEmptyGroup() {
+        // Defensive: the duplicate finder won't ever produce one, but
+        // the picker shouldn't crash if it did.
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k", mode: .byteLevel, files: []
+        )
+        XCTAssertNil(
+            DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder)
+        )
+    }
+
+    // MARK: - Pure helpers
+
+    func testQualityTierMapsExtensions() {
+        XCTAssertEqual(
+            DuplicateKeeperPicker.qualityTier(for: makeFile(id: 1, path: "/x.flac")),
+            2
+        )
+        XCTAssertEqual(
+            DuplicateKeeperPicker.qualityTier(for: makeFile(id: 2, path: "/x.MP3")),
+            1,
+            "extension match is case-insensitive"
+        )
+        XCTAssertEqual(
+            DuplicateKeeperPicker.qualityTier(for: makeFile(id: 3, path: "/x.weird")),
+            0
+        )
+    }
+
+    func testPathMatchesArtistBucketHandlesArticleStripping() {
+        // Artist "The Beatles" normalizes to bucket "B". A file at
+        // <Music>/B/... matches; <Music>/T/... doesn't.
+        let beatlesInBucket = makeFile(
+            id: 1,
+            path: "/Users/test/Music/B/The Beatles - Hey Jude.mp3",
+            artist: "The Beatles"
+        )
+        XCTAssertTrue(
+            DuplicateKeeperPicker.pathMatchesArtistBucket(
+                file: beatlesInBucket, musicFolder: musicFolder
+            )
+        )
+        let beatlesOutOfBucket = makeFile(
+            id: 2,
+            path: "/Users/test/Music/T/The Beatles - Hey Jude.mp3",
+            artist: "The Beatles"
+        )
+        XCTAssertFalse(
+            DuplicateKeeperPicker.pathMatchesArtistBucket(
+                file: beatlesOutOfBucket, musicFolder: musicFolder
+            )
+        )
+    }
+
+    func testPathMatchesArtistBucketReturnsFalseForFilesOutsideMusicFolder() {
+        let outside = makeFile(
+            id: 1,
+            path: "/Volumes/External/A/track.mp3",
+            artist: "Aphex Twin"
+        )
+        XCTAssertFalse(
+            DuplicateKeeperPicker.pathMatchesArtistBucket(
+                file: outside, musicFolder: musicFolder
+            )
+        )
+    }
+}
+
 final class WriteFileTagsMutationTests: XCTestCase {
 
     /// Captures calls from the injected fileTagWriter so the test

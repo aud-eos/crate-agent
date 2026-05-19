@@ -168,6 +168,7 @@ dictionary AudioTagUpdate {
 };
 
 dictionary AudioTags {
+  u32? bitrate_kbps;
   string? title;
   string? artist;
   string? album;

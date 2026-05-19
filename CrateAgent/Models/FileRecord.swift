@@ -29,6 +29,10 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var chromaprintFingerprint: Data?
     public var fingerprintStatus: FingerprintStatus
     public var trackId: Int64?
+    /// Audio bitrate in kbps from lofty's audio_bitrate, populated
+    /// during indexing. Nil for rows pre-dating the bitrate column
+    /// migration (#004) — those get backfilled on the next scan.
+    public var bitrateKbps: Int?
 
     // Serato metadata snapshot. Stored as strings even for numeric
     // fields (`bpm`, `length`) to match Serato's source representation
@@ -54,6 +58,7 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         chromaprintFingerprint: Data? = nil,
         fingerprintStatus: FingerprintStatus = .pending,
         trackId: Int64? = nil,
+        bitrateKbps: Int? = nil,
         artist: String? = nil,
         title: String? = nil,
         album: String? = nil,
@@ -74,6 +79,7 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         self.chromaprintFingerprint = chromaprintFingerprint
         self.fingerprintStatus = fingerprintStatus
         self.trackId = trackId
+        self.bitrateKbps = bitrateKbps
         self.artist = artist
         self.title = title
         self.album = album

@@ -559,6 +559,7 @@ public actor OperationEngine {
             fileSize: fileRecord.fileSize,
             mtime: fileRecord.mtime,
             lightweightHash: fileRecord.lightweightHash,
+            bitrateKbps: fileRecord.bitrateKbps,
             metadata: SeratoMetadata(
                 artist: fileRecord.artist,
                 title: fileRecord.title,
@@ -607,6 +608,7 @@ public actor OperationEngine {
             mtime: payload.mtime,
             lightweightHash: payload.lightweightHash,
             fingerprintStatus: .pending,
+            bitrateKbps: payload.bitrateKbps,
             artist: payload.metadata.artist,
             title: payload.metadata.title,
             album: payload.metadata.album,
@@ -945,6 +947,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
     public let fileSize: Int64
     public let mtime: Int64
     public let lightweightHash: Data?
+    public let bitrateKbps: Int?
     public let metadata: SeratoMetadata
 
     public init(
@@ -954,6 +957,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         fileSize: Int64,
         mtime: Int64,
         lightweightHash: Data? = nil,
+        bitrateKbps: Int? = nil,
         metadata: SeratoMetadata = .empty
     ) {
         self.path = path
@@ -962,6 +966,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         self.fileSize = fileSize
         self.mtime = mtime
         self.lightweightHash = lightweightHash
+        self.bitrateKbps = bitrateKbps
         self.metadata = metadata
     }
 }
