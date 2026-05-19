@@ -2533,3 +2533,73 @@ final class SettingsTemplatePreviewerTests: XCTestCase {
         XCTAssertEqual(preview, "<Music>/A/06_07-Windowlicker.mp3")
     }
 }
+
+final class AppLauncherTests: XCTestCase {
+
+    private let watchedFolderKey = "WatchedMusicFolderPath"
+
+    @MainActor
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.removeObject(forKey: watchedFolderKey)
+    }
+
+    @MainActor
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: watchedFolderKey)
+        super.tearDown()
+    }
+
+    @MainActor
+    func testInitialStateIsNeedsOnboardingWhenNoFolderPreference() {
+        let launcher = AppLauncher()
+        guard case .needsOnboarding = launcher.state else {
+            XCTFail("launcher should require onboarding when no folder is configured; got \(launcher.state)")
+            return
+        }
+    }
+
+    @MainActor
+    func testInitialStateIsReadyWhenFolderPreferenceExists() {
+        let tempFolder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-launcher-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempFolder) }
+
+        UserPreferences.watchedMusicFolder = tempFolder
+        defer { UserPreferences.watchedMusicFolder = nil }
+
+        let launcher = AppLauncher()
+        guard case .ready = launcher.state else {
+            XCTFail("launcher should bootstrap services when a folder is configured; got \(launcher.state)")
+            return
+        }
+    }
+
+    @MainActor
+    func testCompleteOnboardingPersistsFolderAndTransitionsToReady() {
+        let launcher = AppLauncher()
+        // Sanity: starts in onboarding.
+        guard case .needsOnboarding = launcher.state else {
+            XCTFail("expected needsOnboarding starting state")
+            return
+        }
+
+        let tempFolder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-launcher-onboarding-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempFolder)
+            UserPreferences.watchedMusicFolder = nil
+        }
+
+        launcher.completeOnboarding(withFolder: tempFolder)
+
+        XCTAssertEqual(UserPreferences.watchedMusicFolder, tempFolder,
+                       "onboarding must persist the picked folder for next launch")
+        guard case .ready = launcher.state else {
+            XCTFail("launcher should be in .ready after onboarding; got \(launcher.state)")
+            return
+        }
+    }
+}
