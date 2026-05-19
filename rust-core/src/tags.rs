@@ -53,6 +53,10 @@ pub struct AudioTags {
     pub bpm: Option<f64>,
     pub comment: Option<String>,
     pub duration_seconds: Option<u64>,
+    /// Audio bitrate in kilobits per second from `lofty`'s audio
+    /// properties. Used by the duplicate-resolver's keeper picker
+    /// to rank perceptual matches by encoding quality.
+    pub bitrate_kbps: Option<u32>,
 }
 
 pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
@@ -63,6 +67,11 @@ pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
 
     let properties = tagged_file.properties();
     tags.duration_seconds = Some(properties.duration().as_secs());
+    // `audio_bitrate()` returns `Option<u32>` — `None` when the
+    // format doesn't carry a bitrate (e.g., some lossless containers)
+    // and otherwise the value in kbps. Pass through verbatim; the
+    // keeper picker treats `None` as "unknown bitrate" rather than 0.
+    tags.bitrate_kbps = properties.audio_bitrate().filter(|kbps| *kbps > 0);
 
     if let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
         tags.title = tag.title().map(|cow| cow.into_owned());

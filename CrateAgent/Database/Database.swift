@@ -65,6 +65,7 @@ public final class LibraryDatabase {
         InitialSchemaMigration.register(in: &migrator)
         PivotToSeratoSourceOfTruthMigration.register(in: &migrator)
         AddSeratoMetadataToFilesMigration.register(in: &migrator)
+        AddBitrateToFilesMigration.register(in: &migrator)
         try migrator.migrate(writer)
     }
 }

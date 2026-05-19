@@ -774,6 +774,11 @@ private struct DuplicatesPanel: View {
     @State private var mode: DuplicateFinder.Mode = .byteLevel
     @State private var files: [FileRecord] = []
     @State private var groups: [DuplicateFinder.DuplicateGroup] = []
+    /// Per-group user-chosen keeper id. When a group's id is absent
+    /// from this map, we use the analyzer's default
+    /// (DuplicateKeeperPicker.chooseDefaultKeeper). Per-group radio
+    /// taps write into this dictionary.
+    @State private var keeperOverrides: [String: Int64] = [:]
     @State private var isScanning: Bool = false
     @State private var actionError: String?
 
@@ -837,11 +842,17 @@ private struct DuplicatesPanel: View {
                 ForEach(groups) { group in
                     Section {
                         ForEach(group.files, id: \.id) { file in
-                            duplicateRow(file: file, mode: group.mode)
+                            duplicateRow(file: file, group: group)
                         }
                     } header: {
-                        Text("\(group.size) copies · \(modeHeader(for: group))")
-                            .font(.caption.smallCaps())
+                        HStack(spacing: 8) {
+                            Text("\(group.size) copies · \(modeHeader(for: group))")
+                                .font(.caption.smallCaps())
+                            Spacer()
+                            Text("keep ▾")
+                                .font(.caption2.smallCaps())
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                 }
             }
@@ -870,20 +881,50 @@ private struct DuplicatesPanel: View {
     }
 
     @ViewBuilder
-    private func duplicateRow(file: FileRecord, mode: DuplicateFinder.Mode) -> some View {
+    private func duplicateRow(
+        file: FileRecord,
+        group: DuplicateFinder.DuplicateGroup
+    ) -> some View {
+        let keeperId = effectiveKeeperId(for: group)
+        let isKeeper = file.id == keeperId
         HStack(alignment: .top, spacing: 10) {
+            Image(systemName: isKeeper ? "largecircle.fill.circle" : "circle")
+                .foregroundStyle(isKeeper ? Color.accentColor : Color.secondary)
+                .onTapGesture {
+                    if let identifier = file.id {
+                        keeperOverrides[group.id] = identifier
+                    }
+                }
+                .help("Set as the keeper for this group.")
             VStack(alignment: .leading, spacing: 2) {
-                Text(file.path)
-                    .font(.caption.monospaced())
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
+                HStack(spacing: 6) {
+                    Text(file.path)
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .foregroundStyle(isKeeper ? Color.primary : Color.secondary)
+                    if isKeeper {
+                        Text("keeper")
+                            .font(.caption2.smallCaps())
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(
+                                Capsule().fill(Color.accentColor.opacity(0.15))
+                            )
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
                 HStack(spacing: 12) {
                     Text(Self.byteCountFormatter.string(fromByteCount: file.fileSize))
                         .foregroundStyle(.secondary)
                     Text((file.path as NSString).pathExtension.uppercased())
                         .foregroundStyle(.tertiary)
-                    if mode == .perceptual {
+                    if let bitrate = file.bitrateKbps {
+                        Text("\(bitrate) kbps")
+                            .foregroundStyle(.secondary)
+                    }
+                    if group.mode == .perceptual {
                         statusBadge(file.fingerprintStatus)
                     }
                 }
@@ -956,9 +997,28 @@ private struct DuplicatesPanel: View {
                 try FileRecord.fetchAll(db)
             }
             groups = DuplicateFinder.findDuplicates(in: files, mode: mode)
+            // Drop overrides for groups that no longer exist after
+            // the rescan — preserves the user's per-group picks for
+            // surviving groups while pruning stale ones.
+            let currentIds = Set(groups.map(\.id))
+            keeperOverrides = keeperOverrides.filter { currentIds.contains($0.key) }
         } catch {
             actionError = "Couldn't scan library: \(error.localizedDescription)"
         }
+    }
+
+    /// The id of the file we'd keep for this group — user's override
+    /// if set, otherwise the keeper picker's default. Returns nil
+    /// only for impossibly empty groups, which DuplicateFinder
+    /// already excludes.
+    private func effectiveKeeperId(for group: DuplicateFinder.DuplicateGroup) -> Int64? {
+        if let override = keeperOverrides[group.id] {
+            return override
+        }
+        return DuplicateKeeperPicker.chooseDefaultKeeper(
+            for: group,
+            musicFolder: services.watchedMusicFolder
+        )
     }
 }
 

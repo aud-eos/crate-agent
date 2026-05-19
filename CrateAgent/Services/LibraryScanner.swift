@@ -97,6 +97,26 @@ public actor LibraryScanner {
                     }
                 }
 
+                // Same idempotent backfill for bitrate (added in
+                // migration #004). Same direct-write rationale: bitrate
+                // is a derived property of the file, not a user action.
+                if existingFile.bitrateKbps == nil {
+                    if let bitrate = readBitrateKbps(forPathAt: absolutePath) {
+                        do {
+                            try await database.writer.write { db in
+                                try db.execute(
+                                    sql: "UPDATE files SET bitrate_kbps = ? WHERE id = ?",
+                                    arguments: [bitrate, fileId]
+                                )
+                            }
+                        } catch {
+                            Self.logger.error(
+                                "Bitrate backfill for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                            )
+                        }
+                    }
+                }
+
                 let seratoMetadata = makeSeratoMetadata(fromRecord: record)
                 let storedMetadata = makeSeratoMetadata(fromFileRecord: existingFile)
                 if seratoMetadata == storedMetadata {
@@ -129,6 +149,11 @@ public actor LibraryScanner {
                 continue
             }
 
+            // Probe bitrate via the FFI. Cheap (read of a few hundred
+            // bytes for the format header); only happens once per
+            // file because the result lands in the row.
+            let bitrate = readBitrateKbps(forPathAt: absolutePath)
+
             do {
                 try await operationEngine.apply(.indexNewFile(IndexNewFilePayload(
                     path: metadata.path,
@@ -137,6 +162,7 @@ public actor LibraryScanner {
                     fileSize: metadata.fileSize,
                     mtime: metadata.mtime,
                     lightweightHash: metadata.lightweightHash,
+                    bitrateKbps: bitrate,
                     metadata: makeSeratoMetadata(fromRecord: record)
                 )))
                 filesIndexed += 1
@@ -231,5 +257,18 @@ public actor LibraryScanner {
             length: file.length,
             label: file.label
         )
+    }
+
+    /// Probe a file's audio bitrate via the existing `readAudioTags`
+    /// FFI. Returns nil if the file is unreadable or the format
+    /// doesn't carry a bitrate; the keeper picker treats nil as
+    /// "unknown" rather than zero.
+    private func readBitrateKbps(forPathAt path: String) -> Int? {
+        do {
+            let tags = try readAudioTags(filePath: path)
+            return tags.bitrateKbps.map(Int.init)
+        } catch {
+            return nil
+        }
     }
 }

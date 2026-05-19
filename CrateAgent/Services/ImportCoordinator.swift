@@ -80,7 +80,7 @@ public actor ImportCoordinator {
         // Read existing audio tags via the FFI; failures fall back to
         // an empty metadata struct so the file still gets imported
         // (with no artist/title/etc., to be filled in later).
-        let seratoMetadata = readSeratoMetadata(from: absolutePath)
+        let (seratoMetadata, bitrateKbps) = readMetadataAndBitrate(from: absolutePath)
 
         let batchId = UUID().uuidString
 
@@ -94,6 +94,7 @@ public actor ImportCoordinator {
                     fileSize: fileMetadata.fileSize,
                     mtime: fileMetadata.mtime,
                     lightweightHash: fileMetadata.lightweightHash,
+                    bitrateKbps: bitrateKbps,
                     metadata: seratoMetadata
                 )),
                 batchId: batchId
@@ -142,7 +143,7 @@ public actor ImportCoordinator {
         return true
     }
 
-    private func readSeratoMetadata(from path: String) -> SeratoMetadata {
+    private func readMetadataAndBitrate(from path: String) -> (SeratoMetadata, Int?) {
         let tags: AudioTags
         do {
             tags = try readAudioTags(filePath: path)
@@ -150,10 +151,10 @@ public actor ImportCoordinator {
             Self.logger.info(
                 "no readable tags for \(path, privacy: .public); importing with empty metadata"
             )
-            return SeratoMetadata()
+            return (SeratoMetadata(), nil)
         }
 
-        return SeratoMetadata(
+        let metadata = SeratoMetadata(
             artist: tags.artist,
             title: tags.title,
             album: tags.album,
@@ -165,6 +166,7 @@ public actor ImportCoordinator {
             length: tags.durationSeconds.map(Self.formatDuration),
             label: nil
         )
+        return (metadata, tags.bitrateKbps.map(Int.init))
     }
 
     private nonisolated func enumerateAudioFiles(at rootUrl: URL) -> [URL] {
