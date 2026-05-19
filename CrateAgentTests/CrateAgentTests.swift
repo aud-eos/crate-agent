@@ -1851,3 +1851,180 @@ extension FilesystemSyncCoordinatorTests {
         XCTAssertEqual(fileCount, 0)
     }
 }
+
+final class EventHistoryQueryTests: XCTestCase {
+
+    // MARK: - Pure derivation tests (no DB)
+
+    func testDescribeBatchListsEachEventTypeWithCount() {
+        let summary = EventHistoryQuery.describeBatch(typeCounts: [
+            (.fileRenamed, 2),
+            (.metadataSet, 1),
+        ])
+        XCTAssertEqual(summary, "Renamed 2 files · Updated metadata for 1 file")
+    }
+
+    func testDescribeBatchPluralizesByCount() {
+        XCTAssertEqual(
+            EventHistoryQuery.describeBatch(typeCounts: [(.trackImported, 1)]),
+            "Imported 1 track"
+        )
+        XCTAssertEqual(
+            EventHistoryQuery.describeBatch(typeCounts: [(.trackImported, 3)]),
+            "Imported 3 tracks"
+        )
+    }
+
+    func testDescribeBatchOfEmptyReturnsPlaceholder() {
+        XCTAssertEqual(EventHistoryQuery.describeBatch(typeCounts: []), "Empty batch")
+    }
+
+    func testCanUndoBatchAllowsSupportedTypes() {
+        XCTAssertTrue(EventHistoryQuery.canUndoBatch(
+            typeList: [
+                EventType.fileRenamed.rawValue,
+                EventType.metadataSet.rawValue,
+                EventType.trackImported.rawValue,
+                EventType.fileRemoved.rawValue,
+            ]
+        ))
+    }
+
+    func testCanUndoBatchRejectsSeratoSideEvents() {
+        XCTAssertFalse(EventHistoryQuery.canUndoBatch(
+            typeList: [
+                EventType.trackImported.rawValue,
+                EventType.trackAddedToSerato.rawValue,
+            ]
+        ))
+        XCTAssertFalse(EventHistoryQuery.canUndoBatch(
+            typeList: [
+                EventType.metadataSet.rawValue,
+                EventType.metadataCommittedToSerato.rawValue,
+            ]
+        ))
+    }
+
+    // MARK: - End-to-end (DB-backed)
+
+    @MainActor
+    private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator
+        )
+        return (engine, database)
+    }
+
+    func testLoadRecentBatchesReturnsBatchesNewestFirst() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+
+        // Two batches, applied in order. Timestamps come from
+        // Date().timeIntervalSince1970 inside executeAndLog, so a
+        // small sleep between batches keeps the ordering robust on
+        // fast machines.
+        try await engine.apply(
+            .indexNewFile(IndexNewFilePayload(
+                path: "/Music/A/first.mp3",
+                volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+            )),
+            batchId: "older-batch"
+        )
+        try await Task.sleep(nanoseconds: 5_000_000)  // 5ms
+        try await engine.apply(
+            .indexNewFile(IndexNewFilePayload(
+                path: "/Music/A/second.mp3",
+                volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+            )),
+            batchId: "newer-batch"
+        )
+
+        let batches = try await EventHistoryQuery.loadRecentBatches(database: database)
+        XCTAssertEqual(batches.count, 2)
+        XCTAssertEqual(batches[0].batchId, "newer-batch")
+        XCTAssertEqual(batches[1].batchId, "older-batch")
+        XCTAssertEqual(batches[0].description, "Imported 1 track")
+        XCTAssertEqual(batches[0].eventCount, 1)
+    }
+
+    func testLoadRecentBatchesAggregatesCompositeBatch() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+
+        let batchId = "composite-batch"
+        try await engine.apply(
+            .indexNewFile(IndexNewFilePayload(
+                path: "/Music/A/track.mp3",
+                volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+            )),
+            batchId: batchId
+        )
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/track.mp3"])
+        }!
+        try await engine.apply(
+            .renameFile(RenameFilePayload(fileId: fileId, newPath: "/Music/A/renamed.mp3")),
+            batchId: batchId
+        )
+
+        let batches = try await EventHistoryQuery.loadRecentBatches(database: database)
+        XCTAssertEqual(batches.count, 1)
+        XCTAssertEqual(batches[0].eventCount, 2)
+        XCTAssertTrue(
+            batches[0].description.contains("Imported 1 track"),
+            "got '\(batches[0].description)'"
+        )
+        XCTAssertTrue(
+            batches[0].description.contains("Renamed 1 file"),
+            "got '\(batches[0].description)'"
+        )
+        XCTAssertTrue(batches[0].canUndo)
+        XCTAssertFalse(batches[0].isUndoBatch)
+    }
+
+    func testLoadRecentBatchesFlagsUndoBatches() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+
+        try await engine.apply(
+            .indexNewFile(IndexNewFilePayload(
+                path: "/Music/A/x.mp3",
+                volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+            )),
+            batchId: "original"
+        )
+        let undoBatchId = try await engine.undoBatch("original")
+
+        let batches = try await EventHistoryQuery.loadRecentBatches(database: database)
+        guard let undoSummary = batches.first(where: { $0.batchId == undoBatchId }) else {
+            XCTFail("undo batch should have a summary")
+            return
+        }
+        XCTAssertTrue(undoSummary.isUndoBatch)
+        // The undo of an indexNewFile is a removeFile event.
+        XCTAssertTrue(
+            undoSummary.description.contains("Removed 1 file"),
+            "got '\(undoSummary.description)'"
+        )
+    }
+
+    func testLoadRecentBatchesHonorsLimit() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+
+        for index in 0..<5 {
+            try await engine.apply(
+                .indexNewFile(IndexNewFilePayload(
+                    path: "/Music/A/track-\(index).mp3",
+                    volumeUuid: "v1", inode: Int64(index + 1), fileSize: 1, mtime: 1
+                )),
+                batchId: "batch-\(index)"
+            )
+        }
+
+        let limited = try await EventHistoryQuery.loadRecentBatches(database: database, limit: 2)
+        XCTAssertEqual(limited.count, 2)
+    }
+}
