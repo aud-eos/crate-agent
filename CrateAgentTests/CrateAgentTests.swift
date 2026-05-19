@@ -2221,6 +2221,198 @@ final class FingerprintWorkerTests: XCTestCase {
                                  "no more than `concurrency` fingerprint calls may run simultaneously")
         XCTAssertEqual(counter.totalEntered, 8)
     }
+
+    // MARK: - Byte-twin dedup
+
+    /// Insert a pending row with the (file_size, lightweight_hash) of
+    /// our choosing — necessary because the dedup logic groups by
+    /// those two fields. Default values match the basic insertPendingFile
+    /// helper but make the duplicate-relevant fields explicit.
+    @discardableResult
+    private func insertPendingFileWithHash(
+        path: String,
+        in database: LibraryDatabase,
+        inode: Int64,
+        fileSize: Int64 = 1024,
+        lightweightHash: Data
+    ) async throws -> Int64 {
+        try await database.writer.write { db in
+            var record = FileRecord(
+                path: path,
+                volumeUuid: "v1",
+                inode: inode,
+                fileSize: fileSize,
+                mtime: 1_700_000_000,
+                lightweightHash: lightweightHash,
+                fingerprintStatus: .pending
+            )
+            try record.insert(db)
+            return record.id!
+        }
+    }
+
+    func testInBatchDedupFingerprintsOnceForByteTwins() async throws {
+        // Three files in the same batch with identical (size, hash):
+        // the worker should fingerprint exactly one of them and
+        // copy the result to the other two.
+        let database = try await LibraryDatabase.openInMemory()
+        let hash = Data([0xAA, 0xBB, 0xCC])
+        try await insertPendingFileWithHash(
+            path: "/Music/A/copy1.mp3", in: database, inode: 1, lightweightHash: hash
+        )
+        try await insertPendingFileWithHash(
+            path: "/Music/A/copy2.mp3", in: database, inode: 2, lightweightHash: hash
+        )
+        try await insertPendingFileWithHash(
+            path: "/Music/A/copy3.mp3", in: database, inode: 3, lightweightHash: hash
+        )
+
+        let counter = ConcurrencyCounter()
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { _ in
+            counter.enter()
+            counter.leave()
+            return [0xDEAD, 0xBEEF]
+        }
+
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 2,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        XCTAssertEqual(counter.totalEntered, 1,
+                       "byte-twins must fingerprint exactly once; the rest copy the result")
+
+        let rows = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).sorted { $0.id! < $1.id! }
+        }
+        XCTAssertEqual(rows.count, 3)
+        let firstFingerprint = rows[0].chromaprintFingerprint
+        XCTAssertNotNil(firstFingerprint)
+        for row in rows {
+            XCTAssertEqual(row.fingerprintStatus, .done)
+            XCTAssertEqual(row.chromaprintFingerprint, firstFingerprint,
+                           "every byte-twin must have an identical fingerprint after dedup")
+        }
+    }
+
+    func testCopyFromExistingTwinSkipsFingerprintingEntirely() async throws {
+        // A row with the same (size, hash) is ALREADY done in the DB
+        // before the worker runs. A new pending file with that hash
+        // should skip fingerprinting and copy the existing hash.
+        let database = try await LibraryDatabase.openInMemory()
+        let hash = Data([0xCA, 0xFE])
+        let existingFingerprint = Data([0x01, 0x02, 0x03, 0x04])
+
+        // Insert a done row with the hash.
+        try await database.writer.write { db in
+            var record = FileRecord(
+                path: "/Music/A/already-done.mp3",
+                volumeUuid: "v1", inode: 100,
+                fileSize: 1024, mtime: 1_700_000_000,
+                lightweightHash: hash,
+                chromaprintFingerprint: existingFingerprint,
+                fingerprintStatus: .done
+            )
+            try record.insert(db)
+        }
+        // Insert a new pending row with the same (size, hash).
+        try await insertPendingFileWithHash(
+            path: "/Music/A/new-copy.mp3",
+            in: database, inode: 200, lightweightHash: hash
+        )
+
+        let counter = ConcurrencyCounter()
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { _ in
+            counter.enter()
+            counter.leave()
+            return [0xFF]
+        }
+
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 1,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        XCTAssertEqual(counter.totalEntered, 0,
+                       "the new pending row must copy the existing twin's fingerprint; no decode")
+
+        let copied = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/new-copy.mp3").fetchOne(db)!
+        }
+        XCTAssertEqual(copied.fingerprintStatus, .done)
+        XCTAssertEqual(copied.chromaprintFingerprint, existingFingerprint,
+                       "the new row must inherit the twin's exact fingerprint bytes")
+    }
+
+    func testFilesWithoutHashFingerprintIndependently() async throws {
+        // A pending row with no lightweight_hash can't be grouped or
+        // looked up. The worker fingerprints it the old-fashioned way.
+        let database = try await LibraryDatabase.openInMemory()
+        try await insertPendingFile(path: "/Music/A/no-hash.mp3", in: database, inode: 1)
+        try await insertPendingFile(path: "/Music/A/also-no-hash.mp3", in: database, inode: 2)
+
+        let counter = ConcurrencyCounter()
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { _ in
+            counter.enter()
+            counter.leave()
+            return [0xABCD]
+        }
+
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 2,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        XCTAssertEqual(counter.totalEntered, 2,
+                       "files without lightweight_hash can't dedup — each must fingerprint")
+        let rows = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        for row in rows {
+            XCTAssertEqual(row.fingerprintStatus, .done)
+        }
+    }
+
+    func testTwinsWithFailedRepresentativeAllMarkFailed() async throws {
+        // Group of 3 byte-twins. The injected fingerprint function
+        // throws. The representative fails AND so do the siblings —
+        // we shouldn't write a stale success to anyone.
+        let database = try await LibraryDatabase.openInMemory()
+        let hash = Data([0x99])
+        try await insertPendingFileWithHash(
+            path: "/Music/A/a.mp3", in: database, inode: 1, lightweightHash: hash
+        )
+        try await insertPendingFileWithHash(
+            path: "/Music/A/b.mp3", in: database, inode: 2, lightweightHash: hash
+        )
+
+        struct FingerprintError: Error {}
+        let mockFingerprint: @Sendable (String) throws -> [UInt32] = { _ in
+            throw FingerprintError()
+        }
+
+        let worker = FingerprintWorker(
+            database: database,
+            concurrency: 1,
+            fingerprintFunction: mockFingerprint
+        )
+        _ = try await worker.processAllPendingOnce()
+
+        let rows = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        for row in rows {
+            XCTAssertEqual(row.fingerprintStatus, .failed,
+                           "representative failure must propagate to siblings — they share the bytes")
+            XCTAssertNil(row.chromaprintFingerprint)
+        }
+    }
 }
 
 /// Thread-safe peak-concurrency tracker for the worker concurrency test.
