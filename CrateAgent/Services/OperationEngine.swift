@@ -40,10 +40,17 @@ public actor OperationEngine {
     /// real audio files on disk.
     public typealias FileTagWriter = @Sendable (String, AudioTagUpdate) throws -> Void
 
+    /// Injectable file-to-Trash mover. Production uses
+    /// `FileManager.trashItem`; tests inject a no-op or recorder so
+    /// the resolution flow can be exercised without actually moving
+    /// files into the user's Trash.
+    public typealias FileTrasher = @Sendable (String) throws -> Void
+
     private let database: LibraryDatabase
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
     private let fileTagWriter: FileTagWriter
+    private let fileTrasher: FileTrasher
 
     /// Pending writes to Serato library files. Either a path
     /// rewrite or a metadata update. Drained when Serato exits via
@@ -76,12 +83,17 @@ public actor OperationEngine {
         seratoLocator: SeratoLibraryLocator,
         fileTagWriter: @escaping FileTagWriter = { path, update in
             try writeAudioTags(filePath: path, update: update)
+        },
+        fileTrasher: @escaping FileTrasher = { path in
+            let url = URL(fileURLWithPath: path)
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         }
     ) {
         self.database = database
         self.seratoWatchdog = seratoWatchdog
         self.seratoLocator = seratoLocator
         self.fileTagWriter = fileTagWriter
+        self.fileTrasher = fileTrasher
     }
 
     /// Apply a mutation with an auto-generated batch identifier. Use
@@ -202,6 +214,12 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
+        case .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates:
+            // Resolution-flow events are deliberately not undoable.
+            // Recovery: Finder Trash "Put Back" for the file +
+            // manual re-add to Serato. Future work could add an
+            // automated restore path if the user demands it.
+            throw OperationEngineError.undoNotSupported(eventType: event.eventType)
         case .fileTagsWritten:
             // Undoable when previousMetadata was captured at forward
             // time. Same gate as commitMetadataToSerato.
@@ -237,6 +255,74 @@ public actor OperationEngine {
             try await applySeratoAddTrack(add)
         case .fileTagWrite(let write):
             try await applyFileTagWrite(write)
+        case .removeFromDatabase(let removal):
+            try await applySeratoDatabaseRemoval(removal)
+        case .removeFromCrates(let removal):
+            try await applySeratoCrateSweepRemoval(removal)
+        case .trashFile(let trash):
+            try await applyTrashFileOperation(trash)
+        }
+    }
+
+    private func applyTrashFileOperation(_ trash: SeratoPendingTrash) async throws {
+        do {
+            try fileTrasher(trash.absolutePath)
+        } catch {
+            throw OperationEngineError.trashFailed(
+                path: trash.absolutePath,
+                underlying: String(describing: error)
+            )
+        }
+    }
+
+    private func applySeratoDatabaseRemoval(_ removal: SeratoPendingRemoval) async throws {
+        let databaseV2Path = seratoLocator.databaseV2Url.path
+        guard FileManager.default.fileExists(atPath: databaseV2Path) else {
+            // No database V2 yet — nothing to remove from. Same
+            // tolerant behavior as applySeratoMetadataUpdate.
+            return
+        }
+        let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
+            fromAbsolute: removal.absolutePath
+        )
+        do {
+            _ = try removeTrackFromDatabase(
+                databasePath: databaseV2Path,
+                trackPath: seratoRelativePath
+            )
+        } catch {
+            throw OperationEngineError.seratoRewriteFailed(
+                path: databaseV2Path,
+                underlying: String(describing: error)
+            )
+        }
+    }
+
+    private func applySeratoCrateSweepRemoval(_ removal: SeratoPendingRemoval) async throws {
+        let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
+            fromAbsolute: removal.absolutePath
+        )
+        let crateFiles: [URL]
+        do {
+            crateFiles = try seratoLocator.enumerateCrateFiles()
+        } catch {
+            throw OperationEngineError.seratoEnumerationFailed(
+                directory: seratoLocator.subcratesDirectoryUrl.path,
+                underlying: String(describing: error)
+            )
+        }
+        for crateFile in crateFiles {
+            do {
+                _ = try removePathFromCrate(
+                    cratePath: crateFile.path,
+                    trackPath: seratoRelativePath
+                )
+            } catch {
+                throw OperationEngineError.seratoRewriteFailed(
+                    path: crateFile.path,
+                    underlying: String(describing: error)
+                )
+            }
         }
     }
 
@@ -534,6 +620,27 @@ public actor OperationEngine {
             return ExecutionResult(
                 eventId: eventId,
                 seratoWrite: .fileTagWrite(fileTagWrite)
+            )
+        case .trashFile(let payload):
+            let (eventId, trash) = try applyTrashFile(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(eventId: eventId, seratoWrite: .trashFile(trash))
+        case .removeTrackFromSerato(let payload):
+            let (eventId, removal) = try applyRemoveTrackFromSerato(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(
+                eventId: eventId,
+                seratoWrite: .removeFromDatabase(removal)
+            )
+        case .removeFileFromCrates(let payload):
+            let (eventId, removal) = try applyRemoveFileFromCrates(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(
+                eventId: eventId,
+                seratoWrite: .removeFromCrates(removal)
             )
         }
     }
@@ -850,6 +957,100 @@ public actor OperationEngine {
         return (eventId, pending)
     }
 
+    private static func applyTrashFile(
+        _ payload: TrashFilePayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, SeratoPendingTrash) {
+        guard let fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+
+        // Capture path in the journal payload so even if the file
+        // row gets deleted later in the same batch (ON DELETE SET
+        // NULL cascade nulls the event's file_id), History still
+        // records exactly what was trashed.
+        struct ForwardPayload: Codable {
+            let fileId: Int64
+            let path: String
+        }
+        let forwardPayload = ForwardPayload(
+            fileId: payload.fileId,
+            path: fileRecord.path
+        )
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .fileTrashed,
+            forwardPayload: forwardPayload,
+            inversePayload: forwardPayload,
+            in: db
+        )
+        return (eventId, SeratoPendingTrash(absolutePath: fileRecord.path))
+    }
+
+    private static func applyRemoveTrackFromSerato(
+        _ payload: RemoveTrackFromSeratoPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, SeratoPendingRemoval) {
+        guard let fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+        struct ForwardPayload: Codable {
+            let fileId: Int64
+            let path: String
+        }
+        let forwardPayload = ForwardPayload(
+            fileId: payload.fileId,
+            path: fileRecord.path
+        )
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .trackRemovedFromSerato,
+            forwardPayload: forwardPayload,
+            inversePayload: forwardPayload,
+            in: db
+        )
+        let pending = SeratoPendingRemoval(absolutePath: fileRecord.path)
+        return (eventId, pending)
+    }
+
+    private static func applyRemoveFileFromCrates(
+        _ payload: RemoveFileFromCratesPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, SeratoPendingRemoval) {
+        guard let fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+        struct ForwardPayload: Codable {
+            let fileId: Int64
+            let path: String
+        }
+        let forwardPayload = ForwardPayload(
+            fileId: payload.fileId,
+            path: fileRecord.path
+        )
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .fileRemovedFromCrates,
+            forwardPayload: forwardPayload,
+            inversePayload: forwardPayload,
+            in: db
+        )
+        let pending = SeratoPendingRemoval(absolutePath: fileRecord.path)
+        return (eventId, pending)
+    }
+
     private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
         batchId: String,
         timestamp: Int64,
@@ -897,6 +1098,40 @@ public enum TrackMutation: Sendable {
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)
     case addTrackToSerato(AddTrackToSeratoPayload)
     case writeFileTags(WriteFileTagsPayload)
+    case trashFile(TrashFilePayload)
+    case removeTrackFromSerato(RemoveTrackFromSeratoPayload)
+    case removeFileFromCrates(RemoveFileFromCratesPayload)
+}
+
+/// Move the file at `fileId` to the user's Trash via
+/// FileManager.trashItem. Reversible only by the user via Finder
+/// ("Put Back"); journaled but undoNotSupported in the engine
+/// because we can't reliably re-create audio bytes if the user has
+/// emptied Trash by the time undo runs.
+public struct TrashFilePayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public init(fileId: Int64) { self.fileId = fileId }
+}
+
+/// Remove the `otrk` from Serato's database V2 whose `pfil`
+/// matches the file's path. Gated by `SeratoWatchdog` — Serato
+/// must be closed to avoid the in-memory cache overwriting the
+/// disk version on save. Not undoable: re-adding would require
+/// reconstructing the otrk's full metadata + analysis (cue points,
+/// beatgrid) which we don't carry across the boundary today.
+public struct RemoveTrackFromSeratoPayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public init(fileId: Int64) { self.fileId = fileId }
+}
+
+/// Sweep every `.crate` file in Serato's Subcrates directory and
+/// remove the `otrk` whose `ptrk` matches the file's path. Gated
+/// by SeratoWatchdog. Not undoable: a follow-up "re-add to original
+/// crates" would need to track which crates contained the file
+/// before removal, which isn't journaled today.
+public struct RemoveFileFromCratesPayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public init(fileId: Int64) { self.fileId = fileId }
 }
 
 /// Writes metadata into the audio file's primary tag (ID3v2.4 for
@@ -1115,6 +1350,24 @@ enum SeratoPendingWrite: Sendable, Equatable {
     case metadataUpdate(SeratoPendingMetadataUpdate)
     case addTrack(SeratoPendingAddTrack)
     case fileTagWrite(SeratoPendingFileTagWrite)
+    case removeFromDatabase(SeratoPendingRemoval)
+    case removeFromCrates(SeratoPendingRemoval)
+    case trashFile(SeratoPendingTrash)
+}
+
+/// Queued removal of a file's references from Serato. Same payload
+/// for database V2 (`.removeFromDatabase`) and `.crate` sweep
+/// (`.removeFromCrates`) — both need just the absolute path.
+struct SeratoPendingRemoval: Sendable, Equatable {
+    let absolutePath: String
+}
+
+/// Queued trash-move. Routed through the SeratoWatchdog gate
+/// because Serato may have the file open for playback or analysis;
+/// moving a file out from under Serato can crash it or corrupt
+/// in-flight reads.
+struct SeratoPendingTrash: Sendable, Equatable {
+    let absolutePath: String
 }
 
 /// File-tag write deferred by the SeratoWatchdog. Carries the
@@ -1159,6 +1412,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case seratoEnumerationFailed(directory: String, underlying: String)
     case seratoRewriteFailed(path: String, underlying: String)
     case fileTagWriteFailed(path: String, underlying: String)
+    case trashFailed(path: String, underlying: String)
     case batchNotFound(batchId: String)
     case undoNotSupported(eventType: EventType)
 
@@ -1176,6 +1430,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Failed to rewrite Serato library file \(path): \(underlying)"
         case .fileTagWriteFailed(let path, let underlying):
             return "Failed to write audio tags to \(path): \(underlying)"
+        case .trashFailed(let path, let underlying):
+            return "Failed to move \(path) to Trash: \(underlying)"
         case .batchNotFound(let batchId):
             return "No events were found for batch \(batchId); nothing to undo."
         case .undoNotSupported(let eventType):

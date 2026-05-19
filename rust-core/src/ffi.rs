@@ -112,6 +112,32 @@ pub fn rewrite_database_path(
     Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
 }
 
+pub fn remove_track_from_database(
+    database_path: String,
+    track_path: String,
+) -> Result<u32, CoreError> {
+    let path = PathBuf::from(database_path);
+    let mut database = serato::DatabaseV2::read_from_path(&path)?;
+    let count = database.remove_track(&track_path);
+    if count > 0 {
+        database.write_to_path(&path)?;
+    }
+    Ok(u32::try_from(count).expect("remove count exceeded u32"))
+}
+
+pub fn remove_path_from_crate(
+    crate_path: String,
+    track_path: String,
+) -> Result<u32, CoreError> {
+    let path = PathBuf::from(crate_path);
+    let mut crate_file = serato::CrateFile::read_from_path(&path)?;
+    let count = crate_file.remove_track(&track_path);
+    if count > 0 {
+        crate_file.write_to_path(&path)?;
+    }
+    Ok(u32::try_from(count).expect("remove count exceeded u32"))
+}
+
 pub fn database_track_count(database_path: String) -> Result<u32, CoreError> {
     let path = PathBuf::from(database_path);
     let database = serato::DatabaseV2::read_from_path(&path)?;

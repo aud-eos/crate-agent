@@ -72,7 +72,8 @@ final class OperationEngineTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database, locator)
     }
@@ -925,7 +926,8 @@ final class LibraryScannerTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         let scanner = LibraryScanner(
             operationEngine: engine,
@@ -1183,7 +1185,8 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         let coordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
@@ -1925,7 +1928,8 @@ final class EventHistoryQueryTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -2862,7 +2866,8 @@ final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3061,7 +3066,8 @@ final class LibraryHygieneCaseRunnerTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3229,7 +3235,8 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3365,7 +3372,8 @@ final class LibraryHygieneRunnerTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ }
+            fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
+            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3838,6 +3846,203 @@ final class DuplicateKeeperPickerTests: XCTestCase {
                 file: outside, musicFolder: musicFolder
             )
         )
+    }
+}
+
+final class DuplicateResolverTests: XCTestCase {
+
+    /// Records trasher invocations so the test can assert which
+    /// files would have been moved to Trash.
+    private final class TrasherRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _paths: [String] = []
+        var paths: [String] {
+            lock.lock(); defer { lock.unlock() }
+            return _paths
+        }
+        func record(_ path: String) {
+            lock.lock(); defer { lock.unlock() }
+            _paths.append(path)
+        }
+    }
+
+    @MainActor
+    private func makeEngine(
+        recorder: TrasherRecorder = TrasherRecorder()
+    ) throws -> (OperationEngine, LibraryDatabase, TrasherRecorder) {
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in },
+            fileTrasher: { path in recorder.record(path) }
+        )
+        return (engine, database, recorder)
+    }
+
+    private func indexFile(
+        path: String,
+        inode: Int64,
+        engine: OperationEngine
+    ) async throws -> Int64 {
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: path,
+            volumeUuid: "v1",
+            inode: inode,
+            fileSize: 1, mtime: 1
+        )))
+        return try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: path + ".duplicate-bootstrap-noop",  // workaround
+            volumeUuid: "v1",
+            inode: inode + 1000,
+            fileSize: 1, mtime: 1
+        )))
+        // placeholder — replaced below
+    }
+
+    func testResolveTrashesNonKeepersAndKeepsTheChosenFile() async throws {
+        let (engine, database, recorder) = try await MainActor.run { try makeEngine() }
+        let keeperPath = "/Music/A/keeper.mp3"
+        let dupePath = "/Music/A/dupe.mp3"
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: keeperPath, volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: dupePath, volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+        )))
+        let keeperId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: [keeperPath])
+        }!
+        let dupeId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: [dupePath])
+        }!
+
+        // Pull the (now-inserted) FileRecords to build a real group.
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k", mode: .byteLevel, files: files
+        )
+
+        let resolver = DuplicateResolver(operationEngine: engine)
+        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
+
+        XCTAssertEqual(outcome.trashedCount, 1)
+        XCTAssertEqual(recorder.paths, [dupePath],
+                       "the keeper must NOT be trashed; only non-keepers")
+        let surviving = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        XCTAssertEqual(surviving.count, 1)
+        XCTAssertEqual(surviving.first?.id, keeperId,
+                       "the keeper's file row must remain in the DB")
+        XCTAssertNotEqual(surviving.first?.id, dupeId)
+    }
+
+    func testResolveJournalsFourEventsPerNonKeeperUnderOneBatch() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/k.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/d1.mp3", volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/d2.mp3", volumeUuid: "v1", inode: 3, fileSize: 1, mtime: 1
+        )))
+        let keeperId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/k.mp3"])
+        }!
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k", mode: .byteLevel, files: files
+        )
+
+        let resolver = DuplicateResolver(operationEngine: engine)
+        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
+
+        // 2 non-keepers × 4 mutations = 8 events; all under one batch.
+        let batchEvents = try await database.writer.read { db in
+            try EventRecord
+                .filter(Column("batch_id") == outcome.batchId)
+                .order(Column("event_id").asc)
+                .fetchAll(db)
+        }
+        XCTAssertEqual(batchEvents.count, 8)
+        XCTAssertEqual(batchEvents.map(\.eventType), [
+            .trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved,
+            .trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved,
+        ])
+    }
+
+    func testResolveRejectsKeeperNotInGroup() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/a.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k", mode: .byteLevel, files: files
+        )
+        let resolver = DuplicateResolver(operationEngine: engine)
+        do {
+            _ = try await resolver.resolve(group: group, keeperId: 9999)
+            XCTFail("expected keeperNotInGroup")
+        } catch let error as DuplicateResolver.ResolverError {
+            XCTAssertEqual(error, .keeperNotInGroup)
+        }
+    }
+
+    func testResolveBatchIsNotUndoable() async throws {
+        let (engine, database, _) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/k.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/d.mp3", volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+        )))
+        let keeperId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Music/A/k.mp3"])
+        }!
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db)
+        }
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "k", mode: .byteLevel, files: files
+        )
+        let resolver = DuplicateResolver(operationEngine: engine)
+        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
+
+        do {
+            _ = try await engine.undoBatch(outcome.batchId)
+            XCTFail("resolution batch must not be undoable through the engine")
+        } catch let error as OperationEngineError {
+            // The first event in newest-first order is fileRemoved
+            // (the last one journaled). undoBatch processes in
+            // reverse so it sees fileRemoved → its inverse is
+            // indexNewFile which IS supported. The trash, however,
+            // throws undoNotSupported. Either rejection is correct
+            // — what matters is that the batch is rejected.
+            switch error {
+            case .undoNotSupported:
+                break
+            default:
+                XCTFail("expected undoNotSupported, got \(error)")
+            }
+        }
     }
 }
 

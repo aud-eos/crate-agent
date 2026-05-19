@@ -770,6 +770,7 @@ private struct MissingFieldsPanel: View {
 
 private struct DuplicatesPanel: View {
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var mode: DuplicateFinder.Mode = .byteLevel
     @State private var files: [FileRecord] = []
@@ -780,7 +781,10 @@ private struct DuplicatesPanel: View {
     /// taps write into this dictionary.
     @State private var keeperOverrides: [String: Int64] = [:]
     @State private var isScanning: Bool = false
+    @State private var isResolving: Bool = false
     @State private var actionError: String?
+    @State private var lastResolution: String?
+    @State private var pendingResolveGroup: DuplicateFinder.DuplicateGroup?
 
     private static let byteCountFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -790,6 +794,10 @@ private struct DuplicatesPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if seratoWatchdog.isSeratoRunning {
+                seratoRunningBanner
+                Divider()
+            }
             modeBar
             Divider()
             groupListSection
@@ -797,6 +805,36 @@ private struct DuplicatesPanel: View {
             footer
         }
         .task { await rescan() }
+        .alert(
+            "Resolve duplicates?",
+            isPresented: Binding(
+                get: { pendingResolveGroup != nil },
+                set: { isPresented in if !isPresented { pendingResolveGroup = nil } }
+            ),
+            presenting: pendingResolveGroup
+        ) { group in
+            Button("Move \(group.size - 1) file\(group.size - 1 == 1 ? "" : "s") to Trash", role: .destructive) {
+                Task { await resolve(group: group) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { group in
+            Text("This moves \(group.size - 1) file\(group.size - 1 == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. The file in Trash stays restorable from Finder until you empty Trash. This action can't be undone from History.")
+        }
+    }
+
+    @ViewBuilder
+    private var seratoRunningBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.shield.fill")
+                .foregroundStyle(.orange)
+            Text("Serato is running — quit it before resolving duplicates.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.1))
     }
 
     @ViewBuilder
@@ -849,9 +887,17 @@ private struct DuplicatesPanel: View {
                             Text("\(group.size) copies · \(modeHeader(for: group))")
                                 .font(.caption.smallCaps())
                             Spacer()
-                            Text("keep ▾")
-                                .font(.caption2.smallCaps())
-                                .foregroundStyle(.tertiary)
+                            Button {
+                                pendingResolveGroup = group
+                            } label: {
+                                Label("Resolve", systemImage: "trash")
+                                    .labelStyle(.titleAndIcon)
+                            }
+                            .controlSize(.small)
+                            .disabled(isResolving || seratoWatchdog.isSeratoRunning)
+                            .help(seratoWatchdog.isSeratoRunning
+                                  ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
+                                  : "Move non-keepers to Trash and remove their Serato references in one batch.")
                         }
                     }
                 }
@@ -967,6 +1013,10 @@ private struct DuplicatesPanel: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .lineLimit(2)
+            } else if let lastResolution {
+                Label(lastResolution, systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.green)
             } else {
                 Text("\(groups.count) duplicate group\(groups.count == 1 ? "" : "s") · \(totalDuplicateFiles) file\(totalDuplicateFiles == 1 ? "" : "s")")
                     .font(.caption.monospacedDigit())
@@ -978,7 +1028,7 @@ private struct DuplicatesPanel: View {
             } label: {
                 Label("Rescan", systemImage: "arrow.clockwise")
             }
-            .disabled(isScanning)
+            .disabled(isScanning || isResolving)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -1019,6 +1069,26 @@ private struct DuplicatesPanel: View {
             for: group,
             musicFolder: services.watchedMusicFolder
         )
+    }
+
+    private func resolve(group: DuplicateFinder.DuplicateGroup) async {
+        guard let keeperId = effectiveKeeperId(for: group) else {
+            actionError = "No keeper could be determined for this group."
+            return
+        }
+        isResolving = true
+        defer { isResolving = false }
+        actionError = nil
+        lastResolution = nil
+
+        let resolver = DuplicateResolver(operationEngine: services.operationEngine)
+        do {
+            let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
+            lastResolution = "Moved \(outcome.trashedCount) duplicate\(outcome.trashedCount == 1 ? "" : "s") to Trash"
+            await rescan()
+        } catch {
+            actionError = "Resolve failed: \(error.localizedDescription)"
+        }
     }
 }
 

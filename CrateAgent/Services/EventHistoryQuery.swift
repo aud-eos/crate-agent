@@ -105,6 +105,9 @@ public enum EventHistoryQuery {
         // removeTrackFromSerato FFI we don't have yet).
         let unsupportedRaw: Set<String> = [
             EventType.trackAddedToSerato.rawValue,
+            EventType.fileTrashed.rawValue,
+            EventType.trackRemovedFromSerato.rawValue,
+            EventType.fileRemovedFromCrates.rawValue,
         ]
         return !typeList.contains(where: unsupportedRaw.contains)
     }
@@ -139,6 +142,12 @@ public enum EventHistoryQuery {
             return "Committed metadata to Serato for \(count) file\(pluralS)"
         case .fileTagsWritten:
             return "Wrote audio tags on \(count) file\(pluralS)"
+        case .fileTrashed:
+            return "Moved \(count) file\(pluralS) to Trash"
+        case .trackRemovedFromSerato:
+            return "Removed \(count) track\(pluralS) from Serato's database"
+        case .fileRemovedFromCrates:
+            return "Removed \(count) file\(pluralS) from Serato crates"
         case .trackAddedToSerato:
             return "Added \(count) track\(pluralS) to Serato"
         }

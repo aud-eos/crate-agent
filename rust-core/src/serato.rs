@@ -225,6 +225,37 @@ fn track_paths_in_otrks(records: &[TlvRecord], path_tag: &[u8; 4]) -> Vec<String
 /// with one whose `path_tag` payload encodes `new_path`. Preserves all
 /// other fields nested inside the `otrk` container byte-exact. Returns
 /// the number of `otrk` records whose path was rewritten.
+/// Drop every top-level `otrk` whose path field (`pfil` for
+/// database V2, `ptrk` for `.crate`) matches `target_path`.
+/// Non-otrk records and otrks pointing elsewhere are preserved
+/// byte-exact. Returns the count of otrks removed.
+fn remove_otrks_referencing_path(
+    records: &mut Vec<TlvRecord>,
+    path_tag: &[u8; 4],
+    target_path: &str,
+) -> usize {
+    let original_len = records.len();
+    records.retain(|record| {
+        if &record.tag != TAG_OTRK {
+            return true;
+        }
+        let Ok(nested) = TlvRecord::parse_all(&record.payload) else {
+            // Unparseable otrk: preserve verbatim. Better to leave a
+            // weird-but-existing entry alone than to drop something
+            // we don't understand.
+            return true;
+        };
+        let matches = nested.iter().any(|nested_record| {
+            if nested_record.tag != *path_tag {
+                return false;
+            }
+            decode_utf16be(&nested_record.payload).as_deref() == Some(target_path)
+        });
+        !matches
+    });
+    original_len - records.len()
+}
+
 fn rewrite_path_in_otrks(
     records: &mut [TlvRecord],
     path_tag: &[u8; 4],
@@ -300,6 +331,15 @@ impl CrateFile {
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
         rewrite_path_in_otrks(&mut self.records, TAG_PTRK, old_path, new_path)
     }
+
+    /// Drop every otrk in this crate whose `ptrk` points at
+    /// `target_path`. Used by the duplicate-resolver after the file
+    /// has been trashed so the crate no longer holds a broken
+    /// reference. Other otrks in the crate (and non-otrk records)
+    /// are preserved byte-exact.
+    pub fn remove_track(&mut self, target_path: &str) -> usize {
+        remove_otrks_referencing_path(&mut self.records, TAG_PTRK, target_path)
+    }
 }
 
 /// A parsed Serato `database V2` file. Same TLV container format as a
@@ -357,6 +397,16 @@ impl DatabaseV2 {
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
         rewrite_path_in_otrks(&mut self.records, TAG_PFIL, old_path, new_path)
+    }
+
+    /// Drop every otrk whose `pfil` points at `target_path`. Used
+    /// by the duplicate-resolver after the file has been trashed.
+    /// Like `update_track_metadata` / `add_track`, must only be
+    /// called while Serato is NOT running — Serato caches the
+    /// library in memory and overwrites the disk version on save.
+    /// The Swift caller gates via `SeratoWatchdog`.
+    pub fn remove_track(&mut self, target_path: &str) -> usize {
+        remove_otrks_referencing_path(&mut self.records, TAG_PFIL, target_path)
     }
 
     /// Number of `otrk` track entries in the database. Useful for
@@ -1042,6 +1092,80 @@ mod tests {
         assert!(bare.artist.is_none());
         assert!(bare.title.is_none());
         assert!(bare.bpm.is_none());
+    }
+
+    #[test]
+    fn remove_track_drops_matching_otrk_from_database() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &[
+                "Users/x/Music/A/keep1.mp3",
+                "Users/x/Music/A/remove.mp3",
+                "Users/x/Music/A/keep2.mp3",
+            ],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let removed = database.remove_track("Users/x/Music/A/remove.mp3");
+        assert_eq!(removed, 1);
+        assert_eq!(database.track_count(), 2);
+        let after = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
+        let paths = after.track_paths();
+        assert!(paths.contains(&"Users/x/Music/A/keep1.mp3".to_string()));
+        assert!(paths.contains(&"Users/x/Music/A/keep2.mp3".to_string()));
+        assert!(!paths.contains(&"Users/x/Music/A/remove.mp3".to_string()));
+    }
+
+    #[test]
+    fn remove_track_returns_zero_for_unknown_path_in_database() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/Track.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let removed = database.remove_track("Users/x/Music/A/nonexistent.mp3");
+        assert_eq!(removed, 0);
+        assert_eq!(database.track_count(), 1, "no otrks dropped on a miss");
+    }
+
+    #[test]
+    fn remove_track_drops_matching_otrk_from_crate() {
+        // Build a synthetic crate file (TAG_PTRK as the path tag).
+        let bytes = synthetic_library(
+            "1.0/Serato ScratchLive Crate",
+            TAG_PTRK,
+            &[
+                "Users/x/Music/A/keep.mp3",
+                "Users/x/Music/A/remove.mp3",
+            ],
+        );
+        let mut crate_file = CrateFile::from_bytes(&bytes).unwrap();
+        let removed = crate_file.remove_track("Users/x/Music/A/remove.mp3");
+        assert_eq!(removed, 1);
+        let after = CrateFile::from_bytes(&crate_file.to_bytes().unwrap()).unwrap();
+        let paths = after.track_paths();
+        assert_eq!(paths, vec!["Users/x/Music/A/keep.mp3"]);
+    }
+
+    #[test]
+    fn remove_track_preserves_non_otrk_records_in_database() {
+        // The synthetic_library helper produces vrsn + otrk records.
+        // Removing all otrks must leave vrsn intact.
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/only.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let removed = database.remove_track("Users/x/Music/A/only.mp3");
+        assert_eq!(removed, 1);
+        let after = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
+        // Database has no otrks left but the vrsn header survived.
+        assert_eq!(after.track_count(), 0);
+        // Reading via track_records returns empty (no otrks) but the
+        // file still serializes without errors — proves vrsn is intact.
+        assert!(after.to_bytes().is_ok());
     }
 
     #[test]

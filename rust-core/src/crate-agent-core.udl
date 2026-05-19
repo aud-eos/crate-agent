@@ -35,6 +35,25 @@ namespace crate_agent_core {
   [Throws=CoreError]
   u32 rewrite_database_path(string database_path, string old_path, string new_path);
 
+  // Remove every `otrk` from `database V2` whose `pfil` matches
+  // `track_path`. Used by crate-agent's duplicate-resolver after
+  // the file has been trashed so Serato doesn't show a broken
+  // reference. Other otrks (and non-otrk records like vrsn) are
+  // preserved byte-exact. Returns the number of otrks dropped.
+  //
+  // Same SeratoWatchdog gating as update/add — Serato must NOT be
+  // running. Otherwise Serato overwrites the file from its in-memory
+  // cache, undoing the removal.
+  [Throws=CoreError]
+  u32 remove_track_from_database(string database_path, string track_path);
+
+  // Remove every `otrk` from the given `.crate` file whose `ptrk`
+  // matches `track_path`. Sweep this across every `.crate` in the
+  // Subcrates directory to fully de-register a deleted file.
+  // Returns the number of entries removed from this one file.
+  [Throws=CoreError]
+  u32 remove_path_from_crate(string crate_path, string track_path);
+
   // Number of `otrk` entries in a `database V2` file. Useful for
   // progress reporting on full library scans.
   [Throws=CoreError]
