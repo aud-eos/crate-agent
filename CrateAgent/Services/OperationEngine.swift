@@ -174,6 +174,11 @@ public actor OperationEngine {
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(eventId: eventId, seratoRename: seratoRename)
+        case .setMetadata(let payload):
+            let eventId = try applySetMetadata(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(eventId: eventId, seratoRename: nil)
         }
     }
 
@@ -190,7 +195,16 @@ public actor OperationEngine {
             fileSize: payload.fileSize,
             mtime: payload.mtime,
             lightweightHash: payload.lightweightHash,
-            fingerprintStatus: .pending
+            fingerprintStatus: .pending,
+            artist: payload.metadata.artist,
+            title: payload.metadata.title,
+            album: payload.metadata.album,
+            genre: payload.metadata.genre,
+            bpm: payload.metadata.bpm,
+            musicalKey: payload.metadata.musicalKey,
+            comment: payload.metadata.comment,
+            length: payload.metadata.length,
+            label: payload.metadata.label
         )
         try fileRecord.insert(db)
         guard let fileId = fileRecord.id else {
@@ -204,6 +218,61 @@ public actor OperationEngine {
             eventType: .trackImported,
             forwardPayload: payload,
             inversePayload: RemoveFilePayload(fileId: fileId),
+            in: db
+        )
+    }
+
+    private static func applySetMetadata(
+        _ payload: SetMetadataPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> Int64 {
+        guard var fileRecord = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+
+        let originalMetadata = SeratoMetadata(
+            artist: fileRecord.artist,
+            title: fileRecord.title,
+            album: fileRecord.album,
+            genre: fileRecord.genre,
+            bpm: fileRecord.bpm,
+            musicalKey: fileRecord.musicalKey,
+            comment: fileRecord.comment,
+            length: fileRecord.length,
+            label: fileRecord.label
+        )
+
+        fileRecord.artist = payload.metadata.artist
+        fileRecord.title = payload.metadata.title
+        fileRecord.album = payload.metadata.album
+        fileRecord.genre = payload.metadata.genre
+        fileRecord.bpm = payload.metadata.bpm
+        fileRecord.musicalKey = payload.metadata.musicalKey
+        fileRecord.comment = payload.metadata.comment
+        fileRecord.length = payload.metadata.length
+        fileRecord.label = payload.metadata.label
+        try fileRecord.update(db)
+
+        let forwardPayload = SetMetadataPayload(
+            fileId: payload.fileId,
+            metadata: payload.metadata,
+            previousMetadata: originalMetadata
+        )
+        let inversePayload = SetMetadataPayload(
+            fileId: payload.fileId,
+            metadata: originalMetadata,
+            previousMetadata: payload.metadata
+        )
+
+        return try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileId,
+            eventType: .metadataSet,
+            forwardPayload: forwardPayload,
+            inversePayload: inversePayload,
             in: db
         )
     }
@@ -290,6 +359,7 @@ public actor OperationEngine {
 public enum TrackMutation: Sendable {
     case indexNewFile(IndexNewFilePayload)
     case renameFile(RenameFilePayload)
+    case setMetadata(SetMetadataPayload)
 }
 
 public struct IndexNewFilePayload: Codable, Sendable, Equatable {
@@ -299,6 +369,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
     public let fileSize: Int64
     public let mtime: Int64
     public let lightweightHash: Data?
+    public let metadata: SeratoMetadata
 
     public init(
         path: String,
@@ -306,7 +377,8 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         inode: Int64,
         fileSize: Int64,
         mtime: Int64,
-        lightweightHash: Data? = nil
+        lightweightHash: Data? = nil,
+        metadata: SeratoMetadata = .empty
     ) {
         self.path = path
         self.volumeUuid = volumeUuid
@@ -314,6 +386,65 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         self.fileSize = fileSize
         self.mtime = mtime
         self.lightweightHash = lightweightHash
+        self.metadata = metadata
+    }
+}
+
+/// Mirror of Serato's per-track metadata. Stored as strings even
+/// for numeric-ish fields (`bpm`, `length`) because Serato stores
+/// them that way ("128.000", "03:24") — round-trip lossless.
+public struct SeratoMetadata: Codable, Sendable, Equatable, Hashable {
+    public var artist: String?
+    public var title: String?
+    public var album: String?
+    public var genre: String?
+    public var bpm: String?
+    public var musicalKey: String?
+    public var comment: String?
+    public var length: String?
+    public var label: String?
+
+    public init(
+        artist: String? = nil,
+        title: String? = nil,
+        album: String? = nil,
+        genre: String? = nil,
+        bpm: String? = nil,
+        musicalKey: String? = nil,
+        comment: String? = nil,
+        length: String? = nil,
+        label: String? = nil
+    ) {
+        self.artist = artist
+        self.title = title
+        self.album = album
+        self.genre = genre
+        self.bpm = bpm
+        self.musicalKey = musicalKey
+        self.comment = comment
+        self.length = length
+        self.label = label
+    }
+
+    public static let empty = SeratoMetadata()
+}
+
+public struct SetMetadataPayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public let metadata: SeratoMetadata
+    /// Engine populates this at apply time from the row's current
+    /// state. Callers pass `.empty` for forward invocation; the
+    /// engine swaps it for the real previous values before journaling.
+    public let previousMetadata: SeratoMetadata
+
+    public init(
+        fileId: Int64,
+        metadata: SeratoMetadata,
+        previousMetadata: SeratoMetadata = .empty
+    ) {
+        self.fileId = fileId
+        self.metadata = metadata
+        self.previousMetadata = previousMetadata
     }
 }
 

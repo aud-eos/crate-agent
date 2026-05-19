@@ -7,7 +7,7 @@ import Foundation
 extension FileRecord {
 
     /// Final path component, e.g. "Track Name.mp3". Used as the
-    /// primary identifier shown in the library browser table.
+    /// fallback display when no `title` metadata is present.
     public var filenameOnly: String {
         (path as NSString).lastPathComponent
     }
@@ -24,4 +24,17 @@ extension FileRecord {
     public var fingerprintStatusRawValue: String {
         fingerprintStatus.rawValue
     }
+
+    // SwiftUI's TableColumn sort keypaths require a Comparable value.
+    // Optional Strings are NOT Comparable (Optional gets Equatable
+    // and Hashable but not Comparable), so the table sort comparators
+    // can't take `\.artist` directly. These projections return "" for
+    // nil so nil sorts first alphabetically — matches user
+    // expectations for sparse columns.
+    public var artistOrEmpty: String { artist ?? "" }
+    public var titleOrEmpty: String { title ?? "" }
+    public var albumOrEmpty: String { album ?? "" }
+    public var genreOrEmpty: String { genre ?? "" }
+    public var bpmOrEmpty: String { bpm ?? "" }
+    public var musicalKeyOrEmpty: String { musicalKey ?? "" }
 }

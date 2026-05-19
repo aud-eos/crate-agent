@@ -353,6 +353,60 @@ final class OperationEngineTests: XCTestCase {
         synthesizeCrateBytes(withTrackPaths: trackPaths)
     }
 
+    /// Synthesizes a Serato `database V2` file with one otrk per
+    /// supplied path. Optional `metadataByPath` attaches per-track
+    /// metadata fields for tests that exercise the scanner's
+    /// metadata-mirror behavior.
+    static func synthesizeDatabaseV2BytesForTest(
+        withTrackPaths trackPaths: [String],
+        metadataByPath: [String: SeratoMetadata] = [:]
+    ) -> Data {
+        var data = Data()
+        appendTlvRecord(
+            tag: "vrsn",
+            payload: utf16BeBytes(of: "2.0/Serato Scratch LIVE Database"),
+            to: &data
+        )
+
+        for trackPath in trackPaths {
+            var otrkPayload = Data()
+            appendTlvRecord(tag: "pfil", payload: utf16BeBytes(of: trackPath), to: &otrkPayload)
+
+            if let metadata = metadataByPath[trackPath] {
+                if let value = metadata.artist {
+                    appendTlvRecord(tag: "tart", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.title {
+                    appendTlvRecord(tag: "tsng", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.album {
+                    appendTlvRecord(tag: "talb", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.genre {
+                    appendTlvRecord(tag: "tgen", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.bpm {
+                    appendTlvRecord(tag: "tbpm", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.musicalKey {
+                    appendTlvRecord(tag: "tkey", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.comment {
+                    appendTlvRecord(tag: "tcom", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.length {
+                    appendTlvRecord(tag: "tlen", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+                if let value = metadata.label {
+                    appendTlvRecord(tag: "tlbl", payload: utf16BeBytes(of: value), to: &otrkPayload)
+                }
+            }
+
+            appendTlvRecord(tag: "otrk", payload: otrkPayload, to: &data)
+        }
+        return data
+    }
+
     /// TLV-format `.crate` file with a version header + one `otrk` per
     /// path containing a UTF-16BE `ptrk` payload. Mirrors the Rust
     /// `synthetic_library` test helper so behavior is consistent
@@ -425,12 +479,13 @@ final class LibraryScannerTests: XCTestCase {
     ///   - real audio files at the given absolute paths (so stat
     ///     returns valid metadata for indexing)
     ///   - a synthetic Serato library at `seratoDirectory` whose
-    ///     .crate file references those same paths in the Serato-
+    ///     `database V2` references those same paths in the Serato-
     ///     relative form crate-agent decodes
-    /// Returns the seratoDirectory URL plus the absolute paths the
-    /// scanner should index.
+    /// Optional `metadataByAbsolutePath` attaches metadata fields per
+    /// track for tests that check the scanner's metadata mirroring.
     private func makeSeratoFixture(
-        absoluteFilePaths: [String]
+        absoluteFilePaths: [String],
+        metadataByAbsolutePath: [String: SeratoMetadata] = [:]
     ) throws -> (seratoDirectory: URL, absoluteFilePaths: [String]) {
         for filePath in absoluteFilePaths {
             let parentDir = (filePath as NSString).deletingLastPathComponent
@@ -443,20 +498,27 @@ final class LibraryScannerTests: XCTestCase {
         let testRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("crate-agent-test-scanner-\(UUID().uuidString)", isDirectory: true)
         let seratoDirectory = testRoot.appendingPathComponent("_Serato_", isDirectory: true)
-        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
         try FileManager.default.createDirectory(
-            at: subcratesDirectory, withIntermediateDirectories: true
+            at: seratoDirectory, withIntermediateDirectories: true
         )
 
         // Convert absolute paths to Serato's relative form
-        // (`Users/x/...`) — strip the leading slash.
+        // (`Users/x/...`) by stripping the leading slash. Then build
+        // the database V2 file (Serato's source of truth for the
+        // scanner) at `_Serato_/database V2`.
         let seratoRelativePaths = absoluteFilePaths.map { path -> String in
             path.hasPrefix("/") ? String(path.dropFirst()) : path
         }
-        let crateBytes = OperationEngineTests.synthesizeCrateBytesForTest(
-            withTrackPaths: seratoRelativePaths
+        var metadataByRelativePath: [String: SeratoMetadata] = [:]
+        for (absolute, metadata) in metadataByAbsolutePath {
+            let relative = absolute.hasPrefix("/") ? String(absolute.dropFirst()) : absolute
+            metadataByRelativePath[relative] = metadata
+        }
+        let databaseBytes = OperationEngineTests.synthesizeDatabaseV2BytesForTest(
+            withTrackPaths: seratoRelativePaths,
+            metadataByPath: metadataByRelativePath
         )
-        try crateBytes.write(to: subcratesDirectory.appendingPathComponent("Test.crate"))
+        try databaseBytes.write(to: seratoDirectory.appendingPathComponent("database V2"))
         return (seratoDirectory, absoluteFilePaths)
     }
 
@@ -500,14 +562,14 @@ final class LibraryScannerTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent()) }
 
-        // Manually add the phantom path to the .crate so Serato
+        // Manually add the phantom path to the database V2 so Serato
         // references it even though the file doesn't exist.
-        let crateFileUrl = seratoDirectory.appendingPathComponent("Subcrates/Test.crate")
+        let databaseV2Url = seratoDirectory.appendingPathComponent("database V2")
         let seratoRelativePaths = [realFile, phantomFile].map { String($0.dropFirst()) }
-        let updatedCrateBytes = OperationEngineTests.synthesizeCrateBytesForTest(
+        let updatedDatabaseBytes = OperationEngineTests.synthesizeDatabaseV2BytesForTest(
             withTrackPaths: seratoRelativePaths
         )
-        try updatedCrateBytes.write(to: crateFileUrl)
+        try updatedDatabaseBytes.write(to: databaseV2Url)
 
         let (scanner, database) = try await MainActor.run {
             try makeScanner(seratoDirectory: seratoDirectory)
@@ -521,6 +583,99 @@ final class LibraryScannerTests: XCTestCase {
             try String.fetchAll(db, sql: "SELECT path FROM files")
         }
         XCTAssertEqual(indexedPaths, [realFile])
+    }
+
+    func testScanPopulatesMetadataFromSeratoOnInitialIndex() async throws {
+        let scratchDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-meta-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratchDirectory) }
+
+        let absolutePath = scratchDirectory.appendingPathComponent("Track.mp3").path
+        let serataMetadata = SeratoMetadata(
+            artist: "Some Artist",
+            title: "Some Title",
+            album: "Some Album",
+            genre: "House",
+            bpm: "128.000",
+            musicalKey: "Am",
+            comment: "track comment",
+            length: "03:24",
+            label: "Some Label"
+        )
+        let (seratoDirectory, _) = try makeSeratoFixture(
+            absoluteFilePaths: [absolutePath],
+            metadataByAbsolutePath: [absolutePath: serataMetadata]
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent()) }
+
+        let (scanner, database) = try await MainActor.run {
+            try makeScanner(seratoDirectory: seratoDirectory)
+        }
+        _ = try await scanner.scan()
+
+        let indexedFile = try await database.writer.read { db in
+            try FileRecord.fetchOne(db, sql: "SELECT * FROM files WHERE path = ?",
+                                    arguments: [absolutePath])
+        }
+        XCTAssertEqual(indexedFile?.artist, "Some Artist")
+        XCTAssertEqual(indexedFile?.title, "Some Title")
+        XCTAssertEqual(indexedFile?.album, "Some Album")
+        XCTAssertEqual(indexedFile?.genre, "House")
+        XCTAssertEqual(indexedFile?.bpm, "128.000")
+        XCTAssertEqual(indexedFile?.musicalKey, "Am")
+        XCTAssertEqual(indexedFile?.comment, "track comment")
+        XCTAssertEqual(indexedFile?.length, "03:24")
+        XCTAssertEqual(indexedFile?.label, "Some Label")
+    }
+
+    func testRescanFiresSetMetadataWhenSeratoMetadataChanges() async throws {
+        let scratchDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-meta-update-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratchDirectory) }
+
+        let absolutePath = scratchDirectory.appendingPathComponent("Track.mp3").path
+        let initialMetadata = SeratoMetadata(artist: "Initial Artist", bpm: "120.000")
+        let (seratoDirectory, _) = try makeSeratoFixture(
+            absoluteFilePaths: [absolutePath],
+            metadataByAbsolutePath: [absolutePath: initialMetadata]
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent()) }
+
+        let (scanner, database) = try await MainActor.run {
+            try makeScanner(seratoDirectory: seratoDirectory)
+        }
+        _ = try await scanner.scan()
+
+        // Simulate Serato editing the metadata between sessions by
+        // rewriting the database V2 with different field values.
+        let relativePath = String(absolutePath.dropFirst())
+        let updatedMetadata = SeratoMetadata(artist: "Updated Artist", bpm: "128.000")
+        let updatedDatabaseBytes = OperationEngineTests.synthesizeDatabaseV2BytesForTest(
+            withTrackPaths: [relativePath],
+            metadataByPath: [relativePath: updatedMetadata]
+        )
+        try updatedDatabaseBytes.write(to: seratoDirectory.appendingPathComponent("database V2"))
+
+        let result = try await scanner.scan()
+        XCTAssertEqual(result.filesIndexed, 0, "no new files this rescan")
+        XCTAssertEqual(result.filesMetadataUpdated, 1, "one metadata change must be applied")
+
+        let updatedFile = try await database.writer.read { db in
+            try FileRecord.fetchOne(db, sql: "SELECT * FROM files WHERE path = ?",
+                                    arguments: [absolutePath])
+        }
+        XCTAssertEqual(updatedFile?.artist, "Updated Artist")
+        XCTAssertEqual(updatedFile?.bpm, "128.000")
+
+        // A metadata_set event should have been logged with both
+        // forward and inverse payloads.
+        let event = try await database.writer.read { db in
+            try EventRecord.filter(Column("event_type") == EventType.metadataSet.rawValue)
+                .fetchOne(db)
+        }
+        XCTAssertNotNil(event)
+        XCTAssertFalse(event?.payloadJson.isEmpty ?? true)
+        XCTAssertFalse(event?.inversePayloadJson.isEmpty ?? true)
     }
 
     func testRescanDoesNotDuplicateAlreadyKnownFiles() async throws {

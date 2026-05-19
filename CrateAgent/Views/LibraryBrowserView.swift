@@ -16,7 +16,12 @@ struct LibraryBrowserView: View {
             filtered = files
         } else {
             let needle = searchText.lowercased()
-            filtered = files.filter { $0.path.lowercased().contains(needle) }
+            filtered = files.filter { record in
+                record.path.lowercased().contains(needle)
+                    || (record.artist?.lowercased().contains(needle) ?? false)
+                    || (record.title?.lowercased().contains(needle) ?? false)
+                    || (record.album?.lowercased().contains(needle) ?? false)
+            }
         }
         return filtered.sorted(using: sortOrder)
     }
@@ -43,7 +48,7 @@ struct LibraryBrowserView: View {
         HStack(spacing: 12) {
             if let progress = services.scanProgress, !services.initialScanComplete {
                 ProgressView().controlSize(.small)
-                Text("Indexing Serato library… \(progress.filesIndexed) of \(progress.seratoReferenceCount)")
+                Text("Syncing from Serato… \(progress.filesIndexed) new, \(progress.filesMetadataUpdated) updated, of \(progress.seratoReferenceCount)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             } else if services.initialScanComplete {
@@ -79,36 +84,53 @@ struct LibraryBrowserView: View {
     @ViewBuilder
     private var tableSection: some View {
         Table(filteredSortedFiles, sortOrder: $sortOrder) {
-            TableColumn("Filename", value: \.filenameOnly)
-                .width(min: 200, ideal: 320)
+            TableColumn("Artist", value: \.artistOrEmpty) { file in
+                Text(file.artist ?? "—")
+                    .foregroundStyle(file.artist == nil ? .tertiary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .width(min: 140, ideal: 220)
+
+            TableColumn("Title", value: \.titleOrEmpty) { file in
+                Text(file.title ?? file.filenameOnly)
+                    .foregroundStyle(file.title == nil ? .secondary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .width(min: 180, ideal: 280)
+
+            TableColumn("BPM", value: \.bpmOrEmpty) { file in
+                Text(file.bpm ?? "")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 50, ideal: 70)
+
+            TableColumn("Key", value: \.musicalKeyOrEmpty) { file in
+                Text(file.musicalKey ?? "")
+                    .monospaced()
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 40, ideal: 50)
+
+            TableColumn("Album", value: \.albumOrEmpty) { file in
+                Text(file.album ?? "")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 140, ideal: 200)
 
             TableColumn("Folder", value: \.folderPath) { file in
                 Text(file.folderPath)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.tertiary)
             }
-            .width(min: 200, ideal: 360)
-
-            TableColumn("Size", value: \.fileSize) { file in
-                Text(byteFormatter.string(fromByteCount: file.fileSize))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 70, ideal: 90)
-
-            TableColumn("Modified", value: \.mtime) { file in
-                Text(Self.formatModified(file.mtime))
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 130, ideal: 150)
-
-            TableColumn("Status", value: \.fingerprintStatusRawValue) { file in
-                fingerprintBadge(for: file.fingerprintStatus)
-            }
-            .width(min: 80, ideal: 100)
+            .width(min: 140, ideal: 240)
         }
-        .searchable(text: $searchText, prompt: "Filter by path…")
+        .searchable(text: $searchText, prompt: "Filter by artist, title, album, or path…")
     }
 
     @ViewBuilder
@@ -124,27 +146,6 @@ struct LibraryBrowserView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-    }
-
-    @ViewBuilder
-    private func fingerprintBadge(for status: FingerprintStatus) -> some View {
-        switch status {
-        case .pending:
-            Label("pending", systemImage: "circle.dashed")
-                .labelStyle(.iconOnly)
-                .foregroundStyle(.tertiary)
-                .help("Fingerprinting pending")
-        case .done:
-            Label("done", systemImage: "checkmark.circle.fill")
-                .labelStyle(.iconOnly)
-                .foregroundStyle(.green)
-                .help("Fingerprint complete")
-        case .failed:
-            Label("failed", systemImage: "exclamationmark.triangle.fill")
-                .labelStyle(.iconOnly)
-                .foregroundStyle(.red)
-                .help("Fingerprinting failed")
-        }
     }
 
     private func observeFiles() async {
@@ -169,16 +170,4 @@ struct LibraryBrowserView: View {
         formatter.allowsNonnumericFormatting = false
         return formatter
     }()
-
-    private static let dateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        return formatter
-    }()
-
-    private static func formatModified(_ mtimeSeconds: Int64) -> String {
-        let date = Date(timeIntervalSince1970: TimeInterval(mtimeSeconds))
-        return Self.dateFormatter.string(from: date)
-    }
 }
