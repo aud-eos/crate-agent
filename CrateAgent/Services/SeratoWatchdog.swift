@@ -28,10 +28,23 @@ public final class SeratoWatchdog: ObservableObject {
     private let runningBundleIdentifiersProvider: () -> [String]
     private var observers: [NSObjectProtocol] = []
 
+    /// Pass `nil` (or rely on the default) for production behavior —
+    /// reads NSWorkspace.shared.runningApplications. Tests pass a
+    /// closure that returns the set they want to simulate.
+    ///
+    /// The provider is resolved inside init rather than via a default
+    /// argument that references `defaultRunningBundleIdentifiersProvider`
+    /// because the latter was a MainActor-isolated static property,
+    /// which Swift 6 strict-concurrency rejects when referenced from
+    /// a default-argument expression.
     public init(
-        runningBundleIdentifiersProvider: @escaping () -> [String] = SeratoWatchdog.defaultRunningBundleIdentifiersProvider
+        runningBundleIdentifiersProvider customProvider: (() -> [String])? = nil
     ) {
-        self.runningBundleIdentifiersProvider = runningBundleIdentifiersProvider
+        self.runningBundleIdentifiersProvider = customProvider ?? {
+            NSWorkspace.shared.runningApplications.compactMap { app in
+                app.bundleIdentifier
+            }
+        }
         refresh()
     }
 
@@ -76,9 +89,4 @@ public final class SeratoWatchdog: ObservableObject {
         }
     }
 
-    public static let defaultRunningBundleIdentifiersProvider: () -> [String] = {
-        NSWorkspace.shared.runningApplications.compactMap { app in
-            app.bundleIdentifier
-        }
-    }
 }
