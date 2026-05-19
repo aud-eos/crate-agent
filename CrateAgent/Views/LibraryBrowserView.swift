@@ -3,9 +3,9 @@ import SwiftUI
 
 struct LibraryBrowserView: View {
     @EnvironmentObject private var services: AppServices
-    @State private var files: [FileRecord] = []
-    @State private var sortOrder: [KeyPathComparator<FileRecord>] = [
-        KeyPathComparator(\.path, order: .forward)
+    @State private var files: [BrowserRow] = []
+    @State private var sortOrder: [KeyPathComparator<BrowserRow>] = [
+        KeyPathComparator(\BrowserRow.path, order: .forward)
     ]
     @State private var searchText: String = ""
     @State private var showRestartAlert: Bool = false
@@ -14,31 +14,41 @@ struct LibraryBrowserView: View {
     @State private var showHistorySheet: Bool = false
     @State private var showCleanupSheet: Bool = false
     @State private var renameTarget: FileRecord?
-    @State private var selectedFileIds: Set<FileRecord.ID> = []
+    @State private var selectedFileIds: Set<BrowserRow.ID> = []
 
-    private var filteredSortedFiles: [FileRecord] {
-        let filtered: [FileRecord]
+    /// Compute the filtered + sorted slice. Heavy on a 32k-row
+    /// library; called once per body re-evaluation (captured into a
+    /// `let` in `body`) so the Table cells and the footer count
+    /// share the result instead of recomputing it twice.
+    private func computeFilteredSorted() -> [BrowserRow] {
+        let filtered: [BrowserRow]
         if searchText.isEmpty {
             filtered = files
         } else {
             let needle = searchText.lowercased()
-            filtered = files.filter { record in
-                record.path.lowercased().contains(needle)
-                    || (record.artist?.lowercased().contains(needle) ?? false)
-                    || (record.title?.lowercased().contains(needle) ?? false)
-                    || (record.album?.lowercased().contains(needle) ?? false)
+            filtered = files.filter { row in
+                row.path.lowercased().contains(needle)
+                    || (row.artist?.lowercased().contains(needle) ?? false)
+                    || (row.title?.lowercased().contains(needle) ?? false)
+                    || (row.album?.lowercased().contains(needle) ?? false)
             }
         }
         return filtered.sorted(using: sortOrder)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        // Compute the filtered+sorted slice exactly once per render.
+        // Previously this was a computed property called from both
+        // `tableSection` and `footer`, so it ran twice on every body
+        // re-eval — for a 32k-row library that meant ~200 ms × 2
+        // burned on every observation tick.
+        let filteredSortedFiles = computeFilteredSorted()
+        return VStack(spacing: 0) {
             statusHeader
             Divider()
-            tableSection
+            tableSection(rows: filteredSortedFiles)
             Divider()
-            footer
+            footer(visibleCount: filteredSortedFiles.count)
         }
         .frame(minWidth: 920, minHeight: 600)
         .task { await observeFiles() }
@@ -157,8 +167,8 @@ struct LibraryBrowserView: View {
     }
 
     @ViewBuilder
-    private var tableSection: some View {
-        Table(filteredSortedFiles, selection: $selectedFileIds, sortOrder: $sortOrder) {
+    private func tableSection(rows: [BrowserRow]) -> some View {
+        Table(rows, selection: $selectedFileIds, sortOrder: $sortOrder) {
             TableColumn("Artist", value: \.artistOrEmpty) { file in
                 Text(file.artist ?? "—")
                     .foregroundStyle(file.artist == nil ? .tertiary : .primary)
@@ -206,25 +216,44 @@ struct LibraryBrowserView: View {
             .width(min: 140, ideal: 240)
         }
         .searchable(text: $searchText, prompt: "Filter by artist, title, album, or path…")
-        .contextMenu(forSelectionType: FileRecord.ID.self) { selectedIds in
+        .contextMenu(forSelectionType: BrowserRow.ID.self) { selectedIds in
             if let singleId = selectedIds.first, selectedIds.count == 1,
-               let file = filteredSortedFiles.first(where: { $0.id == singleId }) {
+               let row = rows.first(where: { $0.id == singleId }) {
                 Button("Rename…") {
-                    renameTarget = file
+                    Task { await openRenameDialog(forRowId: row.id) }
                 }
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting(
-                        [URL(fileURLWithPath: file.path)]
+                        [URL(fileURLWithPath: row.path)]
                     )
                 }
             }
         }
     }
 
+    /// Fetch the full `FileRecord` on demand (rename dialog needs
+    /// the un-trimmed metadata, hash, etc.) and present the sheet.
+    /// Browser uses `BrowserRow` for the table to keep observation
+    /// cheap; this is the bridge back to a full record when the
+    /// user actually acts on a row.
+    private func openRenameDialog(forRowId rowId: Int64) async {
+        do {
+            let record = try await services.database.writer.read { db in
+                try FileRecord.fetchOne(db, key: rowId)
+            }
+            if let record {
+                renameTarget = record
+            }
+        } catch {
+            // Defensive — if the row vanished between context menu
+            // open and the fetch, do nothing.
+        }
+    }
+
     @ViewBuilder
-    private var footer: some View {
+    private func footer(visibleCount: Int) -> some View {
         HStack {
-            Text("\(filteredSortedFiles.count.formatted()) of \(files.count.formatted()) files")
+            Text("\(visibleCount.formatted()) of \(files.count.formatted()) files")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
             if let summary = lastImportSummary {
@@ -245,9 +274,24 @@ struct LibraryBrowserView: View {
     }
 
     private func observeFiles() async {
-        let observation = ValueObservation.tracking { db in
-            try FileRecord.fetchAll(db)
-        }
+        // Lightweight projection: no BLOB columns, no metadata we
+        // don't render. On a 32k-row library this is the single
+        // biggest perceived-performance win — each fingerprint
+        // batch fired the previous observation against the full
+        // `FileRecord.fetchAll` (with `chromaprint_fingerprint`
+        // BLOBs ≈ 17 MB of decode), and the result rendered on
+        // MainActor.
+        //
+        // `removeDuplicates()` skips emissions where the projected
+        // row set is identical (e.g., a batch that wrote
+        // fingerprints to non-displayed columns — those columns
+        // aren't in BrowserRow so the projection is unchanged and
+        // the UI doesn't re-render).
+        let observation = ValueObservation
+            .tracking { db in
+                try BrowserRow.fetchAll(db, sql: BrowserRow.browserFetchSQL)
+            }
+            .removeDuplicates()
         do {
             for try await freshFiles in observation.values(in: services.database.writer) {
                 files = freshFiles
