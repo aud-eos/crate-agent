@@ -26,6 +26,16 @@ struct MenuBarStatusView: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
 
+            if services.pendingSeratoQueueDepth > 0 {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .foregroundStyle(.orange)
+                    Text("\(services.pendingSeratoQueueDepth) change\(services.pendingSeratoQueueDepth == 1 ? "" : "s") pending sync")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Divider()
             Button("Open Main Window") {
                 NSApp.activate(ignoringOtherApps: true)

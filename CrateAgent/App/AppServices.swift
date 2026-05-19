@@ -2,6 +2,8 @@ import Combine
 import Foundation
 import os.log
 
+// Bring `assign(to:&)` for @Published into scope.
+
 /// Top-level service container for the running application. Owns
 /// every long-lived component and wires them together at startup —
 /// the database, the Serato watchdog, the operation engine, both
@@ -35,6 +37,11 @@ public final class AppServices: ObservableObject {
     /// since launch. The UI can use this to distinguish "still
     /// scanning" from "library appears empty" states.
     @Published public private(set) var initialScanComplete: Bool = false
+
+    /// Number of Serato library rewrites currently queued because
+    /// Serato is running. Fed by `OperationEngine.queueDepthPublisher`
+    /// so the menu bar reflects state changes immediately.
+    @Published public private(set) var pendingSeratoQueueDepth: Int = 0
 
     private let seratoSyncCoordinator: SeratoSyncCoordinator
     private let fsEventsWatcher: FSEventsWatcher
@@ -120,6 +127,14 @@ public final class AppServices: ObservableObject {
         // All stored properties are now assigned; start lifecycle.
         seratoWatchdog.startObservingWorkspace()
         fsEventsWatcher.start()
+
+        // Bridge OperationEngine's queue-depth publisher into the
+        // @Published var so SwiftUI views observe it like any other
+        // ObservableObject state. .receive(on: DispatchQueue.main)
+        // ensures MainActor isolation for the assignment.
+        engine.queueDepthPublisher
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$pendingSeratoQueueDepth)
 
         Self.logger.info(
             "AppServices ready; watching \(watchedMusicFolder.path, privacy: .public)"

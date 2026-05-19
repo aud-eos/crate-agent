@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import GRDB
 
@@ -26,6 +27,20 @@ public actor OperationEngine {
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
     private var pendingSeratoRenames: [SeratoPendingRename] = []
+
+    /// Backing subject for `queueDepthPublisher`. CurrentValueSubject
+    /// emits the latest value on subscribe, so UI bindings render
+    /// with the correct depth at mount time rather than waiting for
+    /// the next mutation. Safe to send to from the actor's isolation
+    /// domain.
+    private let queueDepthSubject = CurrentValueSubject<Int, Never>(0)
+
+    /// Observable stream of `pendingSeratoRenames.count`. Emits a new
+    /// value after every enqueue and every drain step. UI subscribers
+    /// (e.g., the menu bar status item) display "N changes pending."
+    public nonisolated var queueDepthPublisher: AnyPublisher<Int, Never> {
+        queueDepthSubject.eraseToAnyPublisher()
+    }
 
     public init(
         database: LibraryDatabase,
@@ -58,6 +73,7 @@ public actor OperationEngine {
             let isSeratoRunning = await seratoWatchdog.isSeratoRunning
             if isSeratoRunning {
                 pendingSeratoRenames.append(seratoRename)
+                queueDepthSubject.send(pendingSeratoRenames.count)
             } else {
                 try await applySeratoRename(seratoRename)
             }
@@ -80,6 +96,7 @@ public actor OperationEngine {
         while let next = pendingSeratoRenames.first {
             try await applySeratoRename(next)
             pendingSeratoRenames.removeFirst()
+            queueDepthSubject.send(pendingSeratoRenames.count)
         }
     }
 
