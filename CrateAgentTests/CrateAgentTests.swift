@@ -344,6 +344,106 @@ final class OperationEngineTests: XCTestCase {
     }
 }
 
+final class FSEventsWatcherTests: XCTestCase {
+
+    func testObservationParsesCreatedFileFlag() {
+        let observation = FSEventsObservation(
+            path: "/tmp/a.mp3",
+            rawFlags: FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
+            )
+        )
+        XCTAssertTrue(observation.wasCreated)
+        XCTAssertTrue(observation.isFile)
+        XCTAssertFalse(observation.wasRenamed)
+        XCTAssertFalse(observation.wasRemoved)
+    }
+
+    func testObservationParsesRenamedDirectoryFlag() {
+        let observation = FSEventsObservation(
+            path: "/tmp/some-folder",
+            rawFlags: FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemIsDir
+            )
+        )
+        XCTAssertTrue(observation.wasRenamed)
+        XCTAssertTrue(observation.isDirectory)
+        XCTAssertFalse(observation.isFile)
+        XCTAssertFalse(observation.wasCreated)
+    }
+
+    func testObservationParsesMultipleFlagsAtOnce() {
+        // FSEvents coalesces multiple changes during the latency
+        // window into one event; the same observation can carry many
+        // flags simultaneously.
+        let observation = FSEventsObservation(
+            path: "/tmp/multi.mp3",
+            rawFlags: FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemCreated
+                    | kFSEventStreamEventFlagItemRenamed
+                    | kFSEventStreamEventFlagItemModified
+                    | kFSEventStreamEventFlagItemIsFile
+            )
+        )
+        XCTAssertTrue(observation.wasCreated)
+        XCTAssertTrue(observation.wasRenamed)
+        XCTAssertTrue(observation.wasModified)
+        XCTAssertTrue(observation.isFile)
+    }
+
+    func testWatchedDirectoryEmitsCreateEventForNewFile() throws {
+        let watchedDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-fsevents-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: watchedDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: watchedDirectory) }
+
+        // The expectation fulfills only when an observation matching
+        // our predicate arrives — not on every callback. Without this,
+        // FSEvents' first callback (often before our file write
+        // completes) would fulfill prematurely and the assertion
+        // would race against the actual create event.
+        let createObservedExpectation = expectation(
+            description: "create event observed for new-track.mp3"
+        )
+        createObservedExpectation.assertForOverFulfill = false
+
+        let observationLock = NSLock()
+        var observationsCollected: [FSEventsObservation] = []
+
+        let watcher = FSEventsWatcher(
+            watchedPaths: [watchedDirectory.path],
+            coalescingLatency: 0.05  // tight latency for test snappiness
+        ) { batch in
+            observationLock.lock()
+            observationsCollected.append(contentsOf: batch)
+            let matched = observationsCollected.contains {
+                $0.path.contains("new-track.mp3") && $0.wasCreated
+            }
+            observationLock.unlock()
+            if matched {
+                createObservedExpectation.fulfill()
+            }
+        }
+        watcher.start()
+        defer { watcher.stop() }
+
+        // Give FSEvents a moment to register the watch before
+        // triggering events; without this, the create can be missed.
+        Thread.sleep(forTimeInterval: 0.2)
+
+        let createdFile = watchedDirectory.appendingPathComponent("new-track.mp3")
+        try Data("test".utf8).write(to: createdFile)
+
+        let waitResult = XCTWaiter.wait(for: [createObservedExpectation], timeout: 3.0)
+        if waitResult != .completed {
+            observationLock.lock()
+            let snapshot = observationsCollected
+            observationLock.unlock()
+            XCTFail("expected create observation for new-track.mp3; got \(snapshot.count) observations: \(snapshot.map { "\($0.path) file=\($0.isFile) created=\($0.wasCreated)" })")
+        }
+    }
+}
+
 final class SeratoLibraryLocatorTests: XCTestCase {
 
     func testSeratoRelativePathStripsLeadingSlash() {
