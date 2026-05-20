@@ -30,6 +30,7 @@ public final class AppServices: ObservableObject {
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
+    public let activityLog: ActivityLog
 
     /// Latest progress from the running initial scan, or nil when no
     /// scan is in flight. Views observe via @Published.
@@ -81,6 +82,7 @@ public final class AppServices: ObservableObject {
         self.database = database
         self.seratoWatchdog = SeratoWatchdog()
         self.seratoLocator = try SeratoLibraryLocator.defaultLocation()
+        self.activityLog = ActivityLog()
 
         let engine = OperationEngine(
             database: database,
