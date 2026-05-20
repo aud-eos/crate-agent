@@ -47,7 +47,7 @@ struct LibraryHygieneView: View {
 private struct WhitespacePanel: View {
     @EnvironmentObject private var services: AppServices
 
-    @State private var files: [FileRecord] = []
+    @State private var files: [HygieneFileRow] = []
     @State private var issues: [LibraryHygiene.WhitespaceIssue] = []
     @State private var isScanning: Bool = false
     @State private var isFixing: Bool = false
@@ -128,7 +128,7 @@ private struct WhitespacePanel: View {
         actionError = nil
         do {
             files = try await services.database.writer.read { db in
-                try FileRecord.fetchAll(db)
+                try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
             issues = LibraryHygiene.findWhitespaceIssues(in: files)
         } catch {
@@ -162,7 +162,7 @@ private struct FindReplacePanel: View {
     @State private var replaceText: String = ""
     @State private var caseSensitive: Bool = false
     @State private var selectedFields: Set<SeratoMetadataField> = [.artist, .title, .album]
-    @State private var files: [FileRecord] = []
+    @State private var files: [HygieneFileRow] = []
     @State private var matches: [LibraryHygiene.FindAndReplaceMatch] = []
     @State private var selectedMatchIds: Set<String> = []
     @State private var isApplying: Bool = false
@@ -298,7 +298,7 @@ private struct FindReplacePanel: View {
     private func loadFiles() async {
         do {
             files = try await services.database.writer.read { db in
-                try FileRecord.fetchAll(db)
+                try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
             recomputeMatches()
         } catch {
@@ -346,7 +346,7 @@ private struct FindReplacePanel: View {
 private struct CaseConsistencyPanel: View {
     @EnvironmentObject private var services: AppServices
 
-    @State private var files: [FileRecord] = []
+    @State private var files: [HygieneFileRow] = []
     @State private var groups: [LibraryHygiene.CaseInconsistencyGroup] = []
     /// Per-group resolution: nil = leave alone, non-nil = user
     /// picked this variant as canonical. Keyed by group id so
@@ -499,7 +499,7 @@ private struct CaseConsistencyPanel: View {
         actionError = nil
         do {
             files = try await services.database.writer.read { db in
-                try FileRecord.fetchAll(db)
+                try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
             groups = LibraryHygiene.findCaseInconsistencies(in: files)
             // Drop resolutions for groups that no longer exist.
@@ -540,7 +540,7 @@ private struct CaseConsistencyPanel: View {
 private struct MissingFieldsPanel: View {
     @EnvironmentObject private var services: AppServices
 
-    @State private var files: [FileRecord] = []
+    @State private var files: [HygieneFileRow] = []
     @State private var summaries: [LibraryHygiene.MissingFieldSummary] = []
     @State private var selectedField: SeratoMetadataField = .artist
     @State private var fillValue: String = ""
@@ -723,7 +723,7 @@ private struct MissingFieldsPanel: View {
         actionError = nil
         do {
             files = try await services.database.writer.read { db in
-                try FileRecord.fetchAll(db)
+                try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
             summaries = LibraryHygiene.missingFieldSummaries(in: files)
             // If the previously-selected field has no gaps anymore,

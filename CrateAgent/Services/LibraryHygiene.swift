@@ -1,5 +1,31 @@
 import Foundation
 
+/// Shared protocol that both `FileRecord` and `HygieneFileRow`
+/// conform to. The analyzers and runner are generic over this so
+/// they can accept either a full record (production OperationEngine
+/// path; tests) or the lightweight projection used by Library
+/// Cleanup panels.
+///
+/// Fields list = exactly what the analyzers read: id + path + every
+/// text metadata column. No BLOBs, no identity fields, no
+/// fingerprint state.
+public protocol HygieneFileSource {
+    var id: Int64? { get }
+    var path: String { get }
+    var artist: String? { get }
+    var title: String? { get }
+    var album: String? { get }
+    var genre: String? { get }
+    var bpm: String? { get }
+    var musicalKey: String? { get }
+    var comment: String? { get }
+    var length: String? { get }
+    var label: String? { get }
+}
+
+extension FileRecord: HygieneFileSource {}
+extension HygieneFileRow: HygieneFileSource {}
+
 /// SP-1.5's library hygiene primitives. Pure-logic functions that
 /// scan the library for issues and produce structured fix lists
 /// the UI can preview and the operation engine can apply.
@@ -31,7 +57,7 @@ public enum LibraryHygiene {
     /// Internal whitespace is preserved — "Aphex   Twin" (collapsed
     /// double-space) is a separate concern (case/style normalization)
     /// and lives in a future analyzer.
-    public static func findWhitespaceIssues(in files: [FileRecord]) -> [WhitespaceIssue] {
+    public static func findWhitespaceIssues<F: HygieneFileSource>(in files: [F]) -> [WhitespaceIssue] {
         var issues: [WhitespaceIssue] = []
         for file in files {
             guard let fileId = file.id else { continue }
@@ -97,8 +123,8 @@ public enum LibraryHygiene {
     /// shows the user exactly what will land if they apply.
     /// Empty find string returns no matches (avoids the "match
     /// everything, rewrite to nothing" footgun).
-    public static func findAndReplaceMatches(
-        in files: [FileRecord],
+    public static func findAndReplaceMatches<F: HygieneFileSource>(
+        in files: [F],
         query: FindAndReplaceQuery
     ) -> [FindAndReplaceMatch] {
         guard !query.find.isEmpty else { return [] }
@@ -131,8 +157,8 @@ public enum LibraryHygiene {
     /// the find/replace matches that apply to it. Mirrors
     /// `mergedTrimmedMetadata` so the runner reuses one mutation
     /// per file regardless of how many fields matched.
-    public static func mergedFindReplaceMetadata(
-        forFile file: FileRecord,
+    public static func mergedFindReplaceMetadata<F: HygieneFileSource>(
+        forFile file: F,
         matches: [FindAndReplaceMatch]
     ) -> SeratoMetadata {
         var artist = file.artist
@@ -211,8 +237,8 @@ public enum LibraryHygiene {
     /// casings. Returns one CaseInconsistencyGroup per field × per
     /// case-insensitive value with >1 variant; groups with a single
     /// consistent spelling are not reported (nothing to fix).
-    public static func findCaseInconsistencies(
-        in files: [FileRecord]
+    public static func findCaseInconsistencies<F: HygieneFileSource>(
+        in files: [F]
     ) -> [CaseInconsistencyGroup] {
         var groups: [CaseInconsistencyGroup] = []
         for field in SeratoMetadataField.allCases {
@@ -274,12 +300,12 @@ public enum LibraryHygiene {
     /// value has drifted from the variant snapshot (rare but
     /// possible if the user edits in another flow between scan
     /// and apply).
-    public static func caseFixes(
+    public static func caseFixes<F: HygieneFileSource>(
         forGroups groups: [CaseInconsistencyGroup],
         canonicalFor: (CaseInconsistencyGroup) -> String?,
-        in files: [FileRecord]
+        in files: [F]
     ) -> [CaseFix] {
-        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, F)? in
             guard let identifier = file.id else { return nil }
             return (identifier, file)
         })
@@ -339,8 +365,8 @@ public enum LibraryHygiene {
 
     /// Roll up the count of missing rows per field. One pass over
     /// the file list; cheap enough to run on every tab activation.
-    public static func missingFieldSummaries(
-        in files: [FileRecord]
+    public static func missingFieldSummaries<F: HygieneFileSource>(
+        in files: [F]
     ) -> [MissingFieldSummary] {
         var counts: [SeratoMetadataField: Int] = [:]
         for file in files {
@@ -361,9 +387,9 @@ public enum LibraryHygiene {
     /// Detailed list of every file missing the specified field.
     /// Used to render the preview list once the user has picked a
     /// field to fill. Sorted by path for deterministic UI ordering.
-    public static func missingFieldEntries(
+    public static func missingFieldEntries<F: HygieneFileSource>(
         forField field: SeratoMetadataField,
-        in files: [FileRecord]
+        in files: [F]
     ) -> [MissingFieldEntry] {
         files.compactMap { file -> MissingFieldEntry? in
             guard let fileId = file.id else { return nil }
@@ -376,8 +402,8 @@ public enum LibraryHygiene {
     /// Compose the SeratoMetadata snapshot for one file when filling
     /// in a missing field. Sets exactly one field on the otherwise-
     /// preserved snapshot.
-    public static func mergedMissingFieldMetadata(
-        forFile file: FileRecord,
+    public static func mergedMissingFieldMetadata<F: HygieneFileSource>(
+        forFile file: F,
         field: SeratoMetadataField,
         value: String
     ) -> SeratoMetadata {
@@ -411,8 +437,8 @@ public enum LibraryHygiene {
     /// Compose the SeratoMetadata snapshot for one file given the
     /// case fixes against it. Same shape as the other mergedXxx
     /// helpers so the runner can route through `applyMergedMetadata`.
-    public static func mergedCaseMetadata(
-        forFile file: FileRecord,
+    public static func mergedCaseMetadata<F: HygieneFileSource>(
+        forFile file: F,
         fixes: [CaseFix]
     ) -> SeratoMetadata {
         var artist = file.artist
@@ -448,8 +474,8 @@ public enum LibraryHygiene {
     /// given the issues against it. Used by the runner to compose
     /// one `setMetadata` payload per file regardless of how many
     /// fields needed trimming.
-    public static func mergedTrimmedMetadata(
-        forFile file: FileRecord,
+    public static func mergedTrimmedMetadata<F: HygieneFileSource>(
+        forFile file: F,
         issues: [WhitespaceIssue]
     ) -> SeratoMetadata {
         var artist = file.artist
@@ -502,7 +528,7 @@ public enum SeratoMetadataField: String, CaseIterable, Sendable {
     case length
     case label
 
-    public func read(from file: FileRecord) -> String? {
+    public func read<F: HygieneFileSource>(from file: F) -> String? {
         switch self {
         case .artist: return file.artist
         case .title: return file.title
@@ -547,16 +573,16 @@ public actor LibraryHygieneRunner {
     }
 
     @discardableResult
-    public func applyWhitespaceFixes(
+    public func applyWhitespaceFixes<F: HygieneFileSource>(
         _ issues: [LibraryHygiene.WhitespaceIssue],
-        files: [FileRecord],
+        files: [F],
         batchId: String? = nil
     ) async throws -> String {
         guard !issues.isEmpty else { return batchId ?? "" }
 
         let effectiveBatchId = batchId ?? "hygiene-whitespace-\(UUID().uuidString)"
         let issuesByFileId = Dictionary(grouping: issues, by: \.fileId)
-        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, F)? in
             guard let identifier = file.id else { return nil }
             return (identifier, file)
         })
@@ -579,16 +605,16 @@ public actor LibraryHygieneRunner {
     }
 
     @discardableResult
-    public func applyFindAndReplaceFixes(
+    public func applyFindAndReplaceFixes<F: HygieneFileSource>(
         _ matches: [LibraryHygiene.FindAndReplaceMatch],
-        files: [FileRecord],
+        files: [F],
         batchId: String? = nil
     ) async throws -> String {
         guard !matches.isEmpty else { return batchId ?? "" }
 
         let effectiveBatchId = batchId ?? "hygiene-find-replace-\(UUID().uuidString)"
         let matchesByFileId = Dictionary(grouping: matches, by: \.fileId)
-        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, F)? in
             guard let identifier = file.id else { return nil }
             return (identifier, file)
         })
@@ -611,16 +637,16 @@ public actor LibraryHygieneRunner {
     }
 
     @discardableResult
-    public func applyCaseFixes(
+    public func applyCaseFixes<F: HygieneFileSource>(
         _ fixes: [LibraryHygiene.CaseFix],
-        files: [FileRecord],
+        files: [F],
         batchId: String? = nil
     ) async throws -> String {
         guard !fixes.isEmpty else { return batchId ?? "" }
 
         let effectiveBatchId = batchId ?? "hygiene-case-\(UUID().uuidString)"
         let fixesByFileId = Dictionary(grouping: fixes, by: \.fileId)
-        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, F)? in
             guard let identifier = file.id else { return nil }
             return (identifier, file)
         })
@@ -649,11 +675,11 @@ public actor LibraryHygieneRunner {
     /// scan-vs-apply race could otherwise overwrite a real value
     /// the user typed in elsewhere between scan and apply).
     @discardableResult
-    public func applyMissingFieldFill(
+    public func applyMissingFieldFill<F: HygieneFileSource>(
         field: SeratoMetadataField,
         value: String,
         fileIds: [Int64],
-        files: [FileRecord],
+        files: [F],
         batchId: String? = nil
     ) async throws -> String {
         let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -662,7 +688,7 @@ public actor LibraryHygieneRunner {
         }
 
         let effectiveBatchId = batchId ?? "hygiene-missing-\(UUID().uuidString)"
-        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, FileRecord)? in
+        let filesById = Dictionary(uniqueKeysWithValues: files.compactMap { file -> (Int64, F)? in
             guard let identifier = file.id else { return nil }
             return (identifier, file)
         })
@@ -700,9 +726,9 @@ public actor LibraryHygieneRunner {
     ///
     /// All three carry the pre-fix `previousMetadata` so each is
     /// individually invertible — see the matching engine extensions.
-    private func applyMergedMetadata(
+    private func applyMergedMetadata<F: HygieneFileSource>(
         fileId: Int64,
-        file: FileRecord,
+        file: F,
         merged: SeratoMetadata,
         batchId: String
     ) async throws {
