@@ -3,11 +3,25 @@ import SwiftUI
 
 struct LibraryBrowserView: View {
     @EnvironmentObject private var services: AppServices
-    @State private var files: [BrowserRow] = []
+
+    /// Hard cap on rows the table renders. SwiftUI Table doesn't scale
+    /// past ~10k items even with virtualization — diffing + accessibility
+    /// + Sendable copies of the array all touch every element. For DJ
+    /// libraries the user reaches into via search anyway; showing 1000
+    /// rows by default plus a search-to-narrow affordance gives smooth
+    /// scrolling without losing functionality.
+    nonisolated static let visibleRowCap = 1_000
+
+    @State private var rows: [BrowserRow] = []
+    @State private var totalRowCount: Int = 0
     @State private var sortOrder: [KeyPathComparator<BrowserRow>] = [
         KeyPathComparator(\BrowserRow.path, order: .forward)
     ]
     @State private var searchText: String = ""
+    /// Debounced copy of `searchText` — drives the actual SQL query.
+    /// Updated 150 ms after the user stops typing so fast typing
+    /// doesn't trigger a query per keystroke.
+    @State private var debouncedSearch: String = ""
     @State private var showRestartAlert: Bool = false
     @State private var isDropTargeted: Bool = false
     @State private var lastImportSummary: String?
@@ -16,42 +30,32 @@ struct LibraryBrowserView: View {
     @State private var renameTarget: FileRecord?
     @State private var selectedFileIds: Set<BrowserRow.ID> = []
 
-    /// Compute the filtered + sorted slice. Heavy on a 32k-row
-    /// library; called once per body re-evaluation (captured into a
-    /// `let` in `body`) so the Table cells and the footer count
-    /// share the result instead of recomputing it twice.
-    private func computeFilteredSorted() -> [BrowserRow] {
-        let filtered: [BrowserRow]
-        if searchText.isEmpty {
-            filtered = files
-        } else {
-            let needle = searchText.lowercased()
-            filtered = files.filter { row in
-                row.path.lowercased().contains(needle)
-                    || (row.artist?.lowercased().contains(needle) ?? false)
-                    || (row.title?.lowercased().contains(needle) ?? false)
-                    || (row.album?.lowercased().contains(needle) ?? false)
-            }
-        }
-        return filtered.sorted(using: sortOrder)
-    }
-
     var body: some View {
-        // Compute the filtered+sorted slice exactly once per render.
-        // Previously this was a computed property called from both
-        // `tableSection` and `footer`, so it ran twice on every body
-        // re-eval — for a 32k-row library that meant ~200 ms × 2
-        // burned on every observation tick.
-        let filteredSortedFiles = computeFilteredSorted()
-        return VStack(spacing: 0) {
+        VStack(spacing: 0) {
             statusHeader
             Divider()
-            tableSection(rows: filteredSortedFiles)
+            tableSection
             Divider()
-            footer(visibleCount: filteredSortedFiles.count)
+            footer
         }
         .frame(minWidth: 920, minHeight: 600)
-        .task { await observeFiles() }
+        .task { await observeRowCount() }
+        // Debounce: 150 ms after typing settles, copy searchText to
+        // debouncedSearch which is the actual query input.
+        .task(id: searchText) {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            if debouncedSearch != searchText {
+                debouncedSearch = searchText
+            }
+        }
+        // Re-fetch when search, sort, or underlying data changes.
+        // sortOrder isn't Hashable; key by its String description.
+        .task(id: FetchTrigger(search: debouncedSearch,
+                               sortOrderKey: sortOrderKey,
+                               totalRowCount: totalRowCount)) {
+            await refetch()
+        }
         .alert("Restart required", isPresented: $showRestartAlert) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -167,7 +171,7 @@ struct LibraryBrowserView: View {
     }
 
     @ViewBuilder
-    private func tableSection(rows: [BrowserRow]) -> some View {
+    private var tableSection: some View {
         Table(rows, selection: $selectedFileIds, sortOrder: $sortOrder) {
             TableColumn("Artist", value: \.artistOrEmpty) { file in
                 Text(file.artist ?? "—")
@@ -231,31 +235,28 @@ struct LibraryBrowserView: View {
         }
     }
 
-    /// Fetch the full `FileRecord` on demand (rename dialog needs
-    /// the un-trimmed metadata, hash, etc.) and present the sheet.
-    /// Browser uses `BrowserRow` for the table to keep observation
-    /// cheap; this is the bridge back to a full record when the
-    /// user actually acts on a row.
     private func openRenameDialog(forRowId rowId: Int64) async {
         do {
             let record = try await services.database.writer.read { db in
                 try FileRecord.fetchOne(db, key: rowId)
             }
-            if let record {
-                renameTarget = record
-            }
+            if let record { renameTarget = record }
         } catch {
-            // Defensive — if the row vanished between context menu
-            // open and the fetch, do nothing.
+            // Defensive: row vanished between menu open and fetch.
         }
     }
 
     @ViewBuilder
-    private func footer(visibleCount: Int) -> some View {
-        HStack {
-            Text("\(visibleCount.formatted()) of \(files.count.formatted()) files")
+    private var footer: some View {
+        HStack(spacing: 6) {
+            Text("\(rows.count.formatted()) of \(totalRowCount.formatted()) file\(totalRowCount == 1 ? "" : "s")")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+            if rows.count >= Self.visibleRowCap && totalRowCount > Self.visibleRowCap {
+                Text("· capped at \(Self.visibleRowCap.formatted()), search to narrow")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
             if let summary = lastImportSummary {
                 Text("·")
                     .foregroundStyle(.tertiary)
@@ -273,41 +274,129 @@ struct LibraryBrowserView: View {
         .padding(.vertical, 8)
     }
 
-    private func observeFiles() async {
-        // Lightweight projection: no BLOB columns, no metadata we
-        // don't render. On a 32k-row library this is the single
-        // biggest perceived-performance win — each fingerprint
-        // batch fired the previous observation against the full
-        // `FileRecord.fetchAll` (with `chromaprint_fingerprint`
-        // BLOBs ≈ 17 MB of decode), and the result rendered on
-        // MainActor.
-        //
-        // `removeDuplicates()` skips emissions where the projected
-        // row set is identical (e.g., a batch that wrote
-        // fingerprints to non-displayed columns — those columns
-        // aren't in BrowserRow so the projection is unchanged and
-        // the UI doesn't re-render).
+    // MARK: - Data loading
+
+    /// Observe the total row count and tick the FetchTrigger when
+    /// it changes. We trigger refetch on counter changes (rather
+    /// than on every files-table write) because most writes don't
+    /// affect the visible row set under the current search/sort.
+    /// A count change is a strong signal that the visible set
+    /// might have changed; for metadata edits the user can
+    /// refresh by toggling the search (or we add explicit refresh
+    /// in a follow-up).
+    private func observeRowCount() async {
         let observation = ValueObservation
             .tracking { db in
-                try BrowserRow.fetchAll(db, sql: BrowserRow.browserFetchSQL)
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
             }
             .removeDuplicates()
         do {
-            for try await freshFiles in observation.values(in: services.database.writer) {
-                files = freshFiles
+            for try await count in observation.values(in: services.database.writer) {
+                totalRowCount = count
             }
         } catch {
-            // ValueObservation errors are transient; the next emission
-            // takes over. Surfacing them in UI is a polish item.
+            // ValueObservation errors are transient; next emission
+            // resumes.
         }
     }
 
-    // MARK: - Formatters
+    private func refetch() async {
+        let needle = debouncedSearch
+        let order = sortOrder
+        do {
+            let fetched: [BrowserRow] = try await services.database.writer.read { db in
+                try Self.fetchBrowserRows(
+                    db, search: needle, sortOrder: order, limit: Self.visibleRowCap
+                )
+            }
+            rows = fetched
+        } catch {
+            // Defensive — keep showing the previous rows on transient errors.
+        }
+    }
 
-    private let byteFormatter: ByteCountFormatter = {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowsNonnumericFormatting = false
-        return formatter
-    }()
+    /// Stringly key for sort-order in FetchTrigger. KeyPathComparator
+    /// itself isn't Hashable, but PartialKeyPath is — combine with
+    /// the SortOrder for a stable key.
+    private var sortOrderKey: String {
+        sortOrder.map { comparator in
+            let column = Self.sqlColumn(for: comparator.keyPath)
+            let direction = comparator.order == .forward ? "asc" : "desc"
+            return "\(column):\(direction)"
+        }.joined(separator: "|")
+    }
+
+    /// Build and run the projection query. SELECT projects away the
+    /// BLOBs; WHERE applies user search with LIKE COLLATE NOCASE;
+    /// ORDER BY honors the user's column-tap; LIMIT caps the result
+    /// at `Self.visibleRowCap` so the SwiftUI Table never sees a
+    /// 32k array.
+    nonisolated static func fetchBrowserRows(
+        _ db: GRDB.Database,
+        search: String,
+        sortOrder: [KeyPathComparator<BrowserRow>],
+        limit: Int
+    ) throws -> [BrowserRow] {
+        var sql = """
+            SELECT id, path, artist, title, album, bpm, musical_key
+            FROM files
+            """
+        var arguments: [DatabaseValueConvertible] = []
+
+        if !search.isEmpty {
+            // SQLite LIKE with `COLLATE NOCASE` does case-insensitive
+            // matching on ASCII. For Unicode case folding, GRDB
+            // supports custom collations — out of scope for this
+            // pass.
+            sql += """
+                 WHERE (path LIKE ? COLLATE NOCASE)
+                    OR (COALESCE(artist, '') LIKE ? COLLATE NOCASE)
+                    OR (COALESCE(title, '') LIKE ? COLLATE NOCASE)
+                    OR (COALESCE(album, '') LIKE ? COLLATE NOCASE)
+                """
+            let pattern = "%\(search)%"
+            arguments = [pattern, pattern, pattern, pattern]
+        }
+
+        let orderBy = orderByClause(for: sortOrder.first)
+        sql += " ORDER BY \(orderBy)"
+        sql += " LIMIT \(limit)"
+
+        return try BrowserRow.fetchAll(
+            db, sql: sql, arguments: StatementArguments(arguments)
+        )
+    }
+
+    /// Translate the first sort comparator to a SQL ORDER BY clause.
+    nonisolated static func orderByClause(for comparator: KeyPathComparator<BrowserRow>?) -> String {
+        let direction = (comparator?.order ?? .forward) == .forward ? "ASC" : "DESC"
+        let column = sqlColumn(for: comparator?.keyPath)
+        return "\(column) \(direction)"
+    }
+
+    /// Map a `BrowserRow` keypath (used by SwiftUI Table's sort) to
+    /// the matching SQL column expression. The empty-string
+    /// projections (artistOrEmpty, etc.) map to `COALESCE(col, '')`
+    /// so null values sort consistently regardless of SQLite's
+    /// default null ordering.
+    nonisolated static func sqlColumn(for keyPath: PartialKeyPath<BrowserRow>?) -> String {
+        switch keyPath {
+        case \BrowserRow.path: return "path"
+        case \BrowserRow.artistOrEmpty: return "COALESCE(artist, '')"
+        case \BrowserRow.titleOrEmpty: return "COALESCE(title, '')"
+        case \BrowserRow.albumOrEmpty: return "COALESCE(album, '')"
+        case \BrowserRow.bpmOrEmpty: return "COALESCE(bpm, '')"
+        case \BrowserRow.musicalKeyOrEmpty: return "COALESCE(musical_key, '')"
+        case \BrowserRow.folderPath: return "path"
+        default: return "path"
+        }
+    }
+}
+
+/// Composite trigger for refetch — `.task(id:)` runs when any of
+/// these change. Hashable so it works as a task id.
+private struct FetchTrigger: Hashable {
+    let search: String
+    let sortOrderKey: String
+    let totalRowCount: Int
 }
