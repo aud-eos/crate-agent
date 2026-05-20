@@ -567,9 +567,24 @@ public enum SeratoMetadataField: String, CaseIterable, Sendable {
 public actor LibraryHygieneRunner {
 
     private let operationEngine: OperationEngine
+    private let activityLog: ActivityLog?
 
-    public init(operationEngine: OperationEngine) {
+    public init(
+        operationEngine: OperationEngine,
+        activityLog: ActivityLog? = nil
+    ) {
         self.operationEngine = operationEngine
+        self.activityLog = activityLog
+    }
+
+    /// Post a status message to the activity log, if one is wired
+    /// in. The log is `@MainActor`-isolated; `await`ing the hop
+    /// keeps every entry in a consistent order. Existing call sites
+    /// without a log (tests, etc.) pay zero cost — the optional is
+    /// nil and the call is a no-op.
+    private func note(_ message: String) async {
+        guard let log = activityLog else { return }
+        await log.log(message, category: .hygiene)
     }
 
     @discardableResult
@@ -587,20 +602,26 @@ public actor LibraryHygieneRunner {
             return (identifier, file)
         })
 
+        await note("Trimming whitespace on \(issues.count) field\(issues.count == 1 ? "" : "s") across \(issuesByFileId.count) file\(issuesByFileId.count == 1 ? "" : "s")…")
+
+        var filesProcessed = 0
         for (fileId, fileIssues) in issuesByFileId {
             guard let file = filesById[fileId] else { continue }
             let merged = LibraryHygiene.mergedTrimmedMetadata(
                 forFile: file,
                 issues: fileIssues
             )
+            await note("Trimming \(fileIssues.count) field\(fileIssues.count == 1 ? "" : "s") on \(filenameOnly(file.path))")
             try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
             )
+            filesProcessed += 1
         }
 
+        await note("Trimmed whitespace on \(issues.count) field\(issues.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")")
         return effectiveBatchId
     }
 
@@ -619,20 +640,26 @@ public actor LibraryHygieneRunner {
             return (identifier, file)
         })
 
+        await note("Applying find/replace across \(matches.count) field\(matches.count == 1 ? "" : "s") in \(matchesByFileId.count) file\(matchesByFileId.count == 1 ? "" : "s")…")
+
+        var filesProcessed = 0
         for (fileId, fileMatches) in matchesByFileId {
             guard let file = filesById[fileId] else { continue }
             let merged = LibraryHygiene.mergedFindReplaceMetadata(
                 forFile: file,
                 matches: fileMatches
             )
+            await note("Replacing text in \(fileMatches.count) field\(fileMatches.count == 1 ? "" : "s") on \(filenameOnly(file.path))")
             try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
             )
+            filesProcessed += 1
         }
 
+        await note("Replaced text in \(matches.count) field\(matches.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")")
         return effectiveBatchId
     }
 
@@ -651,20 +678,26 @@ public actor LibraryHygieneRunner {
             return (identifier, file)
         })
 
+        await note("Normalizing case on \(fixes.count) field\(fixes.count == 1 ? "" : "s") in \(fixesByFileId.count) file\(fixesByFileId.count == 1 ? "" : "s")…")
+
+        var filesProcessed = 0
         for (fileId, fileFixes) in fixesByFileId {
             guard let file = filesById[fileId] else { continue }
             let merged = LibraryHygiene.mergedCaseMetadata(
                 forFile: file,
                 fixes: fileFixes
             )
+            await note("Normalizing case on \(fileFixes.count) field\(fileFixes.count == 1 ? "" : "s") on \(filenameOnly(file.path))")
             try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
             )
+            filesProcessed += 1
         }
 
+        await note("Normalized case on \(fixes.count) field\(fixes.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")")
         return effectiveBatchId
     }
 
@@ -693,12 +726,17 @@ public actor LibraryHygieneRunner {
             return (identifier, file)
         })
 
+        await note("Filling \(field.displayName) on \(fileIds.count) file\(fileIds.count == 1 ? "" : "s") with “\(trimmedValue)”…")
+
+        var filesProcessed = 0
+        var filesSkipped = 0
         for fileId in fileIds {
             guard let file = filesById[fileId] else { continue }
             guard LibraryHygiene.isMissing(field.read(from: file)) else {
                 // Field acquired a value since the scan (manual
                 // edit elsewhere, Serato exit reload, etc.). Skip
                 // rather than clobber.
+                filesSkipped += 1
                 continue
             }
             let merged = LibraryHygiene.mergedMissingFieldMetadata(
@@ -706,14 +744,18 @@ public actor LibraryHygieneRunner {
                 field: field,
                 value: trimmedValue
             )
+            await note("Filling \(field.displayName) on \(filenameOnly(file.path))")
             try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
             )
+            filesProcessed += 1
         }
 
+        let skippedNote = filesSkipped > 0 ? ", \(filesSkipped) skipped (already populated)" : ""
+        await note("Filled \(field.displayName) on \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")\(skippedNote)")
         return effectiveBatchId
     }
 
@@ -763,5 +805,9 @@ public actor LibraryHygieneRunner {
             )),
             batchId: batchId
         )
+    }
+
+    private nonisolated func filenameOnly(_ path: String) -> String {
+        (path as NSString).lastPathComponent
     }
 }

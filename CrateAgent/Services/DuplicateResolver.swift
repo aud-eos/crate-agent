@@ -46,9 +46,19 @@ public actor DuplicateResolver {
     }
 
     private let operationEngine: OperationEngine
+    private let activityLog: ActivityLog?
 
-    public init(operationEngine: OperationEngine) {
+    public init(
+        operationEngine: OperationEngine,
+        activityLog: ActivityLog? = nil
+    ) {
         self.operationEngine = operationEngine
+        self.activityLog = activityLog
+    }
+
+    private func note(_ message: String) async {
+        guard let log = activityLog else { return }
+        await log.log(message, category: .duplicate)
     }
 
     /// Resolve one duplicate group by trashing every file except
@@ -70,7 +80,10 @@ public actor DuplicateResolver {
 
         let effectiveBatchId = batchId ?? "duplicate-resolution-\(UUID().uuidString)"
 
+        await note("Resolving duplicate group: trashing \(toTrash.count) non-keeper\(toTrash.count == 1 ? "" : "s")…")
+
         for fileId in toTrash {
+            await note("Trashing file id \(fileId) (Serato cleanup → trash → DB)")
             // Order matters for FK behavior: the Serato cleanups and
             // the trash all read the FileRecord by id to resolve the
             // path. `removeFile` deletes the row last, so it can't
@@ -93,6 +106,7 @@ public actor DuplicateResolver {
             )
         }
 
+        await note("Resolved group — \(toTrash.count) file\(toTrash.count == 1 ? "" : "s") trashed")
         return Outcome(batchId: effectiveBatchId, trashedCount: toTrash.count)
     }
 }

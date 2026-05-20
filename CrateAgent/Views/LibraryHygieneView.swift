@@ -134,7 +134,7 @@ private struct WhitespacePanel: View {
         actionError = nil
         lastResult = nil
         let initialCount = issues.count
-        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
+        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine, activityLog: services.activityLog)
         do {
             _ = try await runner.applyWhitespaceFixes(issues, files: files)
             lastResult = "Trimmed whitespace on \(initialCount) field\(initialCount == 1 ? "" : "s")"
@@ -322,7 +322,7 @@ private struct FindReplacePanel: View {
 
         let selectedMatches = matches.filter { selectedMatchIds.contains($0.id) }
         let initialCount = selectedMatches.count
-        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
+        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine, activityLog: services.activityLog)
         do {
             _ = try await runner.applyFindAndReplaceFixes(selectedMatches, files: files)
             lastResult = "Replaced text in \(initialCount) field\(initialCount == 1 ? "" : "s")"
@@ -516,7 +516,7 @@ private struct CaseConsistencyPanel: View {
             lastResult = "Nothing to do — every active group is already on its canonical."
             return
         }
-        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
+        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine, activityLog: services.activityLog)
         do {
             _ = try await runner.applyCaseFixes(fixes, files: files)
             lastResult = "Normalized case for \(fixes.count) field\(fixes.count == 1 ? "" : "s")"
@@ -742,7 +742,7 @@ private struct MissingFieldsPanel: View {
         actionError = nil
         lastResult = nil
         let fileIds = entries.filter { selectedEntryIds.contains($0.id) }.map(\.fileId)
-        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine)
+        let runner = LibraryHygieneRunner(operationEngine: services.operationEngine, activityLog: services.activityLog)
         do {
             _ = try await runner.applyMissingFieldFill(
                 field: selectedField,
@@ -1179,7 +1179,7 @@ private struct DuplicatesPanel: View {
         actionError = nil
         lastResolution = nil
 
-        let resolver = DuplicateResolver(operationEngine: services.operationEngine)
+        let resolver = DuplicateResolver(operationEngine: services.operationEngine, activityLog: services.activityLog)
         do {
             let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
             lastResolution = "Moved \(outcome.trashedCount) duplicate\(outcome.trashedCount == 1 ? "" : "s") to Trash"
@@ -1218,7 +1218,7 @@ private struct DuplicatesPanel: View {
         batchProgress = BatchProgress(trashed: 0, total: plannedTotal)
 
         let sharedBatchId = "duplicate-resolve-all-\(UUID().uuidString)"
-        let resolver = DuplicateResolver(operationEngine: services.operationEngine)
+        let resolver = DuplicateResolver(operationEngine: services.operationEngine, activityLog: services.activityLog)
 
         var trashedSoFar = 0
         var groupsResolved = 0
