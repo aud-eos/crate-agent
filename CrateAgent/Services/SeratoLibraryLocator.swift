@@ -40,23 +40,45 @@ public struct SeratoLibraryLocator: Sendable, Equatable {
         seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
     }
 
-    /// Enumerate every `.crate` file in `Subcrates/`. Returns an empty
-    /// array if the directory does not exist (Serato has never created
-    /// any crates) — this is a normal first-run state, not an error.
-    /// Results are sorted by URL to give stable iteration order.
+    public var smartCratesDirectoryUrl: URL {
+        seratoDirectory.appendingPathComponent("SmartCrates", isDirectory: true)
+    }
+
+    /// Enumerate every crate-like file Serato uses to track paths:
+    /// `Subcrates/*.crate` (user-curated playlists) AND
+    /// `SmartCrates/*.scrate` (rule-based dynamic playlists, which
+    /// also store a MATERIALIZED otrk list — when a path is missing
+    /// from V2 but present in a smart crate, Serato re-imports it
+    /// to V2 on next launch, undoing any V2 rewrite we performed).
+    /// Both file formats share the same TLV layout for `otrk`/`ptrk`
+    /// records, so `rewrite_path` and `remove_track` operate on
+    /// them identically — they just live under different directories.
+    /// Results are sorted by path for stable iteration.
     public func enumerateCrateFiles() throws -> [URL] {
-        let subcratesDirectoryPath = subcratesDirectoryUrl.path
-        guard FileManager.default.fileExists(atPath: subcratesDirectoryPath) else {
+        let regular = try enumerateFiles(
+            in: subcratesDirectoryUrl,
+            extension: "crate"
+        )
+        let smart = try enumerateFiles(
+            in: smartCratesDirectoryUrl,
+            extension: "scrate"
+        )
+        return (regular + smart).sorted(by: { lhs, rhs in lhs.path < rhs.path })
+    }
+
+    private func enumerateFiles(
+        in directory: URL,
+        extension fileExtension: String
+    ) throws -> [URL] {
+        guard FileManager.default.fileExists(atPath: directory.path) else {
             return []
         }
         let allFiles = try FileManager.default.contentsOfDirectory(
-            at: subcratesDirectoryUrl,
+            at: directory,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )
-        return allFiles
-            .filter { $0.pathExtension == "crate" }
-            .sorted(by: { lhs, rhs in lhs.path < rhs.path })
+        return allFiles.filter { $0.pathExtension == fileExtension }
     }
 
     /// Convert an absolute filesystem path to the relative form Serato
