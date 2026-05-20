@@ -11,6 +11,7 @@ import SwiftUI
 /// "I just made a change, show me" case.
 struct HistoryView: View {
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var batches: [BatchSummary] = []
     @State private var isLoading: Bool = false
@@ -112,8 +113,10 @@ struct HistoryView: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .controlSize(.small)
-                .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil)
-                .help("Re-run the Serato library rewrite for every renamed file in this batch. Idempotent — safe to re-run if the original sync only partially succeeded.")
+                .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil || seratoWatchdog.isSeratoRunning)
+                .help(seratoWatchdog.isSeratoRunning
+                      ? "Quit Serato before re-syncing — writes would queue in memory and disappear on app restart."
+                      : "Re-run the Serato library rewrite for every renamed file in this batch. Idempotent — safe to re-run if the original sync only partially succeeded.")
             }
 
             Button("Undo") {
@@ -175,9 +178,15 @@ struct HistoryView: View {
         resyncInFlightBatchId = batch.batchId
         defer { resyncInFlightBatchId = nil }
         do {
-            let replayed = try await services.operationEngine.resyncSeratoForBatch(batch.batchId)
+            let outcome = try await services.operationEngine.resyncSeratoForBatch(batch.batchId)
             actionError = nil
-            _ = replayed  // count surfaced via activity log; no UI banner.
+            // If the resync ended with queued-only writes, surface
+            // it on the inline banner too — the activity strip
+            // message scrolls past quickly, but History's banner
+            // stays visible until the user dismisses or undoes.
+            if outcome.queuedCount > 0 && outcome.appliedCount == 0 {
+                actionError = outcome.summaryMessage
+            }
         } catch {
             actionError = "Re-sync failed: \(error.localizedDescription)"
         }

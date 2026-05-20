@@ -172,12 +172,13 @@ public actor OperationEngine {
     /// Idempotent — re-applying a successful rewrite is a no-op
     /// (the path is already what we'd be setting it to).
     ///
-    /// Returns the number of fileRenamed events that were
-    /// replayed. Events of other types in the batch are skipped
-    /// without error (this is a rename-recovery primitive, not a
-    /// general replay).
+    /// Reports applied vs queued counts so the UI can tell the
+    /// user whether anything actually landed on disk. When Serato
+    /// is running, replays queue in memory and drain on Serato
+    /// exit — "Re-sync complete" without that distinction was
+    /// misleading and bit a user (issue #64).
     @discardableResult
-    public func resyncSeratoForBatch(_ batchId: String) async throws -> Int {
+    public func resyncSeratoForBatch(_ batchId: String) async throws -> ResyncOutcome {
         let events: [EventRecord] = try await database.writer.read { db in
             try EventRecord
                 .filter(Column("batch_id") == batchId)
@@ -190,7 +191,8 @@ public actor OperationEngine {
 
         await note("Re-syncing Serato library for batch — \(events.count) event\(events.count == 1 ? "" : "s") to inspect")
 
-        var replayed = 0
+        var appliedCount = 0
+        var queuedCount = 0
         for event in events {
             guard event.eventType == .fileRenamed else { continue }
             guard let forwardJsonData = event.payloadJson.data(using: .utf8) else {
@@ -219,14 +221,16 @@ public actor OperationEngine {
             if isSeratoRunning {
                 pendingSeratoWrites.append(.rename(rename))
                 queueDepthSubject.send(pendingSeratoWrites.count)
+                queuedCount += 1
             } else {
                 try await applySeratoRename(rename)
+                appliedCount += 1
             }
-            replayed += 1
         }
 
-        await note("Re-sync complete — replayed \(replayed) rename\(replayed == 1 ? "" : "s")")
-        return replayed
+        let outcome = ResyncOutcome(appliedCount: appliedCount, queuedCount: queuedCount)
+        await note(outcome.summaryMessage)
+        return outcome
     }
 
     @discardableResult
@@ -1215,6 +1219,39 @@ public actor OperationEngine {
             throw OperationEngineError.insertDidNotReturnRowId
         }
         return eventId
+    }
+}
+
+// MARK: - Resync types
+
+/// Result of `resyncSeratoForBatch`. Separates writes that
+/// actually hit disk from writes that queued because Serato was
+/// running (in-memory only, drain on Serato exit). The UI uses
+/// this split to phrase the result honestly — "Re-sync complete"
+/// when N actually landed vs "Queued N — quit Serato to apply"
+/// when nothing did.
+public struct ResyncOutcome: Sendable, Equatable {
+    public let appliedCount: Int
+    public let queuedCount: Int
+
+    public init(appliedCount: Int, queuedCount: Int) {
+        self.appliedCount = appliedCount
+        self.queuedCount = queuedCount
+    }
+
+    public var totalCount: Int { appliedCount + queuedCount }
+
+    public var summaryMessage: String {
+        if totalCount == 0 {
+            return "Re-sync inspected the batch — no rename events to replay."
+        }
+        if queuedCount == 0 {
+            return "Re-sync complete — wrote \(appliedCount) rename\(appliedCount == 1 ? "" : "s") to Serato library."
+        }
+        if appliedCount == 0 {
+            return "Re-sync queued \(queuedCount) rename\(queuedCount == 1 ? "" : "s") — Serato is running, quit Serato to apply."
+        }
+        return "Re-sync wrote \(appliedCount), queued \(queuedCount) (Serato started during the sweep)."
     }
 }
 
