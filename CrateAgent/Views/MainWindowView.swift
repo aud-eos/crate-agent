@@ -9,6 +9,7 @@ struct MainWindowView: View {
 
     enum Section: String, Hashable, CaseIterable, Identifiable {
         case library
+        case organize
         case cleanup
         case history
 
@@ -16,17 +17,19 @@ struct MainWindowView: View {
 
         var displayName: String {
             switch self {
-            case .library:  return "Library"
-            case .cleanup:  return "Library Cleanup"
-            case .history:  return "History"
+            case .library:   return "Library"
+            case .organize:  return "Organize"
+            case .cleanup:   return "Library Cleanup"
+            case .history:   return "History"
             }
         }
 
         var iconName: String {
             switch self {
-            case .library:  return "music.note.list"
-            case .cleanup:  return "sparkles"
-            case .history:  return "clock.arrow.circlepath"
+            case .library:   return "music.note.list"
+            case .organize:  return "folder.badge.gearshape"
+            case .cleanup:   return "sparkles"
+            case .history:   return "clock.arrow.circlepath"
             }
         }
     }
@@ -61,6 +64,8 @@ struct MainWindowView: View {
         switch selection {
         case .library:
             LibraryBrowserView()
+        case .organize:
+            OrganizeView()
         case .cleanup:
             LibraryHygieneView()
         case .history:

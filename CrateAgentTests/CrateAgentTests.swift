@@ -4431,3 +4431,93 @@ final class WriteFileTagsMutationTests: XCTestCase {
         }
     }
 }
+
+final class LibraryOrganizerPlannerTests: XCTestCase {
+
+    private let musicFolder = URL(fileURLWithPath: "/Music")
+    private let template = "$artist - $title.$ext"
+
+    func testSkipsFilesAlreadyAtCanonicalPath() {
+        let file = FileRecord(
+            id: 1,
+            path: "/Music/A/Artist - Track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            artist: "Artist", title: "Track"
+        )
+        let plans = LibraryOrganizer.findMoves(
+            in: [file], musicFolder: musicFolder, template: template
+        )
+        XCTAssertTrue(plans.isEmpty, "file at canonical destination produces no plan")
+    }
+
+    func testProducesPlanForFileOutsideMusicFolder() {
+        let file = FileRecord(
+            id: 1,
+            path: "/Users/benny/Downloads/loose.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            artist: "Artist", title: "Track"
+        )
+        let plans = LibraryOrganizer.findMoves(
+            in: [file], musicFolder: musicFolder, template: template
+        )
+        XCTAssertEqual(plans.count, 1)
+        XCTAssertEqual(plans[0].destinationPath, "/Music/A/Artist - Track.mp3")
+        XCTAssertTrue(plans[0].isOutsideMusicFolder)
+    }
+
+    func testProducesPlanForFileInsideButMislocated() {
+        // Wrong letter bucket — file is in B/ but artist starts with A.
+        let file = FileRecord(
+            id: 1,
+            path: "/Music/B/wrong-bucket.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            artist: "Artist", title: "Track"
+        )
+        let plans = LibraryOrganizer.findMoves(
+            in: [file], musicFolder: musicFolder, template: template
+        )
+        XCTAssertEqual(plans.count, 1)
+        XCTAssertEqual(plans[0].destinationPath, "/Music/A/Artist - Track.mp3")
+        XCTAssertFalse(plans[0].isOutsideMusicFolder,
+                       "files within the music folder are not 'outside'")
+    }
+
+    func testDisambiguatesCollisionsWithinBatch() {
+        // Two files map to the same canonical destination — both
+        // have artist "Artist" and title "Track" but different
+        // source paths. The second should get a (1) suffix.
+        let fileA = FileRecord(
+            id: 1,
+            path: "/Users/benny/Downloads/first.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            artist: "Artist", title: "Track"
+        )
+        let fileB = FileRecord(
+            id: 2,
+            path: "/Users/benny/Downloads/second.mp3",
+            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
+            artist: "Artist", title: "Track"
+        )
+        let plans = LibraryOrganizer.findMoves(
+            in: [fileA, fileB], musicFolder: musicFolder, template: template
+        )
+        XCTAssertEqual(plans.count, 2)
+        XCTAssertEqual(plans[0].destinationPath, "/Music/A/Artist - Track.mp3")
+        XCTAssertEqual(plans[1].destinationPath, "/Music/A/Artist - Track (1).mp3",
+                       "second collider must get a (1) suffix")
+    }
+
+    func testFileWithoutIdIsSkipped() {
+        // An un-id'd FileRecord (in-memory only) shouldn't get planned.
+        let file = FileRecord(
+            id: nil,
+            path: "/Users/benny/Downloads/loose.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            artist: "Artist", title: "Track"
+        )
+        let plans = LibraryOrganizer.findMoves(
+            in: [file], musicFolder: musicFolder, template: template
+        )
+        XCTAssertTrue(plans.isEmpty)
+    }
+}

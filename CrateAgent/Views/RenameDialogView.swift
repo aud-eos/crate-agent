@@ -213,10 +213,15 @@ struct RenameDialogView: View {
 /// Pure path-computation for the rename dialog — pulled out of the
 /// view so the bucket-letter + template behavior is unit-testable
 /// without SwiftUI plumbing.
+///
+/// Generic over `HygieneFileSource` so it works against the full
+/// `FileRecord` (used by the rename dialog) and the lightweight
+/// `HygieneFileRow` projection (used by the bulk Organize view —
+/// the BLOB columns aren't needed for path computation).
 public enum RenameDestinationPlanner {
 
-    public static func destination(
-        forFile file: FileRecord,
+    public static func destination<F: HygieneFileSource>(
+        forFile file: F,
         musicFolder: URL,
         template: String
     ) -> URL {
