@@ -11,33 +11,25 @@ import SwiftUI
 /// so a single Undo on History reverts the entire cleanup.
 struct LibraryHygieneView: View {
     @EnvironmentObject private var services: AppServices
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
-            TabView {
-                WhitespacePanel()
-                    .tabItem { Label("Whitespace", systemImage: "scissors") }
+        TabView {
+            WhitespacePanel()
+                .tabItem { Label("Whitespace", systemImage: "scissors") }
 
-                FindReplacePanel()
-                    .tabItem { Label("Find & Replace", systemImage: "text.magnifyingglass") }
+            FindReplacePanel()
+                .tabItem { Label("Find & Replace", systemImage: "text.magnifyingglass") }
 
-                CaseConsistencyPanel()
-                    .tabItem { Label("Case", systemImage: "textformat") }
+            CaseConsistencyPanel()
+                .tabItem { Label("Case", systemImage: "textformat") }
 
-                MissingFieldsPanel()
-                    .tabItem { Label("Missing", systemImage: "exclamationmark.bubble") }
+            MissingFieldsPanel()
+                .tabItem { Label("Missing", systemImage: "exclamationmark.bubble") }
 
-                DuplicatesPanel()
-                    .tabItem { Label("Duplicates", systemImage: "square.on.square") }
-            }
-            .navigationTitle("Library Cleanup")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                }
-            }
+            DuplicatesPanel()
+                .tabItem { Label("Duplicates", systemImage: "square.on.square") }
         }
+        .navigationTitle("Library Cleanup")
         .frame(minWidth: 680, minHeight: 480)
     }
 }

@@ -3,6 +3,7 @@ import SwiftUI
 
 struct LibraryBrowserView: View {
     @EnvironmentObject private var services: AppServices
+    @Environment(\.openWindow) private var openWindow
 
     /// Hard cap on rows the table renders. SwiftUI Table doesn't scale
     /// past ~10k items even with virtualization — diffing + accessibility
@@ -25,8 +26,6 @@ struct LibraryBrowserView: View {
     @State private var showRestartAlert: Bool = false
     @State private var isDropTargeted: Bool = false
     @State private var lastImportSummary: String?
-    @State private var showHistorySheet: Bool = false
-    @State private var showCleanupSheet: Bool = false
     @State private var renameTarget: FileRecord?
     @State private var selectedFileIds: Set<BrowserRow.ID> = []
 
@@ -77,15 +76,6 @@ struct LibraryBrowserView: View {
             return true
         } isTargeted: { targeted in
             isDropTargeted = targeted
-        }
-        .sheet(isPresented: $showHistorySheet) {
-            HistoryView()
-                .environmentObject(services)
-        }
-        .sheet(isPresented: $showCleanupSheet) {
-            LibraryHygieneView()
-                .environmentObject(services)
-                .environmentObject(services.seratoWatchdog)
         }
         .sheet(item: $renameTarget) { fileToRename in
             RenameDialogView(file: fileToRename)
@@ -141,7 +131,7 @@ struct LibraryBrowserView: View {
                 .truncationMode(.middle)
 
             Button {
-                showCleanupSheet = true
+                openWindow(id: "cleanup")
             } label: {
                 Label("Cleanup", systemImage: "sparkles")
             }
@@ -149,7 +139,7 @@ struct LibraryBrowserView: View {
             .help("Scan the library for whitespace issues and apply trims as a single undoable batch.")
 
             Button {
-                showHistorySheet = true
+                openWindow(id: "history")
             } label: {
                 Label("History", systemImage: "clock.arrow.circlepath")
             }
