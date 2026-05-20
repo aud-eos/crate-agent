@@ -248,7 +248,7 @@ struct OrganizeView: View {
     }
 
     private var selectedPlans: [LibraryOrganizer.Plan] {
-        plans.filter { selection.contains($0.id) }
+        plans.filter { plan in selection.contains(plan.id) }
     }
 
     // MARK: - Actions

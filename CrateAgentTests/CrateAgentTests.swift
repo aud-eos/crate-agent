@@ -187,7 +187,7 @@ final class OperationEngineTests: XCTestCase {
     // MARK: - Serato side effects
 
     func testRenameFileRewritesSeratoCrateWhenSeratoClosed() async throws {
-        let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
+        let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
@@ -217,7 +217,7 @@ final class OperationEngineTests: XCTestCase {
     }
 
     func testRenameFileQueuesRewriteWhenSeratoRunning() async throws {
-        let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
+        let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
@@ -317,33 +317,20 @@ final class OperationEngineTests: XCTestCase {
     /// but Serato's "All" view still pointing at the old path.
     /// The fix processes V2 first and tolerates per-crate failures.
     func testRenameRewritesDatabaseV2EvenWhenCrateFileIsCorrupted() async throws {
-        // Build a Subcrates directory with: one good crate, one
-        // garbage file that triseratops can't parse, both with the
-        // .crate extension. Add a valid database V2 that contains
-        // the old path.
-        let rootDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
-        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
-        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
-        try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: rootDirectory) }
-
-        // Valid crate referencing the old path.
-        let goodCrate = subcratesDirectory.appendingPathComponent("Good.crate")
-        try OperationEngineTests.synthesizeCrateBytesForTest(
-            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
-        ).write(to: goodCrate)
-
-        // Corrupt crate: garbage bytes that won't parse as TLV.
-        let badCrate = subcratesDirectory.appendingPathComponent("Bad.crate")
-        try Data(repeating: 0xFF, count: 64).write(to: badCrate)
-
-        // Database V2 with the old path; this is what Serato's
-        // "All" view actually reads.
-        let databaseV2 = seratoDirectory.appendingPathComponent("database V2")
-        try OperationEngineTests.synthesizeDatabaseV2BytesForTest(
-            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
-        ).write(to: databaseV2)
+        // Build a _Serato_ hierarchy with: one good crate, one
+        // garbage `.crate`, and a valid `database V2`. The fixture
+        // builder handles the directory + bytes — this test only
+        // describes WHAT it needs.
+        let (seratoDirectory, goodCrate, databaseV2Optional) =
+            try Self.makeTemporarySeratoLibrary(
+                withCratePaths: ["Users/testuser/Music/A/old.mp3"],
+                corruptedCrateNames: ["Bad"],
+                databaseV2Paths: ["Users/testuser/Music/A/old.mp3"]
+            )
+        let databaseV2 = try XCTUnwrap(databaseV2Optional)
+        defer {
+            try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent())
+        }
 
         let (engine, database, _) = try await MainActor.run {
             try makeEngine(seratoDirectory: seratoDirectory, seratoIsRunning: false)
@@ -383,25 +370,18 @@ final class OperationEngineTests: XCTestCase {
     /// the catch-and-continue logic would silently start aborting
     /// the entire sweep on the first corrupt crate.
     func testRemoveFileFromCratesContinuesPastCorruptedCrate() async throws {
-        let rootDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("crate-agent-test-sweep-corrupt-\(UUID().uuidString)", isDirectory: true)
-        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
-        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
-        try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: rootDirectory) }
-
-        // Valid crate referencing the target path; sweep should
-        // remove this otrk and write the crate back.
-        let goodCrate = subcratesDirectory.appendingPathComponent("Good.crate")
-        try OperationEngineTests.synthesizeCrateBytesForTest(
-            withTrackPaths: ["Users/testuser/Music/A/dupe.mp3"]
-        ).write(to: goodCrate)
-
-        // Garbage bytes that won't parse as TLV. The removal loop
-        // must catch the per-crate parse failure and continue
-        // rather than aborting and leaving the valid crate stale.
-        let badCrate = subcratesDirectory.appendingPathComponent("Bad.crate")
-        try Data(repeating: 0xFF, count: 64).write(to: badCrate)
+        // Valid crate referencing the target path (sweep should
+        // remove this otrk and write the crate back) + a garbage
+        // sibling that won't parse. The fixture builder handles
+        // the directory + bytes.
+        let (seratoDirectory, goodCrate, _) =
+            try Self.makeTemporarySeratoLibrary(
+                withCratePaths: ["Users/testuser/Music/A/dupe.mp3"],
+                corruptedCrateNames: ["Bad"]
+            )
+        defer {
+            try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent())
+        }
 
         let (engine, database, _) = try await MainActor.run {
             try makeEngine(seratoDirectory: seratoDirectory, seratoIsRunning: false)
@@ -499,7 +479,7 @@ final class OperationEngineTests: XCTestCase {
     /// Otherwise a user clicking "Re-sync Serato" with Serato open
     /// sees "Re-sync complete" while nothing actually lands.
     func testResyncReportsQueuedCountWhenSeratoIsRunning() async throws {
-        let (seratoDirectoryUrl, _) = try Self.makeTemporarySeratoLibrary(
+        let (seratoDirectoryUrl, _, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
@@ -531,7 +511,7 @@ final class OperationEngineTests: XCTestCase {
     }
 
     func testQueueDepthPublisherEmitsOnEnqueueAndDrain() async throws {
-        let (seratoDirectoryUrl, _) = try Self.makeTemporarySeratoLibrary(
+        let (seratoDirectoryUrl, _, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
@@ -732,7 +712,7 @@ final class OperationEngineTests: XCTestCase {
     }
 
     func testDrainAppliesQueuedRewrites() async throws {
-        let (seratoDirectoryUrl, crateFileUrl) = try Self.makeTemporarySeratoLibrary(
+        let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
@@ -789,9 +769,18 @@ final class OperationEngineTests: XCTestCase {
     /// supplied Serato-relative paths. Returns the `_Serato_`
     /// directory URL (for passing to SeratoLibraryLocator) and the
     /// path to the crate file (for direct verification).
+    ///
+    /// Optional knobs for the fault-tolerance + recovery tests:
+    /// - `corruptedCrateNames` — sibling `.crate` files filled
+    ///   with garbage bytes to exercise per-crate fault tolerance.
+    /// - `databaseV2Paths` — when non-nil, also writes a valid
+    ///   `database V2` containing those paths, returned alongside
+    ///   the crate URL.
     private static func makeTemporarySeratoLibrary(
-        withCratePaths cratePaths: [String]
-    ) throws -> (seratoDirectoryUrl: URL, crateFileUrl: URL) {
+        withCratePaths cratePaths: [String],
+        corruptedCrateNames: [String] = [],
+        databaseV2Paths: [String]? = nil
+    ) throws -> (seratoDirectoryUrl: URL, crateFileUrl: URL, databaseV2Url: URL?) {
         let rootDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
         let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
@@ -799,10 +788,31 @@ final class OperationEngineTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: subcratesDirectory, withIntermediateDirectories: true
         )
+
+        // Primary good crate — kept as "Test.crate" for backward
+        // compatibility with the many tests that fetch the URL.
         let crateFileUrl = subcratesDirectory.appendingPathComponent("Test.crate")
         let crateBytes = synthesizeCrateBytes(withTrackPaths: cratePaths)
         try crateBytes.write(to: crateFileUrl)
-        return (seratoDirectory, crateFileUrl)
+
+        // Garbage `.crate` siblings for the corruption-tolerance
+        // tests. 64 bytes of 0xFF won't parse as TLV.
+        for name in corruptedCrateNames {
+            let url = subcratesDirectory
+                .appendingPathComponent(name.hasSuffix(".crate") ? name : "\(name).crate")
+            try Data(repeating: 0xFF, count: 64).write(to: url)
+        }
+
+        // Optional valid `database V2` for tests that drive
+        // `applySeratoRename` and need a V2 to inspect after.
+        var databaseV2Url: URL?
+        if let v2Paths = databaseV2Paths {
+            let url = seratoDirectory.appendingPathComponent("database V2")
+            try synthesizeDatabaseV2BytesForTest(withTrackPaths: v2Paths).write(to: url)
+            databaseV2Url = url
+        }
+
+        return (seratoDirectory, crateFileUrl, databaseV2Url)
     }
 
     /// Public wrapper so other test classes (e.g., LibraryScannerTests)
@@ -2308,31 +2318,41 @@ final class EventHistoryQueryTests: XCTestCase {
     }
 
     func testLoadRecentBatchesReturnsBatchesNewestFirst() async throws {
-        let (engine, database) = try await MainActor.run { try makeEngine() }
+        // Previously this test went through `engine.apply` and slept
+        // 5 ms between calls to keep the two `Date()`-derived
+        // timestamps distinct. On a loaded CI host that wasn't
+        // guaranteed and the test could flake on ordering.
+        //
+        // EventHistoryQuery is a pure read against the `events`
+        // table — the test just needs deterministic timestamps in
+        // that table. Insert directly with explicit, well-separated
+        // millisecond values; no engine, no sleep, no clock race.
+        let (_, database) = try await MainActor.run { try makeEngine() }
 
-        // Two batches, applied in order. Timestamps come from
-        // Date().timeIntervalSince1970 inside executeAndLog, so a
-        // small sleep between batches keeps the ordering robust on
-        // fast machines.
-        try await engine.apply(
-            .indexNewFile(IndexNewFilePayload(
-                path: "/Music/A/first.mp3",
-                volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
-            )),
-            batchId: "older-batch"
-        )
-        try await Task.sleep(nanoseconds: 5_000_000)  // 5ms
-        try await engine.apply(
-            .indexNewFile(IndexNewFilePayload(
-                path: "/Music/A/second.mp3",
-                volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
-            )),
-            batchId: "newer-batch"
-        )
+        // Pre-seed an empty `files` row so the foreign key holds.
+        // events.file_id is `references files onDelete: .setNull`,
+        // so a NULL is also fine — use NULL to keep the test small.
+        try await database.writer.write { db in
+            for (eventId, batchId, timestamp) in [
+                (1, "older-batch", Int64(1_700_000_000_000)),
+                (2, "newer-batch", Int64(1_700_000_005_000)),
+            ] {
+                try db.execute(
+                    sql: """
+                        INSERT INTO events
+                          (event_id, batch_id, timestamp, file_id, track_id,
+                           event_type, payload_json, inverse_payload_json)
+                        VALUES (?, ?, ?, NULL, NULL, 'track_imported', '{}', '{}')
+                        """,
+                    arguments: [eventId, batchId, timestamp]
+                )
+            }
+        }
 
         let batches = try await EventHistoryQuery.loadRecentBatches(database: database)
         XCTAssertEqual(batches.count, 2)
-        XCTAssertEqual(batches[0].batchId, "newer-batch")
+        XCTAssertEqual(batches[0].batchId, "newer-batch",
+                       "newest-first ordering must hold by explicit timestamp")
         XCTAssertEqual(batches[1].batchId, "older-batch")
         XCTAssertEqual(batches[0].description, "Imported 1 track")
         XCTAssertEqual(batches[0].eventCount, 1)

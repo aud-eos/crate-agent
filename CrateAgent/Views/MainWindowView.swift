@@ -140,21 +140,9 @@ private struct ActivityStrip: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
             .background(
-                Capsule().fill(categoryTint(category).opacity(0.18))
+                Capsule().fill(category.tint.opacity(0.18))
             )
-            .foregroundStyle(categoryTint(category))
-    }
-
-    private func categoryTint(_ category: ActivityLog.Category) -> Color {
-        switch category {
-        case .hygiene:      return .blue
-        case .duplicate:    return .orange
-        case .rename:       return .purple
-        case .fingerprint:  return .pink
-        case .sync:         return .teal
-        case .scan:         return .green
-        case .general:      return .gray
-        }
+            .foregroundStyle(category.tint)
     }
 }
 
@@ -193,7 +181,7 @@ private struct ActivityHistoryPopover: View {
         case .all:
             return activityLog.recent
         case .category(let cat):
-            return activityLog.recent.filter { $0.category == cat }
+            return activityLog.recent.filter { entry in entry.category == cat }
         }
     }
 
@@ -274,7 +262,7 @@ private struct ActivityHistoryPopover: View {
             Text(entry.category.displayName)
                 .font(.caption2.smallCaps())
                 .frame(width: 78, alignment: .leading)
-                .foregroundStyle(categoryTint(entry.category))
+                .foregroundStyle(entry.category.tint)
             Text(entry.message)
                 .font(.caption.monospaced())
                 .textSelection(.enabled)
@@ -301,9 +289,16 @@ private struct ActivityHistoryPopover: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
     }
+}
 
-    private func categoryTint(_ category: ActivityLog.Category) -> Color {
-        switch category {
+/// Color tint per activity category — single source of truth.
+/// Both `ActivityStrip` and `ActivityHistoryPopover` consume this;
+/// a duplicated `categoryTint(_:)` switch previously lived in each.
+/// Adding a new `ActivityLog.Category` case now produces an
+/// exhaustive-switch warning in one place instead of two.
+fileprivate extension ActivityLog.Category {
+    var tint: Color {
+        switch self {
         case .hygiene:      return .blue
         case .duplicate:    return .orange
         case .rename:       return .purple

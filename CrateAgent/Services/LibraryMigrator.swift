@@ -39,10 +39,12 @@ public actor LibraryMigrator {
         public let errors: [String]
     }
 
-    public enum MigratorError: LocalizedError {
+    public enum MigratorError: LocalizedError, Equatable {
         case noPlans
         case sameRoot
         case crossVolumeUnsupported(reason: String)
+        case sourceNoLongerExists(path: String)
+        case destinationAlreadyExists(path: String)
 
         public var errorDescription: String? {
             switch self {
@@ -52,6 +54,10 @@ public actor LibraryMigrator {
                 return "Source and destination are the same folder."
             case .crossVolumeUnsupported(let reason):
                 return "Cross-volume migration isn't supported yet (\(reason))."
+            case .sourceNoLongerExists:
+                return "Source no longer exists."
+            case .destinationAlreadyExists:
+                return "Destination already exists — re-scan and retry."
             }
         }
     }
@@ -157,16 +163,10 @@ public actor LibraryMigrator {
         let fileManager = FileManager.default
 
         guard fileManager.fileExists(atPath: source.path) else {
-            throw NSError(
-                domain: "LibraryMigrator", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Source no longer exists."]
-            )
+            throw MigratorError.sourceNoLongerExists(path: source.path)
         }
         if fileManager.fileExists(atPath: destination.path) {
-            throw NSError(
-                domain: "LibraryMigrator", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Destination already exists — re-scan and retry."]
-            )
+            throw MigratorError.destinationAlreadyExists(path: destination.path)
         }
 
         let parentDirectory = destination.deletingLastPathComponent()

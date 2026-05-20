@@ -214,8 +214,20 @@ struct LibraryBrowserView: View {
                 try FileRecord.fetchOne(db, key: rowId)
             }
             if let record { renameTarget = record }
+            // record == nil is the common case (row vanished
+            // between menu open and fetch) — no UI action, no log.
         } catch {
-            // Defensive: row vanished between menu open and fetch.
+            // CLAUDE.md no-silent-failures: surface the DB read
+            // error to the activity strip so the user sees that
+            // the Rename… click didn't no-op for a mysterious
+            // reason. The strip is the always-on diagnostic
+            // surface; the rename dialog itself doesn't get to
+            // open here, so this is the only path the user can
+            // observe.
+            services.activityLog.log(
+                "Rename… couldn't load file id \(rowId): \(error.localizedDescription)",
+                category: .general
+            )
         }
     }
 

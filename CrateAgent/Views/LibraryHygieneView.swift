@@ -810,6 +810,10 @@ private struct DuplicatesPanel: View {
     @State private var lastResolution: String?
     @State private var pendingResolveGroup: DuplicateFinder.DuplicateGroup?
     @State private var pendingResolveAll: Bool = false
+    /// Cached fingerprint coverage so the modeBar's "X of Y
+    /// fingerprinted" label doesn't recompute over 32k rows on
+    /// every render. Refreshed in `rescan()` alongside `groups`.
+    @State private var fingerprintCoverage: (done: Int, total: Int) = (done: 0, total: 0)
     /// While a batch resolve-all is in flight, how many files of the
     /// planned total have made it to Trash so far. Drives the
     /// progress text in the action bar. Resets to (0,0) when idle.
@@ -928,8 +932,7 @@ private struct DuplicatesPanel: View {
             }
             Spacer()
             if mode == .perceptual {
-                let coverage = DuplicateFinder.fingerprintCoverage(in: files)
-                Text("\(coverage.done) of \(coverage.total) fingerprinted")
+                Text("\(fingerprintCoverage.done) of \(fingerprintCoverage.total) fingerprinted")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .help("Perceptual matching needs Chromaprint fingerprints. Files still being fingerprinted in the background can't be matched yet — results improve as the fingerprint worker progresses.")
@@ -1137,7 +1140,7 @@ private struct DuplicatesPanel: View {
     }
 
     private var totalDuplicateFiles: Int {
-        groups.reduce(0) { $0 + $1.size }
+        groups.reduce(0) { total, group in total + group.size }
     }
 
     /// Files that would be trashed if the user resolved every group
@@ -1162,11 +1165,15 @@ private struct DuplicatesPanel: View {
                 try FileRecord.fetchAll(db)
             }
             groups = DuplicateFinder.findDuplicates(in: files, mode: mode)
+            // Refresh the cached perceptual-coverage tuple here so
+            // the modeBar can read it without iterating `files`
+            // on every SwiftUI redraw.
+            fingerprintCoverage = DuplicateFinder.fingerprintCoverage(in: files)
             // Drop overrides for groups that no longer exist after
             // the rescan — preserves the user's per-group picks for
             // surviving groups while pruning stale ones.
             let currentIds = Set(groups.map(\.id))
-            keeperOverrides = keeperOverrides.filter { currentIds.contains($0.key) }
+            keeperOverrides = keeperOverrides.filter { entry in currentIds.contains(entry.key) }
         } catch {
             actionError = "Couldn't scan library: \(error.localizedDescription)"
         }
@@ -1235,7 +1242,7 @@ private struct DuplicatesPanel: View {
         actionError = nil
         lastResolution = nil
 
-        let plannedTotal = resolvable.reduce(0) { $0 + ($1.group.size - 1) }
+        let plannedTotal = resolvable.reduce(0) { total, entry in total + (entry.group.size - 1) }
         batchProgress = BatchProgress(trashed: 0, total: plannedTotal)
 
         let sharedBatchId = "duplicate-resolve-all-\(UUID().uuidString)"
