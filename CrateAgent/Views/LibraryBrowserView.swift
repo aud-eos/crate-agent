@@ -3,7 +3,6 @@ import SwiftUI
 
 struct LibraryBrowserView: View {
     @EnvironmentObject private var services: AppServices
-    @Environment(\.openWindow) private var openWindow
 
     /// Hard cap on rows the table renders. SwiftUI Table doesn't scale
     /// past ~10k items even with virtualization — diffing + accessibility
@@ -129,22 +128,6 @@ struct LibraryBrowserView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-
-            Button {
-                openWindow(id: "cleanup")
-            } label: {
-                Label("Cleanup", systemImage: "sparkles")
-            }
-            .controlSize(.small)
-            .help("Scan the library for whitespace issues and apply trims as a single undoable batch.")
-
-            Button {
-                openWindow(id: "history")
-            } label: {
-                Label("History", systemImage: "clock.arrow.circlepath")
-            }
-            .controlSize(.small)
-            .help("Review recent changes crate-agent has made and undo individual batches.")
 
             FolderPickerButton(
                 title: "Change…",

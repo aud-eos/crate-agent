@@ -935,34 +935,60 @@ private struct DuplicatesPanel: View {
                 detail: modeEmptyDetail
             )
         } else {
-            List {
-                ForEach(groups) { group in
-                    Section {
-                        ForEach(group.files, id: \.id) { file in
-                            duplicateRow(file: file, group: group)
-                        }
-                    } header: {
-                        HStack(spacing: 8) {
-                            Text("\(group.size) copies · \(modeHeader(for: group))")
-                                .font(.caption.smallCaps())
-                            Spacer()
-                            Button {
-                                pendingResolveGroup = group
-                            } label: {
-                                Label("Resolve", systemImage: "trash")
-                                    .labelStyle(.titleAndIcon)
-                            }
-                            .controlSize(.small)
-                            .disabled(isResolving || seratoWatchdog.isSeratoRunning)
-                            .help(seratoWatchdog.isSeratoRunning
-                                  ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
-                                  : "Move non-keepers to Trash and remove their Serato references in one batch.")
-                        }
+            // ScrollView + LazyVStack rather than a sectioned List
+            // because sectioned Lists on macOS get sticky section
+            // headers — when the first section's header scrolls to
+            // the top it reads as a global "apply all" affordance.
+            // Per-group cards avoid the stickiness entirely and
+            // make the per-group scope visually obvious.
+            ScrollView {
+                LazyVStack(spacing: 12) {
+                    ForEach(groups) { group in
+                        groupCard(group)
                     }
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
             }
-            .listStyle(.inset)
         }
+    }
+
+    @ViewBuilder
+    private func groupCard(_ group: DuplicateFinder.DuplicateGroup) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("\(group.size) copies · \(modeHeader(for: group))")
+                    .font(.caption.smallCaps())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    pendingResolveGroup = group
+                } label: {
+                    Label("Resolve Group", systemImage: "trash")
+                        .labelStyle(.titleAndIcon)
+                }
+                .controlSize(.small)
+                .disabled(isResolving || seratoWatchdog.isSeratoRunning)
+                .help(seratoWatchdog.isSeratoRunning
+                      ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
+                      : "Move non-keepers in this group to Trash and remove their Serato references in one batch.")
+            }
+            VStack(spacing: 4) {
+                ForEach(group.files, id: \.id) { file in
+                    duplicateRow(file: file, group: group)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.secondary.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
     }
 
     private var modeEmptyDetail: String {
