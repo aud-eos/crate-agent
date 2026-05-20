@@ -432,12 +432,49 @@ final class OperationEngineTests: XCTestCase {
         ).write(to: databaseV2)
 
         // Recovery: replay the Serato side of the batch.
-        let replayed = try await engine.resyncSeratoForBatch(recoveryBatchId)
-        XCTAssertEqual(replayed, 1, "exactly one fileRenamed event was replayed")
+        let outcome = try await engine.resyncSeratoForBatch(recoveryBatchId)
+        XCTAssertEqual(outcome.appliedCount, 1, "exactly one fileRenamed event was applied to disk")
+        XCTAssertEqual(outcome.queuedCount, 0, "Serato was closed; nothing should have queued")
 
         let v2PathsAfter = try readDatabasePaths(databasePath: databaseV2.path)
         XCTAssertEqual(v2PathsAfter, ["Users/testuser/Music/A/new.mp3"],
                        "resync must rewrite database V2 from the event log")
+    }
+
+    /// When Serato is running, resync writes must queue (never
+    /// touch disk) and the outcome must reflect that — issue #64.
+    /// Otherwise a user clicking "Re-sync Serato" with Serato open
+    /// sees "Re-sync complete" while nothing actually lands.
+    func testResyncReportsQueuedCountWhenSeratoIsRunning() async throws {
+        let (seratoDirectoryUrl, _) = try Self.makeTemporarySeratoLibrary(
+            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+        )
+        defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: true)
+        }
+
+        let batchId = "test-queued-resync"
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/old.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )), batchId: batchId)
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+        try await engine.apply(.renameFile(RenameFilePayload(
+            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+        )), batchId: batchId)
+
+        let outcome = try await engine.resyncSeratoForBatch(batchId)
+        XCTAssertEqual(outcome.appliedCount, 0,
+                       "no writes should reach disk while Serato is running")
+        XCTAssertEqual(outcome.queuedCount, 1,
+                       "the one rename event should have queued")
+        XCTAssertTrue(outcome.summaryMessage.contains("queued"),
+                      "summary must communicate the queued state to the user")
     }
 
     func testQueueDepthPublisherEmitsOnEnqueueAndDrain() async throws {
