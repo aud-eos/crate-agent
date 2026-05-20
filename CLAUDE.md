@@ -31,11 +31,17 @@ How to apply: when writing a new mutation, the inverse computation is part of th
 
 ### 3. Serato library files are never written while Serato is running
 
-`SeratoWatchdog` observes Serato's running state. When Serato is running, writes to `~/Music/_Serato_/*.crate` and database files MUST queue, not proceed. Filesystem-level operations (moving files) can still proceed; only the Serato library update is deferred.
+`SeratoWatchdog` observes Serato's running state. When Serato is running, writes to Serato's library files MUST queue, not proceed. Filesystem-level operations (moving files) can still proceed; only the Serato library update is deferred.
+
+**The full set of Serato library files this rule applies to** — any new mutation that touches Serato MUST round-trip every file in this list, not just the first one or two. (`SeratoLibraryLocator.enumerateCrateFiles` already enumerates the crate-shaped ones together.)
+
+- `~/Music/_Serato_/database V2` — main library; source of truth for the "All" view
+- `~/Music/_Serato_/Subcrates/*.crate` — user-curated playlists; reference `otrk`/`ptrk` records
+- `~/Music/_Serato_/SmartCrates/*.scrate` — rule-based dynamic playlists. **These are not pure rules — they cache a materialized otrk list** that Serato uses to auto-re-import paths missing from V2 on next launch. Forgetting this directory caused PR #65 (paths kept restoring even after correct V2 rewrites).
 
 Why this exists: Serato caches the library in memory and overwrites the disk version when it saves. Any write we make while Serato is running gets silently overwritten when Serato next saves. From the user's perspective: their changes vanish at random.
 
-How to apply: anything touching `~/Music/_Serato_/` goes through `OperationEngine`, which routes through `SeratoWatchdog`. Never write directly to `_Serato_` files from another code path.
+How to apply: anything touching the files above goes through `OperationEngine`, which routes through `SeratoWatchdog`. Never write directly to `_Serato_` files from another code path. When adding a new Serato-side operation, audit every directory in the list above — silent omissions surface as "the rewrite kept getting undone" mysteries (see PR #65).
 
 ### 4. Track identity is Chromaprint, not path
 
