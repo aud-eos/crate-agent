@@ -56,13 +56,19 @@ public actor LibraryOrganizer {
         public let errors: [String]
     }
 
-    public enum OrganizerError: LocalizedError {
+    public enum OrganizerError: LocalizedError, Equatable {
         case noPlans
+        case sourceNoLongerExists(path: String)
+        case destinationAlreadyExists(path: String)
 
         public var errorDescription: String? {
             switch self {
             case .noPlans:
                 return "Nothing to organize — every file is already in its canonical location."
+            case .sourceNoLongerExists:
+                return "Source file no longer exists."
+            case .destinationAlreadyExists:
+                return "Destination already exists — re-scan and retry."
             }
         }
     }
@@ -174,18 +180,10 @@ public actor LibraryOrganizer {
         let fileManager = FileManager.default
 
         guard fileManager.fileExists(atPath: source.path) else {
-            throw NSError(
-                domain: "LibraryOrganizer",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Source file no longer exists."]
-            )
+            throw OrganizerError.sourceNoLongerExists(path: source.path)
         }
         if fileManager.fileExists(atPath: destination.path) {
-            throw NSError(
-                domain: "LibraryOrganizer",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Destination already exists — re-scan and retry."]
-            )
+            throw OrganizerError.destinationAlreadyExists(path: destination.path)
         }
 
         let parentDirectory = destination.deletingLastPathComponent()

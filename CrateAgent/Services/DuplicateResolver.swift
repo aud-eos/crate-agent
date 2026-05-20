@@ -88,7 +88,7 @@ public actor DuplicateResolver {
         keeperId: Int64,
         batchId: String? = nil
     ) async throws -> Outcome {
-        let keeperIsInGroup = group.files.contains { $0.id == keeperId }
+        let keeperIsInGroup = group.files.contains { file in file.id == keeperId }
         guard keeperIsInGroup else { throw ResolverError.keeperNotInGroup }
 
         let toTrash: [Int64] = group.files.compactMap { file -> Int64? in
