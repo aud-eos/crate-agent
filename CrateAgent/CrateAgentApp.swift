@@ -14,6 +14,30 @@ struct CrateAgentApp: App {
             CommandGroup(replacing: .newItem) {}
         }
 
+        // Cleanup and History are first-class windows rather than
+        // modal sheets so the user can resize, leave them open
+        // beside the browser, and treat them as long-lived tools.
+        // `Window` (not `WindowGroup`) gives us a singleton per
+        // identifier — repeated `openWindow(id:)` calls focus the
+        // existing window instead of spawning duplicates.
+        Window("Library Cleanup", id: "cleanup") {
+            cleanupContent
+        }
+        .defaultSize(width: 900, height: 640)
+        .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+        }
+
+        Window("History", id: "history") {
+            historyContent
+        }
+        .defaultSize(width: 720, height: 520)
+        .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+        }
+
         MenuBarExtra("crate-agent", systemImage: "music.note.list") {
             menuBarContent
         }
@@ -61,6 +85,46 @@ struct CrateAgentApp: App {
                 .environmentObject(services)
                 .environmentObject(services.seratoWatchdog)
         }
+    }
+
+    @ViewBuilder
+    private var cleanupContent: some View {
+        switch launcher.state {
+        case .needsOnboarding:
+            unavailablePlaceholder(
+                message: "Finish setup to use Library Cleanup."
+            )
+        case .ready(let services):
+            LibraryHygieneView()
+                .environmentObject(services)
+                .environmentObject(services.seratoWatchdog)
+        }
+    }
+
+    @ViewBuilder
+    private var historyContent: some View {
+        switch launcher.state {
+        case .needsOnboarding:
+            unavailablePlaceholder(
+                message: "Finish setup to view History."
+            )
+        case .ready(let services):
+            HistoryView()
+                .environmentObject(services)
+        }
+    }
+
+    @ViewBuilder
+    private func unavailablePlaceholder(message: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "gear.badge.questionmark")
+                .font(.largeTitle)
+                .foregroundStyle(.tertiary)
+            Text(message)
+                .font(.body)
+                .foregroundStyle(.secondary)
+        }
+        .frame(minWidth: 360, minHeight: 200)
     }
 
     @ViewBuilder

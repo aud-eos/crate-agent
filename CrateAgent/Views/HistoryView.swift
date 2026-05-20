@@ -4,13 +4,13 @@ import SwiftUI
 /// `events` table via `EventHistoryQuery` and routes Undo clicks
 /// into `OperationEngine.undoBatch`.
 ///
-/// Presented as a sheet from the library browser — short-lived view,
-/// loads its batches on appear and after every undo. No live
-/// observation: history doesn't update fast enough for SwiftUI's
-/// ValueObservation overhead to be worth the wiring.
+/// Lives as a standalone resizable window opened from the browser
+/// toolbar (see `CrateAgentApp.historyContent`). No live observation:
+/// history doesn't update fast enough for SwiftUI's ValueObservation
+/// overhead to be worth the wiring — the Refresh button covers the
+/// "I just made a change, show me" case.
 struct HistoryView: View {
     @EnvironmentObject private var services: AppServices
-    @Environment(\.dismiss) private var dismiss
 
     @State private var batches: [BatchSummary] = []
     @State private var isLoading: Bool = false
@@ -19,25 +19,20 @@ struct HistoryView: View {
     @State private var undoInFlightBatchId: String?
 
     var body: some View {
-        NavigationStack {
-            content
-                .navigationTitle("History")
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Close") { dismiss() }
+        content
+            .navigationTitle("History")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        Task { await reload() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
                     }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            Task { await reload() }
-                        } label: {
-                            Label("Refresh", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(isLoading)
-                    }
+                    .disabled(isLoading)
                 }
-        }
-        .frame(minWidth: 520, minHeight: 360)
-        .task { await reload() }
+            }
+            .frame(minWidth: 520, minHeight: 360)
+            .task { await reload() }
     }
 
     @ViewBuilder
