@@ -38,6 +38,7 @@ struct LibraryHygieneView: View {
 
 private struct WhitespacePanel: View {
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var files: [HygieneFileRow] = []
     @State private var issues: [LibraryHygiene.WhitespaceIssue] = []
@@ -48,6 +49,10 @@ private struct WhitespacePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if seratoWatchdog.isSeratoRunning {
+                SeratoRunningBanner(message: "Serato is running — quit it before fixing whitespace.")
+                Divider()
+            }
             issueListSection
             Divider()
             footer
@@ -108,7 +113,10 @@ private struct WhitespacePanel: View {
                 Task { await fixAll() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(issues.isEmpty || isFixing)
+            .disabled(issues.isEmpty || isFixing || seratoWatchdog.isSeratoRunning)
+            .help(seratoWatchdog.isSeratoRunning
+                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                  : "Trim whitespace from every flagged field in one undoable batch.")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -149,6 +157,7 @@ private struct WhitespacePanel: View {
 
 private struct FindReplacePanel: View {
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var findText: String = ""
     @State private var replaceText: String = ""
@@ -163,6 +172,10 @@ private struct FindReplacePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if seratoWatchdog.isSeratoRunning {
+                SeratoRunningBanner(message: "Serato is running — quit it before applying find/replace.")
+                Divider()
+            }
             queryForm
             Divider()
             matchesSection
@@ -281,7 +294,10 @@ private struct FindReplacePanel: View {
                 Task { await applySelected() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(selectedMatchIds.isEmpty || isApplying)
+            .disabled(selectedMatchIds.isEmpty || isApplying || seratoWatchdog.isSeratoRunning)
+            .help(seratoWatchdog.isSeratoRunning
+                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                  : "Apply the selected replacements in one undoable batch.")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -337,6 +353,7 @@ private struct FindReplacePanel: View {
 
 private struct CaseConsistencyPanel: View {
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var files: [HygieneFileRow] = []
     @State private var groups: [LibraryHygiene.CaseInconsistencyGroup] = []
@@ -352,6 +369,10 @@ private struct CaseConsistencyPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if seratoWatchdog.isSeratoRunning {
+                SeratoRunningBanner(message: "Serato is running — quit it before normalizing case.")
+                Divider()
+            }
             groupListSection
             Divider()
             footer
@@ -457,7 +478,10 @@ private struct CaseConsistencyPanel: View {
                 Task { await applySelections() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(activeGroupCount == 0 || isApplying)
+            .disabled(activeGroupCount == 0 || isApplying || seratoWatchdog.isSeratoRunning)
+            .help(seratoWatchdog.isSeratoRunning
+                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                  : "Apply the selected canonicals in one undoable batch.")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -531,6 +555,7 @@ private struct CaseConsistencyPanel: View {
 
 private struct MissingFieldsPanel: View {
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var files: [HygieneFileRow] = []
     @State private var summaries: [LibraryHygiene.MissingFieldSummary] = []
@@ -545,6 +570,10 @@ private struct MissingFieldsPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if seratoWatchdog.isSeratoRunning {
+                SeratoRunningBanner(message: "Serato is running — quit it before filling missing fields.")
+                Divider()
+            }
             summaryBar
             Divider()
             fillForm
@@ -698,7 +727,10 @@ private struct MissingFieldsPanel: View {
                 Task { await applyFill() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(canApply == false || isApplying)
+            .disabled(canApply == false || isApplying || seratoWatchdog.isSeratoRunning)
+            .help(seratoWatchdog.isSeratoRunning
+                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                  : "Fill the chosen field on every selected track.")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -801,7 +833,7 @@ private struct DuplicatesPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             if seratoWatchdog.isSeratoRunning {
-                seratoRunningBanner
+                SeratoRunningBanner(message: "Serato is running — quit it before resolving duplicates.")
                 Divider()
             }
             modeBar
@@ -841,21 +873,6 @@ private struct DuplicatesPanel: View {
         } message: {
             Text("This moves \(totalNonKeeperCount) file\(totalNonKeeperCount == 1 ? "" : "s") across \(groups.count) group\(groups.count == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. Files in Trash stay restorable from Finder until you empty Trash. This action can't be undone from History. The keeper for each group is the one currently selected — change keepers before resolving if needed.")
         }
-    }
-
-    @ViewBuilder
-    private var seratoRunningBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.shield.fill")
-                .foregroundStyle(.orange)
-            Text("Serato is running — quit it before resolving duplicates.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(Color.orange.opacity(0.1))
     }
 
     /// Global action affordance for the panel. Sits between the
@@ -1182,7 +1199,11 @@ private struct DuplicatesPanel: View {
         let resolver = DuplicateResolver(operationEngine: services.operationEngine, activityLog: services.activityLog)
         do {
             let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
-            lastResolution = "Moved \(outcome.trashedCount) duplicate\(outcome.trashedCount == 1 ? "" : "s") to Trash"
+            if outcome.failureCount == 0 {
+                lastResolution = "Moved \(outcome.trashedCount) duplicate\(outcome.trashedCount == 1 ? "" : "s") to Trash"
+            } else {
+                actionError = "Moved \(outcome.trashedCount); \(outcome.failureCount) skipped (see activity log)"
+            }
             await rescan()
         } catch {
             actionError = "Resolve failed: \(error.localizedDescription)"
@@ -1221,6 +1242,7 @@ private struct DuplicatesPanel: View {
         let resolver = DuplicateResolver(operationEngine: services.operationEngine, activityLog: services.activityLog)
 
         var trashedSoFar = 0
+        var skippedSoFar = 0
         var groupsResolved = 0
         for entry in resolvable {
             do {
@@ -1230,16 +1252,25 @@ private struct DuplicatesPanel: View {
                     batchId: sharedBatchId
                 )
                 trashedSoFar += outcome.trashedCount
+                skippedSoFar += outcome.failureCount
                 groupsResolved += 1
                 batchProgress = BatchProgress(trashed: trashedSoFar, total: plannedTotal)
             } catch {
+                // Group-level failure (rare — `resolve` now
+                // tolerates per-file errors internally; this
+                // catches structural problems like
+                // `keeperNotInGroup`).
                 actionError = "Stopped after \(groupsResolved) group\(groupsResolved == 1 ? "" : "s"): \(error.localizedDescription)"
                 break
             }
         }
 
         if actionError == nil {
-            lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s") across \(groupsResolved) group\(groupsResolved == 1 ? "" : "s") to Trash"
+            if skippedSoFar == 0 {
+                lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s") across \(groupsResolved) group\(groupsResolved == 1 ? "" : "s") to Trash"
+            } else {
+                lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s"); \(skippedSoFar) skipped (see activity log)"
+            }
         }
         await rescan()
     }

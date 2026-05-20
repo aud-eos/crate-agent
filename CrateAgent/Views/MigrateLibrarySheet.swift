@@ -34,6 +34,10 @@ struct MigrateLibrarySheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if seratoWatchdog.isSeratoRunning {
+                SeratoRunningBanner(message: "Serato is running — quit it before moving the library.")
+                Divider()
+            }
             header
             Divider()
             content

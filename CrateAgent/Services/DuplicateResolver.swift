@@ -27,8 +27,27 @@ public actor DuplicateResolver {
         /// The single batch id all events from this resolution
         /// share. Hand to the History view for cross-reference.
         public let batchId: String
-        /// Number of files that were trashed.
+        /// Number of files that fully completed the 4-mutation
+        /// sequence (Serato cleanup → trash → DB removal).
         public let trashedCount: Int
+        /// Number of files where one or more of the per-file
+        /// mutations threw. Earlier mutations on these files may
+        /// have already applied — see `errors` for context.
+        public let failureCount: Int
+        /// One human-readable error string per failed file.
+        public let errors: [String]
+
+        public init(
+            batchId: String,
+            trashedCount: Int,
+            failureCount: Int = 0,
+            errors: [String] = []
+        ) {
+            self.batchId = batchId
+            self.trashedCount = trashedCount
+            self.failureCount = failureCount
+            self.errors = errors
+        }
     }
 
     public enum ResolverError: LocalizedError, Equatable {
@@ -82,31 +101,59 @@ public actor DuplicateResolver {
 
         await note("Resolving duplicate group: trashing \(toTrash.count) non-keeper\(toTrash.count == 1 ? "" : "s")…")
 
+        var trashedCount = 0
+        var failureCount = 0
+        var errors: [String] = []
         for fileId in toTrash {
-            await note("Trashing file id \(fileId) (Serato cleanup → trash → DB)")
-            // Order matters for FK behavior: the Serato cleanups and
-            // the trash all read the FileRecord by id to resolve the
-            // path. `removeFile` deletes the row last, so it can't
-            // pull the path out from under earlier steps.
-            try await operationEngine.apply(
-                .removeTrackFromSerato(RemoveTrackFromSeratoPayload(fileId: fileId)),
-                batchId: effectiveBatchId
-            )
-            try await operationEngine.apply(
-                .removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fileId)),
-                batchId: effectiveBatchId
-            )
-            try await operationEngine.apply(
-                .trashFile(TrashFilePayload(fileId: fileId)),
-                batchId: effectiveBatchId
-            )
-            try await operationEngine.apply(
-                .removeFile(RemoveFilePayload(fileId: fileId)),
-                batchId: effectiveBatchId
-            )
+            do {
+                try await resolveOne(fileId: fileId, batchId: effectiveBatchId)
+                trashedCount += 1
+            } catch {
+                // Per-file fault tolerance: one failure must not
+                // abort the rest of the batch. The earlier
+                // mutations for THIS file may have partially
+                // applied — the audit trail in the events table
+                // captures what landed; the activity-log note
+                // surfaces it to the user. Without this guard a
+                // single mid-loop throw left every untouched file
+                // forever unresolved.
+                failureCount += 1
+                let message = "file id \(fileId): \(error.localizedDescription)"
+                errors.append(message)
+                await note("Skipped \(message) — earlier steps for this file may have partially applied; subsequent files continue.")
+            }
         }
 
-        await note("Resolved group — \(toTrash.count) file\(toTrash.count == 1 ? "" : "s") trashed")
-        return Outcome(batchId: effectiveBatchId, trashedCount: toTrash.count)
+        await note("Resolved group — \(trashedCount) file\(trashedCount == 1 ? "" : "s") trashed, \(failureCount) skipped")
+        return Outcome(
+            batchId: effectiveBatchId,
+            trashedCount: trashedCount,
+            failureCount: failureCount,
+            errors: errors
+        )
+    }
+
+    private func resolveOne(fileId: Int64, batchId: String) async throws {
+        await note("Trashing file id \(fileId) (Serato cleanup → trash → DB)")
+        // Order matters for FK behavior: the Serato cleanups and
+        // the trash all read the FileRecord by id to resolve the
+        // path. `removeFile` deletes the row last, so it can't
+        // pull the path out from under earlier steps.
+        try await operationEngine.apply(
+            .removeTrackFromSerato(RemoveTrackFromSeratoPayload(fileId: fileId)),
+            batchId: batchId
+        )
+        try await operationEngine.apply(
+            .removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fileId)),
+            batchId: batchId
+        )
+        try await operationEngine.apply(
+            .trashFile(TrashFilePayload(fileId: fileId)),
+            batchId: batchId
+        )
+        try await operationEngine.apply(
+            .removeFile(RemoveFilePayload(fileId: fileId)),
+            batchId: batchId
+        )
     }
 }

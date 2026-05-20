@@ -4510,6 +4510,80 @@ final class DuplicateResolverTests: XCTestCase {
             }
         }
     }
+
+    /// Regression for the per-file-isolation gap the post-session
+    /// code review caught: pre-fix, one file's failure in the
+    /// 4-mutation sequence aborted the entire resolve loop, leaving
+    /// later non-keepers untouched. Now the loop catches per file,
+    /// records the failure in `Outcome.errors`, and continues.
+    func testResolveContinuesAfterPerFileFailureAndReportsCounts() async throws {
+        // Build a 1-keeper + 2-non-keeper group; arrange for the
+        // SECOND non-keeper's trash step to throw. The FIRST
+        // non-keeper should complete; the second should be
+        // recorded as a failure; the loop must not abort.
+        let keeperPath = "/Music/A/keeper.mp3"
+        let dupePathOk = "/Music/A/dupe-ok.mp3"
+        let dupePathFail = "/Music/A/dupe-fail.mp3"
+
+        let database = try await MainActor.run { try LibraryDatabase.openInMemory() }
+        let watchdog = await MainActor.run {
+            SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        }
+        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator,
+            fileTagWriter: { _, _ in },
+            fileTrasher: { path in
+                if path == dupePathFail {
+                    throw NSError(
+                        domain: "TestTrasher", code: 13,
+                        userInfo: [NSLocalizedDescriptionKey: "synthetic trash failure"]
+                    )
+                }
+            }
+        )
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: keeperPath, volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: dupePathOk, volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+        )))
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: dupePathFail, volumeUuid: "v1", inode: 3, fileSize: 1, mtime: 1
+        )))
+        let keeperId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: [keeperPath])
+        }!
+
+        let files = try await database.writer.read { db in
+            try FileRecord.fetchAll(db).sorted(by: { lhs, rhs in
+                // Force a deterministic order so the failing file
+                // is the second one processed.
+                let lhsKey = lhs.path == dupePathFail ? 1 : 0
+                let rhsKey = rhs.path == dupePathFail ? 1 : 0
+                return lhsKey < rhsKey
+            })
+        }
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "isolation-test", mode: .byteLevel, files: files
+        )
+
+        let resolver = DuplicateResolver(operationEngine: engine)
+        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
+
+        XCTAssertEqual(outcome.trashedCount, 1,
+                       "the non-failing duplicate must complete")
+        XCTAssertEqual(outcome.failureCount, 1,
+                       "the failing duplicate must be reported as skipped")
+        XCTAssertEqual(outcome.errors.count, 1,
+                       "one per-file error string must be recorded")
+        XCTAssertTrue(outcome.errors.first?.contains("synthetic trash failure") ?? false,
+                      "error string must include the underlying message; got \(outcome.errors)")
+    }
 }
 
 final class WriteFileTagsMutationTests: XCTestCase {
