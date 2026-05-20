@@ -51,6 +51,7 @@ public actor OperationEngine {
     private let seratoLocator: SeratoLibraryLocator
     private let fileTagWriter: FileTagWriter
     private let fileTrasher: FileTrasher
+    private let activityLog: ActivityLog?
 
     /// Pending writes to Serato library files. Either a path
     /// rewrite or a metadata update. Drained when Serato exits via
@@ -87,13 +88,20 @@ public actor OperationEngine {
         fileTrasher: @escaping FileTrasher = { path in
             let url = URL(fileURLWithPath: path)
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-        }
+        },
+        activityLog: ActivityLog? = nil
     ) {
         self.database = database
         self.seratoWatchdog = seratoWatchdog
         self.seratoLocator = seratoLocator
         self.fileTagWriter = fileTagWriter
         self.fileTrasher = fileTrasher
+        self.activityLog = activityLog
+    }
+
+    private func note(_ message: String) async {
+        guard let log = activityLog else { return }
+        await log.log(message, category: .sync)
     }
 
     /// Apply a mutation with an auto-generated batch identifier. Use
@@ -151,6 +159,76 @@ public actor OperationEngine {
     ///
     /// Returns the new batch id so the caller (UI) can offer "Undo the
     /// undo" without having to scan the events table.
+
+    /// Replay the Serato-side writes for every `fileRenamed` event
+    /// in a batch. Recovery primitive for the case where the
+    /// original `applySeratoRename` failed mid-loop (e.g., a
+    /// corrupted .crate file aborted the rewrite before
+    /// `database V2` got updated). The file move on disk and the
+    /// DB row update are already done; this just re-fires the
+    /// Serato library rewrite so `database V2` and the .crate
+    /// files catch up to the current DB state.
+    ///
+    /// Idempotent — re-applying a successful rewrite is a no-op
+    /// (the path is already what we'd be setting it to).
+    ///
+    /// Returns the number of fileRenamed events that were
+    /// replayed. Events of other types in the batch are skipped
+    /// without error (this is a rename-recovery primitive, not a
+    /// general replay).
+    @discardableResult
+    public func resyncSeratoForBatch(_ batchId: String) async throws -> Int {
+        let events: [EventRecord] = try await database.writer.read { db in
+            try EventRecord
+                .filter(Column("batch_id") == batchId)
+                .order(Column("event_id").asc)
+                .fetchAll(db)
+        }
+        guard !events.isEmpty else {
+            throw OperationEngineError.batchNotFound(batchId: batchId)
+        }
+
+        await note("Re-syncing Serato library for batch — \(events.count) event\(events.count == 1 ? "" : "s") to inspect")
+
+        var replayed = 0
+        for event in events {
+            guard event.eventType == .fileRenamed else { continue }
+            guard let forwardJsonData = event.payloadJson.data(using: .utf8) else {
+                continue
+            }
+            let payload: RenameFilePayload
+            do {
+                payload = try JSONDecoder().decode(
+                    RenameFilePayload.self, from: forwardJsonData
+                )
+            } catch {
+                continue
+            }
+            // The forward payload's `previousPath` is the
+            // pre-rename absolute path; if it's missing (older
+            // events before this field was always populated),
+            // skip — we have no source to rewrite from.
+            guard !payload.previousPath.isEmpty else { continue }
+            let rename = SeratoPendingRename(
+                oldAbsolutePath: payload.previousPath,
+                newAbsolutePath: payload.newPath
+            )
+            // Honor the Serato-running guard the same way
+            // `apply` does — queue if Serato is up.
+            let isSeratoRunning = await seratoWatchdog.isSeratoRunning
+            if isSeratoRunning {
+                pendingSeratoWrites.append(.rename(rename))
+                queueDepthSubject.send(pendingSeratoWrites.count)
+            } else {
+                try await applySeratoRename(rename)
+            }
+            replayed += 1
+        }
+
+        await note("Re-sync complete — replayed \(replayed) rename\(replayed == 1 ? "" : "s")")
+        return replayed
+    }
+
     @discardableResult
     public func undoBatch(_ batchId: String) async throws -> String {
         let events: [EventRecord] = try await database.writer.read { db in
@@ -302,15 +380,21 @@ public actor OperationEngine {
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
+        let displayFilename = (removal.absolutePath as NSString).lastPathComponent
         let crateFiles: [URL]
         do {
             crateFiles = try seratoLocator.enumerateCrateFiles()
         } catch {
+            await note("Failed to enumerate Subcrates directory while removing \(displayFilename): \(error.localizedDescription)")
             throw OperationEngineError.seratoEnumerationFailed(
                 directory: seratoLocator.subcratesDirectoryUrl.path,
                 underlying: String(describing: error)
             )
         }
+        // Per-crate fault tolerance: one bad crate file can't
+        // block removing the file's reference from every other
+        // crate. Symmetric with `applySeratoRename`.
+        var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
             do {
                 _ = try removePathFromCrate(
@@ -318,11 +402,19 @@ public actor OperationEngine {
                     trackPath: seratoRelativePath
                 )
             } catch {
-                throw OperationEngineError.seratoRewriteFailed(
-                    path: crateFile.path,
-                    underlying: String(describing: error)
-                )
+                perCrateFailures.append((crateFile, error))
+                let crateName = crateFile.lastPathComponent
+                await note("Skipped crate \(crateName) while removing \(displayFilename): \(error.localizedDescription)")
             }
+        }
+        // Only throw if EVERY crate failed — a partial sweep is
+        // still useful (most user crates will succeed).
+        if !crateFiles.isEmpty && perCrateFailures.count == crateFiles.count {
+            let firstFailure = perCrateFailures[0]
+            throw OperationEngineError.seratoRewriteFailed(
+                path: firstFailure.0.path,
+                underlying: String(describing: firstFailure.1)
+            )
         }
     }
 
@@ -480,17 +572,56 @@ public actor OperationEngine {
         let newSeratoPath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: rename.newAbsolutePath
         )
+        let displayFilename = (rename.newAbsolutePath as NSString).lastPathComponent
+
+        // Database V2 first, then crates. Database V2 is the source
+        // of truth for Serato's "All" view — the thing the user
+        // actually sees and drags from. If a single corrupted
+        // .crate file throws (rare but real on user libraries
+        // that have accumulated cruft), we still need V2 updated;
+        // otherwise tracks move on disk and Serato keeps the old
+        // path forever (the bug PR fixed).
+        var databaseV2Rewrites: UInt32 = 0
+        var databaseV2Error: Error?
+        let databaseV2Path = seratoLocator.databaseV2Url.path
+        if FileManager.default.fileExists(atPath: databaseV2Path) {
+            do {
+                databaseV2Rewrites = try rewriteDatabasePath(
+                    databasePath: databaseV2Path,
+                    oldPath: oldSeratoPath,
+                    newPath: newSeratoPath
+                )
+                if databaseV2Rewrites == 0 {
+                    // Old path wasn't in database V2. Surprising —
+                    // surface so the user can see something is off
+                    // (e.g., Unicode normalization mismatch, prior
+                    // failed sync, or the track was never in
+                    // Serato to begin with).
+                    await note("⚠️ database V2 had no entry for \(oldSeratoPath) — \(displayFilename) won't appear in Serato until re-imported.")
+                }
+            } catch {
+                databaseV2Error = error
+                await note("Failed to update database V2 for \(displayFilename): \(error.localizedDescription)")
+            }
+        }
 
         let crateFiles: [URL]
         do {
             crateFiles = try seratoLocator.enumerateCrateFiles()
         } catch {
-            throw OperationEngineError.seratoEnumerationFailed(
-                directory: seratoLocator.subcratesDirectoryUrl.path,
-                underlying: String(describing: error)
-            )
+            // Enumeration failure is symmetric with the V2 failure
+            // — both surface, neither stops the other.
+            await note("Failed to enumerate Subcrates directory: \(error.localizedDescription)")
+            if databaseV2Error != nil {
+                throw OperationEngineError.seratoEnumerationFailed(
+                    directory: seratoLocator.subcratesDirectoryUrl.path,
+                    underlying: String(describing: error)
+                )
+            }
+            return
         }
 
+        var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
             do {
                 _ = try rewriteCratePath(
@@ -499,27 +630,26 @@ public actor OperationEngine {
                     newPath: newSeratoPath
                 )
             } catch {
-                throw OperationEngineError.seratoRewriteFailed(
-                    path: crateFile.path,
-                    underlying: String(describing: error)
-                )
+                // Per-crate fault tolerance: log and continue. A
+                // single bad crate file can't poison the entire
+                // sync for the rest of the user's library.
+                perCrateFailures.append((crateFile, error))
+                let crateName = crateFile.lastPathComponent
+                await note("Skipped crate \(crateName) while renaming \(displayFilename): \(error.localizedDescription)")
             }
         }
 
-        let databaseV2Path = seratoLocator.databaseV2Url.path
-        if FileManager.default.fileExists(atPath: databaseV2Path) {
-            do {
-                _ = try rewriteDatabasePath(
-                    databasePath: databaseV2Path,
-                    oldPath: oldSeratoPath,
-                    newPath: newSeratoPath
-                )
-            } catch {
-                throw OperationEngineError.seratoRewriteFailed(
-                    path: databaseV2Path,
-                    underlying: String(describing: error)
-                )
-            }
+        // Throw only if both V2 and every crate failed — at that
+        // point we genuinely couldn't sync anything and the caller
+        // (e.g., the organizer) needs to know the file move on
+        // disk has no matching library update.
+        let everyCrateFailed = !crateFiles.isEmpty
+            && perCrateFailures.count == crateFiles.count
+        if databaseV2Error != nil && (everyCrateFailed || crateFiles.isEmpty) {
+            throw OperationEngineError.seratoRewriteFailed(
+                path: databaseV2Path,
+                underlying: String(describing: databaseV2Error!)
+            )
         }
     }
 

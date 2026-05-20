@@ -17,6 +17,7 @@ struct HistoryView: View {
     @State private var loadError: String?
     @State private var actionError: String?
     @State private var undoInFlightBatchId: String?
+    @State private var resyncInFlightBatchId: String?
 
     var body: some View {
         content
@@ -103,16 +104,28 @@ struct HistoryView: View {
 
             Spacer(minLength: 8)
 
+            if batch.containsRenames {
+                Button {
+                    Task { await resync(batch: batch) }
+                } label: {
+                    Label("Re-sync Serato", systemImage: "arrow.triangle.2.circlepath")
+                        .labelStyle(.titleAndIcon)
+                }
+                .controlSize(.small)
+                .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil)
+                .help("Re-run the Serato library rewrite for every renamed file in this batch. Idempotent — safe to re-run if the original sync only partially succeeded.")
+            }
+
             Button("Undo") {
                 Task { await undo(batch: batch) }
             }
-            .disabled(!batch.canUndo || undoInFlightBatchId != nil)
+            .disabled(!batch.canUndo || undoInFlightBatchId != nil || resyncInFlightBatchId != nil)
             .help(batch.canUndo
                   ? "Reverse every change in this batch."
                   : "This batch contains operations that can't be undone yet (Serato-side imports/commits).")
         }
         .padding(.vertical, 4)
-        .opacity(undoInFlightBatchId == batch.batchId ? 0.55 : 1)
+        .opacity((undoInFlightBatchId == batch.batchId || resyncInFlightBatchId == batch.batchId) ? 0.55 : 1)
     }
 
     @ViewBuilder
@@ -154,6 +167,19 @@ struct HistoryView: View {
             actionError = nil
         } catch {
             actionError = "Undo failed: \(error.localizedDescription)"
+        }
+        await reload()
+    }
+
+    private func resync(batch: BatchSummary) async {
+        resyncInFlightBatchId = batch.batchId
+        defer { resyncInFlightBatchId = nil }
+        do {
+            let replayed = try await services.operationEngine.resyncSeratoForBatch(batch.batchId)
+            actionError = nil
+            _ = replayed  // count surfaced via activity log; no UI banner.
+        } catch {
+            actionError = "Re-sync failed: \(error.localizedDescription)"
         }
         await reload()
     }

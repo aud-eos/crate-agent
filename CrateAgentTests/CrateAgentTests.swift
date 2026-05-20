@@ -247,6 +247,136 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(queueDepth, 1, "the rewrite must be queued, not applied")
     }
 
+    /// Regression for the post-PR-58 organize-to-Serato sync bug:
+    /// a single corrupted `.crate` file used to throw inside
+    /// `applySeratoRename` BEFORE `database V2` got rewritten, so
+    /// every organize move ended up with the file moved on disk
+    /// but Serato's "All" view still pointing at the old path.
+    /// The fix processes V2 first and tolerates per-crate failures.
+    func testRenameRewritesDatabaseV2EvenWhenCrateFileIsCorrupted() async throws {
+        // Build a Subcrates directory with: one good crate, one
+        // garbage file that triseratops can't parse, both with the
+        // .crate extension. Add a valid database V2 that contains
+        // the old path.
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
+        try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        // Valid crate referencing the old path.
+        let goodCrate = subcratesDirectory.appendingPathComponent("Good.crate")
+        try OperationEngineTests.synthesizeCrateBytesForTest(
+            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+        ).write(to: goodCrate)
+
+        // Corrupt crate: garbage bytes that won't parse as TLV.
+        let badCrate = subcratesDirectory.appendingPathComponent("Bad.crate")
+        try Data(repeating: 0xFF, count: 64).write(to: badCrate)
+
+        // Database V2 with the old path; this is what Serato's
+        // "All" view actually reads.
+        let databaseV2 = seratoDirectory.appendingPathComponent("database V2")
+        try OperationEngineTests.synthesizeDatabaseV2BytesForTest(
+            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+        ).write(to: databaseV2)
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectory, seratoIsRunning: false)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/old.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+
+        // The rename must NOT throw despite the corrupted crate.
+        try await engine.apply(.renameFile(RenameFilePayload(
+            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+        )))
+
+        // Database V2 MUST reflect the new path — this is the
+        // bug fix's primary contract.
+        let v2Paths = try readDatabasePaths(databasePath: databaseV2.path)
+        XCTAssertEqual(v2Paths, ["Users/testuser/Music/A/new.mp3"],
+                       "database V2 must be rewritten even when a sibling .crate file is corrupted")
+
+        // The good crate also got rewritten — per-crate tolerance
+        // means the loop continued past the bad one.
+        let goodPaths = try readCratePaths(cratePath: goodCrate.path)
+        XCTAssertEqual(goodPaths, ["Users/testuser/Music/A/new.mp3"])
+    }
+
+    /// `resyncSeratoForBatch` is the recovery primitive: when an
+    /// original `renameFile` succeeded in the DB but its Serato
+    /// rewrite was lost (e.g., a corrupted .crate threw before the
+    /// V2 update under the old logic), re-running it brings
+    /// Serato's library back in sync. Idempotent.
+    func testResyncSeratoForBatchReappliesRenameToDatabaseV2() async throws {
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        let databaseV2 = seratoDirectory.appendingPathComponent("database V2")
+        // Pre-populate V2 with the OLD path — simulating the
+        // user's broken state where a previous rename event
+        // logged the DB-side mutation but the Serato write was
+        // lost.
+        try OperationEngineTests.synthesizeDatabaseV2BytesForTest(
+            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+        ).write(to: databaseV2)
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectory, seratoIsRunning: false)
+        }
+
+        let recoveryBatchId = "test-recovery-batch"
+        try await engine.apply(
+            .indexNewFile(IndexNewFilePayload(
+                path: "/Users/testuser/Music/A/old.mp3",
+                volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+            )),
+            batchId: recoveryBatchId
+        )
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+
+        // First rename succeeds normally — V2 already has new path.
+        try await engine.apply(
+            .renameFile(RenameFilePayload(
+                fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            )),
+            batchId: recoveryBatchId
+        )
+
+        // Simulate the broken-state: forcibly revert V2 to the
+        // pre-rename state. This is what the user's library
+        // looked like after the bug fired.
+        try OperationEngineTests.synthesizeDatabaseV2BytesForTest(
+            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+        ).write(to: databaseV2)
+
+        // Recovery: replay the Serato side of the batch.
+        let replayed = try await engine.resyncSeratoForBatch(recoveryBatchId)
+        XCTAssertEqual(replayed, 1, "exactly one fileRenamed event was replayed")
+
+        let v2PathsAfter = try readDatabasePaths(databasePath: databaseV2.path)
+        XCTAssertEqual(v2PathsAfter, ["Users/testuser/Music/A/new.mp3"],
+                       "resync must rewrite database V2 from the event log")
+    }
+
     func testQueueDepthPublisherEmitsOnEnqueueAndDrain() async throws {
         let (seratoDirectoryUrl, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: ["Users/testuser/Music/A/old.mp3"]
