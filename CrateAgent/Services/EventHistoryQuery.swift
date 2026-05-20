@@ -23,6 +23,10 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     /// batch was itself produced by an undoBatch call. Surfaced so
     /// the UI can label "Undo of …" rows differently if desired.
     public let isUndoBatch: Bool
+    /// `true` when at least one event in the batch is a
+    /// `fileRenamed`. Drives the "Re-sync Serato" button visibility
+    /// — the recovery primitive only does anything for renames.
+    public let containsRenames: Bool
 
     public var timestamp: Date {
         Date(timeIntervalSince1970: TimeInterval(firstTimestampMillis) / 1000)
@@ -79,7 +83,8 @@ public enum EventHistoryQuery {
                 eventCount: row.eventCount,
                 description: describeBatch(typeCounts: typeCounts),
                 canUndo: canUndoBatch(typeList: typeList),
-                isUndoBatch: row.batchId.hasPrefix("undo:")
+                isUndoBatch: row.batchId.hasPrefix("undo:"),
+                containsRenames: typeList.contains(EventType.fileRenamed.rawValue)
             )
         }
     }

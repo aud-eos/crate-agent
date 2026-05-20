@@ -87,7 +87,8 @@ public final class AppServices: ObservableObject {
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: seratoWatchdog,
-            seratoLocator: seratoLocator
+            seratoLocator: seratoLocator,
+            activityLog: activityLog
         )
         self.operationEngine = engine
 
