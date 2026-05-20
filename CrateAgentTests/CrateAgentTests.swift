@@ -247,6 +247,69 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(queueDepth, 1, "the rewrite must be queued, not applied")
     }
 
+    /// Regression for the smart-crate-restoration bug. Serato's
+    /// "Smart Crates" (`.scrate` files in `SmartCrates/`) cache a
+    /// materialized otrk path list alongside the rules. If a path
+    /// is missing from `database V2` but present in a smart crate,
+    /// Serato re-imports it on next launch — which means a rename
+    /// that doesn't touch the smart crate gets silently undone the
+    /// next time the user opens Serato.
+    ///
+    /// Fix: `SeratoLibraryLocator.enumerateCrateFiles` now returns
+    /// both `Subcrates/*.crate` AND `SmartCrates/*.scrate`. Both
+    /// formats share the `otrk`/`ptrk` TLV layout, so the existing
+    /// rewrite walks them transparently.
+    func testRenameRewritesSmartCratesAlongsideRegularCrates() async throws {
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
+        let smartCratesDirectory = seratoDirectory.appendingPathComponent("SmartCrates", isDirectory: true)
+        try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: smartCratesDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        let regularCrate = subcratesDirectory.appendingPathComponent("Regular.crate")
+        try OperationEngineTests.synthesizeCrateBytesForTest(
+            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+        ).write(to: regularCrate)
+
+        // Smart crates share the otrk/ptrk record format used by
+        // regular crates. The version-string text differs in real
+        // Serato output but the rewrite only matches on the otrk
+        // tag, not on the version header — so reusing the regular
+        // synthesizer is sufficient for the rewrite test.
+        let smartCrate = smartCratesDirectory.appendingPathComponent("NEVER PLAYED.scrate")
+        try OperationEngineTests.synthesizeCrateBytesForTest(
+            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+        ).write(to: smartCrate)
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectory, seratoIsRunning: false)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/old.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+        }!
+
+        try await engine.apply(.renameFile(RenameFilePayload(
+            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+        )))
+
+        let regularPaths = try readCratePaths(cratePath: regularCrate.path)
+        XCTAssertEqual(regularPaths, ["Users/testuser/Music/A/new.mp3"],
+                       "regular .crate must be rewritten")
+
+        let smartPaths = try readCratePaths(cratePath: smartCrate.path)
+        XCTAssertEqual(smartPaths, ["Users/testuser/Music/A/new.mp3"],
+                       "smart .scrate must also be rewritten — otherwise Serato restores the old path on next launch")
+    }
+
     /// Regression for the post-PR-58 organize-to-Serato sync bug:
     /// a single corrupted `.crate` file used to throw inside
     /// `applySeratoRename` BEFORE `database V2` got rewritten, so
