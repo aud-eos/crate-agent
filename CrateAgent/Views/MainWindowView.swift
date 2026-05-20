@@ -79,37 +79,58 @@ struct MainWindowView: View {
 /// relative timestamp. Goes blank with a hint message when nothing's
 /// been logged yet — never absent, so the user has a fixed place to
 /// look for "is crate-agent doing anything right now?".
+///
+/// Clickable: opens a popover that shows the full rolling buffer
+/// (`activityLog.recent`) so the user can scroll through entries the
+/// one-line strip already replaced. Critical for debugging fast
+/// operations that fly past faster than anyone can read.
 private struct ActivityStrip: View {
     @EnvironmentObject private var activityLog: ActivityLog
+    @State private var showHistory: Bool = false
 
     var body: some View {
-        HStack(spacing: 10) {
-            if let entry = activityLog.latest {
-                categoryBadge(entry.category)
-                Text(entry.message)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 8)
-                Text(entry.timestamp, style: .relative)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                Text("ago")
+        Button {
+            showHistory.toggle()
+        } label: {
+            HStack(spacing: 10) {
+                if let entry = activityLog.latest {
+                    categoryBadge(entry.category)
+                    Text(entry.message)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    Text(entry.timestamp, style: .relative)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    Text("ago")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    Image(systemName: "moon.zzz")
+                        .foregroundStyle(.tertiary)
+                    Text("Idle — actions will log here.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                }
+                Image(systemName: "chevron.up")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-            } else {
-                Image(systemName: "moon.zzz")
-                    .foregroundStyle(.tertiary)
-                Text("Idle — actions will log here.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                Spacer()
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(minHeight: 26)
+            .frame(maxWidth: .infinity)
+            .background(Color.secondary.opacity(0.06))
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .frame(minHeight: 26)
-        .background(Color.secondary.opacity(0.06))
+        .buttonStyle(.plain)
+        .help("Click to see the full activity log (last \(ActivityLog.bufferLimit) entries).")
+        .popover(isPresented: $showHistory, arrowEdge: .bottom) {
+            ActivityHistoryPopover()
+                .environmentObject(activityLog)
+        }
     }
 
     @ViewBuilder
@@ -122,6 +143,163 @@ private struct ActivityStrip: View {
                 Capsule().fill(categoryTint(category).opacity(0.18))
             )
             .foregroundStyle(categoryTint(category))
+    }
+
+    private func categoryTint(_ category: ActivityLog.Category) -> Color {
+        switch category {
+        case .hygiene:      return .blue
+        case .duplicate:    return .orange
+        case .rename:       return .purple
+        case .fingerprint:  return .pink
+        case .sync:         return .teal
+        case .scan:         return .green
+        case .general:      return .gray
+        }
+    }
+}
+
+/// Scrollable history of every `ActivityLog` entry currently in the
+/// rolling buffer. Shown as a popover from the strip — gives the
+/// user a way to read entries that flew past too fast (per-file
+/// progress, ⚠️ sync warnings, partial-failure reports during a
+/// batch operation).
+///
+/// Filter buttons across the top narrow to a single category — the
+/// expected workflow during a debug session is "I want to see only
+/// the Sync entries from the resync I just ran." Newest-first order
+/// matches the strip's behavior.
+private struct ActivityHistoryPopover: View {
+    @EnvironmentObject private var activityLog: ActivityLog
+    @State private var filter: Filter = .all
+
+    private enum Filter: Hashable {
+        case all
+        case category(ActivityLog.Category)
+
+        var displayName: String {
+            switch self {
+            case .all:                  return "All"
+            case .category(let cat):    return cat.displayName
+            }
+        }
+    }
+
+    private var filterOptions: [Filter] {
+        [.all] + ActivityLog.Category.allCases.map(Filter.category)
+    }
+
+    private var filteredEntries: [ActivityLog.Entry] {
+        switch filter {
+        case .all:
+            return activityLog.recent
+        case .category(let cat):
+            return activityLog.recent.filter { $0.category == cat }
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            content
+            Divider()
+            footer
+        }
+        .frame(width: 540, height: 420)
+    }
+
+    @ViewBuilder
+    private var header: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(filterOptions, id: \.self) { option in
+                    Button {
+                        filter = option
+                    } label: {
+                        Text(option.displayName)
+                            .font(.caption.smallCaps())
+                    }
+                    .buttonStyle(.borderless)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(
+                            filter == option
+                                ? Color.accentColor.opacity(0.18)
+                                : Color.secondary.opacity(0.10)
+                        )
+                    )
+                    .foregroundStyle(filter == option ? Color.accentColor : Color.secondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if filteredEntries.isEmpty {
+            VStack(spacing: 6) {
+                Image(systemName: "tray")
+                    .font(.title2)
+                    .foregroundStyle(.tertiary)
+                Text(filter == .all
+                     ? "Nothing logged yet."
+                     : "No \(filter.displayName) entries.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(filteredEntries) { entry in
+                        entryRow(entry)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func entryRow(_ entry: ActivityLog.Entry) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(entry.timestamp, format: .dateTime.hour().minute().second())
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .frame(width: 70, alignment: .leading)
+            Text(entry.category.displayName)
+                .font(.caption2.smallCaps())
+                .frame(width: 78, alignment: .leading)
+                .foregroundStyle(categoryTint(entry.category))
+            Text(entry.message)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .lineLimit(3)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        HStack {
+            Text("\(filteredEntries.count) of \(activityLog.recent.count) entries · buffer holds last \(ActivityLog.bufferLimit)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Spacer()
+            Button("Clear") {
+                activityLog.clear()
+            }
+            .controlSize(.small)
+            .disabled(activityLog.recent.isEmpty)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
     }
 
     private func categoryTint(_ category: ActivityLog.Category) -> Color {
