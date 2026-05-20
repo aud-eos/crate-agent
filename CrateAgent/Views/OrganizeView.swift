@@ -10,6 +10,7 @@ import SwiftUI
 struct OrganizeView: View {
 
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var plans: [LibraryOrganizer.Plan] = []
     @State private var selection: Set<Int64> = []
@@ -36,6 +37,10 @@ struct OrganizeView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if seratoWatchdog.isSeratoRunning {
+                SeratoRunningBanner(message: "Serato is running — quit it before organizing.")
+                Divider()
+            }
             header
             Divider()
             content
@@ -222,7 +227,10 @@ struct OrganizeView: View {
                 pendingConfirm = true
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(selection.isEmpty || isApplying)
+            .disabled(selection.isEmpty || isApplying || seratoWatchdog.isSeratoRunning)
+            .help(seratoWatchdog.isSeratoRunning
+                  ? "Quit Serato before organizing — renames write to Serato library files and would be clobbered on Serato's next save."
+                  : "Move every selected file into its canonical letter bucket and update Serato + DB in one batch.")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
