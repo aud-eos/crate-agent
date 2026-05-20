@@ -375,6 +375,59 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(goodPaths, ["Users/testuser/Music/A/new.mp3"])
     }
 
+    /// Regression mirror for `applySeratoCrateSweepRemoval` — the
+    /// duplicate-resolver's "remove this path from every crate"
+    /// path. Has the same per-crate fault-tolerance shape as
+    /// `applySeratoRename` but never had a test holding the
+    /// tolerance in place. Without this, an accidental revert of
+    /// the catch-and-continue logic would silently start aborting
+    /// the entire sweep on the first corrupt crate.
+    func testRemoveFileFromCratesContinuesPastCorruptedCrate() async throws {
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-sweep-corrupt-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
+        try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        // Valid crate referencing the target path; sweep should
+        // remove this otrk and write the crate back.
+        let goodCrate = subcratesDirectory.appendingPathComponent("Good.crate")
+        try OperationEngineTests.synthesizeCrateBytesForTest(
+            withTrackPaths: ["Users/testuser/Music/A/dupe.mp3"]
+        ).write(to: goodCrate)
+
+        // Garbage bytes that won't parse as TLV. The removal loop
+        // must catch the per-crate parse failure and continue
+        // rather than aborting and leaving the valid crate stale.
+        let badCrate = subcratesDirectory.appendingPathComponent("Bad.crate")
+        try Data(repeating: 0xFF, count: 64).write(to: badCrate)
+
+        let (engine, database, _) = try await MainActor.run {
+            try makeEngine(seratoDirectory: seratoDirectory, seratoIsRunning: false)
+        }
+
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Users/testuser/Music/A/dupe.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )))
+        let fileId = try await database.writer.read { db in
+            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
+                              arguments: ["/Users/testuser/Music/A/dupe.mp3"])
+        }!
+
+        // The sweep removal must NOT throw despite the corrupt crate.
+        try await engine.apply(.removeFileFromCrates(
+            RemoveFileFromCratesPayload(fileId: fileId)
+        ))
+
+        // Valid crate had its otrk removed; bad crate is untouched
+        // on disk (the parse failed before any write attempt).
+        let goodPaths = try readCratePaths(cratePath: goodCrate.path)
+        XCTAssertEqual(goodPaths, [],
+                       "valid crate must have the path stripped even when a sibling crate is corrupted")
+    }
+
     /// `resyncSeratoForBatch` is the recovery primitive: when an
     /// original `renameFile` succeeded in the DB but its Serato
     /// rewrite was lost (e.g., a corrupted .crate threw before the
@@ -1829,6 +1882,52 @@ final class SeratoLibraryLocatorTests: XCTestCase {
         let locator = SeratoLibraryLocator(seratoDirectory: seratoDirectory)
         let names = try locator.enumerateCrateFiles().map { $0.lastPathComponent }
         XCTAssertEqual(names, ["Alpha.crate", "Beta.crate", "Zeta.crate"])
+    }
+
+    /// Direct regression for PR #65 — the smart crate restoration
+    /// bug we spent multiple debugging rounds chasing. The locator's
+    /// enumeration MUST include `SmartCrates/*.scrate` alongside
+    /// `Subcrates/*.crate`. Before #65 the smart-crate directory was
+    /// invisible to every Serato write path, and smart crates'
+    /// materialized otrk cache silently restored deleted V2 entries
+    /// on Serato's next launch.
+    func testEnumerateCrateFilesIncludesSmartCratesAlongsideSubcrates() throws {
+        let seratoDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-locator-smart-\(UUID().uuidString)", isDirectory: true)
+        let subcratesDirectory = seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
+        let smartCratesDirectory = seratoDirectory.appendingPathComponent("SmartCrates", isDirectory: true)
+        try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: smartCratesDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: seratoDirectory) }
+
+        try Data().write(to: subcratesDirectory.appendingPathComponent("Workout.crate"))
+        try Data().write(to: smartCratesDirectory.appendingPathComponent("NEVER PLAYED.scrate"))
+        try Data().write(to: smartCratesDirectory.appendingPathComponent("UNTAGGED.scrate"))
+        // A non-.scrate file inside SmartCrates must be ignored.
+        try Data().write(to: smartCratesDirectory.appendingPathComponent("notes.txt"))
+
+        let locator = SeratoLibraryLocator(seratoDirectory: seratoDirectory)
+        let names = try locator.enumerateCrateFiles().map { $0.lastPathComponent }
+
+        XCTAssertEqual(names.sorted(), [
+            "NEVER PLAYED.scrate",
+            "UNTAGGED.scrate",
+            "Workout.crate",
+        ], "enumeration must include both directories' files")
+        XCTAssertTrue(names.contains("NEVER PLAYED.scrate"),
+                      ".scrate files in SmartCrates/ must surface — without this, Serato re-imports stale paths from the smart-crate otrk cache (the PR #65 bug)")
+    }
+
+    func testEnumerateCrateFilesReturnsEmptyWhenBothDirectoriesAreMissing() throws {
+        // A fresh Serato install without crates yet: neither
+        // Subcrates/ nor SmartCrates/ exists. Must not throw.
+        let seratoDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-test-locator-fresh-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: seratoDirectory) }
+
+        let locator = SeratoLibraryLocator(seratoDirectory: seratoDirectory)
+        XCTAssertEqual(try locator.enumerateCrateFiles(), [])
     }
 }
 
@@ -4929,5 +5028,71 @@ final class LibraryMigratorPlannerTests: XCTestCase {
         XCTAssertEqual(plans[1].destinationPath,
                        "/Music/_DJ_Library_/A/Artist - Track (1).mp3",
                        "second colliding plan must be suffixed")
+    }
+}
+
+@MainActor
+final class ActivityLogTests: XCTestCase {
+
+    func testLogSetsLatestAndAppendsToRecent() {
+        let log = ActivityLog()
+        XCTAssertNil(log.latest)
+        XCTAssertTrue(log.recent.isEmpty)
+
+        log.log("scanning library", category: .scan)
+
+        XCTAssertEqual(log.latest?.message, "scanning library")
+        XCTAssertEqual(log.latest?.category, .scan)
+        XCTAssertEqual(log.recent.count, 1)
+        XCTAssertEqual(log.recent.first?.message, "scanning library")
+    }
+
+    func testRecentIsNewestFirst() {
+        let log = ActivityLog()
+        log.log("first", category: .general)
+        log.log("second", category: .general)
+        log.log("third", category: .general)
+
+        XCTAssertEqual(log.recent.map(\.message), ["third", "second", "first"],
+                       "newest entries must appear at the head of `recent`")
+        XCTAssertEqual(log.latest?.message, "third",
+                       "latest must track the most recently logged entry")
+    }
+
+    func testBufferIsCappedAtBufferLimit() {
+        let log = ActivityLog()
+        let overflow = ActivityLog.bufferLimit + 50
+        for index in 0..<overflow {
+            log.log("entry \(index)", category: .general)
+        }
+
+        XCTAssertEqual(log.recent.count, ActivityLog.bufferLimit,
+                       "buffer must stop growing once the cap is reached")
+        // Oldest 50 entries dropped; the head must be the newest.
+        XCTAssertEqual(log.recent.first?.message, "entry \(overflow - 1)")
+        // Tail must be the 51st entry (index 50), because entries
+        // 0..49 fell off as the cap was exceeded.
+        XCTAssertEqual(log.recent.last?.message, "entry \(overflow - ActivityLog.bufferLimit)")
+    }
+
+    func testClearResetsLatestAndRecent() {
+        let log = ActivityLog()
+        log.log("something happened", category: .hygiene)
+        XCTAssertNotNil(log.latest)
+        XCTAssertFalse(log.recent.isEmpty)
+
+        log.clear()
+
+        XCTAssertNil(log.latest)
+        XCTAssertTrue(log.recent.isEmpty)
+    }
+
+    func testCategoryIsPreservedOnEntry() {
+        let log = ActivityLog()
+        log.log("syncing", category: .sync)
+        log.log("organizing", category: .rename)
+        log.log("trashing", category: .duplicate)
+
+        XCTAssertEqual(log.recent.map(\.category), [.duplicate, .rename, .sync])
     }
 }
