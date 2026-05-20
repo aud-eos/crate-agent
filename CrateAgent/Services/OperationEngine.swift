@@ -1091,6 +1091,22 @@ public actor OperationEngine {
         return (eventId, pending)
     }
 
+    /// Sentinel stored in `inverse_payload_json` for events that
+    /// are structurally non-undoable (trash, remove-from-Serato,
+    /// remove-from-crates). Previously these events stored the
+    /// forward payload twice — auditors couldn't distinguish "no
+    /// inverse" from "inverse identical to forward," and a future
+    /// engineer wiring up undo would decode garbage. The sentinel
+    /// makes the events table self-describing: `inverse_payload_json`
+    /// reading `{"reason":"non-undoable",…}` is the unambiguous
+    /// signal that `decodeInverseMutation` will throw
+    /// `undoNotSupported` for this row.
+    private struct NonUndoableInverse: Codable {
+        let reason: String
+        let eventType: String
+        let recoveryNote: String
+    }
+
     private static func applyTrashFile(
         _ payload: TrashFilePayload,
         batchId: String,
@@ -1113,13 +1129,18 @@ public actor OperationEngine {
             fileId: payload.fileId,
             path: fileRecord.path
         )
+        let inverse = NonUndoableInverse(
+            reason: "non-undoable",
+            eventType: EventType.fileTrashed.rawValue,
+            recoveryNote: "Restore from Finder Trash before it is emptied."
+        )
         let eventId = try insertEvent(
             batchId: batchId,
             timestamp: timestamp,
             fileId: payload.fileId,
             eventType: .fileTrashed,
             forwardPayload: forwardPayload,
-            inversePayload: forwardPayload,
+            inversePayload: inverse,
             in: db
         )
         return (eventId, SeratoPendingTrash(absolutePath: fileRecord.path))
@@ -1142,13 +1163,18 @@ public actor OperationEngine {
             fileId: payload.fileId,
             path: fileRecord.path
         )
+        let inverse = NonUndoableInverse(
+            reason: "non-undoable",
+            eventType: EventType.trackRemovedFromSerato.rawValue,
+            recoveryNote: "Re-add the track to Serato's library via drag-drop or rescan."
+        )
         let eventId = try insertEvent(
             batchId: batchId,
             timestamp: timestamp,
             fileId: payload.fileId,
             eventType: .trackRemovedFromSerato,
             forwardPayload: forwardPayload,
-            inversePayload: forwardPayload,
+            inversePayload: inverse,
             in: db
         )
         let pending = SeratoPendingRemoval(absolutePath: fileRecord.path)
@@ -1172,13 +1198,18 @@ public actor OperationEngine {
             fileId: payload.fileId,
             path: fileRecord.path
         )
+        let inverse = NonUndoableInverse(
+            reason: "non-undoable",
+            eventType: EventType.fileRemovedFromCrates.rawValue,
+            recoveryNote: "Re-add the path to each affected crate manually in Serato."
+        )
         let eventId = try insertEvent(
             batchId: batchId,
             timestamp: timestamp,
             fileId: payload.fileId,
             eventType: .fileRemovedFromCrates,
             forwardPayload: forwardPayload,
-            inversePayload: forwardPayload,
+            inversePayload: inverse,
             in: db
         )
         let pending = SeratoPendingRemoval(absolutePath: fileRecord.path)
