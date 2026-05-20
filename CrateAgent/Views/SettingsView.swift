@@ -27,11 +27,12 @@ struct SettingsView: View {
 struct GeneralSettingsView: View {
     @EnvironmentObject private var services: AppServices
     @State private var showRestartAlert: Bool = false
+    @State private var showMigrationSheet: Bool = false
 
     var body: some View {
         Form {
             Section {
-                LabeledContent("Watched folder") {
+                LabeledContent("Library folder") {
                     VStack(alignment: .trailing, spacing: 4) {
                         Text(services.watchedMusicFolder.path)
                             .font(.caption.monospaced())
@@ -39,18 +40,26 @@ struct GeneralSettingsView: View {
                             .lineLimit(2)
                             .truncationMode(.middle)
                             .textSelection(.enabled)
-                        FolderPickerButton(
-                            title: "Change…",
-                            message: "Choose the folder crate-agent should watch."
-                        ) { pickedUrl in
-                            UserPreferences.watchedMusicFolder = pickedUrl
-                            showRestartAlert = true
+                        HStack(spacing: 6) {
+                            Button("Move Library…") {
+                                showMigrationSheet = true
+                            }
+                            .controlSize(.small)
+                            .help("Move every tracked file under this folder into a new location. The DB and Serato library follow in one undoable batch.")
+
+                            FolderPickerButton(
+                                title: "Change Without Moving…",
+                                message: "Point crate-agent at a different folder. Files stay where they are — use this if you've moved them manually."
+                            ) { pickedUrl in
+                                UserPreferences.watchedMusicFolder = pickedUrl
+                                showRestartAlert = true
+                            }
+                            .controlSize(.small)
                         }
-                        .controlSize(.small)
                     }
                 }
             } footer: {
-                Text("crate-agent watches this folder for renames and indexes the files Serato references inside it. Add new tracks via Serato or by dragging onto the library window.")
+                Text("crate-agent watches this folder for renames and indexes the files Serato references inside it. The recommended location is `~/Music/_DJ_Library_/` — a dedicated managed folder that sorts alongside Serato's own `_Serato_/`.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -60,6 +69,11 @@ struct GeneralSettingsView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("crate-agent will start watching the new folder the next time it launches.")
+        }
+        .sheet(isPresented: $showMigrationSheet) {
+            MigrateLibrarySheet()
+                .environmentObject(services)
+                .environmentObject(services.seratoWatchdog)
         }
     }
 }

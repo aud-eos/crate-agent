@@ -33,17 +33,38 @@ public enum UserPreferences {
     }
 
     /// Resolve the music folder to watch: stored preference takes
-    /// precedence; falls back to `~/Music`. Throws only if the
-    /// fallback URL itself cannot be resolved (effectively never).
+    /// precedence; falls back to the opinionated default
+    /// (`defaultLibraryRoot`). Throws only if the fallback URL
+    /// itself cannot be resolved (effectively never).
     public static func resolveMusicFolder() throws -> URL {
         if let stored = watchedMusicFolder {
             return stored
         }
-        return try FileManager.default.url(
+        return try defaultLibraryRoot()
+    }
+
+    /// Opinionated default location for a fresh install:
+    /// `~/Music/_DJ_Library_/`. Underscore-bracketed to match
+    /// Serato's `_Serato_` convention — sorts to the top of
+    /// `~/Music/` and visually telegraphs "managed by the tool,
+    /// don't reorganize by hand."
+    ///
+    /// The directory is NOT created here — callers that pick this
+    /// as the destination (onboarding "Use default" button,
+    /// migration sheet) are responsible for `createDirectory`
+    /// at the point of use so the side effect is visible.
+    public static let defaultLibraryFolderName: String = "_DJ_Library_"
+
+    public static func defaultLibraryRoot() throws -> URL {
+        let musicDirectory = try FileManager.default.url(
             for: .musicDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: false
+        )
+        return musicDirectory.appendingPathComponent(
+            defaultLibraryFolderName,
+            isDirectory: true
         )
     }
 
