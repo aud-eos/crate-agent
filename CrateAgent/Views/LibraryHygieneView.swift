@@ -777,6 +777,20 @@ private struct DuplicatesPanel: View {
     @State private var actionError: String?
     @State private var lastResolution: String?
     @State private var pendingResolveGroup: DuplicateFinder.DuplicateGroup?
+    @State private var pendingResolveAll: Bool = false
+    /// While a batch resolve-all is in flight, how many files of the
+    /// planned total have made it to Trash so far. Drives the
+    /// progress text in the action bar. Resets to (0,0) when idle.
+    @State private var batchProgress: BatchProgress = .idle
+
+    private struct BatchProgress: Equatable {
+        var trashed: Int
+        var total: Int
+
+        static let idle = BatchProgress(trashed: 0, total: 0)
+
+        var isActive: Bool { total > 0 }
+    }
 
     private static let byteCountFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -792,6 +806,10 @@ private struct DuplicatesPanel: View {
             }
             modeBar
             Divider()
+            if !groups.isEmpty {
+                batchActionBar
+                Divider()
+            }
             groupListSection
             Divider()
             footer
@@ -812,6 +830,17 @@ private struct DuplicatesPanel: View {
         } message: { group in
             Text("This moves \(group.size - 1) file\(group.size - 1 == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. The file in Trash stays restorable from Finder until you empty Trash. This action can't be undone from History.")
         }
+        .alert(
+            "Resolve all duplicate groups?",
+            isPresented: $pendingResolveAll
+        ) {
+            Button("Move \(totalNonKeeperCount) file\(totalNonKeeperCount == 1 ? "" : "s") to Trash", role: .destructive) {
+                Task { await resolveAll() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This moves \(totalNonKeeperCount) file\(totalNonKeeperCount == 1 ? "" : "s") across \(groups.count) group\(groups.count == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. Files in Trash stay restorable from Finder until you empty Trash. This action can't be undone from History. The keeper for each group is the one currently selected — change keepers before resolving if needed.")
+        }
     }
 
     @ViewBuilder
@@ -827,6 +856,44 @@ private struct DuplicatesPanel: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color.orange.opacity(0.1))
+    }
+
+    /// Global action affordance for the panel. Sits between the
+    /// mode picker and the grouped List so the user sees an
+    /// unambiguous "Resolve All" before any sticky per-group
+    /// section header. Hidden when there are no groups (the
+    /// list section renders its own empty state).
+    @ViewBuilder
+    private var batchActionBar: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(groups.count) duplicate group\(groups.count == 1 ? "" : "s")")
+                    .font(.subheadline.weight(.medium))
+                if batchProgress.isActive {
+                    Text("Resolving… \(batchProgress.trashed) of \(batchProgress.total) files trashed")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(totalNonKeeperCount) file\(totalNonKeeperCount == 1 ? "" : "s") will move to Trash")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button(role: .destructive) {
+                pendingResolveAll = true
+            } label: {
+                Label("Resolve All", systemImage: "trash")
+                    .labelStyle(.titleAndIcon)
+            }
+            .disabled(isResolving || seratoWatchdog.isSeratoRunning || totalNonKeeperCount == 0)
+            .help(seratoWatchdog.isSeratoRunning
+                  ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
+                  : "Trash every non-keeper across all groups in one undoable-as-an-audit-log batch.")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.secondary.opacity(0.06))
     }
 
     @ViewBuilder
@@ -1030,6 +1097,19 @@ private struct DuplicatesPanel: View {
         groups.reduce(0) { $0 + $1.size }
     }
 
+    /// Files that would be trashed if the user resolved every group
+    /// with the current keeper selections. (One keeper survives per
+    /// group; everything else goes to Trash.) Counts only groups
+    /// that have a determinable keeper — groups with no keeper are
+    /// skipped here and also skipped at apply time, so the count and
+    /// the actual outcome stay aligned.
+    private var totalNonKeeperCount: Int {
+        groups.reduce(0) { accumulator, group in
+            guard effectiveKeeperId(for: group) != nil else { return accumulator }
+            return accumulator + (group.size - 1)
+        }
+    }
+
     private func rescan() async {
         isScanning = true
         defer { isScanning = false }
@@ -1081,6 +1161,61 @@ private struct DuplicatesPanel: View {
         } catch {
             actionError = "Resolve failed: \(error.localizedDescription)"
         }
+    }
+
+    /// Resolve every group with its current keeper selection. Shares
+    /// one `batch_id` across all groups so History shows a single
+    /// audit entry. If a group fails mid-stream, the failure stops
+    /// the loop and we report partial progress — groups already
+    /// resolved stay resolved (Finder's Trash is the recovery path
+    /// per group), and the user can rescan to see what's left.
+    private func resolveAll() async {
+        let resolvable: [(group: DuplicateFinder.DuplicateGroup, keeperId: Int64)] =
+            groups.compactMap { group in
+                guard let keeperId = effectiveKeeperId(for: group) else { return nil }
+                return (group, keeperId)
+            }
+        guard !resolvable.isEmpty else {
+            actionError = "No groups have a determinable keeper to resolve."
+            return
+        }
+
+        isResolving = true
+        defer {
+            isResolving = false
+            batchProgress = .idle
+        }
+        actionError = nil
+        lastResolution = nil
+
+        let plannedTotal = resolvable.reduce(0) { $0 + ($1.group.size - 1) }
+        batchProgress = BatchProgress(trashed: 0, total: plannedTotal)
+
+        let sharedBatchId = "duplicate-resolve-all-\(UUID().uuidString)"
+        let resolver = DuplicateResolver(operationEngine: services.operationEngine)
+
+        var trashedSoFar = 0
+        var groupsResolved = 0
+        for entry in resolvable {
+            do {
+                let outcome = try await resolver.resolve(
+                    group: entry.group,
+                    keeperId: entry.keeperId,
+                    batchId: sharedBatchId
+                )
+                trashedSoFar += outcome.trashedCount
+                groupsResolved += 1
+                batchProgress = BatchProgress(trashed: trashedSoFar, total: plannedTotal)
+            } catch {
+                actionError = "Stopped after \(groupsResolved) group\(groupsResolved == 1 ? "" : "s"): \(error.localizedDescription)"
+                break
+            }
+        }
+
+        if actionError == nil {
+            lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s") across \(groupsResolved) group\(groupsResolved == 1 ? "" : "s") to Trash"
+        }
+        await rescan()
     }
 }
 
