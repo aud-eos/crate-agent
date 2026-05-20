@@ -13,13 +13,17 @@ struct OnboardingView: View {
     @State private var chosenFolder: URL = OnboardingView.defaultMusicFolder
     @State private var hasConfirmed: Bool = false
 
+    /// Opinionated default for the watched library folder.
+    /// `~/Music/_DJ_Library_/`. Falls back to plain `~/Music` only
+    /// if the Music directory can't be resolved (effectively never).
     static var defaultMusicFolder: URL {
-        (try? FileManager.default.url(
-            for: .musicDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false
-        )) ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Music")
+        (try? UserPreferences.defaultLibraryRoot())
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Music", isDirectory: true)
+                .appendingPathComponent(
+                    UserPreferences.defaultLibraryFolderName,
+                    isDirectory: true
+                )
     }
 
     var body: some View {
@@ -105,6 +109,15 @@ struct OnboardingView: View {
         HStack {
             Spacer()
             Button("Start") {
+                // Make sure the chosen directory exists before the
+                // app tries to watch it — the opinionated default
+                // `~/Music/_DJ_Library_/` is intentionally not
+                // pre-created (the user might pick something else),
+                // so we create-on-confirm here.
+                try? FileManager.default.createDirectory(
+                    at: chosenFolder,
+                    withIntermediateDirectories: true
+                )
                 onComplete(chosenFolder)
             }
             .keyboardShortcut(.defaultAction)

@@ -4714,3 +4714,109 @@ final class LibraryOrganizerPlannerTests: XCTestCase {
         XCTAssertTrue(plans.isEmpty)
     }
 }
+
+final class LibraryMigratorPlannerTests: XCTestCase {
+
+    private let oldRoot = URL(fileURLWithPath: "/Music")
+    private let newRoot = URL(fileURLWithPath: "/Music/_DJ_Library_")
+
+    func testRebasesPathUnderNewRootPreservingRelativeStructure() {
+        // The most common case from issue #59: a file at
+        // /Music/A/Artist - Track.mp3 needs to land at
+        // /Music/_DJ_Library_/A/Artist - Track.mp3.
+        let file = FileRecord(
+            id: 1,
+            path: "/Music/A/Artist - Track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )
+        let plans = LibraryMigrator.findMoves(
+            in: [file], oldRoot: oldRoot, newRoot: newRoot
+        )
+        XCTAssertEqual(plans.count, 1)
+        XCTAssertEqual(plans[0].destinationPath,
+                       "/Music/_DJ_Library_/A/Artist - Track.mp3")
+    }
+
+    func testSkipsFilesOutsideOldRoot() {
+        // The user's Apple Music library, Soulseek folder, etc.
+        // — files not under the old root must NOT be migrated.
+        let file = FileRecord(
+            id: 1,
+            path: "/Users/benny/Soulseek Downloads/song.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )
+        let plans = LibraryMigrator.findMoves(
+            in: [file], oldRoot: oldRoot, newRoot: newRoot
+        )
+        XCTAssertTrue(plans.isEmpty,
+                      "files outside the old root must not be migrated")
+    }
+
+    func testSkipsFilesAlreadyAtCanonicalNewPath() {
+        // Re-running the migrator after a successful run should
+        // find nothing to do for files already under the new root.
+        let file = FileRecord(
+            id: 1,
+            path: "/Music/_DJ_Library_/A/Artist - Track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )
+        let plans = LibraryMigrator.findMoves(
+            in: [file], oldRoot: newRoot, newRoot: newRoot
+        )
+        XCTAssertTrue(plans.isEmpty)
+    }
+
+    func testTrailingSlashAmbiguityDoesNotFalseMatch() {
+        // Without ensureTrailingSlash, "/Music" would naively
+        // prefix-match "/Music Folder/..." and try to migrate
+        // files that don't belong. Lock that in.
+        let file = FileRecord(
+            id: 1,
+            path: "/Music Other Folder/A/song.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )
+        let plans = LibraryMigrator.findMoves(
+            in: [file], oldRoot: oldRoot, newRoot: newRoot
+        )
+        XCTAssertTrue(plans.isEmpty,
+                      "ensureTrailingSlash must prevent false prefix matches")
+    }
+
+    func testReturnsEmptyWhenOldAndNewRootMatch() {
+        let file = FileRecord(
+            id: 1,
+            path: "/Music/A/song.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )
+        let plans = LibraryMigrator.findMoves(
+            in: [file], oldRoot: oldRoot, newRoot: oldRoot
+        )
+        XCTAssertTrue(plans.isEmpty,
+                      "same-root migration must be a no-op")
+    }
+
+    func testDisambiguatesCollisionsWithinPlanBatch() {
+        // Two source files that map to the same destination
+        // (synthetic but defensible — e.g., symlinked layouts).
+        // The planner must produce a unique destination set.
+        let fileA = FileRecord(
+            id: 1,
+            path: "/Music/A/Artist - Track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+        )
+        let fileB = FileRecord(
+            id: 2,
+            path: "/Music/A/Artist - Track.mp3",
+            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+        )
+        let plans = LibraryMigrator.findMoves(
+            in: [fileA, fileB], oldRoot: oldRoot, newRoot: newRoot
+        )
+        XCTAssertEqual(plans.count, 2)
+        XCTAssertEqual(plans[0].destinationPath,
+                       "/Music/_DJ_Library_/A/Artist - Track.mp3")
+        XCTAssertEqual(plans[1].destinationPath,
+                       "/Music/_DJ_Library_/A/Artist - Track (1).mp3",
+                       "second colliding plan must be suffixed")
+    }
+}
