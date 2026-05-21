@@ -119,13 +119,28 @@ fn decode_utf16be(bytes: &[u8]) -> Option<String> {
     if bytes.len() % 2 != 0 {
         return None;
     }
-    let units: Vec<u16> =
-        bytes.chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect();
-    String::from_utf16(&units).ok()
+    // Stream the u16 units through char::decode_utf16 directly into
+    // a String — no intermediate Vec<u16>. `read_database_records`
+    // calls this up to 10× per otrk; a 20k-track read previously
+    // allocated 200k transient vectors.
+    char::decode_utf16(
+        bytes.chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+    )
+    .collect::<Result<String, _>>()
+    .ok()
 }
 
 fn encode_utf16be(value: &str) -> Vec<u8> {
-    value.encode_utf16().flat_map(|unit| unit.to_be_bytes()).collect()
+    // UTF-8 byte length is a tight upper bound for the UTF-16 byte
+    // length on Western text (1 byte ASCII → 2 bytes UTF-16) and
+    // safe for higher planes (4-byte UTF-8 emoji → 4 bytes UTF-16).
+    // Skips the doubling-reallocation chain that `flat_map`'s
+    // unsized size_hint forced on every call.
+    let mut out = Vec::with_capacity(value.len() * 2);
+    for unit in value.encode_utf16() {
+        out.extend_from_slice(&unit.to_be_bytes());
+    }
+    out
 }
 
 /// Extract a path from an `otrk` container payload by locating the
@@ -313,7 +328,11 @@ impl CrateFile {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, SeratoError> {
-        let mut bytes = Vec::new();
+        // Pre-size to the known total. Skips the ~25 doubling
+        // reallocations a fresh Vec::new() incurs on its way to
+        // 25 MB+ output (the size of a real database V2 file).
+        let estimated_size: usize = self.records.iter().map(|record| 8 + record.payload.len()).sum();
+        let mut bytes = Vec::with_capacity(estimated_size);
         TlvRecord::write_all(&self.records, &mut bytes)?;
         Ok(bytes)
     }
@@ -364,7 +383,11 @@ impl DatabaseV2 {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, SeratoError> {
-        let mut bytes = Vec::new();
+        // Pre-size to the known total. Skips the ~25 doubling
+        // reallocations a fresh Vec::new() incurs on its way to
+        // 25 MB+ output (the size of a real database V2 file).
+        let estimated_size: usize = self.records.iter().map(|record| 8 + record.payload.len()).sum();
+        let mut bytes = Vec::with_capacity(estimated_size);
         TlvRecord::write_all(&self.records, &mut bytes)?;
         Ok(bytes)
     }
@@ -453,7 +476,10 @@ impl DatabaseV2 {
             tag: *TAG_PFIL,
             payload: encode_utf16be(track_path),
         }];
-        apply_metadata_update_to_nested(&mut nested, metadata);
+        // Return value ignored: a fresh otrk starts empty so every
+        // supplied field is by definition new — for an add_track the
+        // mutation always counts.
+        let _ = apply_metadata_update_to_nested(&mut nested, metadata);
 
         let mut payload = Vec::with_capacity(nested.iter().map(|r| 8 + r.payload.len()).sum());
         TlvRecord::write_all(&nested, &mut payload).expect("writing to Vec<u8> cannot fail");
@@ -500,7 +526,16 @@ impl DatabaseV2 {
                 continue;
             }
 
-            apply_metadata_update_to_nested(&mut nested, update);
+            let changed = apply_metadata_update_to_nested(&mut nested, update);
+            if !changed {
+                // Path matched but every supplied field already held
+                // its target value. Skip the rebuild — and return 0
+                // so the FFI caller skips the file write too. This
+                // matters for the SP-2 MusicBrainz pass, which calls
+                // update_database_record per track including ones
+                // whose Serato metadata already matches.
+                return 0;
+            }
 
             let mut rebuilt = Vec::with_capacity(record.payload.len());
             TlvRecord::write_all(&nested, &mut rebuilt)
@@ -528,46 +563,58 @@ pub struct SeratoMetadataUpdate {
     pub label: Option<String>,
 }
 
+/// Returns true if any field was actually changed. False means the
+/// update was a no-op (all-None, or every `Some(value)` equalled
+/// the existing tag) and the caller can skip serialisation.
 fn apply_metadata_update_to_nested(
     nested: &mut Vec<TlvRecord>,
     update: &SeratoMetadataUpdate,
-) {
+) -> bool {
+    let mut changed = false;
     if let Some(value) = &update.artist {
-        set_or_insert_text_field(nested, b"tart", value);
+        changed |= set_or_insert_text_field(nested, b"tart", value);
     }
     if let Some(value) = &update.title {
-        set_or_insert_text_field(nested, b"tsng", value);
+        changed |= set_or_insert_text_field(nested, b"tsng", value);
     }
     if let Some(value) = &update.album {
-        set_or_insert_text_field(nested, b"talb", value);
+        changed |= set_or_insert_text_field(nested, b"talb", value);
     }
     if let Some(value) = &update.genre {
-        set_or_insert_text_field(nested, b"tgen", value);
+        changed |= set_or_insert_text_field(nested, b"tgen", value);
     }
     if let Some(value) = &update.bpm {
-        set_or_insert_text_field(nested, b"tbpm", value);
+        changed |= set_or_insert_text_field(nested, b"tbpm", value);
     }
     if let Some(value) = &update.key {
-        set_or_insert_text_field(nested, b"tkey", value);
+        changed |= set_or_insert_text_field(nested, b"tkey", value);
     }
     if let Some(value) = &update.comment {
-        set_or_insert_text_field(nested, b"tcom", value);
+        changed |= set_or_insert_text_field(nested, b"tcom", value);
     }
     if let Some(value) = &update.length {
-        set_or_insert_text_field(nested, b"tlen", value);
+        changed |= set_or_insert_text_field(nested, b"tlen", value);
     }
     if let Some(value) = &update.label {
-        set_or_insert_text_field(nested, b"tlbl", value);
+        changed |= set_or_insert_text_field(nested, b"tlbl", value);
     }
+    changed
 }
 
-fn set_or_insert_text_field(nested: &mut Vec<TlvRecord>, tag: &[u8; 4], value: &str) {
+/// Returns true if the otrk's nested records were actually modified.
+/// A `Some(value)` that equals the existing tag value is treated as
+/// a no-op so callers can skip the rebuild + file write.
+fn set_or_insert_text_field(nested: &mut Vec<TlvRecord>, tag: &[u8; 4], value: &str) -> bool {
     let payload = encode_utf16be(value);
     if let Some(existing) = nested.iter_mut().find(|record| &record.tag == tag) {
+        if existing.payload == payload {
+            return false;
+        }
         existing.payload = payload;
     } else {
         nested.push(TlvRecord { tag: *tag, payload });
     }
+    true
 }
 
 #[cfg(test)]
@@ -1177,16 +1224,41 @@ mod tests {
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
         let update = SeratoMetadataUpdate::default();
-        database.update_track_metadata("Users/x/Music/A/Track.mp3", &update);
+        let updated = database.update_track_metadata("Users/x/Music/A/Track.mp3", &update);
 
-        // The otrk's nested records get parse-rebuild-written even on
-        // a no-op update, so the bytes might NOT be byte-exact at the
-        // payload level if any unknown nested records were silently
-        // dropped. But the round-trip MUST preserve all data — verify
-        // by re-reading the records and comparing.
-        let after = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
-        assert_eq!(after.track_records(), database.track_records());
-        assert_eq!(after.track_records().len(), 1);
+        // An all-None update is a true no-op: the function returns 0
+        // (so the FFI caller skips the file write) and the bytes
+        // round-trip byte-exact since we never rebuilt the otrk.
+        assert_eq!(updated, 0);
+        assert_eq!(database.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn update_track_metadata_returns_zero_when_supplied_values_already_match() {
+        // Set up an otrk whose tart is already "Some Artist", then
+        // call update with artist=Some("Some Artist"). No fields
+        // changed → return 0, bytes byte-exact.
+        let pfil = TlvRecord { tag: *TAG_PFIL, payload: encode_utf16be("Music/A/x.mp3") };
+        let tart = TlvRecord { tag: *b"tart", payload: encode_utf16be("Some Artist") };
+        let mut otrk_payload = Vec::new();
+        TlvRecord::write_all(&[pfil, tart], &mut otrk_payload).unwrap();
+        let vrsn = TlvRecord {
+            tag: *b"vrsn",
+            payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+        };
+        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let mut db_bytes = Vec::new();
+        TlvRecord::write_all(&[vrsn, otrk], &mut db_bytes).unwrap();
+
+        let mut database = DatabaseV2::from_bytes(&db_bytes).unwrap();
+        let update = SeratoMetadataUpdate {
+            artist: Some("Some Artist".to_string()),
+            ..SeratoMetadataUpdate::default()
+        };
+        let updated = database.update_track_metadata("Music/A/x.mp3", &update);
+
+        assert_eq!(updated, 0);
+        assert_eq!(database.to_bytes().unwrap(), db_bytes);
     }
 
     /// Opt-in integration test: parses a real Serato `database V2`

@@ -95,7 +95,12 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
         .start(sample_rate, channel_count)
         .map_err(|err| FingerprintError::UnsupportedAudioConfig(format!("{err:?}")))?;
 
-    let mut samples: Vec<i16> = Vec::new();
+    // Pre-size to one packet's worth of stereo MP3 samples (1152
+    // frames × 2 channels = 2304). Real values vary by codec but
+    // this avoids the resize-then-zero-fill-then-overwrite cycle
+    // on the first ~38 packets of a typical track. The buffer
+    // grows on demand if a codec hands us larger packets.
+    let mut samples: Vec<i16> = Vec::with_capacity(4096 * channel_count.max(1) as usize);
     let max_frames = sample_rate as u64 * FINGERPRINT_MAX_DURATION_SECONDS;
     let mut frames_consumed: u64 = 0;
 
@@ -109,7 +114,15 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
                 let interleaved = audio_buf.samples_interleaved();
-                samples.resize(interleaved, 0i16);
+                // Only grow — never shrink — to avoid pointless
+                // dealloc / realloc cycles when packet sizes vary.
+                // copy_to_slice_interleaved overwrites every byte,
+                // so the zero-fill of `resize` is wasted work.
+                if samples.len() < interleaved {
+                    samples.resize(interleaved, 0i16);
+                } else {
+                    samples.truncate(interleaved);
+                }
                 audio_buf.copy_to_slice_interleaved(&mut samples);
                 fingerprinter.consume(&samples);
                 // Track time consumed by counting frames (interleaved
