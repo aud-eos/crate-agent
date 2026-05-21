@@ -115,11 +115,12 @@ public actor LibraryMigrator {
         return plans
     }
 
-    /// Apply the migration. Each file: ensure parent dir exists,
-    /// `moveItem` on disk, then fire `renameFile` to update Serato
-    /// + DB under the shared batch_id. Best-effort — per-file
-    /// failures append to `Outcome.errors` and the loop continues.
-    /// After success, the caller updates
+    /// Apply the migration. Two-phase: every file moves on disk
+    /// first, then one `applyBatch` covers every successful move's
+    /// `renameFile` mutation. Single SQLite transaction, single
+    /// batched Serato library rewrite. Per-file move failures
+    /// append to `Outcome.errors` and don't block other files.
+    /// After success the caller updates
     /// `UserPreferences.watchedMusicFolder` to the new root.
     @discardableResult
     public func migrate(
@@ -131,13 +132,16 @@ public actor LibraryMigrator {
         let effectiveBatchId = batchId ?? "migrate-\(UUID().uuidString)"
         await note("Migrating \(plans.count) file\(plans.count == 1 ? "" : "s") to the new library root…")
 
-        var moved = 0
+        var renameMutations: [TrackMutation] = []
         var failures = 0
         var errors: [String] = []
         for plan in plans {
             do {
-                try await applyOne(plan, batchId: effectiveBatchId)
-                moved += 1
+                try await moveFileOnDisk(plan)
+                renameMutations.append(.renameFile(RenameFilePayload(
+                    fileId: plan.id,
+                    newPath: plan.destinationPath
+                )))
             } catch {
                 failures += 1
                 let filename = (plan.sourcePath as NSString).lastPathComponent
@@ -146,6 +150,14 @@ public actor LibraryMigrator {
             }
         }
 
+        if !renameMutations.isEmpty {
+            try await operationEngine.applyBatch(
+                renameMutations,
+                batchId: effectiveBatchId
+            )
+        }
+
+        let moved = renameMutations.count
         await note("Migration complete — moved \(moved), \(failures) skipped")
         return Outcome(
             batchId: effectiveBatchId,
@@ -157,7 +169,7 @@ public actor LibraryMigrator {
 
     // MARK: - Internals
 
-    private func applyOne(_ plan: Plan, batchId: String) async throws {
+    private func moveFileOnDisk(_ plan: Plan) async throws {
         let source = URL(fileURLWithPath: plan.sourcePath)
         let destination = URL(fileURLWithPath: plan.destinationPath)
         let fileManager = FileManager.default
@@ -177,14 +189,6 @@ public actor LibraryMigrator {
 
         await note("Moving \(source.lastPathComponent) → \(destination.path)")
         try fileManager.moveItem(at: source, to: destination)
-
-        _ = try await operationEngine.apply(
-            .renameFile(RenameFilePayload(
-                fileId: plan.id,
-                newPath: destination.path
-            )),
-            batchId: batchId
-        )
     }
 
     private func note(_ message: String) async {
