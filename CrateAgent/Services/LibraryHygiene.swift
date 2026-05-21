@@ -785,24 +785,26 @@ public actor LibraryHygieneRunner {
             length: file.length,
             label: file.label
         )
-        try await operationEngine.apply(
-            .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged)),
-            batchId: batchId
-        )
-        try await operationEngine.apply(
-            .commitMetadataToSerato(CommitMetadataToSeratoPayload(
-                fileId: fileId,
-                metadata: merged,
-                previousMetadata: previousSnapshot
-            )),
-            batchId: batchId
-        )
-        try await operationEngine.apply(
-            .writeFileTags(WriteFileTagsPayload(
-                fileId: fileId,
-                metadata: merged,
-                previousMetadata: previousSnapshot
-            )),
+        // One transaction for all three mutations: setMetadata writes
+        // the DB row, commitMetadataToSerato queues/applies the
+        // Serato library snapshot, writeFileTags writes the audio
+        // file tags. Bundling avoids three separate writer
+        // transactions per file — the hot path during hygiene runs
+        // over thousands of files.
+        try await operationEngine.applyBatch(
+            [
+                .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged)),
+                .commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                    fileId: fileId,
+                    metadata: merged,
+                    previousMetadata: previousSnapshot
+                )),
+                .writeFileTags(WriteFileTagsPayload(
+                    fileId: fileId,
+                    metadata: merged,
+                    previousMetadata: previousSnapshot
+                )),
+            ],
             batchId: batchId
         )
     }
