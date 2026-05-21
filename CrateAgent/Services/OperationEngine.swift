@@ -134,6 +134,45 @@ public actor OperationEngine {
         return executionResult.eventId
     }
 
+    /// Apply many mutations under a single batch identifier, atomically.
+    ///
+    /// One SQLite write transaction covers every mutation's DB-side
+    /// work — if any throws, none persist. The `seratoWatchdog`
+    /// running-state check happens once, before the transaction, and
+    /// is reused for routing every Serato write the batch produced
+    /// (queue if Serato is up, apply now if not). This is the path
+    /// any caller that produces N>1 related mutations should take —
+    /// for N renames the cost goes from N writer transactions and N
+    /// actor hops to one of each.
+    @discardableResult
+    public func applyBatch(
+        _ mutations: [TrackMutation],
+        batchId: String
+    ) async throws -> [Int64] {
+        guard !mutations.isEmpty else { return [] }
+
+        let executionResults: [ExecutionResult] = try await database.writer.write { db in
+            try mutations.map { mutation in
+                try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
+            }
+        }
+
+        let pendingWrites = executionResults.compactMap { $0.seratoWrite }
+        if !pendingWrites.isEmpty {
+            let isSeratoRunning = await seratoWatchdog.isSeratoRunning
+            if isSeratoRunning {
+                pendingSeratoWrites.append(contentsOf: pendingWrites)
+                queueDepthSubject.send(pendingSeratoWrites.count)
+            } else {
+                for write in pendingWrites {
+                    try await applySeratoWrite(write)
+                }
+            }
+        }
+
+        return executionResults.map(\.eventId)
+    }
+
     /// Number of Serato library writes (renames + metadata updates)
     /// currently queued because Serato was running at apply time.
     /// Surfaced for UI ("M changes pending").
@@ -254,9 +293,12 @@ public actor OperationEngine {
         }
 
         let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
-        for inverseMutation in inverseMutations {
-            _ = try await apply(inverseMutation, batchId: undoBatchId)
-        }
+        // One transaction for every inverse mutation in the batch.
+        // Undo is conceptually atomic: either the whole batch
+        // reverts or none of it does. With N transactions (the
+        // pre-batch shape) we'd risk leaving the DB half-undone if
+        // one inverse hit a fileNotFound mid-loop.
+        _ = try await applyBatch(inverseMutations, batchId: undoBatchId)
         return undoBatchId
     }
 
