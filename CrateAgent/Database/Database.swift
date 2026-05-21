@@ -47,14 +47,43 @@ public final class LibraryDatabase {
             withIntermediateDirectories: true
         )
         let databaseUrl = crateAgentDirectory.appendingPathComponent("library.sqlite")
-        let pool = try DatabasePool(path: databaseUrl.path)
+        let pool = try DatabasePool(path: databaseUrl.path, configuration: makeConfiguration())
         return try LibraryDatabase(writer: pool)
     }
 
     /// Open an in-memory database. Used by unit and integration tests.
     public static func openInMemory() throws -> LibraryDatabase {
-        let queue = try DatabaseQueue()
+        let queue = try DatabaseQueue(configuration: makeConfiguration())
         return try LibraryDatabase(writer: queue)
+    }
+
+    /// Tuning PRAGMAs applied to every connection. `journal_mode=WAL`
+    /// is already forced by `DatabasePool`; `foreign_keys=ON` is
+    /// GRDB's default. The rest exist because SQLite's stock
+    /// settings are conservatively tuned for embedded devices, not
+    /// for a desktop app holding tens of thousands of rows hot.
+    private static func makeConfiguration() -> Configuration {
+        var configuration = Configuration()
+        configuration.prepareDatabase { database in
+            // NORMAL is the WAL-mode recommended setting: durable
+            // across power loss (committed transactions survive),
+            // but only fsyncs once per commit instead of twice.
+            // Halves write latency for the initial Serato-library
+            // scan, where every track is its own transaction.
+            try database.execute(sql: "PRAGMA synchronous = NORMAL")
+            // 8 MB page cache. Default is ~2 MB, which forces page
+            // evictions during the hygiene scan over 30k+ rows.
+            try database.execute(sql: "PRAGMA cache_size = -8000")
+            // Keep temp B-trees (ORDER BY, GROUP BY, hash joins) in
+            // RAM rather than spilling to a temp file on disk.
+            try database.execute(sql: "PRAGMA temp_store = MEMORY")
+            // 128 MB mmap window. Lets SQLite read pages via the
+            // page cache without a read() syscall per page; matters
+            // for the History panel's full-events aggregation and
+            // the LibraryBrowser's full-files scan.
+            try database.execute(sql: "PRAGMA mmap_size = 134217728")
+        }
+        return configuration
     }
 
     private static func runMigrations(_ writer: any DatabaseWriter) throws {
