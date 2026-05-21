@@ -170,6 +170,15 @@ private struct FindReplacePanel: View {
     @State private var actionError: String?
     @State private var lastResult: String?
 
+    /// Combined trigger for the debounced recompute. Any change to
+    /// these inputs invalidates pending matches; nothing else does.
+    private struct FindReplaceTrigger: Hashable {
+        let find: String
+        let replace: String
+        let caseSensitive: Bool
+        let fields: Set<SeratoMetadataField>
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if seratoWatchdog.isSeratoRunning {
@@ -183,6 +192,22 @@ private struct FindReplacePanel: View {
             footer
         }
         .task { await loadFiles() }
+        // Debounce: every keystroke / field-toggle restarts this
+        // task; the 150 ms sleep + cancellation check coalesces a
+        // burst of typing into one recompute. Without this, every
+        // character typed re-scanned the full file list on the
+        // main thread (a 50k-track library = thousands of
+        // string comparisons per keystroke).
+        .task(id: FindReplaceTrigger(
+            find: findText,
+            replace: replaceText,
+            caseSensitive: caseSensitive,
+            fields: selectedFields
+        )) {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            recomputeMatches()
+        }
     }
 
     @ViewBuilder
@@ -191,12 +216,9 @@ private struct FindReplacePanel: View {
             Section {
                 TextField("Find", text: $findText)
                     .font(.body.monospaced())
-                    .onChange(of: findText) { _, _ in recomputeMatches() }
                 TextField("Replace with", text: $replaceText)
                     .font(.body.monospaced())
-                    .onChange(of: replaceText) { _, _ in recomputeMatches() }
                 Toggle("Match case", isOn: $caseSensitive)
-                    .onChange(of: caseSensitive) { _, _ in recomputeMatches() }
             }
             Section("Fields") {
                 fieldsRow
@@ -216,7 +238,6 @@ private struct FindReplacePanel: View {
                     get: { selectedFields.contains(field) },
                     set: { include in
                         if include { selectedFields.insert(field) } else { selectedFields.remove(field) }
-                        recomputeMatches()
                     }
                 ))
                 .toggleStyle(.checkbox)
@@ -818,6 +839,13 @@ private struct DuplicatesPanel: View {
     /// planned total have made it to Trash so far. Drives the
     /// progress text in the action bar. Resets to (0,0) when idle.
     @State private var batchProgress: BatchProgress = .idle
+    /// Memoized result of `DuplicateKeeperPicker.chooseDefaultKeeper`
+    /// per group, layered with `keeperOverrides`. Rebuilt only when
+    /// `groups` or `keeperOverrides` change. Previously the row
+    /// body called the picker on every redraw — and every keeper-
+    /// radio toggle invalidated all visible rows, fanning out to
+    /// hundreds of redundant picker invocations per click.
+    @State private var keeperIdByGroup: [String: Int64] = [:]
 
     private struct BatchProgress: Equatable {
         var trashed: Int
@@ -851,6 +879,14 @@ private struct DuplicatesPanel: View {
             footer
         }
         .task { await rescan() }
+        // Cache invalidation: when the group set changes (after a
+        // rescan, or after a resolve removed files) or the user
+        // taps a different keeper radio, rebuild every group's
+        // cached keeper id. The picker is non-trivial — running it
+        // hundreds of times from a row body on every redraw was
+        // the dominant cost of clicking through groups.
+        .onChange(of: groups) { _, _ in rebuildKeeperCache() }
+        .onChange(of: keeperOverrides) { _, _ in rebuildKeeperCache() }
         .alert(
             "Resolve duplicates?",
             isPresented: Binding(
@@ -1182,15 +1218,32 @@ private struct DuplicatesPanel: View {
     /// The id of the file we'd keep for this group — user's override
     /// if set, otherwise the keeper picker's default. Returns nil
     /// only for impossibly empty groups, which DuplicateFinder
-    /// already excludes.
+    /// already excludes. Reads from the precomputed cache; callers
+    /// must have called `rebuildKeeperCache()` after any mutation
+    /// to `groups` or `keeperOverrides`.
     private func effectiveKeeperId(for group: DuplicateFinder.DuplicateGroup) -> Int64? {
-        if let override = keeperOverrides[group.id] {
-            return override
+        keeperIdByGroup[group.id]
+    }
+
+    /// Refresh the keeper cache for every current group. Runs the
+    /// picker once per group, on demand — not in `body`.
+    private func rebuildKeeperCache() {
+        var refreshed: [String: Int64] = [:]
+        refreshed.reserveCapacity(groups.count)
+        let musicFolder = services.watchedMusicFolder
+        for group in groups {
+            if let override = keeperOverrides[group.id] {
+                refreshed[group.id] = override
+                continue
+            }
+            if let keeperId = DuplicateKeeperPicker.chooseDefaultKeeper(
+                for: group,
+                musicFolder: musicFolder
+            ) {
+                refreshed[group.id] = keeperId
+            }
         }
-        return DuplicateKeeperPicker.chooseDefaultKeeper(
-            for: group,
-            musicFolder: services.watchedMusicFolder
-        )
+        keeperIdByGroup = refreshed
     }
 
     private func resolve(group: DuplicateFinder.DuplicateGroup) async {
@@ -1261,7 +1314,15 @@ private struct DuplicatesPanel: View {
                 trashedSoFar += outcome.trashedCount
                 skippedSoFar += outcome.failureCount
                 groupsResolved += 1
-                batchProgress = BatchProgress(trashed: trashedSoFar, total: plannedTotal)
+                // Throttle: every progress mutation fires a full
+                // redraw of the visible group cards, which is the
+                // expensive bit (each card runs an Equatable diff
+                // against its data). One update per 5 groups gives
+                // the user a meaningful "still moving" signal
+                // without paying N redraws for N resolutions.
+                if groupsResolved.isMultiple(of: 5) || groupsResolved == resolvable.count {
+                    batchProgress = BatchProgress(trashed: trashedSoFar, total: plannedTotal)
+                }
             } catch {
                 // Group-level failure (rare — `resolve` now
                 // tolerates per-file errors internally; this
