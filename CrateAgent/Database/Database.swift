@@ -67,6 +67,7 @@ public final class LibraryDatabase {
         AddSeratoMetadataToFilesMigration.register(in: &migrator)
         AddBitrateToFilesMigration.register(in: &migrator)
         ResetFingerprintsForDurationCapMigration.register(in: &migrator)
+        AddEventsBatchAggIndexMigration.register(in: &migrator)
         try migrator.migrate(writer)
     }
 }
