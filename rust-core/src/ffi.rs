@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -8,6 +9,22 @@ use crate::tags;
 
 pub use crate::serato::{SeratoMetadataUpdate, SeratoTrackRecord};
 pub use crate::tags::{AudioTagUpdate, AudioTags};
+
+/// One rename pair in a `batch_rewrite_*` call. UniFFI doesn't take
+/// tuples, so the (old, new) pair is wrapped in a dictionary.
+#[derive(Debug, Clone)]
+pub struct SeratoPathRename {
+    pub old_path: String,
+    pub new_path: String,
+}
+
+fn rename_map(renames: &[SeratoPathRename]) -> HashMap<String, String> {
+    renames
+        .iter()
+        .filter(|rename| rename.old_path != rename.new_path)
+        .map(|rename| (rename.old_path.clone(), rename.new_path.clone()))
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -108,6 +125,47 @@ pub fn rewrite_database_path(
     let count = database.rewrite_path(&old_path, &new_path);
     if count > 0 {
         database.write_to_path(&path)?;
+    }
+    Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
+}
+
+/// Bulk variant of `rewrite_database_path`. One file read + one file
+/// write regardless of how many renames are batched. Used by bulk
+/// Organize / Migrate, which would otherwise read+rewrite a multi-MB
+/// `database V2` file once per moved track.
+pub fn batch_rewrite_database_paths(
+    database_path: String,
+    renames: Vec<SeratoPathRename>,
+) -> Result<u32, CoreError> {
+    let map = rename_map(&renames);
+    if map.is_empty() {
+        return Ok(0);
+    }
+    let path = PathBuf::from(database_path);
+    let mut database = serato::DatabaseV2::read_from_path(&path)?;
+    let count = database.rewrite_paths(&map);
+    if count > 0 {
+        database.write_to_path(&path)?;
+    }
+    Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
+}
+
+/// Bulk variant of `rewrite_crate_path`. One file read + one file
+/// write per crate file, regardless of how many renames apply within
+/// that crate. Symmetric counterpart to `batch_rewrite_database_paths`.
+pub fn batch_rewrite_crate_paths(
+    crate_path: String,
+    renames: Vec<SeratoPathRename>,
+) -> Result<u32, CoreError> {
+    let map = rename_map(&renames);
+    if map.is_empty() {
+        return Ok(0);
+    }
+    let path = PathBuf::from(crate_path);
+    let mut crate_file = serato::CrateFile::read_from_path(&path)?;
+    let count = crate_file.rewrite_paths(&map);
+    if count > 0 {
+        crate_file.write_to_path(&path)?;
     }
     Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
 }

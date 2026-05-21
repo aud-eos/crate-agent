@@ -32,6 +32,7 @@
 //   https://github.com/flatmax/XwaxSeratoScanner   (SeratoData.py / Entry.py — `database V2` tag derivation rules)
 //   https://github.com/Holzhaus/serato-tags   (per-track GEOB tags inside audio files — relevant to Pillar F)
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
@@ -262,6 +263,27 @@ fn rewrite_path_in_otrks(
     old_path: &str,
     new_path: &str,
 ) -> usize {
+    let mut renames = HashMap::with_capacity(1);
+    renames.insert(old_path.to_string(), new_path.to_string());
+    rewrite_paths_in_otrks(records, path_tag, &renames)
+}
+
+/// Multi-rename variant: rewrite every otrk whose path field matches
+/// any key in `renames`, replacing it with the mapped value. One pass
+/// over the records, HashMap-O(1) lookup per matching nested record.
+///
+/// Cost vs. N separate `rewrite_path` calls: one file read + one file
+/// write at the caller layer instead of N + N. The per-otrk nested
+/// parse cost is unchanged — but it was already paid by every otrk
+/// regardless of rename target, so batching doesn't make it worse.
+fn rewrite_paths_in_otrks(
+    records: &mut [TlvRecord],
+    path_tag: &[u8; 4],
+    renames: &HashMap<String, String>,
+) -> usize {
+    if renames.is_empty() {
+        return 0;
+    }
     let mut count: usize = 0;
     for record in records.iter_mut() {
         if &record.tag != TAG_OTRK {
@@ -278,7 +300,7 @@ fn rewrite_path_in_otrks(
             let Some(current) = decode_utf16be(&nested_record.payload) else {
                 continue;
             };
-            if current == old_path {
+            if let Some(new_path) = renames.get(&current) {
                 nested_record.payload = encode_utf16be(new_path);
                 changed = true;
             }
@@ -330,6 +352,13 @@ impl CrateFile {
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
         rewrite_path_in_otrks(&mut self.records, TAG_PTRK, old_path, new_path)
+    }
+
+    /// Multi-rename variant: rewrite every matching `ptrk` in one pass.
+    /// Caller layer pairs this with one read + one write of the
+    /// crate file regardless of how many renames are batched.
+    pub fn rewrite_paths(&mut self, renames: &HashMap<String, String>) -> usize {
+        rewrite_paths_in_otrks(&mut self.records, TAG_PTRK, renames)
     }
 
     /// Drop every otrk in this crate whose `ptrk` points at
@@ -397,6 +426,14 @@ impl DatabaseV2 {
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
         rewrite_path_in_otrks(&mut self.records, TAG_PFIL, old_path, new_path)
+    }
+
+    /// Multi-rename variant: rewrite every matching `pfil` in one pass.
+    /// Used by bulk Organize / Migrate — one read + one write of the
+    /// (typically multi-MB) `database V2` file regardless of how many
+    /// renames are in the batch.
+    pub fn rewrite_paths(&mut self, renames: &HashMap<String, String>) -> usize {
+        rewrite_paths_in_otrks(&mut self.records, TAG_PFIL, renames)
     }
 
     /// Drop every otrk whose `pfil` points at `target_path`. Used
@@ -664,6 +701,55 @@ mod tests {
     }
 
     #[test]
+    fn crate_rewrite_paths_applies_every_rename_in_one_pass() {
+        let mut parsed = CrateFile::from_bytes(&synthetic_library(
+            "1.0/Serato ScratchLive Crate",
+            TAG_PTRK,
+            &[
+                "Music/A/one.mp3",
+                "Music/A/two.mp3",
+                "Music/A/three.mp3",
+                "Music/A/keep.mp3",
+            ],
+        ))
+        .unwrap();
+
+        let mut renames = HashMap::new();
+        renames.insert("Music/A/one.mp3".to_string(), "Music/B/one.mp3".to_string());
+        renames.insert("Music/A/two.mp3".to_string(), "Music/B/two.mp3".to_string());
+        renames.insert(
+            "Music/A/three.mp3".to_string(),
+            "Music/B/three.mp3".to_string(),
+        );
+
+        let count = parsed.rewrite_paths(&renames);
+
+        assert_eq!(count, 3, "three matching otrks should be rewritten");
+        assert_eq!(
+            parsed.track_paths(),
+            vec![
+                "Music/B/one.mp3".to_string(),
+                "Music/B/two.mp3".to_string(),
+                "Music/B/three.mp3".to_string(),
+                "Music/A/keep.mp3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn crate_rewrite_paths_with_empty_map_is_noop() {
+        let bytes = synthetic_library(
+            "1.0/Serato ScratchLive Crate",
+            TAG_PTRK,
+            &["Music/A/track.mp3"],
+        );
+        let mut parsed = CrateFile::from_bytes(&bytes).unwrap();
+        let count = parsed.rewrite_paths(&HashMap::new());
+        assert_eq!(count, 0);
+        assert_eq!(parsed.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
     fn crate_rewrite_path_preserves_other_nested_fields_in_otrk() {
         // Synthesize an otrk containing both a ptrk and an unknown tag.
         let ptrk = TlvRecord { tag: *TAG_PTRK, payload: encode_utf16be("Music/A/old.mp3") };
@@ -755,6 +841,39 @@ mod tests {
         );
         let parsed = DatabaseV2::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn database_rewrite_paths_applies_every_rename_in_one_pass() {
+        let mut parsed = DatabaseV2::from_bytes(&synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &[
+                "Music/A/a.mp3",
+                "Music/A/b.mp3",
+                "Music/A/c.mp3",
+                "Music/A/keep.mp3",
+            ],
+        ))
+        .unwrap();
+
+        let mut renames = HashMap::new();
+        renames.insert("Music/A/a.mp3".to_string(), "Music/B/a.mp3".to_string());
+        renames.insert("Music/A/b.mp3".to_string(), "Music/B/b.mp3".to_string());
+        renames.insert("Music/A/c.mp3".to_string(), "Music/B/c.mp3".to_string());
+
+        let count = parsed.rewrite_paths(&renames);
+
+        assert_eq!(count, 3);
+        assert_eq!(
+            parsed.track_paths(),
+            vec![
+                "Music/B/a.mp3".to_string(),
+                "Music/B/b.mp3".to_string(),
+                "Music/B/c.mp3".to_string(),
+                "Music/A/keep.mp3".to_string(),
+            ]
+        );
     }
 
     #[test]
