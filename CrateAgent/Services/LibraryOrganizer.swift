@@ -133,9 +133,18 @@ public actor LibraryOrganizer {
         return plans
     }
 
-    /// Apply a set of moves. Each file: ensure parent dir exists,
-    /// `moveItem` on disk, then fire `renameFile` to sync Serato +
-    /// DB. Failures append to `errors` and the loop continues.
+    /// Apply a set of moves. Two-phase:
+    ///   1. Move every file on disk (per-file failures recorded,
+    ///      loop continues)
+    ///   2. One `applyBatch` with a `.renameFile` mutation for
+    ///      every successful move — single SQLite transaction,
+    ///      single batched Serato library rewrite
+    ///
+    /// The previous per-file `apply(.renameFile)` triggered one
+    /// full read + full write of the (~25 MB) `database V2` file
+    /// *per moved track* — a 5000-file Organize batch wrote 250 GB
+    /// of Serato library state. The batched apply collapses that
+    /// to one V2 rewrite + one rewrite per crate file.
     @discardableResult
     public func organize(
         _ plans: [Plan],
@@ -146,14 +155,17 @@ public actor LibraryOrganizer {
         let effectiveBatchId = batchId ?? "organize-\(UUID().uuidString)"
         await note("Organizing \(plans.count) file\(plans.count == 1 ? "" : "s")…")
 
-        var moved = 0
+        var renameMutations: [TrackMutation] = []
         var failures = 0
         var errors: [String] = []
 
         for plan in plans {
             do {
-                try await applyOne(plan, batchId: effectiveBatchId)
-                moved += 1
+                try await moveFileOnDisk(plan)
+                renameMutations.append(.renameFile(RenameFilePayload(
+                    fileId: plan.id,
+                    newPath: plan.destinationPath
+                )))
             } catch {
                 failures += 1
                 let filename = (plan.sourcePath as NSString).lastPathComponent
@@ -163,6 +175,14 @@ public actor LibraryOrganizer {
             }
         }
 
+        if !renameMutations.isEmpty {
+            try await operationEngine.applyBatch(
+                renameMutations,
+                batchId: effectiveBatchId
+            )
+        }
+
+        let moved = renameMutations.count
         await note("Organize complete — moved \(moved), \(failures) skipped")
         return Outcome(
             batchId: effectiveBatchId,
@@ -174,7 +194,7 @@ public actor LibraryOrganizer {
 
     // MARK: - Internals
 
-    private func applyOne(_ plan: Plan, batchId: String) async throws {
+    private func moveFileOnDisk(_ plan: Plan) async throws {
         let source = URL(fileURLWithPath: plan.sourcePath)
         let destination = URL(fileURLWithPath: plan.destinationPath)
         let fileManager = FileManager.default
@@ -192,23 +212,8 @@ public actor LibraryOrganizer {
             withIntermediateDirectories: true
         )
 
-        let sourceFilename = source.lastPathComponent
-        let destinationFilename = destination.lastPathComponent
-        await note("Moving \(sourceFilename) → \(destinationFilename)")
+        await note("Moving \(source.lastPathComponent) → \(destination.lastPathComponent)")
         try fileManager.moveItem(at: source, to: destination)
-
-        // FSEvents may already have observed the move and updated
-        // the DB row by the time we get here. The renameFile
-        // mutation in OperationEngine is idempotent against that
-        // (it no-ops if the row already points at `newPath`) so
-        // we always apply.
-        _ = try await operationEngine.apply(
-            .renameFile(RenameFilePayload(
-                fileId: plan.id,
-                newPath: destination.path
-            )),
-            batchId: batchId
-        )
     }
 
     private func note(_ message: String) async {

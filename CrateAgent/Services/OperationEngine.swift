@@ -164,9 +164,7 @@ public actor OperationEngine {
                 pendingSeratoWrites.append(contentsOf: pendingWrites)
                 queueDepthSubject.send(pendingSeratoWrites.count)
             } else {
-                for write in pendingWrites {
-                    try await applySeratoWrite(write)
-                }
+                try await applyConsecutiveSeratoWrites(pendingWrites)
             }
         }
 
@@ -696,6 +694,111 @@ public actor OperationEngine {
                 path: databaseV2Path,
                 underlying: String(describing: databaseV2Error!)
             )
+        }
+    }
+
+    /// Bulk variant of `applySeratoRename`. One Rust FFI call to
+    /// rewrite the `database V2` file for every rename in the batch,
+    /// then one FFI call per crate file. Same failure semantics as
+    /// the single-rename path — V2 errors are recorded but don't
+    /// stop the crate sweep; a final throw only fires if V2 failed
+    /// AND every crate failed (or there were no crates).
+    ///
+    /// Falls back to the per-rename path for batches of size 1 to
+    /// preserve the more granular "⚠️ no entry for X" diagnostic
+    /// (the batch FFI returns a single aggregate count and can't
+    /// distinguish "0 renames applied" from "all renames missed").
+    private func applySeratoRenameBatch(_ renames: [SeratoPendingRename]) async throws {
+        guard renames.count > 1 else {
+            if let single = renames.first {
+                try await applySeratoRename(single)
+            }
+            return
+        }
+
+        let pairs = renames.map { rename in
+            SeratoPathRename(
+                oldPath: SeratoLibraryLocator.seratoRelativePath(
+                    fromAbsolute: rename.oldAbsolutePath
+                ),
+                newPath: SeratoLibraryLocator.seratoRelativePath(
+                    fromAbsolute: rename.newAbsolutePath
+                )
+            )
+        }
+
+        var databaseV2Error: Error?
+        let databaseV2Path = seratoLocator.databaseV2Url.path
+        if FileManager.default.fileExists(atPath: databaseV2Path) {
+            do {
+                _ = try batchRewriteDatabasePaths(
+                    databasePath: databaseV2Path,
+                    renames: pairs
+                )
+            } catch {
+                databaseV2Error = error
+                await note("Failed to update database V2 for \(renames.count) renames: \(error.localizedDescription)")
+            }
+        }
+
+        let crateFiles: [URL]
+        do {
+            crateFiles = try seratoLocator.enumerateCrateFiles()
+        } catch {
+            await note("Failed to enumerate Subcrates directory: \(error.localizedDescription)")
+            if databaseV2Error != nil {
+                throw OperationEngineError.seratoEnumerationFailed(
+                    directory: seratoLocator.subcratesDirectoryUrl.path,
+                    underlying: String(describing: error)
+                )
+            }
+            return
+        }
+
+        var perCrateFailures: [(URL, Error)] = []
+        for crateFile in crateFiles {
+            do {
+                _ = try batchRewriteCratePaths(
+                    cratePath: crateFile.path,
+                    renames: pairs
+                )
+            } catch {
+                perCrateFailures.append((crateFile, error))
+                await note("Skipped crate \(crateFile.lastPathComponent) during batch rename: \(error.localizedDescription)")
+            }
+        }
+
+        let everyCrateFailed = !crateFiles.isEmpty
+            && perCrateFailures.count == crateFiles.count
+        if databaseV2Error != nil && (everyCrateFailed || crateFiles.isEmpty) {
+            throw OperationEngineError.seratoRewriteFailed(
+                path: databaseV2Path,
+                underlying: String(describing: databaseV2Error!)
+            )
+        }
+    }
+
+    /// Coalesce consecutive `.rename` writes into one
+    /// `applySeratoRenameBatch` call; non-rename writes apply
+    /// individually. Used by `applyBatch` when Serato is not
+    /// running — for a bulk Organize batch (all renames) this
+    /// turns N full V2 read+write cycles into one.
+    private func applyConsecutiveSeratoWrites(
+        _ writes: [SeratoPendingWrite]
+    ) async throws {
+        var index = 0
+        while index < writes.count {
+            if case .rename = writes[index] {
+                var renames: [SeratoPendingRename] = []
+                while index < writes.count, case .rename(let rename) = writes[index] {
+                    renames.append(rename)
+                    index += 1
+                }
+                try await applySeratoRenameBatch(renames)
+            } else {
+                try await applySeratoWrite(writes[index])
+                index += 1
+            }
         }
     }
 

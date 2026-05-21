@@ -35,6 +35,26 @@ namespace crate_agent_core {
   [Throws=CoreError]
   u32 rewrite_database_path(string database_path, string old_path, string new_path);
 
+  // Bulk variant: apply every rename in `renames` to `database V2` in
+  // one read + one write. Returns the total number of otrks rewritten
+  // (an otrk matching a rename in the batch counts once). For an
+  // Organize batch moving N tracks, this collapses N full reads + N
+  // full writes of a multi-MB file into one of each.
+  [Throws=CoreError]
+  u32 batch_rewrite_database_paths(
+    string database_path,
+    sequence<SeratoPathRename> renames
+  );
+
+  // Bulk variant of `rewrite_crate_path`. Same semantics applied
+  // per-crate-file — one read + one write of the crate file regardless
+  // of how many renames apply within it.
+  [Throws=CoreError]
+  u32 batch_rewrite_crate_paths(
+    string crate_path,
+    sequence<SeratoPathRename> renames
+  );
+
   // Remove every `otrk` from `database V2` whose `pfil` matches
   // `track_path`. Used by crate-agent's duplicate-resolver after
   // the file has been trashed so Serato doesn't show a broken
@@ -126,6 +146,13 @@ namespace crate_agent_core {
   // Serato and crate-agent DB writes.
   [Throws=CoreError]
   void write_audio_tags(string file_path, AudioTagUpdate update);
+};
+
+// One rename pair in a `batch_rewrite_*` call. Both paths are
+// Serato-relative (the `Music/...` form Serato itself stores).
+dictionary SeratoPathRename {
+  string old_path;
+  string new_path;
 };
 
 // Full track-level metadata extracted from a Serato `database V2`
