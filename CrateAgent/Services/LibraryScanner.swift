@@ -72,6 +72,15 @@ public actor LibraryScanner {
         var filesSkipped = 0
         var lastChangedPath: String?
 
+        // Collected backfill writes — flushed in one transaction
+        // after the per-file loop. The previous shape opened one
+        // `database.writer.write` per backfilled field per file; a
+        // first-scan over 30k files with both hash and bitrate
+        // missing meant ~60k separate transactions, each with its
+        // own fsync.
+        var hashBackfills: [(fileId: Int64, hash: Data)] = []
+        var bitrateBackfills: [(fileId: Int64, bitrate: Int)] = []
+
         for (absolutePath, record) in seratoRecords {
             if let existingFile = knownFilesByPath[absolutePath],
                let fileId = existingFile.id {
@@ -80,41 +89,17 @@ public actor LibraryScanner {
                 // the hash is already present. Direct DB write rather
                 // than a mutation — the hash is a derived value, not
                 // a user action, so it doesn't belong in the event log.
-                if existingFile.lightweightHash == nil {
-                    if let hash = LightweightHashCalculator.compute(forFileAt: absolutePath) {
-                        do {
-                            try await database.writer.write { db in
-                                try db.execute(
-                                    sql: "UPDATE files SET lightweight_hash = ? WHERE id = ?",
-                                    arguments: [hash, fileId]
-                                )
-                            }
-                        } catch {
-                            Self.logger.error(
-                                "Hash backfill for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
-                            )
-                        }
-                    }
+                if existingFile.lightweightHash == nil,
+                   let hash = LightweightHashCalculator.compute(forFileAt: absolutePath) {
+                    hashBackfills.append((fileId: fileId, hash: hash))
                 }
 
                 // Same idempotent backfill for bitrate (added in
                 // migration #004). Same direct-write rationale: bitrate
                 // is a derived property of the file, not a user action.
-                if existingFile.bitrateKbps == nil {
-                    if let bitrate = readBitrateKbps(forPathAt: absolutePath) {
-                        do {
-                            try await database.writer.write { db in
-                                try db.execute(
-                                    sql: "UPDATE files SET bitrate_kbps = ? WHERE id = ?",
-                                    arguments: [bitrate, fileId]
-                                )
-                            }
-                        } catch {
-                            Self.logger.error(
-                                "Bitrate backfill for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
-                            )
-                        }
-                    }
+                if existingFile.bitrateKbps == nil,
+                   let bitrate = readBitrateKbps(forPathAt: absolutePath) {
+                    bitrateBackfills.append((fileId: fileId, bitrate: bitrate))
                 }
 
                 let seratoMetadata = makeSeratoMetadata(fromRecord: record)
@@ -183,6 +168,32 @@ public actor LibraryScanner {
                     filesSkipped: filesSkipped,
                     lastChangedPath: lastChangedPath
                 ))
+            }
+        }
+
+        // Flush every backfill update in one transaction. SQLite
+        // commits + fsyncs once instead of once per row; for 30k
+        // files this is the difference between ~60k fsyncs and 1.
+        if !hashBackfills.isEmpty || !bitrateBackfills.isEmpty {
+            do {
+                try await database.writer.write { db in
+                    for entry in hashBackfills {
+                        try db.execute(
+                            sql: "UPDATE files SET lightweight_hash = ? WHERE id = ?",
+                            arguments: [entry.hash, entry.fileId]
+                        )
+                    }
+                    for entry in bitrateBackfills {
+                        try db.execute(
+                            sql: "UPDATE files SET bitrate_kbps = ? WHERE id = ?",
+                            arguments: [entry.bitrate, entry.fileId]
+                        )
+                    }
+                }
+            } catch {
+                Self.logger.error(
+                    "Backfill flush failed: \(error.localizedDescription, privacy: .public)"
+                )
             }
         }
 
