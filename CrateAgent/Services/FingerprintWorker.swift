@@ -338,11 +338,12 @@ public actor FingerprintWorker {
     /// - Files with no `lightweight_hash`: standalone groups of
     ///   one. They can't be deduplicated until backfill populates
     ///   their hash on a later scan.
+    private struct GroupingKey: Hashable {
+        let fileSize: Int64
+        let hash: Data
+    }
+
     private func planBatch(_ batch: [FileRecord]) async -> BatchPlan {
-        struct GroupingKey: Hashable {
-            let fileSize: Int64
-            let hash: Data
-        }
         var groups: [GroupingKey: [FileRecord]] = [:]
         var groupOrder: [GroupingKey] = []
         var standaloneFiles: [FileRecord] = []
@@ -367,22 +368,21 @@ public actor FingerprintWorker {
             ))
         }
 
+        // One DB query for every (file_size, lightweight_hash) group
+        // in the batch. The previous shape — one query per group
+        // serially — meant the batch's "is there a done twin?" check
+        // fired N times per batch, awaiting each result. For a 32k-
+        // track import (batches of 16, ~2k batches), that compounded
+        // to ~32k DB round-trips just for planning.
+        let inBatchIds: Set<Int64> = Set(batch.compactMap(\.id))
+        let twins = await lookupExistingDoneFingerprints(
+            for: groupOrder,
+            excludingFileIds: inBatchIds
+        )
+
         for key in groupOrder {
             let groupFiles = groups[key]!
-            let inBatchIds = Set(groupFiles.compactMap(\.id))
-
-            // Check for an existing done twin in the DB. excludes
-            // the in-batch members so a batch-internal already-done
-            // file (shouldn't happen — they're filtered as pending
-            // before this — but defensive) doesn't get treated as
-            // an external source.
-            let existingFingerprint = await lookupExistingDoneFingerprint(
-                fileSize: key.fileSize,
-                lightweightHash: key.hash,
-                excludingFileIds: inBatchIds
-            )
-
-            if let fingerprint = existingFingerprint {
+            if let fingerprint = twins[key] {
                 for file in groupFiles {
                     guard let identifier = file.id else { continue }
                     copyFromExisting.append(
@@ -408,33 +408,66 @@ public actor FingerprintWorker {
         )
     }
 
-    private func lookupExistingDoneFingerprint(
-        fileSize: Int64,
-        lightweightHash: Data,
+    /// Single-query twin lookup for an entire batch's worth of
+    /// `(file_size, lightweight_hash)` groups. Returns a map from
+    /// grouping key → existing done fingerprint for every group that
+    /// has one. Groups without a twin are absent from the map.
+    private func lookupExistingDoneFingerprints(
+        for keys: [GroupingKey],
         excludingFileIds: Set<Int64>
-    ) async -> Data? {
+    ) async -> [GroupingKey: Data] {
+        guard !keys.isEmpty else { return [:] }
+
+        // SQLite row-value IN: `(col1, col2) IN (VALUES (?,?), (?,?), ...)`.
+        // Available since SQLite 3.15; macOS ships modern SQLite.
+        let placeholders = keys.map { _ in "(?, ?)" }.joined(separator: ", ")
         let excludeList = excludingFileIds.map(String.init).joined(separator: ",")
         let excludeClause = excludeList.isEmpty ? "" : " AND id NOT IN (\(excludeList))"
         let sql = """
-            SELECT chromaprint_fingerprint FROM files
-            WHERE file_size = ?
-              AND lightweight_hash = ?
-              AND fingerprint_status = 'done'
+            SELECT file_size, lightweight_hash, chromaprint_fingerprint
+            FROM files
+            WHERE fingerprint_status = 'done'
               AND chromaprint_fingerprint IS NOT NULL
+              AND (file_size, lightweight_hash) IN (VALUES \(placeholders))
             \(excludeClause)
-            LIMIT 1
             """
+        var arguments: [DatabaseValueConvertible] = []
+        for key in keys {
+            arguments.append(key.fileSize)
+            arguments.append(key.hash)
+        }
+
+        struct TwinRow: FetchableRecord, Decodable {
+            let fileSize: Int64
+            let lightweightHash: Data
+            let chromaprintFingerprint: Data
+            static let databaseColumnDecodingStrategy =
+                DatabaseColumnDecodingStrategy.convertFromSnakeCase
+        }
         do {
-            return try await database.writer.read { db in
-                try Data.fetchOne(
-                    db, sql: sql, arguments: [fileSize, lightweightHash]
+            let rows = try await database.writer.read { db -> [TwinRow] in
+                try TwinRow.fetchAll(
+                    db,
+                    sql: sql,
+                    arguments: StatementArguments(arguments)
                 )
             }
+            // Multiple rows may share the same (size, hash) — pick
+            // the first; any done fingerprint is interchangeable
+            // since the byte twin guarantee asserts they're equal.
+            var twins: [GroupingKey: Data] = [:]
+            for row in rows {
+                let key = GroupingKey(fileSize: row.fileSize, hash: row.lightweightHash)
+                if twins[key] == nil {
+                    twins[key] = row.chromaprintFingerprint
+                }
+            }
+            return twins
         } catch {
             Self.logger.error(
-                "Twin lookup failed: \(error.localizedDescription, privacy: .public)"
+                "Batch twin lookup failed: \(error.localizedDescription, privacy: .public)"
             )
-            return nil
+            return [:]
         }
     }
 

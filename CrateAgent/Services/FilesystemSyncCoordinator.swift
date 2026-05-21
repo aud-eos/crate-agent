@@ -87,9 +87,13 @@ public actor FilesystemSyncCoordinator {
     }
 
     private func handleRename(path: String) async {
-        guard let metadata = FileMetadataCollector.collect(
+        // Stat-only first. Computing the lightweight hash reads up to
+        // 2 MB per file — wasted work for the common case (same-volume
+        // rename, satisfied by the inode lookup below). During a Bulk
+        // Organize of 5k files this avoided ~10 GB of disk I/O.
+        guard let statMetadata = FileMetadataCollector.collect(
             at: path,
-            includeLightweightHash: true
+            includeLightweightHash: false
         ) else {
             Self.logger.warning(
                 "could not stat file at \(path, privacy: .public); skipping"
@@ -104,13 +108,13 @@ public actor FilesystemSyncCoordinator {
         do {
             inodeMatch = try await database.writer.read { db in
                 try FileRecord
-                    .filter(Column("inode") == metadata.inode)
-                    .filter(Column("volume_uuid") == metadata.volumeUuid)
+                    .filter(Column("inode") == statMetadata.inode)
+                    .filter(Column("volume_uuid") == statMetadata.volumeUuid)
                     .fetchOne(db)
             }
         } catch {
             Self.logger.error(
-                "DB lookup for inode \(metadata.inode) failed: \(error.localizedDescription, privacy: .public)"
+                "DB lookup for inode \(statMetadata.inode) failed: \(error.localizedDescription, privacy: .public)"
             )
             return
         }
@@ -129,14 +133,25 @@ public actor FilesystemSyncCoordinator {
 
         // Second pass: cross-volume move fallback (file_size +
         // lightweight_hash match an existing row whose inode/volume
-        // didn't). The hash skips the inode lookup's exact-match
-        // semantics — same content at a new inode on a new volume.
-        guard let lightweightHash = metadata.lightweightHash else {
-            // No hash computed (file unreadable, or stat ran but the
-            // hash didn't): fall back to inode-only behavior, which
-            // we've already exhausted. Not our file.
+        // didn't). Only now do we read the file content to compute
+        // the hash — same-volume renames never get this far.
+        guard let lightweightHash = LightweightHashCalculator.compute(
+            forFileAt: path
+        ) else {
+            // Hash unreadable: fall back to inode-only behavior,
+            // which we've already exhausted. Not our file.
             return
         }
+        // Compose a metadata record carrying the freshly-computed
+        // hash so the rest of the function reads as one logical flow.
+        let metadata = FileMetadata(
+            path: statMetadata.path,
+            volumeUuid: statMetadata.volumeUuid,
+            inode: statMetadata.inode,
+            fileSize: statMetadata.fileSize,
+            mtime: statMetadata.mtime,
+            lightweightHash: lightweightHash
+        )
 
         let hashMatch: FileRecord?
         do {
