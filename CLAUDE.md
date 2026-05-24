@@ -71,11 +71,9 @@ Why this exists: a path-translation layer is a major engineering effort that wou
 
 ## Conventions
 
-- **Variable naming:** descriptive. No single-character identifiers — even in lambdas/callbacks. (`post` not `p`, `index` not `i`.)
+Universal rules (descriptive variable names, no lint-suppression comments, strict env vars with module-level asserts, no silent failures, etc.) live in `~/.claude/CLAUDE.md` and are hook-enforced. The bullets below are crate-agent-specific only.
+
 - **Comments:** default to none. Only when the *why* is non-obvious. Never explain *what* the code does.
-- **No `eslint-disable` / similar lint bypasses.** Fix the underlying code.
-- **No environment-variable fallback values.** Assert at module level that required vars exist; fail fast.
-- **No silent failures.** Reject unknown fields, throw on unexpected states. Loud failures > silent bugs.
 - **Run formatter before committing.** `cargo fmt` for Rust, `swiftformat` (or Xcode's built-in) for Swift.
 
 ## Build commands
