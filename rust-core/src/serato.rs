@@ -81,18 +81,22 @@ impl TlvRecord {
 
             let offset_after_tag = cursor.position();
             let mut length_bytes = [0u8; 4];
-            cursor.read_exact(&mut length_bytes).map_err(|_| SeratoError::UnexpectedEof {
-                offset: offset_after_tag,
-                needed: 4,
-            })?;
+            cursor
+                .read_exact(&mut length_bytes)
+                .map_err(|_| SeratoError::UnexpectedEof {
+                    offset: offset_after_tag,
+                    needed: 4,
+                })?;
             let length = u32::from_be_bytes(length_bytes) as usize;
 
             let offset_after_length = cursor.position();
             let mut payload = vec![0u8; length];
-            cursor.read_exact(&mut payload).map_err(|_| SeratoError::UnexpectedEof {
-                offset: offset_after_length,
-                needed: length,
-            })?;
+            cursor
+                .read_exact(&mut payload)
+                .map_err(|_| SeratoError::UnexpectedEof {
+                    offset: offset_after_length,
+                    needed: length,
+                })?;
 
             records.push(TlvRecord { tag, payload });
         }
@@ -117,7 +121,7 @@ impl TlvRecord {
 }
 
 fn decode_utf16be(bytes: &[u8]) -> Option<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     // Stream the u16 units through char::decode_utf16 directly into
@@ -125,7 +129,9 @@ fn decode_utf16be(bytes: &[u8]) -> Option<String> {
     // calls this up to 10× per otrk; a 20k-track read previously
     // allocated 200k transient vectors.
     char::decode_utf16(
-        bytes.chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
     )
     .collect::<Result<String, _>>()
     .ok()
@@ -353,7 +359,11 @@ impl CrateFile {
         // Pre-size to the known total. Skips the ~25 doubling
         // reallocations a fresh Vec::new() incurs on its way to
         // 25 MB+ output (the size of a real database V2 file).
-        let estimated_size: usize = self.records.iter().map(|record| 8 + record.payload.len()).sum();
+        let estimated_size: usize = self
+            .records
+            .iter()
+            .map(|record| 8 + record.payload.len())
+            .sum();
         let mut bytes = Vec::with_capacity(estimated_size);
         TlvRecord::write_all(&self.records, &mut bytes)?;
         Ok(bytes)
@@ -415,7 +425,11 @@ impl DatabaseV2 {
         // Pre-size to the known total. Skips the ~25 doubling
         // reallocations a fresh Vec::new() incurs on its way to
         // 25 MB+ output (the size of a real database V2 file).
-        let estimated_size: usize = self.records.iter().map(|record| 8 + record.payload.len()).sum();
+        let estimated_size: usize = self
+            .records
+            .iter()
+            .map(|record| 8 + record.payload.len())
+            .sum();
         let mut bytes = Vec::with_capacity(estimated_size);
         TlvRecord::write_all(&self.records, &mut bytes)?;
         Ok(bytes)
@@ -472,7 +486,10 @@ impl DatabaseV2 {
     /// Number of `otrk` track entries in the database. Useful for
     /// progress reporting on full library scans.
     pub fn track_count(&self) -> usize {
-        self.records.iter().filter(|record| &record.tag == TAG_OTRK).count()
+        self.records
+            .iter()
+            .filter(|record| &record.tag == TAG_OTRK)
+            .count()
     }
 
     /// Append a new `otrk` for `track_path` with the supplied
@@ -488,11 +505,7 @@ impl DatabaseV2 {
     /// Like `update_track_metadata`, must only be called while
     /// Serato is NOT running. The Swift caller gates via
     /// SeratoWatchdog.
-    pub fn add_track(
-        &mut self,
-        track_path: &str,
-        metadata: &SeratoMetadataUpdate,
-    ) -> bool {
+    pub fn add_track(&mut self, track_path: &str, metadata: &SeratoMetadataUpdate) -> bool {
         let already_present = self.records.iter().any(|record| {
             if &record.tag != TAG_OTRK {
                 return false;
@@ -575,8 +588,7 @@ impl DatabaseV2 {
             }
 
             let mut rebuilt = Vec::with_capacity(record.payload.len());
-            TlvRecord::write_all(&nested, &mut rebuilt)
-                .expect("writing to Vec<u8> cannot fail");
+            TlvRecord::write_all(&nested, &mut rebuilt).expect("writing to Vec<u8> cannot fail");
             record.payload = rebuilt;
             return 1;
         }
@@ -659,17 +671,26 @@ mod tests {
     use super::*;
 
     fn synthetic_otrk(path_tag: &[u8; 4], path: &str) -> TlvRecord {
-        let path_record = TlvRecord { tag: *path_tag, payload: encode_utf16be(path) };
+        let path_record = TlvRecord {
+            tag: *path_tag,
+            payload: encode_utf16be(path),
+        };
         let mut otrk_payload = Vec::new();
         TlvRecord::write_all(&[path_record], &mut otrk_payload).unwrap();
-        TlvRecord { tag: *TAG_OTRK, payload: otrk_payload }
+        TlvRecord {
+            tag: *TAG_OTRK,
+            payload: otrk_payload,
+        }
     }
 
     /// Build a synthetic library byte stream (works for either `.crate`
     /// or `database V2` depending on `path_tag`) containing the
     /// supplied version string and track paths.
     fn synthetic_library(version: &str, path_tag: &[u8; 4], paths: &[&str]) -> Vec<u8> {
-        let mut records = vec![TlvRecord { tag: *b"vrsn", payload: encode_utf16be(version) }];
+        let mut records = vec![TlvRecord {
+            tag: *b"vrsn",
+            payload: encode_utf16be(version),
+        }];
         for path in paths {
             records.push(synthetic_otrk(path_tag, path));
         }
@@ -685,7 +706,10 @@ mod tests {
         let bytes = synthetic_library(
             "1.0/Serato ScratchLive Crate",
             TAG_PTRK,
-            &["Music/A/Artist - Track A.mp3", "Music/B/Artist - Track B.mp3"],
+            &[
+                "Music/A/Artist - Track A.mp3",
+                "Music/B/Artist - Track B.mp3",
+            ],
         );
 
         let parsed = CrateFile::from_bytes(&bytes).unwrap();
@@ -799,8 +823,14 @@ mod tests {
     #[test]
     fn crate_rewrite_path_preserves_other_nested_fields_in_otrk() {
         // Synthesize an otrk containing both a ptrk and an unknown tag.
-        let ptrk = TlvRecord { tag: *TAG_PTRK, payload: encode_utf16be("Music/A/old.mp3") };
-        let unknown = TlvRecord { tag: *b"zzzz", payload: vec![0xDE, 0xAD, 0xBE, 0xEF] };
+        let ptrk = TlvRecord {
+            tag: *TAG_PTRK,
+            payload: encode_utf16be("Music/A/old.mp3"),
+        };
+        let unknown = TlvRecord {
+            tag: *b"zzzz",
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
         let mut otrk_payload = Vec::new();
         TlvRecord::write_all(&[ptrk, unknown.clone()], &mut otrk_payload).unwrap();
 
@@ -808,7 +838,10 @@ mod tests {
             tag: *b"vrsn",
             payload: encode_utf16be("1.0/Serato ScratchLive Crate"),
         };
-        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let otrk = TlvRecord {
+            tag: *TAG_OTRK,
+            payload: otrk_payload,
+        };
         let mut crate_bytes = Vec::new();
         TlvRecord::write_all(&[vrsn, otrk], &mut crate_bytes).unwrap();
 
@@ -824,8 +857,14 @@ mod tests {
         let nested = TlvRecord::parse_all(&rewritten_otrk.payload).unwrap();
         assert_eq!(nested.len(), 2);
         assert_eq!(&nested[0].tag, TAG_PTRK);
-        assert_eq!(decode_utf16be(&nested[0].payload).unwrap(), "Music/A/new.mp3");
-        assert_eq!(nested[1], unknown, "unknown nested record must be byte-identical");
+        assert_eq!(
+            decode_utf16be(&nested[0].payload).unwrap(),
+            "Music/A/new.mp3"
+        );
+        assert_eq!(
+            nested[1], unknown,
+            "unknown nested record must be byte-identical"
+        );
     }
 
     #[test]
@@ -874,7 +913,10 @@ mod tests {
         let parsed = DatabaseV2::from_bytes(&bytes).unwrap();
         assert_eq!(
             parsed.track_paths(),
-            vec!["Music/T/Track A.mp3".to_string(), "Music/T/Track B.mp3".to_string()]
+            vec![
+                "Music/T/Track A.mp3".to_string(),
+                "Music/T/Track B.mp3".to_string()
+            ]
         );
         assert_eq!(parsed.track_count(), 2);
     }
@@ -928,15 +970,36 @@ mod tests {
         // Synthesize a realistic-ish otrk containing pfil + tart (artist)
         // + tsng (title) + tbpm (BPM) + a future unknown tag. Rewriting
         // pfil must not touch the metadata fields.
-        let pfil = TlvRecord { tag: *TAG_PFIL, payload: encode_utf16be("Music/A/old.mp3") };
-        let tart = TlvRecord { tag: *b"tart", payload: encode_utf16be("Some Artist") };
-        let tsng = TlvRecord { tag: *b"tsng", payload: encode_utf16be("Some Track") };
-        let tbpm = TlvRecord { tag: *b"tbpm", payload: encode_utf16be("128.000") };
-        let unknown = TlvRecord { tag: *b"q9q9", payload: vec![1, 2, 3, 4, 5] };
+        let pfil = TlvRecord {
+            tag: *TAG_PFIL,
+            payload: encode_utf16be("Music/A/old.mp3"),
+        };
+        let tart = TlvRecord {
+            tag: *b"tart",
+            payload: encode_utf16be("Some Artist"),
+        };
+        let tsng = TlvRecord {
+            tag: *b"tsng",
+            payload: encode_utf16be("Some Track"),
+        };
+        let tbpm = TlvRecord {
+            tag: *b"tbpm",
+            payload: encode_utf16be("128.000"),
+        };
+        let unknown = TlvRecord {
+            tag: *b"q9q9",
+            payload: vec![1, 2, 3, 4, 5],
+        };
 
         let mut otrk_payload = Vec::new();
         TlvRecord::write_all(
-            &[pfil, tart.clone(), tsng.clone(), tbpm.clone(), unknown.clone()],
+            &[
+                pfil,
+                tart.clone(),
+                tsng.clone(),
+                tbpm.clone(),
+                unknown.clone(),
+            ],
             &mut otrk_payload,
         )
         .unwrap();
@@ -945,7 +1008,10 @@ mod tests {
             tag: *b"vrsn",
             payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
         };
-        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let otrk = TlvRecord {
+            tag: *TAG_OTRK,
+            payload: otrk_payload,
+        };
         let mut db_bytes = Vec::new();
         TlvRecord::write_all(&[vrsn, otrk], &mut db_bytes).unwrap();
 
@@ -961,7 +1027,10 @@ mod tests {
         let nested = TlvRecord::parse_all(&rewritten_otrk.payload).unwrap();
         assert_eq!(nested.len(), 5);
         assert_eq!(&nested[0].tag, TAG_PFIL);
-        assert_eq!(decode_utf16be(&nested[0].payload).unwrap(), "Music/A/new.mp3");
+        assert_eq!(
+            decode_utf16be(&nested[0].payload).unwrap(),
+            "Music/A/new.mp3"
+        );
         // Every metadata field after pfil must survive byte-identical.
         assert_eq!(nested[1], tart);
         assert_eq!(nested[2], tsng);
@@ -986,7 +1055,10 @@ mod tests {
         // metadata tags we extract, plus an unknown tag (`zzzz`) to
         // verify it's silently ignored.
         fn nested(tag: &[u8; 4], value: &str) -> TlvRecord {
-            TlvRecord { tag: *tag, payload: encode_utf16be(value) }
+            TlvRecord {
+                tag: *tag,
+                payload: encode_utf16be(value),
+            }
         }
         let otrk_fields = [
             nested(TAG_PFIL, "Users/x/Music/A/Track.mp3"),
@@ -999,7 +1071,10 @@ mod tests {
             nested(b"tcom", "a comment"),
             nested(b"tlen", "03:24"),
             nested(b"tlbl", "Some Label"),
-            TlvRecord { tag: *b"zzzz", payload: vec![1, 2, 3, 4] },
+            TlvRecord {
+                tag: *b"zzzz",
+                payload: vec![1, 2, 3, 4],
+            },
         ];
         let mut otrk_payload = Vec::new();
         TlvRecord::write_all(&otrk_fields, &mut otrk_payload).unwrap();
@@ -1007,7 +1082,10 @@ mod tests {
             tag: *b"vrsn",
             payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
         };
-        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let otrk = TlvRecord {
+            tag: *TAG_OTRK,
+            payload: otrk_payload,
+        };
         let mut bytes = Vec::new();
         TlvRecord::write_all(&[vrsn, otrk], &mut bytes).unwrap();
 
@@ -1031,7 +1109,10 @@ mod tests {
     fn database_track_records_returns_none_for_otrk_without_pfil() {
         // An otrk that has tart but no pfil — useless to crate-agent
         // (no file to match against), should be skipped.
-        let tart_only = TlvRecord { tag: *b"tart", payload: encode_utf16be("Ghost Artist") };
+        let tart_only = TlvRecord {
+            tag: *b"tart",
+            payload: encode_utf16be("Ghost Artist"),
+        };
         let mut otrk_payload = Vec::new();
         TlvRecord::write_all(&[tart_only], &mut otrk_payload).unwrap();
         let vrsn = TlvRecord {
@@ -1040,7 +1121,13 @@ mod tests {
         };
         let mut bytes = Vec::new();
         TlvRecord::write_all(
-            &[vrsn, TlvRecord { tag: *TAG_OTRK, payload: otrk_payload }],
+            &[
+                vrsn,
+                TlvRecord {
+                    tag: *TAG_OTRK,
+                    payload: otrk_payload,
+                },
+            ],
             &mut bytes,
         )
         .unwrap();
@@ -1073,7 +1160,10 @@ mod tests {
     #[test]
     fn update_track_metadata_replaces_existing_tag_value() {
         fn nested(tag: &[u8; 4], value: &str) -> TlvRecord {
-            TlvRecord { tag: *tag, payload: encode_utf16be(value) }
+            TlvRecord {
+                tag: *tag,
+                payload: encode_utf16be(value),
+            }
         }
         let otrk_fields = [
             nested(TAG_PFIL, "Users/x/Music/A/Track.mp3"),
@@ -1086,7 +1176,10 @@ mod tests {
             tag: *b"vrsn",
             payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
         };
-        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let otrk = TlvRecord {
+            tag: *TAG_OTRK,
+            payload: otrk_payload,
+        };
         let mut bytes = Vec::new();
         TlvRecord::write_all(&[vrsn, otrk], &mut bytes).unwrap();
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
@@ -1129,7 +1222,10 @@ mod tests {
     #[test]
     fn update_track_metadata_leaves_unspecified_fields_alone() {
         fn nested(tag: &[u8; 4], value: &str) -> TlvRecord {
-            TlvRecord { tag: *tag, payload: encode_utf16be(value) }
+            TlvRecord {
+                tag: *tag,
+                payload: encode_utf16be(value),
+            }
         }
         let otrk_fields = [
             nested(TAG_PFIL, "Users/x/Music/A/Track.mp3"),
@@ -1145,7 +1241,13 @@ mod tests {
         };
         let mut bytes = Vec::new();
         TlvRecord::write_all(
-            &[vrsn, TlvRecord { tag: *TAG_OTRK, payload: otrk_payload }],
+            &[
+                vrsn,
+                TlvRecord {
+                    tag: *TAG_OTRK,
+                    payload: otrk_payload,
+                },
+            ],
             &mut bytes,
         )
         .unwrap();
@@ -1236,7 +1338,10 @@ mod tests {
         // existing entry had no `tart`, so it should still have none.
         let records = database.track_records();
         assert_eq!(records.len(), 1);
-        assert!(records[0].artist.is_none(), "existing entry's metadata is untouched");
+        assert!(
+            records[0].artist.is_none(),
+            "existing entry's metadata is untouched"
+        );
     }
 
     #[test]
@@ -1247,14 +1352,15 @@ mod tests {
             &["Users/x/Music/A/existing.mp3"],
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let added = database.add_track(
-            "Users/x/Music/A/bare.mp3",
-            &SeratoMetadataUpdate::default(),
-        );
+        let added =
+            database.add_track("Users/x/Music/A/bare.mp3", &SeratoMetadataUpdate::default());
         assert!(added);
 
         let records = database.track_records();
-        let bare = records.iter().find(|r| r.path == "Users/x/Music/A/bare.mp3").unwrap();
+        let bare = records
+            .iter()
+            .find(|r| r.path == "Users/x/Music/A/bare.mp3")
+            .unwrap();
         assert!(bare.artist.is_none());
         assert!(bare.title.is_none());
         assert!(bare.bpm.is_none());
@@ -1301,10 +1407,7 @@ mod tests {
         let bytes = synthetic_library(
             "1.0/Serato ScratchLive Crate",
             TAG_PTRK,
-            &[
-                "Users/x/Music/A/keep.mp3",
-                "Users/x/Music/A/remove.mp3",
-            ],
+            &["Users/x/Music/A/keep.mp3", "Users/x/Music/A/remove.mp3"],
         );
         let mut crate_file = CrateFile::from_bytes(&bytes).unwrap();
         let removed = crate_file.remove_track("Users/x/Music/A/remove.mp3");
@@ -1357,15 +1460,24 @@ mod tests {
         // Set up an otrk whose tart is already "Some Artist", then
         // call update with artist=Some("Some Artist"). No fields
         // changed → return 0, bytes byte-exact.
-        let pfil = TlvRecord { tag: *TAG_PFIL, payload: encode_utf16be("Music/A/x.mp3") };
-        let tart = TlvRecord { tag: *b"tart", payload: encode_utf16be("Some Artist") };
+        let pfil = TlvRecord {
+            tag: *TAG_PFIL,
+            payload: encode_utf16be("Music/A/x.mp3"),
+        };
+        let tart = TlvRecord {
+            tag: *b"tart",
+            payload: encode_utf16be("Some Artist"),
+        };
         let mut otrk_payload = Vec::new();
         TlvRecord::write_all(&[pfil, tart], &mut otrk_payload).unwrap();
         let vrsn = TlvRecord {
             tag: *b"vrsn",
             payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
         };
-        let otrk = TlvRecord { tag: *TAG_OTRK, payload: otrk_payload };
+        let otrk = TlvRecord {
+            tag: *TAG_OTRK,
+            payload: otrk_payload,
+        };
         let mut db_bytes = Vec::new();
         TlvRecord::write_all(&[vrsn, otrk], &mut db_bytes).unwrap();
 
@@ -1394,8 +1506,8 @@ mod tests {
             eprintln!("CRATE_AGENT_TEST_DATABASE_V2 not set; skipping real-database test");
             return;
         };
-        let database = DatabaseV2::read_from_path(&path)
-            .expect("real database V2 must parse cleanly");
+        let database =
+            DatabaseV2::read_from_path(&path).expect("real database V2 must parse cleanly");
         let otrk_count = database.track_count();
         let path_count = database.track_paths().len();
         let file_size = std::fs::metadata(&path).unwrap().len();
@@ -1404,7 +1516,10 @@ mod tests {
             file_size, otrk_count, path_count
         );
         assert!(otrk_count > 0, "expected a non-empty database");
-        assert_eq!(otrk_count, path_count, "every otrk should expose exactly one pfil");
+        assert_eq!(
+            otrk_count, path_count,
+            "every otrk should expose exactly one pfil"
+        );
 
         // Track-record extraction: count records and tally how many
         // populated each well-known metadata field. Useful as a
@@ -1417,16 +1532,28 @@ mod tests {
         let mut bpm_count = 0;
         let mut key_count = 0;
         for record in &records {
-            if record.artist.is_some() { artist_count += 1; }
-            if record.title.is_some() { title_count += 1; }
-            if record.bpm.is_some() { bpm_count += 1; }
-            if record.key.is_some() { key_count += 1; }
+            if record.artist.is_some() {
+                artist_count += 1;
+            }
+            if record.title.is_some() {
+                title_count += 1;
+            }
+            if record.bpm.is_some() {
+                bpm_count += 1;
+            }
+            if record.key.is_some() {
+                key_count += 1;
+            }
         }
         eprintln!(
             "metadata coverage: {} records, {} with artist, {} with title, {} with bpm, {} with key",
             records.len(), artist_count, title_count, bpm_count, key_count
         );
-        assert_eq!(records.len(), path_count, "every otrk with a pfil should yield a record");
+        assert_eq!(
+            records.len(),
+            path_count,
+            "every otrk with a pfil should yield a record"
+        );
 
         // Round-trip the bytes (parse → serialize) and confirm byte-exactness.
         let original_bytes = std::fs::read(&path).unwrap();
