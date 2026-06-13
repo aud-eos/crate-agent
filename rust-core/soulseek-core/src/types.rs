@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Desired output format for an entry. Feeds the ranker and the
 /// auto-accept quality gate. Defaults to `Any`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FormatPreference {
     Flac,
@@ -15,6 +16,7 @@ pub enum FormatPreference {
 /// One wanted track. A subset of crate-agent's track/placeholder schema
 /// so the two are the same object at different lifecycle stages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ListEntry {
     pub artist: String,
     pub title: String,
@@ -34,6 +36,7 @@ pub struct ListEntry {
 
 /// One raw search result from slskd, normalized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Candidate {
     pub username: String,
     /// Remote path exactly as slskd reports it (often mangled:
@@ -49,6 +52,7 @@ pub struct Candidate {
 
 /// A candidate plus the ranker's verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ScoredCandidate {
     pub candidate: Candidate,
     pub score: i64,
@@ -58,6 +62,7 @@ pub struct ScoredCandidate {
 
 /// Where a downloaded file came from. Recorded in the manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SourceInfo {
     pub slskd_username: String,
     pub original_filename: String,
@@ -70,6 +75,7 @@ pub struct SourceInfo {
 /// `fingerprint` is the join key Phase 2 / crate-agent uses to match a
 /// download to a waiting placeholder (by perceptual hash, NOT filename).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AcquisitionRecord {
     pub list_entry: ListEntry,
     pub file_path: String,

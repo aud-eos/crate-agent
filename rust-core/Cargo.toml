@@ -1,6 +1,6 @@
 [workspace]
 # soulseek-core and soulseek-mcp are added by their respective tasks.
-members = ["fingerprint-core", "soulseek-core"]
+members = ["fingerprint-core", "soulseek-core", "soulseek-mcp"]
 resolver = "2"
 
 [package]
