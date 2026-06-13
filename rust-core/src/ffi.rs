@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::fingerprint;
+use fingerprint_core as fingerprint;
 use crate::serato;
 use crate::tags;
 

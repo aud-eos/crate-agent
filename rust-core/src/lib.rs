@@ -1,5 +1,4 @@
 mod ffi;
-mod fingerprint;
 mod serato;
 mod tags;
 

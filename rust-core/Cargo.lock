@@ -241,11 +241,10 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "crate-agent-core"
 version = "0.1.0"
 dependencies = [
+ "fingerprint-core",
  "lofty",
- "rusty-chromaprint",
  "serde",
  "serde_json",
- "symphonia",
  "thiserror",
  "uniffi",
 ]
@@ -270,6 +269,15 @@ name = "extended"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
+
+[[package]]
+name = "fingerprint-core"
+version = "0.1.0"
+dependencies = [
+ "rusty-chromaprint",
+ "symphonia",
+ "thiserror",
+]
 
 [[package]]
 name = "flate2"
