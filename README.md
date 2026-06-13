@@ -73,9 +73,19 @@ See [`docs/soulseek.md`](./docs/soulseek.md) for setup, env vars, Claude MCP reg
 
 ```
 CrateAgent/        Swift app (SwiftUI, AppKit hooks where needed)
-rust-core/         Rust crate: Serato I/O, fingerprinting, tag I/O
+CrateAgentTests/   Swift test suite
+rust-core/         Cargo workspace (see crates below)
 scripts/           Build scripts
-test-fixtures/     Sample Serato library files and audio for tests
+docs/              Design docs, Soulseek setup, planning artifacts
+```
+
+`rust-core/` is a Cargo workspace:
+
+```
+crate-agent-core/  Serato library I/O + tag I/O; the uniffi FFI surface for the Swift app
+fingerprint-core/  Chromaprint audio fingerprinting (shared by crate-agent-core and soulseek-core)
+soulseek-core/     Soulseek acquisition logic (slskd client, candidate ranking, download confirmation)
+soulseek-mcp/      MCP server binary exposing soulseek-core to Claude
 ```
 
 ## License
