@@ -9,13 +9,13 @@ Drive Soulseek downloads from a tracklist via Claude, routed through a local [sl
 | Tool | What it does |
 |------|-------------|
 | `ingest_list` | Parse a newline-delimited `Artist - Title` list into a session |
-| `plan_acquisition` | Search slskd and auto-accept / propose / park each entry |
+| `plan_acquisition` | Search slskd; auto-accepted entries are enqueued immediately, proposed entries await `confirm_download`, parked entries need manual attention |
 | `review_candidates` | Show ranked candidates for one entry |
 | `set_auto_accept` | Toggle high-confidence auto-accept and set the minimum score |
 | `confirm_download` | Queue a chosen candidate for download in slskd |
 | `acquisition_status` | Poll download progress; fingerprint + manifest finished files; report the needs-review list |
 
-Typical flow: `ingest_list` → `plan_acquisition` → `review_candidates` / `set_auto_accept` → `confirm_download` → `acquisition_status` (poll until complete).
+Typical flow: `ingest_list` → `plan_acquisition` (auto-accepted entries are enqueued here) → `review_candidates` / `confirm_download` for proposed entries → `acquisition_status` (poll until complete).
 
 `acquisition_status` writes a `<filename>.json` manifest into the staging dir for each confirmed download. The manifest includes the Chromaprint fingerprint that Phase 2 uses to match the download to a crate-agent placeholder. Anything that cannot be confirmed (decode failure, duration mismatch, file not yet in staging dir) lands in the returned `needs_review` list.
 
@@ -54,7 +54,7 @@ Start slskd and verify it's reachable at `http://localhost:5030` (the default po
 |----------|---------|---------|
 | `SLSKD_URL` | `http://localhost:5030` | Base URL of the local slskd instance |
 | `SLSKD_API_KEY` | `your-api-key-here` | API key from `slskd.yml` `web.authentication.api_keys` |
-| `SOULSEEK_STAGING_DIR` | `/Users/you/Music/_staging` | Directory where completed downloads land and manifests are written |
+| `SOULSEEK_STAGING_DIR` | `/Users/you/Music/_staging` | Directory where completed downloads land and manifests are written. **Must match slskd's configured download directory** (`directories.downloads` in `slskd.yml`) — if these differ, `acquisition_status` cannot find completed files and every download falls to `needs_review`. |
 
 ## Build
 
@@ -110,7 +110,7 @@ With the MCP server registered and Claude open:
    ```
    Note the `session_id` returned.
 
-2. **Plan:** call `plan_acquisition` with that `session_id`. Claude will search slskd and report auto-accepted / proposed / parked counts.
+2. **Plan:** call `plan_acquisition` with that `session_id`. Claude will search slskd, immediately enqueue any auto-accepted entries, and report auto-accepted / proposed / parked counts.
 
 3. **Confirm:** for any `proposed` entries, call `review_candidates` to see the ranked list, then `confirm_download` to queue your chosen candidate. For auto-accepted entries the top candidate is queued automatically.
 

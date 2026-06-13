@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,15 +13,25 @@ use soulseek_core::confirmer::confirm_download;
 use soulseek_core::planner::{plan, ConfidencePolicy, Decision};
 use soulseek_core::slskd_client::SlskdClient;
 use soulseek_core::staging::write_manifest;
-use soulseek_core::types::{AcquisitionRecord, ListEntry, ScoredCandidate, SourceInfo};
+use soulseek_core::types::{AcquisitionRecord, Candidate, ListEntry, ScoredCandidate, SourceInfo};
 
 // ---------------------------------------------------------------------------
 // Session state
 // ---------------------------------------------------------------------------
 
+/// Records an enqueued download so `acquisition_status` can recover exact
+/// provenance (username, remote path) without guessing by title-substring.
+/// The map key is the basename of `candidate.filename`.
+struct EnqueuedDownload {
+    list_entry: ListEntry,
+    candidate: Candidate,
+}
+
 struct Session {
     entries: Vec<ListEntry>,
     decisions: HashMap<usize, Decision>,
+    /// Keyed by the download's basename (what slskd and the staging dir both use).
+    enqueued: HashMap<String, EnqueuedDownload>,
 }
 
 struct State {
@@ -146,6 +156,7 @@ impl SoulseekMcp {
             Session {
                 entries: parsed.entries,
                 decisions: HashMap::new(),
+                enqueued: HashMap::new(),
             },
         );
         Json(IngestResult {
@@ -162,10 +173,12 @@ impl SoulseekMcp {
         &self,
         Parameters(params): Parameters<SessionParams>,
     ) -> Json<PlanResult> {
-        let entries: Vec<ListEntry> = {
+        // Clone what we need under a short lock so we never hold it across
+        // the async network calls below.
+        let (entries, policy) = {
             let state = self.state.lock().await;
             match state.sessions.get(&params.session_id) {
-                Some(session) => session.entries.clone(),
+                Some(session) => (session.entries.clone(), state.policy.clone()),
                 None => {
                     return Json(PlanResult {
                         auto_accepted: 0,
@@ -176,8 +189,9 @@ impl SoulseekMcp {
             }
         };
 
-        let policy = self.state.lock().await.policy.clone();
         let mut decisions: HashMap<usize, Decision> = HashMap::new();
+        // Enqueued records built here; written back under lock after all async work.
+        let mut new_enqueued: HashMap<String, EnqueuedDownload> = HashMap::new();
         let (mut auto_accepted, mut proposed, mut parked) = (0usize, 0usize, Vec::<String>::new());
 
         for (index, entry) in entries.iter().enumerate() {
@@ -192,8 +206,39 @@ impl SoulseekMcp {
                     reason: error.to_string(),
                 },
             };
+
             match &decision {
-                Decision::AutoAccept(_) => auto_accepted += 1,
+                Decision::AutoAccept(top) => {
+                    // Auto-accept = enqueue immediately; the user asked for hands-off.
+                    match self
+                        .client
+                        .enqueue_download(
+                            &top.candidate.username,
+                            &top.candidate.filename,
+                            top.candidate.size_bytes,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            let basename = candidate_basename(&top.candidate.filename);
+                            new_enqueued.insert(
+                                basename,
+                                EnqueuedDownload {
+                                    list_entry: entry.clone(),
+                                    candidate: top.candidate.clone(),
+                                },
+                            );
+                            auto_accepted += 1;
+                        }
+                        Err(error) => {
+                            // Enqueue failure is not silent — surface it as parked.
+                            parked.push(format!(
+                                "{} - {}: auto-accept enqueue failed: {}",
+                                entry.artist, entry.title, error
+                            ));
+                        }
+                    }
+                }
                 Decision::Propose(_) => proposed += 1,
                 Decision::Park { reason } => {
                     parked.push(format!("{} - {}: {}", entry.artist, entry.title, reason))
@@ -202,9 +247,11 @@ impl SoulseekMcp {
             decisions.insert(index, decision);
         }
 
+        // Write decisions and enqueued records back under a single lock acquisition.
         let mut state = self.state.lock().await;
         if let Some(session) = state.sessions.get_mut(&params.session_id) {
             session.decisions = decisions;
+            session.enqueued.extend(new_enqueued);
         }
         Json(PlanResult {
             auto_accepted,
@@ -245,20 +292,23 @@ impl SoulseekMcp {
         &self,
         Parameters(params): Parameters<ConfirmParams>,
     ) -> Json<ConfirmResult> {
-        let candidate = {
+        // Clone out the candidate and its list entry under a short lock.
+        let resolved = {
             let state = self.state.lock().await;
             state.sessions.get(&params.session_id).and_then(|session| {
-                match session.decisions.get(&params.entry_index) {
+                let entry = session.entries.get(params.entry_index)?.clone();
+                let scored = match session.decisions.get(&params.entry_index) {
                     Some(Decision::Propose(list)) => list.get(params.candidate_index).cloned(),
                     Some(Decision::AutoAccept(top)) if params.candidate_index == 0 => {
                         Some(top.clone())
                     }
                     _ => None,
-                }
+                }?;
+                Some((entry, scored))
             })
         };
 
-        let Some(scored) = candidate else {
+        let Some((list_entry, scored)) = resolved else {
             return Json(ConfirmResult {
                 queued: false,
                 message: "no such candidate".into(),
@@ -274,10 +324,23 @@ impl SoulseekMcp {
             )
             .await
         {
-            Ok(()) => Json(ConfirmResult {
-                queued: true,
-                message: format!("queued {}", scored.candidate.filename),
-            }),
+            Ok(()) => {
+                let basename = candidate_basename(&scored.candidate.filename);
+                let mut state = self.state.lock().await;
+                if let Some(session) = state.sessions.get_mut(&params.session_id) {
+                    session.enqueued.insert(
+                        basename,
+                        EnqueuedDownload {
+                            list_entry,
+                            candidate: scored.candidate.clone(),
+                        },
+                    );
+                }
+                Json(ConfirmResult {
+                    queued: true,
+                    message: format!("queued {}", scored.candidate.filename),
+                })
+            }
             Err(error) => Json(ConfirmResult {
                 queued: false,
                 message: error.to_string(),
@@ -332,7 +395,35 @@ impl SoulseekMcp {
                 ));
                 continue;
             }
-            let entry = self.best_effort_entry_for(filename).await;
+
+            // Fix 4: surface metadata errors instead of silently defaulting to size 0.
+            let size_bytes = match std::fs::metadata(&file_path) {
+                Ok(meta) => meta.len(),
+                Err(error) => {
+                    needs_review.push(format!("{filename}: could not read file metadata: {error}"));
+                    continue;
+                }
+            };
+
+            // Fix 3 + Fix 5: prefer recorded provenance over title-substring guessing.
+            // For files not enqueued through this server, fall back to title-substring
+            // matching across sessions (same logic as before, but exact only when found).
+            let (entry, slskd_username, original_filename) = {
+                let state = self.state.lock().await;
+                find_enqueued_download(&state, filename)
+                    .map(|enqueued| {
+                        (
+                            enqueued.list_entry.clone(),
+                            enqueued.candidate.username.clone(),
+                            enqueued.candidate.filename.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        let fallback_entry = best_effort_entry_for_state(&state, filename);
+                        (fallback_entry, String::new(), filename.clone())
+                    })
+            };
+
             match confirm_download(&file_path, &entry) {
                 Ok(verdict) => {
                     let record = AcquisitionRecord {
@@ -340,13 +431,13 @@ impl SoulseekMcp {
                         file_path: file_path.to_string_lossy().to_string(),
                         fingerprint: verdict.fingerprint,
                         source: SourceInfo {
-                            slskd_username: String::new(),
-                            original_filename: filename.clone(),
+                            slskd_username,
+                            original_filename,
+                            // Use the confirmer's detected values for the actual file's
+                            // bitrate and format (ground truth from the decoded audio).
                             bitrate_kbps: verdict.bitrate_kbps,
                             format: verdict.format,
-                            size_bytes: std::fs::metadata(&file_path)
-                                .map(|meta| meta.len())
-                                .unwrap_or(0),
+                            size_bytes,
                         },
                         confirmed: verdict.confirmed,
                     };
@@ -371,30 +462,57 @@ impl SoulseekMcp {
             needs_review,
         })
     }
+}
 
-    /// Match a completed filename back to the list entry that requested
-    /// it (by title containment across all sessions); falls back to a
-    /// bare entry derived from the filename when no session claims it.
-    async fn best_effort_entry_for(&self, filename: &str) -> ListEntry {
-        let state = self.state.lock().await;
-        let lowercase = filename.to_lowercase();
-        for session in state.sessions.values() {
-            for entry in &session.entries {
-                if !entry.title.is_empty() && lowercase.contains(&entry.title.to_lowercase()) {
-                    return entry.clone();
-                }
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the basename of a remote slskd path (what the staging dir and
+/// slskd's completed-downloads list both use as the key).
+fn candidate_basename(remote_path: &str) -> String {
+    Path::new(remote_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| remote_path.to_string())
+}
+
+/// Search all sessions for an `EnqueuedDownload` whose basename matches
+/// `filename` (the basename as reported by slskd).
+fn find_enqueued_download<'state>(
+    state: &'state State,
+    filename: &str,
+) -> Option<&'state EnqueuedDownload> {
+    for session in state.sessions.values() {
+        if let Some(enqueued) = session.enqueued.get(filename) {
+            return Some(enqueued);
+        }
+    }
+    None
+}
+
+/// Match a completed filename back to the list entry that requested it, using
+/// title containment across all sessions. Falls back to a bare entry derived
+/// from the filename when no session claims it. Used for files that completed
+/// in slskd but were not enqueued through this server's tools.
+fn best_effort_entry_for_state(state: &State, filename: &str) -> ListEntry {
+    let lowercase = filename.to_lowercase();
+    for session in state.sessions.values() {
+        for entry in &session.entries {
+            if !entry.title.is_empty() && lowercase.contains(&entry.title.to_lowercase()) {
+                return entry.clone();
             }
         }
-        ListEntry {
-            artist: String::new(),
-            title: filename.to_string(),
-            album: None,
-            year: None,
-            duration_secs: None,
-            isrc: None,
-            musicbrainz_recording_id: None,
-            format_preference: Default::default(),
-        }
+    }
+    ListEntry {
+        artist: String::new(),
+        title: filename.to_string(),
+        album: None,
+        year: None,
+        duration_secs: None,
+        isrc: None,
+        musicbrainz_recording_id: None,
+        format_preference: Default::default(),
     }
 }
 
