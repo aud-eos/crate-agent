@@ -35,6 +35,22 @@ struct SearchFile {
     extension: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DownloadUser {
+    directories: Vec<DownloadDirectory>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadDirectory {
+    files: Vec<DownloadFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadFile {
+    filename: String,
+    state: String,
+}
+
 impl SlskdClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
@@ -109,6 +125,37 @@ impl SlskdClient {
             }
         }
         Ok(candidates)
+    }
+
+    /// Filenames of downloads slskd reports as fully completed.
+    pub async fn completed_downloads(&self) -> Result<Vec<String>> {
+        let users: Vec<DownloadUser> = self
+            .http
+            .get(format!("{}/api/v0/transfers/downloads", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .map_err(|error| SoulseekError::Slskd(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| SoulseekError::Slskd(error.to_string()))?
+            .json()
+            .await
+            .map_err(|error| SoulseekError::SlskdProtocol(error.to_string()))?;
+        let mut done = Vec::new();
+        for user in users {
+            for directory in user.directories {
+                for file in directory.files {
+                    if file.state.contains("Completed") && file.state.contains("Succeeded") {
+                        let name = std::path::Path::new(&file.filename)
+                            .file_name()
+                            .map(|os_str| os_str.to_string_lossy().to_string())
+                            .unwrap_or(file.filename);
+                        done.push(name);
+                    }
+                }
+            }
+        }
+        Ok(done)
     }
 
     /// Queue a download of one file from a user.
@@ -202,6 +249,26 @@ mod tests {
             .enqueue_download("dj_alice", "Daft Punk - Around the World.flac", 41000000)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_downloads_lists_finished_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/transfers/downloads"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "username": "dj_alice", "directories": [
+                    { "files": [
+                        { "filename": "Around the World.flac", "state": "Completed, Succeeded" },
+                        { "filename": "Other.mp3", "state": "InProgress" }
+                    ]}
+                ]}
+            ])))
+            .mount(&server)
+            .await;
+        let client = SlskdClient::new(server.uri(), "secret");
+        let done = client.completed_downloads().await.unwrap();
+        assert_eq!(done, vec!["Around the World.flac".to_string()]);
     }
 
     #[tokio::test]

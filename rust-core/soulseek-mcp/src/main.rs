@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use soulseek_core::adapters::text_paste::parse_text;
+use soulseek_core::confirmer::confirm_download;
 use soulseek_core::planner::{plan, ConfidencePolicy, Decision};
 use soulseek_core::slskd_client::SlskdClient;
-use soulseek_core::types::{ListEntry, ScoredCandidate};
+use soulseek_core::staging::write_manifest;
+use soulseek_core::types::{AcquisitionRecord, ListEntry, ScoredCandidate, SourceInfo};
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -36,8 +38,7 @@ struct State {
 struct SoulseekMcp {
     state: Arc<Mutex<State>>,
     client: SlskdClient,
-    // Used by acquisition_status (Task 9).
-    _staging_dir: PathBuf,
+    staging_dir: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +106,13 @@ struct PolicyResult {
     min_score: i64,
 }
 
+#[derive(Serialize, schemars::JsonSchema)]
+struct StatusResult {
+    completed: Vec<String>,
+    confirmed: Vec<String>,
+    needs_review: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -119,7 +127,7 @@ impl SoulseekMcp {
                 next_id: 0,
             })),
             client,
-            _staging_dir: staging_dir,
+            staging_dir,
         }
     }
 
@@ -293,6 +301,100 @@ impl SoulseekMcp {
             auto_accept: state.policy.auto_accept,
             min_score: state.policy.min_score,
         })
+    }
+
+    #[tool(
+        description = "Poll download progress; confirm + manifest finished files; report the needs-review list."
+    )]
+    async fn acquisition_status(&self) -> Json<StatusResult> {
+        let completed = match self.client.completed_downloads().await {
+            Ok(list) => list,
+            Err(error) => {
+                return Json(StatusResult {
+                    completed: vec![],
+                    confirmed: vec![],
+                    needs_review: vec![error.to_string()],
+                })
+            }
+        };
+
+        let mut confirmed = Vec::new();
+        let mut needs_review = Vec::new();
+
+        for filename in &completed {
+            let file_path = self.staging_dir.join(filename);
+            if self.staging_dir.join(format!("{filename}.json")).exists() {
+                continue; // already confirmed on a prior poll
+            }
+            if !file_path.exists() {
+                needs_review.push(format!(
+                    "{filename}: completed in slskd but not present in staging dir"
+                ));
+                continue;
+            }
+            let entry = self.best_effort_entry_for(filename).await;
+            match confirm_download(&file_path, &entry) {
+                Ok(verdict) => {
+                    let record = AcquisitionRecord {
+                        list_entry: entry,
+                        file_path: file_path.to_string_lossy().to_string(),
+                        fingerprint: verdict.fingerprint,
+                        source: SourceInfo {
+                            slskd_username: String::new(),
+                            original_filename: filename.clone(),
+                            bitrate_kbps: verdict.bitrate_kbps,
+                            format: verdict.format,
+                            size_bytes: std::fs::metadata(&file_path)
+                                .map(|meta| meta.len())
+                                .unwrap_or(0),
+                        },
+                        confirmed: verdict.confirmed,
+                    };
+                    match write_manifest(&self.staging_dir, &record) {
+                        Ok(_) if verdict.confirmed => confirmed.push(filename.clone()),
+                        Ok(_) => needs_review.push(format!(
+                            "{filename}: {}",
+                            verdict.reason.unwrap_or_default()
+                        )),
+                        Err(error) => {
+                            needs_review.push(format!("{filename}: manifest write failed: {error}"))
+                        }
+                    }
+                }
+                Err(error) => needs_review.push(format!("{filename}: {error}")),
+            }
+        }
+
+        Json(StatusResult {
+            completed,
+            confirmed,
+            needs_review,
+        })
+    }
+
+    /// Match a completed filename back to the list entry that requested
+    /// it (by title containment across all sessions); falls back to a
+    /// bare entry derived from the filename when no session claims it.
+    async fn best_effort_entry_for(&self, filename: &str) -> ListEntry {
+        let state = self.state.lock().await;
+        let lowercase = filename.to_lowercase();
+        for session in state.sessions.values() {
+            for entry in &session.entries {
+                if !entry.title.is_empty() && lowercase.contains(&entry.title.to_lowercase()) {
+                    return entry.clone();
+                }
+            }
+        }
+        ListEntry {
+            artist: String::new(),
+            title: filename.to_string(),
+            album: None,
+            year: None,
+            duration_secs: None,
+            isrc: None,
+            musicbrainz_recording_id: None,
+            format_preference: Default::default(),
+        }
     }
 }
 

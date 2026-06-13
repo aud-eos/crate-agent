@@ -59,6 +59,16 @@ make lint           # cargo clippy
 make clean          # Remove all generated artifacts (target/, build-output/, etc.)
 ```
 
+## Soulseek acquisition (MCP)
+
+`soulseek-mcp` is a standalone MCP binary that lets Claude drive Soulseek downloads from a tracklist via a local [slskd](https://github.com/slskd/slskd) daemon — search, rank candidates, queue downloads, fingerprint + manifest completed files. This is Phase 1 (standalone acquisition); Phase 2 (syncing downloads into the crate-agent library via Chromaprint match) is gated on Pillar C.
+
+```sh
+cargo build --manifest-path rust-core/Cargo.toml -p soulseek-mcp --release
+```
+
+See [`docs/soulseek.md`](./docs/soulseek.md) for setup, env vars, Claude MCP registration, and smoke-test steps.
+
 ## Project layout
 
 ```
