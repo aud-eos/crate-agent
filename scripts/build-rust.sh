@@ -34,10 +34,10 @@ echo "==> Ensuring Rust toolchain targets are installed"
 rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
 
 echo "==> Building Rust core for aarch64-apple-darwin"
-(cd "$RUST_DIR" && cargo build $CARGO_FLAGS --target aarch64-apple-darwin)
+(cd "$RUST_DIR" && cargo build $CARGO_FLAGS -p crate-agent-core --target aarch64-apple-darwin)
 
 echo "==> Building Rust core for x86_64-apple-darwin"
-(cd "$RUST_DIR" && cargo build $CARGO_FLAGS --target x86_64-apple-darwin)
+(cd "$RUST_DIR" && cargo build $CARGO_FLAGS -p crate-agent-core --target x86_64-apple-darwin)
 
 echo "==> Combining into universal static library"
 mkdir -p "$OUTPUT_DIR"
@@ -48,7 +48,7 @@ lipo -create \
 
 echo "==> Generating Swift FFI bindings"
 mkdir -p "$SWIFT_GENERATED_DIR"
-(cd "$RUST_DIR" && cargo run $CARGO_FLAGS --bin uniffi-bindgen -- \
+(cd "$RUST_DIR" && cargo run $CARGO_FLAGS -p crate-agent-core --bin uniffi-bindgen -- \
     generate src/crate-agent-core.udl \
     --language swift \
     --out-dir "$SWIFT_GENERATED_DIR")

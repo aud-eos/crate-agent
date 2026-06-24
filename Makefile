@@ -111,7 +111,7 @@ test: test-rust test-swift
 
 test-rust:
 	@echo "==> Running Rust tests..."
-	$(CARGO) test --manifest-path rust-core/Cargo.toml
+	$(CARGO) test --manifest-path rust-core/Cargo.toml --workspace
 
 test-swift: xcodeproj
 	@echo "==> Running Swift tests..."
@@ -123,7 +123,7 @@ test-swift: xcodeproj
 
 format:
 	@echo "==> cargo fmt..."
-	$(CARGO) fmt --manifest-path rust-core/Cargo.toml
+	$(CARGO) fmt --manifest-path rust-core/Cargo.toml --all
 	@if command -v swiftformat >/dev/null 2>&1; then \
 	    echo "==> swiftformat..."; \
 	    swiftformat CrateAgent CrateAgentTests; \
@@ -133,7 +133,7 @@ format:
 
 lint:
 	@echo "==> cargo clippy (warnings = errors)..."
-	$(CARGO) clippy --manifest-path rust-core/Cargo.toml -- -D warnings
+	$(CARGO) clippy --manifest-path rust-core/Cargo.toml --workspace -- -D warnings
 
 # ---------------------------------------------------------------------------
 # Misc

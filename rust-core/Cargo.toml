@@ -1,3 +1,8 @@
+[workspace]
+# soulseek-core and soulseek-mcp are added by their respective tasks.
+members = ["fingerprint-core", "soulseek-core", "soulseek-mcp"]
+resolver = "2"
+
 [package]
 name = "crate-agent-core"
 version = "0.1.0"
@@ -27,17 +32,9 @@ thiserror = "1"
 # Serato `.crate` reader/writer is implemented in-house (rust-core/src/
 # serato.rs) — see CLAUDE.md for the AGPL-avoidance rationale.
 
-# Audio fingerprinting (foundation, day 1 — Approach 3 in the design).
-# Pure Rust, MIT-declared via Cargo.toml (note: upstream repo at
-# github.com/darksv/rusty-chromaprint lacks a LICENSE file at time of
-# adoption; we rely on the crates.io declaration).
-rusty-chromaprint = "0.3"
-
-# Audio decoder feeding chromaprint. MPL-2.0 — file-level copyleft,
-# fine for library use without modification. Default features include
-# MP3, FLAC, WAV, Vorbis; extra features pick up the rest of Serato's
-# supported set.
-symphonia = { version = "0.6", features = ["mp3", "aac", "alac", "isomp4", "aiff"] }
+# Audio fingerprinting — implementation lives in the shared fingerprint-core
+# crate so soulseek-core can use it too without duplication.
+fingerprint-core = { path = "fingerprint-core" }
 
 # Tag I/O (read in SP-1, write in SP-1.5). MIT/Apache-2.0, supports
 # MP3 (ID3v2), M4A/MP4 (iTunes atoms), FLAC/OGG (Vorbis comments),

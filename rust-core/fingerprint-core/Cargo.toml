@@ -1,0 +1,10 @@
+[package]
+name = "fingerprint-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rusty-chromaprint = "0.3"
+symphonia = { version = "0.6", features = ["mp3", "aac", "alac", "isomp4", "aiff"] }
+thiserror = "1"

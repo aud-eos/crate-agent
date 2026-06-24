@@ -1,0 +1,17 @@
+[package]
+name = "soulseek-mcp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "soulseek-mcp"
+path = "src/main.rs"
+
+[dependencies]
+soulseek-core = { path = "../soulseek-core", features = ["schemars"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+schemars = "1"
+anyhow = "1"

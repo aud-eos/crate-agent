@@ -59,13 +59,33 @@ make lint           # cargo clippy
 make clean          # Remove all generated artifacts (target/, build-output/, etc.)
 ```
 
+## Soulseek acquisition (MCP)
+
+`soulseek-mcp` is a standalone MCP binary that lets Claude drive Soulseek downloads from a tracklist via a local [slskd](https://github.com/slskd/slskd) daemon — search, rank candidates, queue downloads, fingerprint + manifest completed files. This is Phase 1 (standalone acquisition); Phase 2 (syncing downloads into the crate-agent library via Chromaprint match) is gated on Pillar C.
+
+```sh
+cargo build --manifest-path rust-core/Cargo.toml -p soulseek-mcp --release
+```
+
+See [`docs/soulseek.md`](./docs/soulseek.md) for setup, env vars, Claude MCP registration, and smoke-test steps.
+
 ## Project layout
 
 ```
 CrateAgent/        Swift app (SwiftUI, AppKit hooks where needed)
-rust-core/         Rust crate: Serato I/O, fingerprinting, tag I/O
+CrateAgentTests/   Swift test suite
+rust-core/         Cargo workspace (see crates below)
 scripts/           Build scripts
-test-fixtures/     Sample Serato library files and audio for tests
+docs/              Design docs, Soulseek setup, planning artifacts
+```
+
+`rust-core/` is a Cargo workspace:
+
+```
+crate-agent-core/  Serato library I/O + tag I/O; the uniffi FFI surface for the Swift app
+fingerprint-core/  Chromaprint audio fingerprinting (shared by crate-agent-core and soulseek-core)
+soulseek-core/     Soulseek acquisition logic (slskd client, candidate ranking, download confirmation)
+soulseek-mcp/      MCP server binary exposing soulseek-core to Claude
 ```
 
 ## License
