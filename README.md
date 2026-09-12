@@ -4,7 +4,7 @@ A macOS-native companion app for Serato DJ library management.
 
 `crate-agent` sits alongside Serato DJ, watches your filesystem, and keeps Serato's library in sync when you rename or move music files in Finder — the bug that has annoyed every working Serato DJ since 2005. It is also being built to grow into a full library-management toolkit: MusicBrainz auto-tagging, format conversion with cue-point preservation, library hygiene tools, Spotify playlist matching, chart-gap analysis, and more.
 
-**Status:** SP-1 in development. See [design plan](#design-plan) below.
+**Status:** SP-1 (Serato rename-sync) and SP-1.5 (library hygiene tools) are shipped, along with a desktop-scale performance pass. Soulseek acquisition Phase 1 is shipped as a standalone MCP server (see [below](#soulseek-acquisition-mcp)). Next planned milestone is SP-2 (MusicBrainz auto-tagging). See [design plan](#design-plan) below.
 
 ## Why this exists
 
@@ -12,7 +12,7 @@ Serato stores absolute file paths in its binary library files. When you rename a
 
 ## Architecture (one paragraph)
 
-Swift / SwiftUI macOS app with a hybrid window-plus-menu-bar shape. The Serato library read/write path goes through a Rust core (wrapping the `triseratops` crate) bridged to Swift via `uniffi`. Audio fingerprinting uses `chromaprint`. Tag I/O uses `lofty`. State lives in a SQLite database via GRDB.swift, with an event-sourced schema that powers both undo and per-file history. Every state-changing operation goes through a single "apply track mutation" primitive — the architectural keystone — so new features (auto-tag, re-encode, rule engine, etc.) add a mutation type rather than a new code path.
+Swift / SwiftUI macOS app with a hybrid window-plus-menu-bar shape. The Serato library read/write path goes through a Rust core (wrapping the `triseratops` crate) bridged to Swift via `uniffi`. The Rust side is a Cargo workspace: `crate-agent-core` (Serato + tag I/O, the FFI surface), `fingerprint-core` (Chromaprint, shared), plus `soulseek-core` and the `soulseek-mcp` server binary. Audio fingerprinting uses `chromaprint`. Tag I/O uses `lofty`. State lives in a SQLite database via GRDB.swift, with an event-sourced schema that powers both undo and per-file history. Every state-changing operation goes through a single "apply track mutation" primitive — the architectural keystone — so new features (auto-tag, re-encode, rule engine, etc.) add a mutation type rather than a new code path.
 
 ## Design plan
 
