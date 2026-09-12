@@ -241,6 +241,14 @@ pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> 
     Ok(fingerprint::fingerprint_file(&path)?)
 }
 
+/// Encode a raw Chromaprint fingerprint into the compressed, base64url
+/// string AcoustID's lookup API expects. Consumes the `Vec<u32>`
+/// `fingerprint_audio_file` produces; the two are always used together
+/// by the AcoustID lookup path.
+pub fn encode_fingerprint(raw: Vec<u32>) -> String {
+    fingerprint::encode_fingerprint_to_base64(&raw)
+}
+
 pub fn read_audio_tags(file_path: String) -> Result<AudioTags, CoreError> {
     let path = PathBuf::from(file_path);
     Ok(tags::read_tags(&path)?)

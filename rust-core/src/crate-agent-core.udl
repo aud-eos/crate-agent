@@ -124,6 +124,12 @@ namespace crate_agent_core {
   [Throws=CoreError]
   sequence<u32> fingerprint_audio_file(string file_path);
 
+  // Encode a raw Chromaprint fingerprint (as returned by
+  // fingerprint_audio_file) into the compressed, base64url string
+  // AcoustID's lookup API expects -- the same wire format fpcalc's
+  // FINGERPRINT= line emits.
+  string encode_fingerprint(sequence<u32> raw);
+
   // Read metadata tags and audio properties from an audio file. All
   // text fields are optional — real-world files often have partial
   // metadata. duration_seconds is populated from audio properties
