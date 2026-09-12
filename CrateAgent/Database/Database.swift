@@ -87,9 +87,20 @@ public final class LibraryDatabase {
     }
 
     private static func runMigrations(_ writer: any DatabaseWriter) throws {
+        try makeMigrator().migrate(writer)
+    }
+
+    /// Builds the migrator with every registered migration, in
+    /// registration order. Not private: tests that need to seed
+    /// pre-migration data (e.g. asserting a reset migration's effect
+    /// on a `done`-status row) migrate a fresh database up to a named
+    /// migration, insert legacy-shaped rows, then finish migrating and
+    /// assert -- this is the one place that ordering is defined, so
+    /// tests reuse it rather than re-declaring their own subset.
+    static func makeMigrator() -> DatabaseMigrator {
         var migrator = DatabaseMigrator()
         #if DEBUG
-        migrator.eraseDatabaseOnSchemaChange = false
+            migrator.eraseDatabaseOnSchemaChange = false
         #endif
         InitialSchemaMigration.register(in: &migrator)
         PivotToSeratoSourceOfTruthMigration.register(in: &migrator)
@@ -98,6 +109,7 @@ public final class LibraryDatabase {
         ResetFingerprintsForDurationCapMigration.register(in: &migrator)
         AddEventsBatchAggIndexMigration.register(in: &migrator)
         AddMusicBrainzColumnsMigration.register(in: &migrator)
-        try migrator.migrate(writer)
+        ResetFingerprintsForAlgorithmTest2Migration.register(in: &migrator)
+        return migrator
     }
 }
