@@ -217,6 +217,7 @@ dictionary AudioTagUpdate {
   string? musical_key;
   string? comment;
   string? label;
+  u32? year;
 };
 
 dictionary AudioTags {

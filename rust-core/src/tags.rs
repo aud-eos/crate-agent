@@ -20,6 +20,7 @@ use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::*;
 use lofty::probe::Probe;
+use lofty::tag::items::Timestamp;
 use lofty::tag::{ItemKey, Tag};
 use thiserror::Error;
 
@@ -78,7 +79,13 @@ pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
         tags.artist = tag.artist().map(|cow| cow.into_owned());
         tags.album = tag.album().map(|cow| cow.into_owned());
         tags.genre = tag.genre().map(|cow| cow.into_owned());
-        tags.year = tag.get_string(ItemKey::Year).and_then(|value| value.parse::<u32>().ok());
+        // `Accessor::date()` reads `ItemKey::RecordingDate` (ID3v2.4 `TDRC` /
+        // Vorbis `DATE` / iTunes `©day`) falling back to the legacy
+        // `ItemKey::Year`, and parses whatever subset of the timestamp is
+        // present. `write_tags` below writes through the same accessor, so
+        // this must stay paired with `set_date` rather than reading
+        // `ItemKey::Year` directly.
+        tags.year = tag.date().map(|timestamp| u32::from(timestamp.year));
         tags.track_number = tag.track();
         tags.total_tracks = tag.track_total();
         tags.comment = tag.comment().map(|cow| cow.into_owned());
@@ -105,6 +112,7 @@ pub struct AudioTagUpdate {
     pub musical_key: Option<String>,
     pub comment: Option<String>,
     pub label: Option<String>,
+    pub year: Option<u32>,
 }
 
 /// Write the supplied fields to the audio file's primary tag. For
@@ -168,6 +176,15 @@ fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) {
     }
     if let Some(value) = &update.label {
         tag.insert_text(ItemKey::Label, value.clone());
+    }
+    if let Some(year) = update.year {
+        // `Timestamp::year` is a `u16`; release years never approach that
+        // range, but clamp rather than panic on an out-of-range input.
+        let year = u16::try_from(year).unwrap_or(u16::MAX);
+        tag.set_date(Timestamp {
+            year,
+            ..Timestamp::default()
+        });
     }
 }
 
@@ -242,11 +259,9 @@ mod tests {
         let mut tagged_file = Probe::open(&path).unwrap().read().unwrap();
         let mut tag = Tag::new(TagType::RiffInfo);
         // Fields that round-trip reliably through RIFF INFO (the WAV
-        // tag format lofty chose for us). Year is intentionally omitted
-        // because the lofty 0.24 Accessor trait lacks set_year and the
-        // RIFF INFO mapping for ItemKey::Year is one-way on read but
-        // not on write — those are exercised against ID3-tagged files
-        // in higher-fidelity tests once we have real fixtures.
+        // tag format lofty chose for us). Year is exercised separately
+        // in `writes_and_reads_year`, via `set_date`/`date` rather than
+        // this test's direct `Tag` construction.
         tag.set_title("Test Title".to_string());
         tag.set_artist("Test Artist".to_string());
         tag.set_album("Test Album".to_string());
@@ -305,6 +320,8 @@ mod tests {
             bpm: Some("128.000".to_string()),
             musical_key: Some("Am".to_string()),
             label: Some("Test Label".to_string()),
+            // Year has a dedicated round-trip test (`writes_and_reads_year`).
+            year: None,
         };
         write_tags(&path, &update).unwrap();
 
@@ -355,6 +372,22 @@ mod tests {
             Some("Keep Me Too"),
             "fields with None in the update must be preserved verbatim"
         );
+    }
+
+    #[test]
+    fn writes_and_reads_year() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-write-year");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("year.wav");
+        write_silent_wav(&path, 2).unwrap();
+
+        let update = AudioTagUpdate { year: Some(1994), ..AudioTagUpdate::default() };
+        write_tags(&path, &update).unwrap();
+
+        let read_back = read_tags(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back.year, Some(1994));
     }
 
     #[test]
