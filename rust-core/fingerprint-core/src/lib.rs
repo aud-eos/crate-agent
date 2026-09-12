@@ -91,7 +91,11 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|err| FingerprintError::Decode(err.to_string()))?;
 
-    let config = Configuration::preset_test1();
+    // TEST2 is chromaprint's default algorithm and the one AcoustID's
+    // fingerprint database is built from (`fpcalc` uses it too). TEST1
+    // uses a different classifier and produces fingerprints AcoustID
+    // cannot match against.
+    let config = Configuration::preset_test2();
     let mut fingerprinter = Fingerprinter::new(&config);
     fingerprinter
         .start(sample_rate, channel_count)
@@ -159,7 +163,7 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
 /// mismatched id makes AcoustID misinterpret the bit layout of every
 /// subfingerprint that follows.
 pub fn encode_fingerprint_to_base64(raw: &[u32]) -> String {
-    let config = Configuration::preset_test1();
+    let config = Configuration::preset_test2();
     let compressed = FingerprintCompressor::from(&config).compress(raw);
     URL_SAFE_NO_PAD.encode(compressed)
 }
@@ -219,7 +223,7 @@ mod tests {
         // to emit a non-trivial fingerprint, no symphonia involvement.
         let samples = sine_wave_samples(440.0, 10.0);
 
-        let config = Configuration::preset_test1();
+        let config = Configuration::preset_test2();
         let mut fingerprinter = Fingerprinter::new(&config);
         fingerprinter.start(SAMPLE_RATE, CHANNELS as u32).unwrap();
         fingerprinter.consume(&samples);
@@ -235,7 +239,7 @@ mod tests {
 
         let mut runs = Vec::new();
         for _ in 0..2 {
-            let config = Configuration::preset_test1();
+            let config = Configuration::preset_test2();
             let mut fingerprinter = Fingerprinter::new(&config);
             fingerprinter.start(SAMPLE_RATE, CHANNELS as u32).unwrap();
             fingerprinter.consume(&samples);
@@ -248,11 +252,18 @@ mod tests {
 
     #[test]
     fn fingerprint_differs_between_different_audio() {
+        // 660Hz, not 880Hz: chroma features are pitch-class (octave-
+        // invariant) by design, and 880Hz is exactly one octave above
+        // 440Hz -- the same pitch class. Under TEST2's classifier a
+        // pure sine at an exact octave collapses to an identical
+        // fingerprint, which is a property of chroma, not a bug. A
+        // perfect fifth (660Hz) is a genuinely different pitch class
+        // and asserts what this test actually means to check.
         let samples_a = sine_wave_samples(440.0, 10.0);
-        let samples_b = sine_wave_samples(880.0, 10.0);
+        let samples_b = sine_wave_samples(660.0, 10.0);
 
         let fingerprint = |samples: &[i16]| {
-            let config = Configuration::preset_test1();
+            let config = Configuration::preset_test2();
             let mut fingerprinter = Fingerprinter::new(&config);
             fingerprinter.start(SAMPLE_RATE, CHANNELS as u32).unwrap();
             fingerprinter.consume(samples);
@@ -276,6 +287,15 @@ mod tests {
     // base64url -- the wire format AcoustID's API and `fpcalc` both use.
     #[test]
     fn encode_fingerprint_to_base64_is_deterministic_and_valid_base64url() {
+        // TEST2 (id 1) is chromaprint's default and the algorithm
+        // AcoustID's fingerprint database is built from. Asserting the
+        // id here catches an accidental regression back to TEST1.
+        assert_eq!(
+            Configuration::preset_test2().id(),
+            1,
+            "encode_fingerprint_to_base64 must use TEST2 (id 1) for AcoustID compatibility"
+        );
+
         // Representative raw fingerprint values -- these are opaque
         // 32-bit perceptual hashes; their specific values don't matter
         // for this test, only that encoding them is stable and produces
