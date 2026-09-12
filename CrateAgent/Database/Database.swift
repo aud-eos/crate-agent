@@ -97,6 +97,7 @@ public final class LibraryDatabase {
         AddBitrateToFilesMigration.register(in: &migrator)
         ResetFingerprintsForDurationCapMigration.register(in: &migrator)
         AddEventsBatchAggIndexMigration.register(in: &migrator)
+        AddMusicBrainzColumnsMigration.register(in: &migrator)
         try migrator.migrate(writer)
     }
 }
