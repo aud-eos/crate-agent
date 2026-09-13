@@ -79,14 +79,22 @@ final class MusicBrainzModelsTests: XCTestCase {
     }
 
     func testParsesMultipleAcoustIDResults() throws {
+        // Deliberately NOT in score-descending order in the fixture —
+        // `AcoustIDResponse` decoding preserves raw JSON array order
+        // as-is; sorting is `AcoustIDClient`'s job, not the model's.
         let response = try JSONDecoder().decode(AcoustIDResponse.self, from: fixture("acoustid_multi.json"))
 
         XCTAssertEqual(response.results.count, 2)
 
-        let best = try XCTUnwrap(response.results.first)
-        XCTAssertEqual(best.id, "9ff43b6a-4f16-427c-93c2-92307ca505e0")
-        XCTAssertEqual(best.score, 0.93)
-        XCTAssertEqual(best.recordingIDs, [
+        let first = try XCTUnwrap(response.results.first)
+        XCTAssertEqual(first.id, "1cbano2a-04a6-4b12-9a12-1234567890ab")
+        XCTAssertEqual(first.score, 0.71)
+        XCTAssertEqual(first.recordingIDs, ["b2c3d4e5-2345-4b5c-9d0e-1f2a3b4c5d6e"])
+
+        let second = response.results[1]
+        XCTAssertEqual(second.id, "9ff43b6a-4f16-427c-93c2-92307ca505e0")
+        XCTAssertEqual(second.score, 0.93)
+        XCTAssertEqual(second.recordingIDs, [
             "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10",
             "a1b2c3d4-1234-4a5b-8c9d-0e1f2a3b4c5d",
         ])

@@ -31,8 +31,13 @@ public struct AcoustIDClient: Sendable {
 
         let request = Self.makeRequest(apiKey: apiKey, durationSeconds: durationSeconds, fingerprintBase64: fingerprintBase64)
         let responseData = try await requester.perform(request)
+        // Decode (and validate the in-body `status`) BEFORE caching — a
+        // 200-with-body-error must never be cached, or every subsequent
+        // lookup for this fingerprint would replay the same failure
+        // forever instead of retrying the network.
+        let results = try Self.decodeSortedResults(from: responseData)
         cache.store(responseData, forKey: cacheKey)
-        return try Self.decodeSortedResults(from: responseData)
+        return results
     }
 
     private static func makeRequest(apiKey: String, durationSeconds: Int, fingerprintBase64: String) -> URLRequest {

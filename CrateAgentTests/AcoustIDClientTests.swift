@@ -30,7 +30,7 @@ final class AcoustIDClientTests: XCTestCase {
     }
 
     func testCacheHitSkipsNetwork() async throws {
-        let loader = CountingStubLoader(status: 200, body: fixture("acoustid_multi.json"))
+        let loader = StubLoader(status: 200, body: fixture("acoustid_multi.json"))
         let cache = LookupCache.memory()
         let client = AcoustIDClient(loader: loader, limiter: .noop, cache: cache)
 
@@ -38,6 +38,31 @@ final class AcoustIDClientTests: XCTestCase {
         _ = try await client.lookup(fingerprintBase64: "F", durationSeconds: 200, apiKey: "K")
 
         XCTAssertEqual(loader.callCount, 1)
+    }
+
+    func testStatusErrorBodyIsNotCachedAndRetriesOnNextCall() async throws {
+        // AcoustID's documented failure mode: HTTP 200 with an in-body
+        // "status": "error" — this must never be cached, or every
+        // subsequent lookup for this fingerprint would replay the same
+        // failure forever instead of hitting the network again.
+        let errorBody = Data(#"{ "status": "error", "results": [] }"#.utf8)
+        let loader = SequencedStubLoader(responses: [
+            (status: 200, body: errorBody, headers: [:]),
+            (status: 200, body: fixture("acoustid_multi.json"), headers: [:]),
+        ])
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
+
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")) {
+            guard case .transport = $0 as? LookupError else {
+                XCTFail("expected .transport, got \($0)")
+                return
+            }
+        }
+
+        let results = try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")
+
+        XCTAssertEqual(loader.callCount, 2, "the failed body must not have been cached — the second call should hit the network again")
+        XCTAssertEqual(results.count, 2)
     }
 
     func testRetriesAfterRateLimitAndSucceedsWithoutRealDelay() async throws {
@@ -134,31 +159,6 @@ private func XCTAssertThrowsErrorAsync<T>(
 
 /// Returns a fixed status/body on every call.
 private final class StubLoader: URLLoading, @unchecked Sendable {
-    private let status: Int
-    private let body: Data
-    private let lock = NSLock()
-    private var count = 0
-
-    init(status: Int, body: Data) {
-        self.status = status
-        self.body = body
-    }
-
-    var callCount: Int {
-        lock.withLock { count }
-    }
-
-    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        lock.withLock { count += 1 }
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
-        return (body, response)
-    }
-}
-
-/// Same as `StubLoader`, kept as a distinct type only so cache-hit tests
-/// read as "assert the counting loader" rather than reusing `StubLoader`'s
-/// unrelated `callCount` for an unrelated assertion.
-private final class CountingStubLoader: URLLoading, @unchecked Sendable {
     private let status: Int
     private let body: Data
     private let lock = NSLock()
