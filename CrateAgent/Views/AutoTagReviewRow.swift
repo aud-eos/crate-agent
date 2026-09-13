@@ -122,7 +122,11 @@ struct AutoTagRowModel {
             artist: includeArtist ? candidate.proposedArtist : nil,
             title: resolvedTitle,
             album: includeAlbum ? candidate.proposedAlbum : nil,
-            year: includeYear ? candidate.proposedYear : nil
+            year: includeYear ? candidate.proposedYear : nil,
+            // The file's real pre-match on-disk year, so undo restores
+            // (or clears) the exact prior value — not the canonical
+            // `tracks.year`, which is a different field (invariant #4).
+            currentFileYear: candidate.currentFileYear
         )
     }
 }

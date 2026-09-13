@@ -92,12 +92,14 @@ final class MusicBrainzMutationTests: XCTestCase {
         artist: String? = "Nas",
         title: String? = "N.Y. State of Mind",
         album: String? = "Illmatic",
-        year: Int? = 1994
+        year: Int? = 1994,
+        currentFileYear: Int? = nil,
+        recordingMBID: String = "rec"
     ) -> ApplyMusicBrainzMatchPayload {
         ApplyMusicBrainzMatchPayload(
             fileID: fileID,
             acoustID: "aid",
-            recordingMBID: "rec",
+            recordingMBID: recordingMBID,
             releaseMBID: "rel",
             artistMBID: "art",
             isrc: "ISRC123",
@@ -105,7 +107,8 @@ final class MusicBrainzMutationTests: XCTestCase {
             artist: artist,
             title: title,
             album: album,
-            year: year
+            year: year,
+            currentFileYear: currentFileYear
         )
     }
 
@@ -197,7 +200,101 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(lastCall.update.artist, "old")
         XCTAssertEqual(lastCall.update.title, "old (Dirty)")
         XCTAssertEqual(lastCall.update.album, "old")
-        XCTAssertNil(lastCall.update.year, "no canonical year before the match → restore to nil")
+        // The file had no on-disk year; the match added 1994. Undo must
+        // *clear* the added year, not leave it (nil = leave-unchanged).
+        XCTAssertNil(lastCall.update.year, "no value to restore — clear instead")
+        XCTAssertTrue(lastCall.update.clearYear, "match-added year must be removed on undo")
+    }
+
+    /// C1a: a match that adds a field absent before the match (album)
+    /// must, on undo, *clear* that field in the audio tags — not leave
+    /// the just-applied value in place. nil = leave-unchanged, so undo
+    /// must pass an empty string.
+    func testUndoClearsFieldAddedFromEmpty() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: nil, recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // Match adds album where the file had none; artist/title left as-is.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: fingerprint,
+                artist: nil, title: nil, album: "Illmatic", year: nil
+            )),
+            batchId: "add-album"
+        )
+        try await engine.undoBatch("add-album")
+
+        let undoUpdate = recorder.calls.last!.update
+        XCTAssertEqual(
+            undoUpdate.album, "",
+            "album added from empty must be cleared (empty string), not left unchanged (nil)"
+        )
+        XCTAssertNil(undoUpdate.artist, "artist wasn't written by the match → left unchanged on undo")
+        XCTAssertNil(undoUpdate.title, "title wasn't written by the match → left unchanged on undo")
+    }
+
+    /// C1a: year restore must come from the file's captured pre-match
+    /// on-disk year, for a match that CREATED the track row.
+    func testUndoRestoresFileYearForNewTrackRow() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // File was 2001 on disk; match sets 1994.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: fingerprint, year: 1994, currentFileYear: 2001
+            )),
+            batchId: "year-new"
+        )
+        try await engine.undoBatch("year-new")
+
+        let undoUpdate = recorder.calls.last!.update
+        XCTAssertEqual(undoUpdate.year, 2001, "undo restores the file's real pre-match year, not nil/1994")
+        XCTAssertFalse(undoUpdate.clearYear, "there was a prior year to restore → not a clear")
+    }
+
+    /// C1a: the restored year is the file's captured pre-match year even
+    /// when a pre-existing track row carries a *different* `tracks.year`
+    /// — proving the source is the file, not the track row (invariant #4).
+    func testUndoRestoresFileYearIndependentOfTrackRow() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // Pre-existing canonical row whose year (2000) differs from the
+        // file's on-disk year (2001).
+        try await database.writer.write { db in
+            var track = TrackRecord(
+                fingerprintHash: fingerprint,
+                musicbrainzRecordingId: "orig-rec",
+                artist: "OrigArtist", year: 2000
+            )
+            try track.insert(db)
+            try db.execute(
+                sql: "UPDATE files SET track_id = ? WHERE id = ?",
+                arguments: [track.id!, fileId]
+            )
+        }
+
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: fingerprint, year: 1994, currentFileYear: 2001
+            )),
+            batchId: "year-pre"
+        )
+        try await engine.undoBatch("year-pre")
+
+        let undoUpdate = recorder.calls.last!.update
+        XCTAssertEqual(
+            undoUpdate.year, 2001,
+            "restore the file's captured year (2001), not the track row's year (2000)"
+        )
+        XCTAssertFalse(undoUpdate.clearYear)
     }
 
     func testUndoRoundTripsPreexistingTrackRow() async throws {

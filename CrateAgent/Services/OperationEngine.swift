@@ -491,7 +491,8 @@ public actor OperationEngine {
             // Serato's database V2 has no year field, so the MusicBrainz
             // match routes year to the file tags only. `writeFileTags`
             // leaves it nil.
-            year: write.year.flatMap { $0 >= 0 ? UInt32($0) : nil }
+            year: write.year.flatMap { $0 >= 0 ? UInt32($0) : nil },
+            clearYear: write.clearYear
         )
         do {
             try fileTagWriter(write.absolutePath, update)
@@ -1406,15 +1407,19 @@ public actor OperationEngine {
         artist: String?,
         title: String?,
         album: String?,
-        year: Int?
+        year: Int?,
+        clearFileYear: Bool = false
     ) -> [SeratoPendingWrite] {
         let metadata = SeratoMetadata(artist: artist, title: title, album: album)
         return [
+            // Serato's database V2 has no year field, so `clearFileYear`
+            // is irrelevant to the metadata update — it only affects the
+            // file-tag write.
             .metadataUpdate(SeratoPendingMetadataUpdate(
                 absolutePath: absolutePath, metadata: metadata
             )),
             .fileTagWrite(SeratoPendingFileTagWrite(
-                absolutePath: absolutePath, metadata: metadata, year: year
+                absolutePath: absolutePath, metadata: metadata, year: year, clearYear: clearFileYear
             )),
         ]
     }
@@ -1514,6 +1519,7 @@ public actor OperationEngine {
         forwardPayload.previousTrackID = previousTrackID
         forwardPayload.previousMetadata = previousMetadata
         forwardPayload.previousFileTags = previousMetadata
+        forwardPayload.previousFileYear = payload.currentFileYear
         forwardPayload.previousTrackIdentifiers = previousTrackIdentifiers
         forwardPayload.createdTrackRow = createdTrackRow
 
@@ -1617,13 +1623,23 @@ public actor OperationEngine {
             in: db
         )
 
+        // Restore the audio file's tags to their exact pre-match values.
+        // For every text field the forward actually wrote, undo must
+        // rewrite it: to its captured pre-match value, or — when that was
+        // absent — an empty string so the Rust writer *clears* it (nil
+        // would leave the just-applied value in place).
         let restoredTags = applied.previousFileTags ?? applied.previousMetadata ?? .empty
+        let forwardWroteYear = applied.year != nil
         let seratoWrites = musicBrainzSeratoWrites(
             absolutePath: fileRecord.path,
-            artist: applied.artist != nil ? restoredTags.artist : nil,
-            title: applied.title != nil ? restoredTags.title : nil,
-            album: applied.album != nil ? restoredTags.album : nil,
-            year: applied.year != nil ? applied.previousTrackIdentifiers?.year : nil
+            artist: applied.artist != nil ? (restoredTags.artist ?? "") : nil,
+            title: applied.title != nil ? (restoredTags.title ?? "") : nil,
+            album: applied.album != nil ? (restoredTags.album ?? "") : nil,
+            // Year rides only on the file tag. Restore the file's real
+            // pre-match year; if the match added one where none existed
+            // (previousFileYear == nil), clear the frame outright.
+            year: forwardWroteYear ? applied.previousFileYear : nil,
+            clearFileYear: forwardWroteYear && applied.previousFileYear == nil
         )
         return (eventId, seratoWrites)
     }
@@ -1822,10 +1838,22 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public let title: String?
     public let album: String?
     public let year: Int?
+    /// The file's actual on-disk year tag before the match, read by the
+    /// review UI (`AudioTags.year`) and supplied by the caller. The
+    /// engine can't recover it at apply time (`tracks.year` is a
+    /// different, often-empty value — invariant #4), so undo depends on
+    /// it being threaded through here. Snapshotted into
+    /// `previousFileYear` at apply time.
+    public let currentFileYear: Int?
     // Previous-state snapshots, filled by the engine at apply time:
     public var previousTrackID: Int64?
     public var previousMetadata: SeratoMetadata?
     public var previousFileTags: SeratoMetadata?
+    /// The file's on-disk year immediately before the match (copied from
+    /// `currentFileYear` at apply time). Undo restores the file tag to
+    /// this value — or clears the year frame when it's nil and the match
+    /// added one — independent of the canonical `tracks.year`.
+    public var previousFileYear: Int?
     public var previousTrackIdentifiers: TrackIdentifiers?
     public var createdTrackRow: Bool
 
@@ -1841,9 +1869,11 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         title: String?,
         album: String?,
         year: Int?,
+        currentFileYear: Int? = nil,
         previousTrackID: Int64? = nil,
         previousMetadata: SeratoMetadata? = nil,
         previousFileTags: SeratoMetadata? = nil,
+        previousFileYear: Int? = nil,
         previousTrackIdentifiers: TrackIdentifiers? = nil,
         createdTrackRow: Bool = false
     ) {
@@ -1858,9 +1888,11 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         self.title = title
         self.album = album
         self.year = year
+        self.currentFileYear = currentFileYear
         self.previousTrackID = previousTrackID
         self.previousMetadata = previousMetadata
         self.previousFileTags = previousFileTags
+        self.previousFileYear = previousFileYear
         self.previousTrackIdentifiers = previousTrackIdentifiers
         self.createdTrackRow = createdTrackRow
     }
@@ -2125,11 +2157,17 @@ struct SeratoPendingFileTagWrite: Sendable, Equatable {
     /// field — only the file-tag path carries it. `nil` for callers
     /// that don't set a year (e.g. `writeFileTags`).
     let year: Int?
+    /// Remove the file's year/date frame instead of writing a value.
+    /// Used by MusicBrainz undo when the match added a year to a file
+    /// that had none: `year: nil` alone would leave the added value in
+    /// place (nil = leave-unchanged), so the clear must be explicit.
+    let clearYear: Bool
 
-    init(absolutePath: String, metadata: SeratoMetadata, year: Int? = nil) {
+    init(absolutePath: String, metadata: SeratoMetadata, year: Int? = nil, clearYear: Bool = false) {
         self.absolutePath = absolutePath
         self.metadata = metadata
         self.year = year
+        self.clearYear = clearYear
     }
 }
 

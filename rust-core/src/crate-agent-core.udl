@@ -218,6 +218,11 @@ dictionary AudioTagUpdate {
   string? comment;
   string? label;
   u32? year;
+  // `year` cannot express "clear": null means leave-unchanged. This
+  // flag removes the file's date frame outright (used by MusicBrainz
+  // undo when the match added a year to a previously-yearless file).
+  // Takes precedence over `year`.
+  boolean clear_year = false;
 };
 
 dictionary AudioTags {
