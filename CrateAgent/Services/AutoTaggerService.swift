@@ -419,7 +419,15 @@ final class AutoTaggerService: ObservableObject {
         } catch let failure as AutoTaggerRowFailure {
             throw failure
         } catch {
-            try? await persistFingerprint(fileID: fileID, bytes: nil, status: .failed)
+            // Guard the failure write on the row still being `.pending`: the
+            // background worker may have persisted a valid `.done` fingerprint
+            // for this file while this on-demand decode was running, and
+            // clobbering it with `.failed` would strip the fingerprint and force
+            // a later scan to decode again (finding #4001064040). This is the
+            // mirror of the worker's own `requirePendingStatus` guard
+            // (#4000806487): there the worker yields to a newer on-demand
+            // result; here the on-demand FAILURE yields to the worker's success.
+            try? await persistFingerprint(fileID: fileID, bytes: nil, status: .failed, requirePendingStatus: true)
             throw AutoTaggerRowFailure("failed to compute fingerprint for file \(fileID): \(error)")
         }
     }
@@ -525,11 +533,13 @@ final class AutoTaggerService: ObservableObject {
         fileID: Int64,
         bytes: Data?,
         status: FingerprintStatus,
-        freshnessBasis: FileFreshnessSnapshot? = nil
+        freshnessBasis: FileFreshnessSnapshot? = nil,
+        requirePendingStatus: Bool = false
     ) async throws {
         try await database.writer.write { db in
             try FingerprintPersistence.write(
-                fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis, in: db
+                fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis,
+                requirePendingStatus: requirePendingStatus, in: db
             )
         }
     }
@@ -556,13 +566,18 @@ typealias AudioTagsReading = @Sendable (String) throws -> AudioTags
 /// (finding D-B). Production reads via `FileMetadataCollector` (same `stat`
 /// path that captured the indexed snapshot, so the units match); tests
 /// inject a stub. Returns nil when the file can't be stat'd.
-typealias FileFreshnessReading = @Sendable (String) -> FileFreshnessSnapshot?
+public typealias FileFreshnessReading = @Sendable (String) -> FileFreshnessSnapshot?
 
 /// A file's current on-disk identity, in the same units as
 /// `FileRecord.fileSize`/`mtime` (bytes; mtime seconds since the epoch).
-struct FileFreshnessSnapshot: Equatable, Sendable {
-    let fileSize: Int64
-    let mtime: Int64
+public struct FileFreshnessSnapshot: Equatable, Sendable {
+    public let fileSize: Int64
+    public let mtime: Int64
+
+    public init(fileSize: Int64, mtime: Int64) {
+        self.fileSize = fileSize
+        self.mtime = mtime
+    }
 }
 
 /// Seam over `AcoustIDClient.lookup` so tests can stub AcoustID without a

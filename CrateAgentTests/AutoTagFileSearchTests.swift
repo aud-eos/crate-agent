@@ -18,11 +18,12 @@ final class AutoTagFileSearchTests: XCTestCase {
     private func insertFile(
         in database: LibraryDatabase,
         artist: String?,
-        title: String?
+        title: String?,
+        path: String? = nil
     ) throws -> Int64 {
         inodeCounter += 1
         var record = FileRecord(
-            path: "/music/\(inodeCounter).mp3",
+            path: path ?? "/music/\(inodeCounter).mp3",
             volumeUuid: "VOL",
             inode: inodeCounter,
             fileSize: 1000,
@@ -88,6 +89,44 @@ final class AutoTagFileSearchTests: XCTestCase {
         }
 
         XCTAssertEqual(results.matches.map(\.id), [percentFileID])
+    }
+
+    func testMatchesUntaggedFileByFilename() throws {
+        let database = try makeDatabase()
+        // A file with NO artist and NO title — exactly the kind that most
+        // needs auto-tagging, and which an artist/title-only search could
+        // never surface (finding #4001064044).
+        let untaggedID = try insertFile(
+            in: database, artist: nil, title: nil,
+            path: "/Music/U/mystery-track-1234.mp3"
+        )
+        try insertFile(in: database, artist: "Boards of Canada", title: "Roygbiv")
+
+        let results = try database.writer.read { db in
+            try AutoTagFileSearch.search(query: "mystery-track", in: db)
+        }
+
+        XCTAssertEqual(results.matches.map(\.id), [untaggedID])
+        XCTAssertEqual(results.totalMatchCount, 1)
+    }
+
+    func testFilenameQueryDoesNotMatchUnrelatedRows() throws {
+        let database = try makeDatabase()
+        try insertFile(
+            in: database, artist: nil, title: nil,
+            path: "/Music/U/mystery-track-1234.mp3"
+        )
+        try insertFile(
+            in: database, artist: "Boards of Canada", title: "Roygbiv",
+            path: "/Music/B/roygbiv.mp3"
+        )
+
+        let results = try database.writer.read { db in
+            try AutoTagFileSearch.search(query: "nonexistent-filename", in: db)
+        }
+
+        XCTAssertEqual(results.matches, [])
+        XCTAssertEqual(results.totalMatchCount, 0)
     }
 
     // MARK: - Cap

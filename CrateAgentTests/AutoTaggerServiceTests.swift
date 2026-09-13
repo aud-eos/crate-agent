@@ -636,6 +636,66 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
     }
 
+    /// Finding #4001064040: the on-demand decode's FAILURE write must not
+    /// clobber a `.done` fingerprint the background `FingerprintWorker`
+    /// persisted concurrently. Symmetric to the worker-side
+    /// `requirePendingStatus` guard (#4000806487) — there the worker's write
+    /// yields to a newer on-demand result; here the on-demand FAILURE yields
+    /// to the worker's completed result, so the row is not forced back to
+    /// `.failed` (which would strip the valid fingerprint and force a re-decode).
+    func testOnDemandFailureDoesNotClobberConcurrentWorkerDone() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(
+            in: database, path: "/music/race.mp3",
+            fingerprintHashes: nil, fingerprintStatus: .pending
+        )
+        let workerHashes: [UInt32] = [7, 8, 9]
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                XCTFail("decode failed — lookup must not run")
+                return []
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in
+                XCTFail("decode failed — MusicBrainz must not be hit")
+                throw LookupError.transport("unreachable")
+            },
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in
+                // Simulate the background worker persisting .done in the window
+                // between this on-demand decode starting and its failure.
+                try? database.writer.write { db in
+                    try FingerprintPersistence.write(
+                        fileID: fileID,
+                        fingerprint: FingerprintEncoder.serialize(workerHashes),
+                        status: .done, in: db
+                    )
+                }
+                throw NSError(domain: "test.decode", code: 1)
+            },
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        // The on-demand attempt failed for THIS run…
+        guard case .failed = service.rows[fileID] else {
+            return XCTFail("expected .failed for the on-demand run, got \(String(describing: service.rows[fileID]))")
+        }
+        // …but the worker's completed fingerprint must survive in the DB, so a
+        // retry / next scan reuses it instead of re-decoding a now-.failed row.
+        let persisted = try await database.writer.read { db in try FileRecord.fetchOne(db, key: fileID) }
+        XCTAssertEqual(
+            persisted?.fingerprintStatus, .done,
+            "the concurrent worker .done must not be overwritten with .failed"
+        )
+        XCTAssertEqual(
+            persisted?.chromaprintFingerprint, FingerprintEncoder.serialize(workerHashes),
+            "the worker's fingerprint bytes must be preserved"
+        )
+    }
+
     // MARK: - D-A: apply-time candidate revalidation
 
     private func makeMatchPayload(

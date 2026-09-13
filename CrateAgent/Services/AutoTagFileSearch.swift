@@ -2,13 +2,16 @@ import GRDB
 
 /// Bounded file search behind the Auto-Tag panel's selection stage.
 ///
-/// Matches artist/title only (not path/album — `LibraryBrowserView`'s
+/// Matches artist/title/path (not album — `LibraryBrowserView`'s
 /// broader match is a different surface with a different job) and
 /// never returns more than `resultCap` rows, so picking tracks to
 /// scan never materializes the whole library into memory or into a
-/// SwiftUI `List`. An empty (or whitespace-only) query matches
-/// nothing — the selection stage prompts the user to search rather
-/// than falling back to "show everything".
+/// SwiftUI `List`. Path is included so files with NO artist and NO
+/// title — exactly the files that most need auto-tagging, and which
+/// an artist/title-only search could never surface — stay selectable
+/// by filename (finding #4001064044). An empty (or whitespace-only)
+/// query matches nothing — the selection stage prompts the user to
+/// search rather than falling back to "show everything".
 ///
 /// Returns `BrowserRow` — already the library's lightweight files
 /// projection (id/path/artist/title/album/bpm/musicalKey) used by
@@ -49,6 +52,7 @@ enum AutoTagFileSearch {
         let whereClause = """
         WHERE (COALESCE(artist, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)
            OR (COALESCE(title, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)
+           OR (COALESCE(path, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)
         """
         let pattern = "%\(escapeLikeMetacharacters(trimmedQuery))%"
 
@@ -61,13 +65,13 @@ enum AutoTagFileSearch {
             ORDER BY artist, title
             LIMIT ?
             """,
-            arguments: [pattern, pattern, resultCap]
+            arguments: [pattern, pattern, pattern, resultCap]
         )
 
         let totalMatchCount = try Int.fetchOne(
             db,
             sql: "SELECT COUNT(*) FROM files \(whereClause)",
-            arguments: [pattern, pattern]
+            arguments: [pattern, pattern, pattern]
         ) ?? matches.count
 
         return Results(matches: matches, totalMatchCount: totalMatchCount)
