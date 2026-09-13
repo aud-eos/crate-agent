@@ -11,10 +11,10 @@ import SwiftUI
 /// Ruling M: a pass must never fan out to the whole library unprompted.
 /// Nothing is looked up until the user has explicitly selected tracks —
 /// selection starts empty, "Scan Selected" is disabled at zero
-/// selections, and "Select All" (the only path to a library-wide pass)
-/// is gated behind a confirmation showing the track count and a rough
-/// time estimate against the shared ≤1 req/sec AcoustID/MusicBrainz
-/// rate limit.
+/// selections, and the only way to add tracks to the selection is
+/// `AutoTagFileSearch` — a search that never returns more than
+/// `AutoTagFileSearch.resultCap` rows. There is no "select everything"
+/// control, so no single action can ever queue up a library-wide pass.
 ///
 /// `autoTaggerService` is taken as an explicit `@ObservedObject` init
 /// parameter (rather than reached via `services.autoTaggerService`
@@ -26,15 +26,31 @@ struct AutoTaggerView: View {
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
-    @State private var files: [FileRecord] = []
+    /// "Current" (pre-match) tag snapshot, loaded only for files that
+    /// have been scanned at least once — never the whole library. See
+    /// `loadCurrentMetadata(forFileIDs:)`.
     @State private var filesByID: [Int64: FileRecord] = [:]
     @State private var currentYearByFileID: [Int64: Int?] = [:]
 
-    /// The user's checkbox picks on the pre-scan selection list. Starts
-    /// empty on every launch of this view — never defaults to "all".
+    /// Total row count in the `files` table, used only to distinguish
+    /// "library is genuinely empty" from "nothing matches the current
+    /// search" — a cheap `SELECT COUNT(*)`, never a full-table fetch.
+    @State private var libraryFileCount: Int = 0
+
+    /// The selection-stage search box and its debounced, capped results.
+    @State private var searchQuery: String = ""
+    @State private var searchResults: [BrowserRow] = []
+    @State private var searchTotalMatchCount: Int = 0
+    @State private var isSearching: Bool = false
+    @State private var searchError: String?
+
+    /// The user's checkbox picks across every search the user has run
+    /// this session. Starts empty on every launch of this view — never
+    /// defaults to "all" — and persists across query changes, so
+    /// searching again to find more tracks doesn't lose earlier picks.
     @State private var selectedFileIDs: Set<Int64> = []
-    /// The exact file IDs the most recent scan was run against, in
-    /// library order. Drives which rows `reviewList` renders — NOT
+    /// The exact file IDs the most recent scan was run against.
+    /// Drives which rows `reviewList` renders — NOT
     /// `autoTaggerService.rows`' full key set, which is shared,
     /// long-lived service state that can carry entries from a prior
     /// scan the current view instance never asked for.
@@ -46,12 +62,11 @@ struct AutoTaggerView: View {
     /// "Applied" indicator instead of silently vanishing from the list.
     @State private var appliedFileIDs: Set<Int64> = []
 
-    @State private var isLoadingFiles: Bool = false
+    @State private var isLoadingLibraryCount: Bool = false
     @State private var isApplying: Bool = false
     @State private var loadError: String?
     @State private var actionError: String?
     @State private var lastResult: String?
-    @State private var showSelectAllConfirmation: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -69,20 +84,37 @@ struct AutoTaggerView: View {
         }
         .navigationTitle("Auto-Tag")
         .frame(minWidth: 680, minHeight: 480)
-        .task { await loadFiles() }
+        .task { await loadLibraryFileCount() }
         .onChange(of: autoTaggerService.rows) { _, _ in syncRowModels() }
+        // Debounce: every keystroke restarts this task; the sleep +
+        // cancellation check coalesces a burst of typing into one
+        // query. Without this, every character typed would fire a
+        // fresh bounded DB read — cheap individually, but wasteful at
+        // typing speed. Mirrors LibraryBrowserView's search debounce.
+        .task(id: searchQuery) {
+            let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedQuery.isEmpty else {
+                searchResults = []
+                searchTotalMatchCount = 0
+                searchError = nil
+                return
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled else { return }
+            await performSearch(query: trimmedQuery)
+        }
     }
 
     // MARK: - Content
 
     @ViewBuilder
     private var content: some View {
-        if isLoadingFiles {
+        if isLoadingLibraryCount {
             ProgressView("Loading library…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let loadError {
             placeholder(icon: "exclamationmark.triangle", color: .orange, headline: "Couldn't load library", detail: loadError)
-        } else if files.isEmpty {
+        } else if libraryFileCount == 0 {
             placeholder(
                 icon: "tray",
                 color: .secondary,
@@ -90,7 +122,7 @@ struct AutoTaggerView: View {
                 detail: "Auto-Tag needs files in your library before it can look up matches."
             )
         } else if scannedFileIDs.isEmpty {
-            selectionList
+            selectionStage
         } else {
             reviewList
         }
@@ -98,44 +130,82 @@ struct AutoTaggerView: View {
 
     // MARK: - Selection stage
 
-    private var selectionList: some View {
-        List(files, id: \.id) { file in
-            if let fileID = file.id {
-                selectionRow(fileID: fileID, file: file)
+    /// Search field + capped results. Never renders more than
+    /// `AutoTagFileSearch.resultCap` rows, and renders nothing at all
+    /// until the user types a query — the whole point being that this
+    /// stage never materializes the whole library.
+    private var selectionStage: some View {
+        VStack(spacing: 0) {
+            searchField
+            Divider()
+            selectionResultsSection
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search by artist or title…", text: $searchQuery)
+                .textFieldStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var selectionResultsSection: some View {
+        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let searchError {
+            placeholder(icon: "exclamationmark.triangle", color: .orange, headline: "Search failed", detail: searchError)
+        } else if trimmedQuery.isEmpty {
+            placeholder(
+                icon: "magnifyingglass",
+                color: .secondary,
+                headline: "Search to select tracks",
+                detail: "Auto-Tag never loads the whole library at once — search by artist or title to find tracks to scan."
+            )
+        } else if isSearching && searchResults.isEmpty {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if searchResults.isEmpty {
+            placeholder(
+                icon: "questionmark.circle",
+                color: .secondary,
+                headline: "No matches",
+                detail: "No artist or title contains “\(trimmedQuery)”."
+            )
+        } else {
+            VStack(spacing: 0) {
+                selectionList
+                if searchIsCapped {
+                    Text("Showing first \(searchResults.count) of \(searchTotalMatchCount) — refine your search")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 4)
+                }
             }
+        }
+    }
+
+    private var searchIsCapped: Bool {
+        searchTotalMatchCount > searchResults.count
+    }
+
+    private var selectionList: some View {
+        List(searchResults, id: \.id) { result in
+            AutoTagSelectionRow(
+                fileID: result.id,
+                path: result.path,
+                artist: result.artist,
+                title: result.title,
+                isSelected: selectedFileIDs.contains(result.id),
+                onToggle: { toggleSelection(result.id) }
+            )
+            .equatable()
         }
         .listStyle(.inset)
-    }
-
-    private func selectionRow(fileID: Int64, file: FileRecord) -> some View {
-        HStack(spacing: 10) {
-            Toggle(isOn: selectionBinding(for: fileID)) { EmptyView() }
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-            VStack(alignment: .leading, spacing: 2) {
-                Text(displayTitle(for: file))
-                    .font(.caption)
-                    .lineLimit(1)
-                Text((file.path as NSString).lastPathComponent)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-        }
-        .padding(.vertical, 2)
-        .contentShape(Rectangle())
-        .onTapGesture { toggleSelection(fileID) }
-    }
-
-    private func displayTitle(for file: FileRecord) -> String {
-        switch (file.artist, file.title) {
-        case let (artist?, title?): return "\(artist) — \(title)"
-        case let (artist?, nil): return artist
-        case let (nil, title?): return title
-        case (nil, nil): return (file.path as NSString).lastPathComponent
-        }
     }
 
     // MARK: - Review stage
@@ -210,7 +280,7 @@ struct AutoTaggerView: View {
 
     @ViewBuilder
     private var footer: some View {
-        if !isLoadingFiles && loadError == nil && !files.isEmpty {
+        if !isLoadingLibraryCount && loadError == nil && libraryFileCount > 0 {
             if scannedFileIDs.isEmpty {
                 selectionFooter
             } else {
@@ -221,14 +291,16 @@ struct AutoTaggerView: View {
 
     private var selectionFooter: some View {
         HStack(spacing: 12) {
-            Text("\(selectedFileIDs.count) of \(files.count) selected")
+            Text("\(selectedFileIDs.count) selected")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer()
-            Button("Select All") {
-                showSelectAllConfirmation = true
+            Button("Select All Results") {
+                selectedFileIDs.formUnion(searchResults.map(\.id))
             }
             .controlSize(.small)
+            .disabled(searchResults.isEmpty)
+            .help("Adds every currently-shown search result to the selection — never the whole library.")
             Button("Select None") {
                 selectedFileIDs.removeAll()
             }
@@ -242,18 +314,6 @@ struct AutoTaggerView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .alert("Scan all \(files.count) tracks?", isPresented: $showSelectAllConfirmation) {
-            Button("Select All \(files.count)") {
-                selectedFileIDs = Set(files.compactMap(\.id))
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("""
-            Auto-Tag looks up every selected track against AcoustID and MusicBrainz through a shared rate limit of about 1 request per second (2 requests per track). \
-            At \(files.count) track\(files.count == 1 ? "" : "s"), that's roughly \(Self.estimatedDuration(trackCount: files.count)). \
-            You'll still review and confirm every match before anything is written — this only starts the lookup pass.
-            """)
-        }
     }
 
     private var reviewFooter: some View {
@@ -315,19 +375,6 @@ struct AutoTaggerView: View {
 
     // MARK: - Bindings
 
-    private func selectionBinding(for fileID: Int64) -> Binding<Bool> {
-        Binding(
-            get: { selectedFileIDs.contains(fileID) },
-            set: { include in
-                if include {
-                    selectedFileIDs.insert(fileID)
-                } else {
-                    selectedFileIDs.remove(fileID)
-                }
-            }
-        )
-    }
-
     private func toggleSelection(_ fileID: Int64) {
         if selectedFileIDs.contains(fileID) {
             selectedFileIDs.remove(fileID)
@@ -372,13 +419,52 @@ struct AutoTaggerView: View {
 
     // MARK: - Loading
 
-    private func loadFiles() async {
-        isLoadingFiles = true
-        defer { isLoadingFiles = false }
+    /// Cheap `SELECT COUNT(*)` used only to tell "library genuinely
+    /// empty" apart from "nothing matches the current search" — never
+    /// a full-table fetch.
+    private func loadLibraryFileCount() async {
+        isLoadingLibraryCount = true
+        defer { isLoadingLibraryCount = false }
         loadError = nil
         do {
+            libraryFileCount = try await services.database.writer.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
+            }
+        } catch {
+            loadError = "\(error.localizedDescription)"
+        }
+    }
+
+    /// Runs the debounced search behind the selection stage. Bounded by
+    /// `AutoTagFileSearch.resultCap` — this never loads the whole
+    /// library, on the main thread or otherwise.
+    private func performSearch(query: String) async {
+        isSearching = true
+        defer { isSearching = false }
+        searchError = nil
+        do {
+            let results = try await services.database.writer.read { db in
+                try AutoTagFileSearch.search(query: query, in: db)
+            }
+            searchResults = results.matches
+            searchTotalMatchCount = results.totalMatchCount
+        } catch {
+            searchError = "\(error.localizedDescription)"
+        }
+    }
+
+    /// Loads (or refreshes) the "current" tag baseline — `filesByID`
+    /// and `currentYearByFileID` — for exactly `fileIDs`, never the
+    /// whole library. Called before a scan starts (so the review stage
+    /// has current values to diff the proposed match against) and
+    /// again after a successful apply (so a later re-scan of the same
+    /// files diffs against what's actually in the DB now, not stale
+    /// pre-apply values).
+    private func loadCurrentMetadata(forFileIDs fileIDs: [Int64]) async {
+        guard !fileIDs.isEmpty else { return }
+        do {
             let loadedFiles = try await services.database.writer.read { db in
-                try FileRecord.fetchAll(db)
+                try FileRecord.filter(keys: fileIDs).fetchAll(db)
             }
             let trackIDs = Set(loadedFiles.compactMap(\.trackId))
             let tracks = try await services.database.writer.read { db in
@@ -389,14 +475,11 @@ struct AutoTaggerView: View {
                 return (trackID, year)
             })
 
-            files = loadedFiles
-            filesByID = Dictionary(uniqueKeysWithValues: loadedFiles.compactMap { file in
-                file.id.map { ($0, file) }
-            })
-            currentYearByFileID = Dictionary(uniqueKeysWithValues: loadedFiles.compactMap { file -> (Int64, Int?)? in
-                guard let fileID = file.id else { return nil }
-                return (fileID, file.trackId.flatMap { yearByTrackID[$0] })
-            })
+            for file in loadedFiles {
+                guard let fileID = file.id else { continue }
+                filesByID[fileID] = file
+                currentYearByFileID[fileID] = file.trackId.flatMap { yearByTrackID[$0] }
+            }
         } catch {
             loadError = "\(error.localizedDescription)"
         }
@@ -437,10 +520,12 @@ struct AutoTaggerView: View {
     // MARK: - Actions
 
     /// Runs the lookup pass over exactly `selectedFileIDs` — never over
-    /// every loaded file. Preserves the library's display order so the
-    /// review list reads top-to-bottom the same way the selection list did.
+    /// every loaded file. Selections can be accumulated across several
+    /// searches (in no particular library order), so we sort ascending
+    /// by file id for a stable, deterministic review order rather than
+    /// the search-result order of whichever query last touched a row.
     private func startScan() async {
-        let idsToScan = files.compactMap(\.id).filter { selectedFileIDs.contains($0) }
+        let idsToScan = selectedFileIDs.sorted()
         guard !idsToScan.isEmpty else { return }
 
         scannedFileIDs = idsToScan
@@ -449,6 +534,7 @@ struct AutoTaggerView: View {
         rowModels.removeAll()
         actionError = nil
         lastResult = nil
+        await loadCurrentMetadata(forFileIDs: idsToScan)
         await autoTaggerService.run(fileIDs: idsToScan)
     }
 
@@ -485,31 +571,18 @@ struct AutoTaggerView: View {
                 rowModels.removeValue(forKey: fileID)
             }
             // Refresh the cached current-tag baseline (filesByID /
-            // currentYearByFileID) so a later "New Scan" over the same
-            // files — including these just-applied ones, if re-selected —
+            // currentYearByFileID) for exactly the files this scan
+            // covered, so a later "New Scan" over the same files —
+            // including these just-applied ones, if re-selected —
             // diffs against what's actually in the DB now, not against
             // stale pre-apply values. Without this, `syncRowModels`
             // rebuilds a re-scanned row's `AutoTagRowModel` from outdated
             // current-artist/title/album/year, undermining the review
             // UI's whole current→proposed diff.
-            await loadFiles()
+            await loadCurrentMetadata(forFileIDs: scannedFileIDs)
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
         }
-    }
-
-    /// Rough wall-clock estimate for scanning `trackCount` tracks: 2
-    /// sequential lookups per track (AcoustID, then MusicBrainz), both
-    /// routed through one shared rate limiter capped at ≤1 request/second
-    /// (MusicBrainz's own ceiling; `AppServices` shares it with AcoustID
-    /// too, conservatively).
-    private static func estimatedDuration(trackCount: Int) -> String {
-        let totalSeconds = TimeInterval(trackCount * 2)
-        let formatter = DateComponentsFormatter()
-        formatter.allowedUnits = [.hour, .minute, .second]
-        formatter.unitsStyle = .abbreviated
-        formatter.maximumUnitCount = 2
-        return formatter.string(from: totalSeconds) ?? "\(Int(totalSeconds))s"
     }
 }
 
