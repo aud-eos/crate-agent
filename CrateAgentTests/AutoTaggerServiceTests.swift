@@ -666,6 +666,35 @@ final class AutoTaggerServiceTests: XCTestCase {
         let stale = await service.staleFileIDs(for: [payload])
         XCTAssertEqual(stale, [fileID])
     }
+
+    /// A legacy payload lacking the on-disk snapshot (both expected fields
+    /// nil — journaled before D-A) can't be revalidated and is treated as
+    /// NOT stale, even when the file would otherwise appear changed. It must
+    /// never crash by force-unwrapping the missing snapshot.
+    func testStaleFileIDsSkipsLegacyPayloadWithoutSnapshot() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/legacy.mp3")
+        // Reader would report a wildly different size/mtime, but the payload
+        // has no captured snapshot to compare against.
+        let service = makeService(database: database) { _ in
+            FileFreshnessSnapshot(fileSize: 999_999, mtime: 123_456)
+        }
+        let payload = ApplyMusicBrainzMatchPayload(
+            fileID: fileID,
+            acoustID: nil,
+            recordingMBID: "rec",
+            releaseMBID: nil,
+            artistMBID: nil,
+            isrc: nil,
+            fingerprintHash: Data([0x01]),
+            expectedFileSize: nil,
+            expectedMtime: nil,
+            artist: nil, title: nil, album: nil, year: nil
+        )
+
+        let stale = await service.staleFileIDs(for: [payload])
+        XCTAssertTrue(stale.isEmpty, "a legacy event with no captured snapshot must not be flagged stale")
+    }
 }
 
 // MARK: - Test doubles

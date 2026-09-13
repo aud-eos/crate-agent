@@ -2119,8 +2119,13 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     /// than linking stale identity to changed audio (finding D-A). The
     /// engine can't do that stat inside its write transaction, so the guard
     /// runs in the async apply path, not here.
-    public let expectedFileSize: Int64
-    public let expectedMtime: Int64
+    ///
+    /// Optional so an event JOURNALED by an earlier build of this branch —
+    /// before D-A added these fields — still decodes (both come back nil);
+    /// such a legacy event predates the check, so revalidation skips it.
+    /// `AutoTagRowModel.payload()` always populates them for a fresh apply.
+    public let expectedFileSize: Int64?
+    public let expectedMtime: Int64?
     // Cherry-picked display fields — absent (nil) means not applied:
     public let artist: String?
     public let title: String?
@@ -2163,8 +2168,8 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         artistMBID: String?,
         isrc: String?,
         fingerprintHash: Data,
-        expectedFileSize: Int64,
-        expectedMtime: Int64,
+        expectedFileSize: Int64? = nil,
+        expectedMtime: Int64? = nil,
         artist: String?,
         title: String?,
         album: String?,

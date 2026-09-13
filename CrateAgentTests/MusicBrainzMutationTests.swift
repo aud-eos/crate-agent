@@ -582,6 +582,27 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    // MARK: - D-A: legacy event decode (fields added mid-branch)
+
+    /// An event JOURNALED by an earlier build of this branch — before D-A
+    /// added `expectedFileSize`/`expectedMtime` — must still decode when read
+    /// back (e.g. on undo of that batch). The two fields are optional, so a
+    /// legacy-shape payload lacking them decodes with both nil.
+    func testLegacyPayloadWithoutExpectedFieldsDecodes() throws {
+        // fingerprintHash [0x01,0x02,0x03] encodes as base64 "AQID".
+        let legacyJson = """
+        {"fileID":7,"recordingMBID":"rec","fingerprintHash":"AQID","createdTrackRow":false}
+        """
+        let payload = try JSONDecoder().decode(
+            ApplyMusicBrainzMatchPayload.self, from: Data(legacyJson.utf8)
+        )
+        XCTAssertNil(payload.expectedFileSize, "legacy event has no captured on-disk size")
+        XCTAssertNil(payload.expectedMtime, "legacy event has no captured on-disk mtime")
+        XCTAssertEqual(payload.fileID, 7)
+        XCTAssertEqual(payload.recordingMBID, "rec")
+        XCTAssertEqual(payload.fingerprintHash, Data([0x01, 0x02, 0x03]))
+    }
+
     // MARK: - D-C: capped-fingerprint collision between different recordings
 
     /// Two DIFFERENT songs share their first 120s → same capped fingerprint,

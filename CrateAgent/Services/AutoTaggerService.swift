@@ -381,6 +381,13 @@ final class AutoTaggerService: ObservableObject {
 
         var stale: Set<Int64> = []
         for payload in payloads {
+            guard let expectedFileSize = payload.expectedFileSize,
+                  let expectedMtime = payload.expectedMtime else {
+                // Legacy event journaled before D-A captured the on-disk
+                // snapshot — nothing to revalidate against, and it predates
+                // the check by definition. Treat as not stale.
+                continue
+            }
             guard let path = pathByFileID[payload.fileID] else {
                 stale.insert(payload.fileID) // row gone from the DB — can't apply
                 continue
@@ -389,9 +396,7 @@ final class AutoTaggerService: ObservableObject {
                 stale.insert(payload.fileID) // file missing/unreadable now
                 continue
             }
-            if current.fileSize != payload.expectedFileSize
-                || current.mtime != payload.expectedMtime
-            {
+            if current.fileSize != expectedFileSize || current.mtime != expectedMtime {
                 stale.insert(payload.fileID) // edited/replaced since review
             }
         }
