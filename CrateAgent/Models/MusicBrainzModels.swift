@@ -3,9 +3,38 @@ import Foundation
 // MARK: - AcoustID
 
 /// Top-level payload from AcoustID's `/v2/lookup` endpoint.
+///
+/// A failure response (`status: "error"`) omits `results` entirely and
+/// instead carries an `error` object — both are decoded leniently
+/// (`results` defaulting to empty) so a failure body decodes cleanly
+/// instead of throwing before the caller can inspect `status`/`error`.
 public struct AcoustIDResponse: Codable, Equatable {
     let status: String
     let results: [AcoustIDResult]
+    let error: AcoustIDErrorPayload?
+
+    public init(status: String, results: [AcoustIDResult], error: AcoustIDErrorPayload? = nil) {
+        self.status = status
+        self.results = results
+        self.error = error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(String.self, forKey: .status)
+        results = try container.decodeIfPresent([AcoustIDResult].self, forKey: .results) ?? []
+        error = try container.decodeIfPresent(AcoustIDErrorPayload.self, forKey: .error)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status, results, error
+    }
+}
+
+/// The in-body error object AcoustID sends alongside `"status": "error"`.
+public struct AcoustIDErrorPayload: Codable, Equatable {
+    let code: Int
+    let message: String
 }
 
 /// One fingerprint match candidate from AcoustID, with the MusicBrainz

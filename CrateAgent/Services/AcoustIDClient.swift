@@ -24,7 +24,7 @@ public struct AcoustIDClient: Sendable {
 
     /// - Returns: candidates sorted by AcoustID confidence score, descending.
     public func lookup(fingerprintBase64: String, durationSeconds: Int, apiKey: String) async throws -> [AcoustIDResult] {
-        let cacheKey = Self.cacheKey(forFingerprint: fingerprintBase64)
+        let cacheKey = Self.cacheKey(forFingerprint: fingerprintBase64, durationSeconds: durationSeconds)
         if let cachedData = cache.data(forKey: cacheKey) {
             return try Self.decodeSortedResults(from: cachedData)
         }
@@ -57,7 +57,7 @@ public struct AcoustIDClient: Sendable {
             ("client", apiKey),
             ("duration", String(durationSeconds)),
             ("fingerprint", fingerprintBase64),
-            ("meta", "recordings+recordingids"),
+            ("meta", "recordings recordingids"),
             ("format", "json"),
         ]
         .map { key, value in "\(key)=\(formURLEncodedValue(value))" }
@@ -67,14 +67,22 @@ public struct AcoustIDClient: Sendable {
     /// `application/x-www-form-urlencoded` encoding: everything outside
     /// unreserved characters is percent-encoded, including `+` — a literal
     /// `+` byte in a form body decodes to a space server-side, so a `+`
-    /// meant literally (the `+` joining `meta=recordings+recordingids`, or
-    /// one that happens to appear inside a base64 fingerprint) must be
-    /// escaped to `%2B` rather than sent as-is.
+    /// that happens to appear inside a base64 fingerprint or key must be
+    /// escaped to `%2B` rather than sent as-is. A real space (e.g. the one
+    /// separating AcoustID's two `meta` option names) is percent-encoded to
+    /// `%20`, which standard form parsers decode back to a space just like
+    /// `+` — so it reaches AcoustID as the option separator it needs to be,
+    /// not folded into one invalid combined option name.
     private static func formURLEncodedValue(_ value: String) -> String {
         var allowedCharacters = CharacterSet.alphanumerics
         allowedCharacters.insert(charactersIn: "-._~")
         return value.addingPercentEncoding(withAllowedCharacters: allowedCharacters) ?? value
     }
+
+    /// AcoustID's documented code for "invalid API key" within an in-body
+    /// error object — distinct from an HTTP 401, which `RetryingLookupRequester`
+    /// already maps to `.unauthorized` directly.
+    private static let invalidAPIKeyErrorCode = 4
 
     private static func decodeSortedResults(from data: Data) throws -> [AcoustIDResult] {
         let response: AcoustIDResponse
@@ -84,16 +92,29 @@ public struct AcoustIDClient: Sendable {
             throw LookupError.transport("invalid AcoustID response body: \(error.localizedDescription)")
         }
         // AcoustID can answer with HTTP 200 and a body that itself reports
-        // failure (e.g. a malformed fingerprint) — that must not decode
-        // into an empty-but-successful result set.
+        // failure (e.g. a malformed fingerprint, or an invalid/revoked API
+        // key) — that must not decode into an empty-but-successful result
+        // set, and an invalid key must not be treated as a per-file/retryable
+        // failure or the caller keeps hammering the bad key for every file.
         guard response.status == "ok" else {
+            if let errorPayload = response.error {
+                if errorPayload.code == invalidAPIKeyErrorCode {
+                    throw LookupError.unauthorized
+                }
+                throw LookupError.server
+            }
             throw LookupError.transport("AcoustID returned status \"\(response.status)\"")
         }
         return response.results.sorted { $0.score > $1.score }
     }
 
-    private static func cacheKey(forFingerprint fingerprintBase64: String) -> String {
-        let digest = SHA256.hash(data: Data(fingerprintBase64.utf8))
+    /// Fingerprints are capped at the first 120s, so two recordings that
+    /// share an identical opening but differ in total length can produce
+    /// the same fingerprint while needing a different `duration` param —
+    /// keying on fingerprint alone would let the second lookup wrongly
+    /// reuse the first's cached candidates.
+    private static func cacheKey(forFingerprint fingerprintBase64: String, durationSeconds: Int) -> String {
+        let digest = SHA256.hash(data: Data("\(fingerprintBase64)|\(durationSeconds)".utf8))
         let hexDigest = digest.map { String(format: "%02x", $0) }.joined()
         return "acoustid:\(hexDigest)"
     }

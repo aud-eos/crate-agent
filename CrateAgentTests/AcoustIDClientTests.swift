@@ -140,6 +140,93 @@ final class AcoustIDClientTests: XCTestCase {
         XCTAssertTrue(results.isEmpty)
     }
 
+    func testRequestBodyEncodesMetaOptionsSpaceSeparatedNotPlusJoined() async throws {
+        // `meta=recordings+recordingids` is WRONG in a form-urlencoded body:
+        // `+` decodes to a literal space server-side, so a "+" meant to
+        // join two option names must reach the wire as a real space
+        // (encoded as `+` or `%20`), never as a literal `+` byte
+        // (`%2B`) — that would make AcoustID see one invalid option
+        // "recordings+recordingids" instead of two valid ones.
+        let loader = StubLoader(status: 200, body: fixture("acoustid_multi.json"))
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
+
+        _ = try await client.lookup(fingerprintBase64: "F", durationSeconds: 200, apiKey: "K")
+
+        let body = try XCTUnwrap(loader.lastRequest?.httpBody)
+        let bodyString = try XCTUnwrap(String(data: body, encoding: .utf8))
+        XCTAssertFalse(
+            bodyString.contains("recordings%2Brecordingids"),
+            "meta options must not be joined with a literal-escaped plus: \(bodyString)"
+        )
+        XCTAssertTrue(
+            bodyString.contains("recordings+recordingids") || bodyString.contains("recordings%20recordingids"),
+            "expected the two meta options separated by a space-encoding (+ or %20), got: \(bodyString)"
+        )
+    }
+
+    func testRequestBodyStillEscapesLiteralPlusInFingerprint() async throws {
+        // A literal "+" that's actually part of the base64 fingerprint (or
+        // key) must still be escaped to %2B — only the meta separator is a
+        // "real" space, not every "+" in the body.
+        let loader = StubLoader(status: 200, body: fixture("acoustid_multi.json"))
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
+
+        _ = try await client.lookup(fingerprintBase64: "AB+CD", durationSeconds: 200, apiKey: "K")
+
+        let body = try XCTUnwrap(loader.lastRequest?.httpBody)
+        let bodyString = try XCTUnwrap(String(data: body, encoding: .utf8))
+        XCTAssertTrue(
+            bodyString.contains("fingerprint=AB%2BCD"),
+            "expected the literal + inside the fingerprint to stay percent-escaped, got: \(bodyString)"
+        )
+    }
+
+    func testInvalidAPIKeyErrorBodyMapsToUnauthorized() async {
+        // AcoustID answers a revoked/bad key with HTTP 200 and an in-body
+        // error object — error code 4 is documented as "invalid API key".
+        // This must map to .unauthorized, the same as an HTTP 401, so
+        // AutoTaggerService stops the whole scan instead of retrying every
+        // file against a key that will never work.
+        let errorBody = Data(#"{ "status": "error", "error": { "code": 4, "message": "Invalid API key" } }"#.utf8)
+        let client = AcoustIDClient(loader: StubLoader(status: 200, body: errorBody), limiter: .noop, cache: .memory())
+
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "bad")) {
+            XCTAssertEqual($0 as? LookupError, .unauthorized)
+        }
+    }
+
+    func testGenericInBodyErrorCodeMapsToServerError() async {
+        // Any other documented in-body error code (e.g. malformed
+        // fingerprint) is not an auth problem — map it to .server rather
+        // than crashing the decode or reporting it as .transport.
+        let errorBody = Data(#"{ "status": "error", "error": { "code": 2, "message": "Missing required parameter" } }"#.utf8)
+        let client = AcoustIDClient(loader: StubLoader(status: 200, body: errorBody), limiter: .noop, cache: .memory())
+
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")) {
+            XCTAssertEqual($0 as? LookupError, .server)
+        }
+    }
+
+    func testCacheKeyIncludesDurationSoDifferentDurationsDoNotCollide() async throws {
+        // Fingerprints are capped at the first 120s, so two recordings that
+        // share an identical opening but differ in total length can share
+        // a fingerprint while needing different `duration` params. Keying
+        // the cache on fingerprint alone would let the second lookup wrongly
+        // reuse the first's cached candidates.
+        let loader = SequencedStubLoader(responses: [
+            (status: 200, body: fixture("acoustid_multi.json"), headers: [:]),
+            (status: 200, body: fixture("acoustid_empty.json"), headers: [:]),
+        ])
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
+
+        let first = try await client.lookup(fingerprintBase64: "SAME", durationSeconds: 120, apiKey: "K")
+        let second = try await client.lookup(fingerprintBase64: "SAME", durationSeconds: 240, apiKey: "K")
+
+        XCTAssertEqual(loader.callCount, 2, "a different duration must not be served from the first duration's cache entry")
+        XCTAssertEqual(first.count, 2)
+        XCTAssertTrue(second.isEmpty)
+    }
+
     func testRequestBodyPinsResponseFormatToJSON() async throws {
         // AcoustID's default response format is JSON, but it's ambiguous
         // historically and decodeSortedResults unconditionally
