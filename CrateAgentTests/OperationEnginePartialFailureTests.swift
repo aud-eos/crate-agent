@@ -470,6 +470,45 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         )
     }
 
+    // MARK: - #4000806481: resync supersession is per FIELD, not per target
+
+    /// Batch A writes only `title`, a later batch B writes only `artist` to the
+    /// same file. B does not supersede A's title (different field), so re-syncing
+    /// A still replays its title — per-target ranking would have dropped A's
+    /// whole write because B is the newer metadata event.
+    func testResyncKeepsEarlierFieldWhenLaterBatchWritesADifferentField() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let file = fileIds[0]
+
+        try await engine.applyBatch(
+            [.commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                fileId: file, metadata: SeratoMetadata(title: "A Title"),
+                previousMetadata: SeratoMetadata(title: "old")
+            ))],
+            batchId: "batchA"
+        )
+        try await engine.applyBatch(
+            [.commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                fileId: file, metadata: SeratoMetadata(artist: "B Artist"),
+                previousMetadata: SeratoMetadata(artist: "old")
+            ))],
+            batchId: "batchB"
+        )
+
+        // Re-syncing A must still replay its title field (B only touched artist).
+        let outcome = try await engine.resyncSeratoForBatch("batchA")
+        XCTAssertEqual(outcome.appliedCount, 1, "A's title field is still current and must replay")
+
+        let records = try readDatabaseRecords(
+            databasePath: seratoDirectory.appendingPathComponent("database V2").path
+        )
+        let record = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertEqual(record?.title, "A Title", "A's title survives B's artist-only write")
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {

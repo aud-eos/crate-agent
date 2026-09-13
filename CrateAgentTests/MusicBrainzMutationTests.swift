@@ -879,6 +879,46 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// Undoing a match must be refused when a LATER non-match edit
+    /// (`metadataSet`/hygiene) changed a field the match applied — the inverse
+    /// would restore the match's pre-apply value and clobber that newer edit
+    /// (finding #4000806477).
+    func testUndoOfMatchRejectedAfterLaterNonMatchFieldEdit() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Match applies an artist.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint,
+                artist: "Matched Artist", title: nil, album: nil, year: nil
+            )),
+            batchId: "match"
+        )
+        // A later MANUAL edit changes the same field.
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(fileId: file1, metadata: SeratoMetadata(artist: "Manually Edited"))),
+            batchId: "manual-edit"
+        )
+
+        do {
+            try await engine.undoBatch("match")
+            XCTFail("expected undoSupersededByLaterMatch")
+        } catch let OperationEngineError.undoSupersededByLaterMatch(fid) {
+            XCTAssertEqual(fid, file1)
+        }
+
+        try await database.writer.read { db in
+            XCTAssertEqual(
+                try FileRecord.fetchOne(db, key: file1)!.artist, "Manually Edited",
+                "the later manual edit survives the refused undo"
+            )
+        }
+    }
+
     /// A sibling (FLAC+MP3 of ONE recording) matched to a DIFFERENT release
     /// drifts the shared row's `releaseMBID` — but that is NOT a supersession
     /// of the first file's match, so undoing the older batch must SUCCEED

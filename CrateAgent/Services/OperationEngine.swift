@@ -334,19 +334,16 @@ public actor OperationEngine {
         // Re-sync must project each file's CURRENT external state, not blindly
         // replay this batch's journaled writes. A batch may have been undone or
         // a file re-matched since, and Serato's `database V2` and the audio tag
-        // are INDEPENDENT stores that different events patch separately. Rather
-        // than approximate "current" by ranking events by TYPE (which a later
-        // year-only/identity-only match — journaled but producing no metadata
-        // write — would corrupt, silently dropping an earlier event's
-        // still-current metadata: finding #4000261xxx), we reconstruct the
-        // ACTUAL writes and, per file and per target, keep only the write from
-        // the event that most recently PRODUCED a write for that target. That
-        // latest actual write is the file's current intended state, carrying
-        // clears and exact values straight from its journaled payload — so this
-        // is correct by construction for undone batches, re-matches, hygiene
-        // V2+tag pairs, and partial-metadata matches alike (issue #104).
-        let (latestMetadataWriteByFile, latestFileTagWriteByFile) =
-            try await latestProjectedWriteEventIds(pathByFileId: pathByFileId)
+        // are INDEPENDENT stores whose FIELDS different events patch separately.
+        // A journaled write is a per-FIELD cherry-picked patch, so supersession
+        // is tracked per (file, target, field): we keep each replayed write's
+        // field only when this event is the latest to have actually written
+        // that field. So a failed earlier title write survives a later
+        // artist-only write to the same target (finding #4000806481), while an
+        // undone/superseded field is dropped — and each kept field carries its
+        // exact value (including "" clears) straight from the journaled payload.
+        let (latestV2FieldWriter, latestTagFieldWriter) =
+            try await latestFieldWriterEventIds(pathByFileId: pathByFileId)
 
         var writes: [SeratoPendingWrite] = []
         var replayedEventCount = 0
@@ -355,12 +352,19 @@ public actor OperationEngine {
             let reconstructed = Self.resyncWrites(
                 for: event, pathByFileId: pathByFileId, decoder: decoder
             )
-            let kept = Self.dropSupersededWrites(
-                reconstructed,
-                event: event,
-                latestMetadataWriteByFile: latestMetadataWriteByFile,
-                latestFileTagWriteByFile: latestFileTagWriteByFile
-            )
+            guard let fileId = event.fileId, let eventId = event.eventId else {
+                // No id to rank against — replay as-is (shouldn't happen for
+                // projecting events, which always carry a file id).
+                if !reconstructed.isEmpty { writes.append(contentsOf: reconstructed); replayedEventCount += 1 }
+                continue
+            }
+            let kept = reconstructed.compactMap {
+                Self.reduceWriteToCurrentFields(
+                    $0, eventId: eventId, fileId: fileId,
+                    latestV2FieldWriter: latestV2FieldWriter,
+                    latestTagFieldWriter: latestTagFieldWriter
+                )
+            }
             if !kept.isEmpty {
                 writes.append(contentsOf: kept)
                 replayedEventCount += 1
@@ -371,46 +375,86 @@ public actor OperationEngine {
 
     /// Event types whose journaled payload can reconstruct a Serato/audio-tag
     /// write (the same set `resyncWrites` handles, minus rename which is a
-    /// path-only transition ranked separately). Used to gather the candidate
-    /// events for latest-actual-write ranking.
+    /// path-only transition, projected to the current path rather than ranked).
     private static let metadataOrTagProjectingEventTypes: Set<EventType> = [
         .musicBrainzMatchApplied, .musicBrainzMatchReverted,
         .metadataCommittedToSerato, .fileTagsWritten,
     ]
 
-    /// Keeps an event's write only when it is the file's CURRENT state for that
-    /// write's target: a `.metadataUpdate` iff this event is the latest to have
-    /// produced a Serato-V2 write for the file, a `.fileTagWrite` iff the latest
-    /// to have produced a file-tag write. Path-only writes always replay.
-    private static func dropSupersededWrites(
-        _ writes: [SeratoPendingWrite],
-        event: EventRecord,
-        latestMetadataWriteByFile: [Int64: Int64],
-        latestFileTagWriteByFile: [Int64: Int64]
-    ) -> [SeratoPendingWrite] {
-        guard let fileId = event.fileId, let thisEventId = event.eventId else { return writes }
-        return writes.filter { write in
-            switch write {
-            case .metadataUpdate:
-                return latestMetadataWriteByFile[fileId] == thisEventId
-            case .fileTagWrite:
-                return latestFileTagWriteByFile[fileId] == thisEventId
-            case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile:
-                return true
-            }
+    /// The non-nil fields of a `SeratoMetadata`, keyed by a stable field name.
+    /// An empty-string value (a clear) is a real value and IS included.
+    private static func metadataFieldMap(_ metadata: SeratoMetadata) -> [String: String] {
+        var result: [String: String] = [:]
+        if let value = metadata.artist { result["artist"] = value }
+        if let value = metadata.title { result["title"] = value }
+        if let value = metadata.album { result["album"] = value }
+        if let value = metadata.genre { result["genre"] = value }
+        if let value = metadata.bpm { result["bpm"] = value }
+        if let value = metadata.musicalKey { result["key"] = value }
+        if let value = metadata.comment { result["comment"] = value }
+        if let value = metadata.length { result["length"] = value }
+        if let value = metadata.label { result["label"] = value }
+        return result
+    }
+
+    /// A copy of `metadata` with only the fields in `keep`; every other field
+    /// becomes nil (leave-unchanged for the writers).
+    private static func reducedMetadata(_ metadata: SeratoMetadata, keeping keep: Set<String>) -> SeratoMetadata {
+        SeratoMetadata(
+            artist: keep.contains("artist") ? metadata.artist : nil,
+            title: keep.contains("title") ? metadata.title : nil,
+            album: keep.contains("album") ? metadata.album : nil,
+            genre: keep.contains("genre") ? metadata.genre : nil,
+            bpm: keep.contains("bpm") ? metadata.bpm : nil,
+            musicalKey: keep.contains("key") ? metadata.musicalKey : nil,
+            comment: keep.contains("comment") ? metadata.comment : nil,
+            length: keep.contains("length") ? metadata.length : nil,
+            label: keep.contains("label") ? metadata.label : nil
+        )
+    }
+
+    /// Reduce one reconstructed write to only the fields this event still owns
+    /// (is the latest writer of) for the write's target; returns nil if none
+    /// survive. Path-only writes pass through unchanged.
+    private static func reduceWriteToCurrentFields(
+        _ write: SeratoPendingWrite,
+        eventId: Int64,
+        fileId: Int64,
+        latestV2FieldWriter: [Int64: [String: Int64]],
+        latestTagFieldWriter: [Int64: [String: Int64]]
+    ) -> SeratoPendingWrite? {
+        switch write {
+        case .metadataUpdate(let update):
+            let latest = latestV2FieldWriter[fileId] ?? [:]
+            let keep = Set(metadataFieldMap(update.metadata).keys.filter { latest[$0] == eventId })
+            guard !keep.isEmpty else { return nil }
+            return .metadataUpdate(SeratoPendingMetadataUpdate(
+                absolutePath: update.absolutePath,
+                metadata: reducedMetadata(update.metadata, keeping: keep)
+            ))
+        case .fileTagWrite(let tagWrite):
+            let latest = latestTagFieldWriter[fileId] ?? [:]
+            let keep = Set(metadataFieldMap(tagWrite.metadata).keys.filter { latest[$0] == eventId })
+            let keepYear = (tagWrite.year != nil || tagWrite.clearYear) && latest["year"] == eventId
+            guard !keep.isEmpty || keepYear else { return nil }
+            return .fileTagWrite(SeratoPendingFileTagWrite(
+                absolutePath: tagWrite.absolutePath,
+                metadata: reducedMetadata(tagWrite.metadata, keeping: keep),
+                year: keepYear ? tagWrite.year : nil,
+                clearYear: keepYear ? tagWrite.clearYear : false
+            ))
+        case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile:
+            return write
         }
     }
 
-    /// For each file in `pathByFileId`, the event ids of the latest events that
-    /// ACTUALLY produce a Serato-V2 metadata write and a file-tag write
-    /// (respectively), across EVERY batch. Ranks by reconstructed writes rather
-    /// than by event type, so an event that is a projecting type but produces
-    /// no write for a target (e.g. a year-only match emits no `.metadataUpdate`)
-    /// does not falsely supersede an earlier event that did. The latest actual
-    /// producer's write is the file's current intended state for that target.
-    private func latestProjectedWriteEventIds(
+    /// For each file in `pathByFileId`, the latest event id that actually wrote
+    /// each FIELD, per target (Serato V2 and the audio tag), across EVERY batch.
+    /// Ranking per field (not per whole target) is what lets a still-current
+    /// title survive a later artist-only write to the same target.
+    private func latestFieldWriterEventIds(
         pathByFileId: [Int64: String]
-    ) async throws -> (metadata: [Int64: Int64], fileTag: [Int64: Int64]) {
+    ) async throws -> (v2: [Int64: [String: Int64]], tag: [Int64: [String: Int64]]) {
         let fileIds = Array(pathByFileId.keys)
         guard !fileIds.isEmpty else { return ([:], [:]) }
         let typeValues = Self.metadataOrTagProjectingEventTypes.map(\.rawValue)
@@ -425,21 +469,25 @@ public actor OperationEngine {
             try EventRecord.fetchAll(db, sql: sql, arguments: arguments)
         }
 
-        var metadata: [Int64: Int64] = [:]
-        var fileTag: [Int64: Int64] = [:]
+        var v2: [Int64: [String: Int64]] = [:]
+        var tag: [Int64: [String: Int64]] = [:]
         let decoder = JSONDecoder()
         for event in history {
             guard let fileId = event.fileId, let eventId = event.eventId else { continue }
-            // ASC order → last write producer seen per file is the latest.
+            // ASC order → the last event to write a field wins for that field.
             for write in Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder) {
                 switch write {
-                case .metadataUpdate: metadata[fileId] = eventId
-                case .fileTagWrite: fileTag[fileId] = eventId
-                case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile: break
+                case .metadataUpdate(let update):
+                    for key in Self.metadataFieldMap(update.metadata).keys { v2[fileId, default: [:]][key] = eventId }
+                case .fileTagWrite(let tagWrite):
+                    for key in Self.metadataFieldMap(tagWrite.metadata).keys { tag[fileId, default: [:]][key] = eventId }
+                    if tagWrite.year != nil || tagWrite.clearYear { tag[fileId, default: [:]]["year"] = eventId }
+                case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile:
+                    break
                 }
             }
         }
-        return (metadata, fileTag)
+        return (v2, tag)
     }
 
     /// Whether an event's Serato writes are reconstructed against the
@@ -618,6 +666,11 @@ public actor OperationEngine {
     ///    order iff that revert is the file's LAST match event — anything after
     ///    it (a newer match or revert) means the redo is out of order
     ///    (finding #4000261463).
+    ///
+    /// Additionally, undoing an APPLY is rejected if a later NON-match event
+    /// (`metadataSet`, `metadataCommittedToSerato`, `fileTagsWritten`) wrote a
+    /// field the match applied: the inverse would restore the match's pre-apply
+    /// value and clobber that newer edit (finding #4000806477).
     private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId _: String) async throws {
         let matchEvents = events.filter {
             $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
@@ -626,8 +679,14 @@ public actor OperationEngine {
         let fileIds = Array(Set(matchEvents.compactMap(\.fileId)))
         guard !fileIds.isEmpty else { return }
 
-        // Full per-file match-event history across ALL batches, oldest-first.
-        let typeValues = [EventType.musicBrainzMatchApplied.rawValue, EventType.musicBrainzMatchReverted.rawValue]
+        // Full per-file history of every FIELD-WRITING event across ALL batches,
+        // oldest-first: match applies/reverts (for the LIFO stack) plus the
+        // non-match metadata writers (for the field-overlap check).
+        let typeValues = [
+            EventType.musicBrainzMatchApplied.rawValue, EventType.musicBrainzMatchReverted.rawValue,
+            EventType.metadataSet.rawValue, EventType.metadataCommittedToSerato.rawValue,
+            EventType.fileTagsWritten.rawValue,
+        ]
         let sql = """
             SELECT * FROM events
             WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
@@ -646,9 +705,12 @@ public actor OperationEngine {
         for event in matchEvents {
             guard let fileId = event.fileId, let eventId = event.eventId else { continue }
             let fileHistory = historyByFile[fileId] ?? []
+            let matchHistory = fileHistory.filter {
+                $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
+            }
             if event.eventType == .musicBrainzMatchApplied {
                 var stack: [Int64] = []
-                for historyEvent in fileHistory {
+                for historyEvent in matchHistory {
                     if historyEvent.eventType == .musicBrainzMatchApplied {
                         if let id = historyEvent.eventId { stack.append(id) }
                     } else if !stack.isEmpty {
@@ -658,9 +720,61 @@ public actor OperationEngine {
                 if stack.last != eventId {
                     throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                 }
-            } else if fileHistory.last?.eventId != eventId {
+                // A later non-match edit to a field this match applied would be
+                // clobbered by restoring the match's pre-apply value.
+                let restoredFields = Self.appliedMetadataFields(forwardPayloadJson: event.payloadJson)
+                if !restoredFields.isEmpty {
+                    for later in fileHistory
+                        where (later.eventId ?? 0) > eventId
+                        && Self.nonMatchFieldWritingTypes.contains(later.eventType)
+                        && !restoredFields.isDisjoint(with: Self.writtenMetadataFields(of: later))
+                    {
+                        throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
+                    }
+                }
+            } else if matchHistory.last?.eventId != eventId {
                 throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
             }
+        }
+    }
+
+    /// Non-match event types that write file-metadata fields — checked for
+    /// field overlap when deciding whether an older match can be undone.
+    private static let nonMatchFieldWritingTypes: Set<EventType> = [
+        .metadataSet, .metadataCommittedToSerato, .fileTagsWritten,
+    ]
+
+    /// The Serato-metadata fields a MusicBrainz match applied (whose inverse an
+    /// undo would restore), decoded from the forward `musicBrainzMatchApplied`
+    /// payload.
+    private static func appliedMetadataFields(forwardPayloadJson json: String) -> Set<String> {
+        guard let data = json.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(ApplyMusicBrainzMatchPayload.self, from: data)
+        else { return [] }
+        var fields: Set<String> = []
+        if payload.artist != nil { fields.insert("artist") }
+        if payload.title != nil { fields.insert("title") }
+        if payload.album != nil { fields.insert("album") }
+        return fields
+    }
+
+    /// The Serato-metadata fields a non-match field-writing event wrote,
+    /// decoded from its forward payload.
+    private static func writtenMetadataFields(of event: EventRecord) -> Set<String> {
+        guard let data = event.payloadJson.data(using: .utf8) else { return [] }
+        let decoder = JSONDecoder()
+        switch event.eventType {
+        case .metadataSet:
+            guard let payload = try? decoder.decode(SetMetadataPayload.self, from: data) else { return [] }
+            return Set(metadataFieldMap(payload.metadata).keys)
+        case .metadataCommittedToSerato:
+            guard let payload = try? decoder.decode(CommitMetadataToSeratoPayload.self, from: data) else { return [] }
+            return Set(metadataFieldMap(payload.metadata).keys)
+        case .fileTagsWritten:
+            guard let payload = try? decoder.decode(WriteFileTagsPayload.self, from: data) else { return [] }
+            return Set(metadataFieldMap(payload.metadata).keys)
+        default:
+            return []
         }
     }
 
