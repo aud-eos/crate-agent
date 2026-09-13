@@ -583,49 +583,6 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
-    // MARK: - D-A: apply-time candidate staleness
-
-    /// The file was edited/replaced between lookup and Apply: its indexed
-    /// identity (fileSize/mtime) no longer matches what the candidate
-    /// captured. The apply must reject before mutating anything, so stale
-    /// MusicBrainz identity is never linked to the changed audio.
-    func testApplyRejectsStaleCandidateWhenFileChangedSinceLookup() async throws {
-        let recorder = FileTagWriterRecorder()
-        let (engine, database, fileId) = try await MainActor.run {
-            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
-        }
-        let fingerprint = sha256(sampleFingerprintBytes)
-        // Simulate a post-lookup edit: bump the indexed identity away from
-        // the candidate's captured values (fileSize/mtime == 1).
-        try await database.writer.write { db in
-            try db.execute(
-                sql: "UPDATE files SET mtime = ?, file_size = ? WHERE id = ?",
-                arguments: [999, 5000, fileId]
-            )
-        }
-
-        do {
-            try await engine.apply(
-                .applyMusicBrainzMatch(fullPayload(fileID: fileId, fingerprintHash: fingerprint)),
-                batchId: "stale"
-            )
-            XCTFail("expected candidateStale")
-        } catch OperationEngineError.candidateStale(let staleFileId) {
-            XCTAssertEqual(staleFileId, fileId)
-        }
-
-        try await database.writer.read { db in
-            let file = try FileRecord.fetchOne(db, key: fileId)!
-            XCTAssertNil(file.trackId, "stale apply must not link a track")
-            XCTAssertEqual(try TrackRecord.fetchCount(db), 0, "stale apply must not create a track row")
-            XCTAssertEqual(
-                try EventRecord.filter(Column("batch_id") == "stale").fetchCount(db), 0,
-                "stale apply must journal nothing"
-            )
-        }
-        XCTAssertEqual(recorder.calls.count, 0, "stale apply must not write file tags")
-    }
-
     // MARK: - D-C: capped-fingerprint collision between different recordings
 
     /// Two DIFFERENT songs share their first 120s → same capped fingerprint,

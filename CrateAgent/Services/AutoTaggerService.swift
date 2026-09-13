@@ -204,6 +204,15 @@ final class AutoTaggerService: ObservableObject {
             throw AutoTaggerRowFailure("missing audio duration for file \(fileID)")
         }
 
+        // D-A: snapshot the file's ACTUAL on-disk identity as the lookup
+        // sees it now — not the DB-indexed `FileRecord.fileSize`/`mtime`,
+        // which no in-place edit ever updates. This is what apply-time
+        // revalidation (`staleFileIDs`) re-checks against. Falls back to the
+        // indexed values only if the stat fails (the file was just read for
+        // tags, so that's degenerate).
+        let lookupFreshness = await onDiskFreshness(ofFileAt: file.path)
+            ?? FileFreshnessSnapshot(fileSize: file.fileSize, mtime: file.mtime)
+
         let acoustIDResults = try await acoustIDClient.lookup(
             fingerprintBase64: fingerprintBase64,
             durationSeconds: Int(durationSeconds),
@@ -230,8 +239,8 @@ final class AutoTaggerService: ObservableObject {
             recordingMBID: recordingMBID,
             artistMBID: artistCredit?.artist.id,
             fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
-            expectedFileSize: file.fileSize,
-            expectedMtime: file.mtime,
+            expectedFileSize: lookupFreshness.fileSize,
+            expectedMtime: lookupFreshness.mtime,
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
@@ -307,12 +316,18 @@ final class AutoTaggerService: ObservableObject {
     /// the stored bytes are kept — the imminent tag read fails loudly if the
     /// file is genuinely gone.
     private func storedFingerprintIsFresh(for file: FileRecord) async -> Bool {
-        let path = file.path
-        let current = await Task.detached(priority: .userInitiated) { [fileFreshnessReader] in
+        guard let current = await onDiskFreshness(ofFileAt: file.path) else { return true }
+        return current.fileSize == file.fileSize && current.mtime == file.mtime
+    }
+
+    /// Reads the file's current on-disk size+mtime off the main actor via
+    /// the injected `fileFreshnessReader`. Nil when the file can't be
+    /// stat'd (missing/unreadable). The single seam both the D-B fingerprint
+    /// freshness check and the D-A apply-time revalidation read through.
+    private func onDiskFreshness(ofFileAt path: String) async -> FileFreshnessSnapshot? {
+        await Task.detached(priority: .userInitiated) { [fileFreshnessReader] in
             fileFreshnessReader(path)
         }.value
-        guard let current else { return true }
-        return current.fileSize == file.fileSize && current.mtime == file.mtime
     }
 
     /// Runs a blocking closure off the main actor so CPU-bound FFI calls
@@ -321,6 +336,45 @@ final class AutoTaggerService: ObservableObject {
         try await Task.detached(priority: .userInitiated) {
             try work()
         }.value
+    }
+
+    // MARK: - Apply-time revalidation (D-A)
+
+    /// Re-stat each confirmed candidate's file on disk NOW and compare to
+    /// the on-disk snapshot captured at lookup (carried on the payload).
+    /// Returns the fileIDs whose bytes changed — or whose file is now
+    /// missing/unreadable, or whose row vanished — since review. The caller
+    /// MUST exclude these from the apply and surface them (no silent drop):
+    /// applying a reviewed MusicBrainz identity to audio that changed since
+    /// review would mis-link a different recording. This is the REAL D-A
+    /// guard; it lives here (not inside the engine's write transaction)
+    /// because it needs file I/O, kept off the main actor.
+    func staleFileIDs(for payloads: [ApplyMusicBrainzMatchPayload]) async -> Set<Int64> {
+        guard !payloads.isEmpty else { return [] }
+        let fileIDs = payloads.map(\.fileID)
+        let pathByFileID = (try? await database.writer.read { db in
+            try FileRecord.filter(keys: fileIDs).fetchAll(db)
+                .reduce(into: [Int64: String]()) { accumulator, file in
+                    if let id = file.id { accumulator[id] = file.path }
+                }
+        }) ?? [:]
+
+        var stale: Set<Int64> = []
+        for payload in payloads {
+            guard let path = pathByFileID[payload.fileID] else {
+                stale.insert(payload.fileID) // row gone from the DB — can't apply
+                continue
+            }
+            guard let current = await onDiskFreshness(ofFileAt: path) else {
+                stale.insert(payload.fileID) // file missing/unreadable now
+                continue
+            }
+            if current.fileSize != payload.expectedFileSize
+                || current.mtime != payload.expectedMtime {
+                stale.insert(payload.fileID) // edited/replaced since review
+            }
+        }
+        return stale
     }
 
     // MARK: - Database

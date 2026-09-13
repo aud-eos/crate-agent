@@ -582,17 +582,37 @@ struct AutoTaggerView: View {
         pendingResyncBatchId = nil
 
         let confirmedIDs = confirmedFileIDs
-        let mutations: [TrackMutation] = confirmedIDs.compactMap { fileID in
-            rowModels[fileID].map { .applyMusicBrainzMatch($0.payload()) }
+        let payloadByFileID: [Int64: ApplyMusicBrainzMatchPayload] = confirmedIDs.reduce(into: [:]) { accumulator, fileID in
+            if let model = rowModels[fileID] { accumulator[fileID] = model.payload() }
         }
-        guard !mutations.isEmpty else { return }
+        guard !payloadByFileID.isEmpty else { return }
+
+        // D-A: revalidate every confirmed candidate against the file on disk
+        // NOW. A review pass can stay open a long time; a file edited or
+        // replaced since its candidate was built must NOT get the stale
+        // recording/identity applied. Stale rows are excluded from the apply
+        // and surfaced (no silent drop) so the user can re-scan them.
+        let staleIDs = await autoTaggerService.staleFileIDs(for: Array(payloadByFileID.values))
+        let freshPayloadByFileID = payloadByFileID.filter { !staleIDs.contains($0.key) }
+        let appliedIDs = Set(freshPayloadByFileID.keys)
+        let mutations: [TrackMutation] = freshPayloadByFileID.values.map { .applyMusicBrainzMatch($0) }
+
+        let staleNotice = staleIDs.isEmpty
+            ? nil
+            : "\(staleIDs.count) file\(staleIDs.count == 1 ? "" : "s") changed on disk since review and \(staleIDs.count == 1 ? "was" : "were") skipped — re-scan to review the current audio."
+
+        guard !mutations.isEmpty else {
+            actionError = staleNotice
+            return
+        }
 
         let batchId = "auto-tag-\(UUID().uuidString)"
         do {
             _ = try await services.operationEngine.applyBatch(mutations, batchId: batchId)
             let appliedCount = mutations.count
-            markConfirmedApplied(confirmedIDs)
+            markConfirmedApplied(appliedIDs)
             lastResult = "Applied \(appliedCount) match\(appliedCount == 1 ? "" : "es")"
+            actionError = staleNotice
             await refreshCurrentMetadataAfterApply()
         } catch let error as OperationEngineError {
             // A committed batch whose external writes partially failed is
@@ -602,10 +622,11 @@ struct AutoTaggerView: View {
             // which would re-journal against the mutated rows and corrupt
             // undo (invariant #2).
             if case let .externalSyncIncomplete(failedBatchId, _) = error {
-                markConfirmedApplied(confirmedIDs)
+                markConfirmedApplied(appliedIDs)
                 await refreshCurrentMetadataAfterApply()
                 pendingResyncBatchId = failedBatchId
-                actionError = "Applied to the library, but some Serato/file writes didn't land. Use Re-sync to finish."
+                let base = "Applied to the library, but some Serato/file writes didn't land. Use Re-sync to finish."
+                actionError = staleNotice.map { "\(base) \($0)" } ?? base
             } else {
                 actionError = "Apply failed: \(error.localizedDescription)"
             }

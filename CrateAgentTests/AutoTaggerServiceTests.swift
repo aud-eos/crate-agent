@@ -450,6 +450,118 @@ final class AutoTaggerServiceTests: XCTestCase {
             return XCTFail("expected .strong, got \(String(describing: service.rows[fileID]))")
         }
     }
+
+    // MARK: - D-A: apply-time candidate revalidation
+
+    private func makeMatchPayload(
+        fileID: Int64,
+        expectedFileSize: Int64,
+        expectedMtime: Int64
+    ) -> ApplyMusicBrainzMatchPayload {
+        ApplyMusicBrainzMatchPayload(
+            fileID: fileID,
+            acoustID: "aid",
+            recordingMBID: "rec",
+            releaseMBID: "rel",
+            artistMBID: "art",
+            isrc: "isrc",
+            fingerprintHash: Data([0x01]),
+            expectedFileSize: expectedFileSize,
+            expectedMtime: expectedMtime,
+            artist: "A", title: "T", album: "Al", year: 1994
+        )
+    }
+
+    private func makeService(
+        database: LibraryDatabase,
+        fileFreshnessReader: @escaping FileFreshnessReading
+    ) -> AutoTaggerService {
+        AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in [] },
+            musicBrainzClient: StubMusicBrainzClient { _ in
+                XCTFail("revalidation must not hit MusicBrainz")
+                throw LookupError.transport("unreachable")
+            },
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader(),
+            fileFreshnessReader: fileFreshnessReader
+        )
+    }
+
+    /// The candidate's `expected*` snapshot is the file's ACTUAL on-disk
+    /// identity at lookup (via the freshness reader), NOT the DB-indexed
+    /// `FileRecord.fileSize`/`mtime` — otherwise D-A can never fire, since
+    /// nothing mutates the DB values in place.
+    func testCandidateCapturesOnDiskFreshnessSnapshotAtLookup() async throws {
+        let database = try makeDatabase()
+        // DB row is fileSize 1000 / mtime 0; on disk it's something else.
+        let fileID = try insertFile(
+            in: database, path: "/music/x.mp3",
+            fingerprintHashes: nil, fingerprintStatus: .pending
+        )
+        let recording = makeRecording()
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in [9, 9, 9] },
+            audioTagsReader: stubAudioTagsReader(),
+            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 7777, mtime: 8888) }
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard let candidate = service.candidate(for: fileID) else {
+            return XCTFail("expected a resolved candidate")
+        }
+        XCTAssertEqual(candidate.expectedFileSize, 7777, "expected size must be the on-disk value, not the DB 1000")
+        XCTAssertEqual(candidate.expectedMtime, 8888, "expected mtime must be the on-disk value, not the DB 0")
+    }
+
+    /// A file whose on-disk size/mtime changed between lookup and Apply is
+    /// flagged stale, so the caller excludes it from the batch.
+    func testStaleFileIDsFlagsFileChangedSinceLookup() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/edited.mp3")
+        // Current on-disk (2000, 999) differs from the lookup snapshot (1000, 0).
+        let service = makeService(database: database) { _ in
+            FileFreshnessSnapshot(fileSize: 2000, mtime: 999)
+        }
+        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
+
+        let stale = await service.staleFileIDs(for: [payload])
+        XCTAssertEqual(stale, [fileID])
+    }
+
+    /// A file whose on-disk size/mtime still match the lookup snapshot is
+    /// NOT flagged — the apply proceeds for it.
+    func testStaleFileIDsPassesUnchangedFile() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/unchanged.mp3")
+        let service = makeService(database: database) { _ in
+            FileFreshnessSnapshot(fileSize: 1000, mtime: 0)
+        }
+        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
+
+        let stale = await service.staleFileIDs(for: [payload])
+        XCTAssertTrue(stale.isEmpty)
+    }
+
+    /// A file that vanished / can't be stat'd at apply time is flagged
+    /// stale — applying a tag write to a missing file is meaningless.
+    func testStaleFileIDsFlagsMissingFile() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/gone.mp3")
+        let service = makeService(database: database) { _ in nil }
+        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
+
+        let stale = await service.staleFileIDs(for: [payload])
+        XCTAssertEqual(stale, [fileID])
+    }
 }
 
 // MARK: - Test doubles

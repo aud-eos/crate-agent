@@ -94,6 +94,22 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
     }
+
+    /// Whether any file OTHER than `excludingFileId` links to `trackId`.
+    /// The shared reference-count probe behind both the D-C collision guard
+    /// (in `applyMusicBrainzMatch`) and the reference-aware undo teardown
+    /// (in `applyRevertMusicBrainzMatch`): a fingerprint-keyed track row
+    /// (invariant #4) may be shared by FLAC+MP3 of one recording, so both
+    /// paths must know whether another file still depends on it.
+    public static func hasOtherFilesReferencingTrack(
+        _ trackId: Int64?,
+        excluding excludingFileId: Int64,
+        in db: GRDB.Database
+    ) throws -> Bool {
+        try FileRecord
+            .filter(Column("track_id") == trackId && Column("id") != excludingFileId)
+            .fetchCount(db) > 0
+    }
 }
 
 /// State of the background fingerprinting pipeline for a given file.

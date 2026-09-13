@@ -1636,17 +1636,13 @@ public actor OperationEngine {
             throw OperationEngineError.fileNotFound(fileId: payload.fileID)
         }
 
-        // D-A: the review pass can stay open indefinitely between lookup and
-        // Apply. Reject if the file's indexed identity drifted since the
-        // candidate was built — applying stale MusicBrainz identity to
-        // changed audio would mis-link a different recording. The compared
-        // values are the indexed snapshot (`FileRecord.fileSize`/`mtime`),
-        // which no flow updates after indexing without also re-fingerprinting
-        // (see D-B), so this needs no file I/O inside the transaction.
-        if fileRecord.fileSize != payload.expectedFileSize
-            || fileRecord.mtime != payload.expectedMtime {
-            throw OperationEngineError.candidateStale(fileId: payload.fileID)
-        }
+        // D-A note: apply-time candidate staleness is enforced BEFORE this
+        // transaction by `AutoTaggerService.staleFileIDs`, which re-stats the
+        // file on disk and compares to the payload's on-disk-at-lookup
+        // snapshot. It can't run here — this closure is inside the writer
+        // transaction and must not do file I/O — and a DB-vs-DB comparison
+        // would be a no-op anyway (nothing mutates `files.fileSize`/`mtime`
+        // after indexing; see D-B).
 
         // Snapshot the file's Serato metadata + track link before
         // mutating, so the inverse can restore them exactly.
@@ -1683,9 +1679,9 @@ public actor OperationEngine {
             // collision from a re-match.
             if let existingRecordingMBID = existingTrack.musicbrainzRecordingId,
                existingRecordingMBID != payload.recordingMBID {
-                let otherFilesReferenceRow = try FileRecord
-                    .filter(Column("track_id") == existingTrack.id && Column("id") != payload.fileID)
-                    .fetchCount(db) > 0
+                let otherFilesReferenceRow = try FileRecord.hasOtherFilesReferencingTrack(
+                    existingTrack.id, excluding: payload.fileID, in: db
+                )
                 if otherFilesReferenceRow {
                     throw OperationEngineError.fingerprintRecordingConflict(
                         fileId: payload.fileID,
@@ -1831,9 +1827,9 @@ public actor OperationEngine {
             // predicate gates both teardown (created row) and restore
             // (pre-existing row); the file itself has already been
             // unlinked above.
-            let otherFilesReferenceRow = try FileRecord
-                .filter(Column("track_id") == track.id && Column("id") != applied.fileID)
-                .fetchCount(db) > 0
+            let otherFilesReferenceRow = try FileRecord.hasOtherFilesReferencingTrack(
+                track.id, excluding: applied.fileID, in: db
+            )
             let forwardIdentityStillOnRow =
                 track.acoustidId == applied.acoustID
                 && track.musicbrainzRecordingId == applied.recordingMBID
@@ -2114,12 +2110,15 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public let artistMBID: String?
     public let isrc: String?
     public let fingerprintHash: Data
-    /// The file's indexed identity (`FileRecord.fileSize`/`mtime`) as seen
-    /// when the candidate was built at lookup time. Re-checked against the
-    /// current `files` row at apply time; a mismatch means the file was
-    /// replaced or edited since review, so the apply is rejected before any
-    /// mutation rather than linking stale identity to changed audio
-    /// (finding D-A).
+    /// The file's ACTUAL on-disk identity (`fileSize`/`mtime`, read via the
+    /// freshness stat — NOT the DB-indexed `FileRecord` values, which no
+    /// in-place edit updates) as seen when the candidate was built at lookup
+    /// time. `AutoTaggerService.staleFileIDs` re-stats the file just before
+    /// Apply and compares to these; a mismatch means the file was replaced
+    /// or edited since review, so that row is excluded from the batch rather
+    /// than linking stale identity to changed audio (finding D-A). The
+    /// engine can't do that stat inside its write transaction, so the guard
+    /// runs in the async apply path, not here.
     public let expectedFileSize: Int64
     public let expectedMtime: Int64
     // Cherry-picked display fields — absent (nil) means not applied:
@@ -2518,12 +2517,6 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case batchNotFound(batchId: String)
     case undoNotSupported(eventType: EventType)
     case missingPreviousTrackIdentifiers(fileId: Int64)
-    /// The reviewed candidate was built against a file whose indexed
-    /// identity (`fileSize`/`mtime`) no longer matches at apply time — the
-    /// file was replaced or edited between lookup and Apply. Rejected
-    /// before any mutation so stale MusicBrainz identity is never linked to
-    /// changed audio (finding D-A). The row must be re-scanned.
-    case candidateStale(fileId: Int64)
     /// A 120s-capped Chromaprint fingerprint collided across two DIFFERENT
     /// recordings: an existing `tracks` row for this fingerprint already
     /// carries a non-nil recording MBID that other files depend on, and the
@@ -2561,8 +2554,6 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Events of type \(eventType.rawValue) can't be undone yet."
         case .missingPreviousTrackIdentifiers(let fileId):
             return "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
-        case .candidateStale(let fileId):
-            return "The reviewed match for file id \(fileId) is stale: the file changed on disk since it was scanned. Re-scan the file and review again."
         case .fingerprintRecordingConflict(let fileId, let existingMBID, let incomingMBID):
             return "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case .externalSyncIncomplete(let batchId, let underlying):
