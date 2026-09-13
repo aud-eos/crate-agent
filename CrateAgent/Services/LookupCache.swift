@@ -129,6 +129,6 @@ private final class MemoryLookupCacheBackend: LookupCacheBackend, @unchecked Sen
     }
 
     func remove(forKey key: String) {
-        lock.withLock { storage.removeValue(forKey: key) }
+        lock.withLock { _ = storage.removeValue(forKey: key) }
     }
 }
