@@ -88,11 +88,16 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     /// whether it has a replayable Serato projection.
     public var hasReplayableSeratoProjection: Bool {
         switch self {
-        case .fileRenamed, .musicBrainzMatchApplied, .metadataCommittedToSerato, .fileTagsWritten:
+        case .fileRenamed, .musicBrainzMatchApplied, .metadataCommittedToSerato,
+             .fileTagsWritten, .musicBrainzMatchReverted:
+            // `musicBrainzMatchReverted` is replayable too: an undo commits its
+            // SQLite revert + event before the audio-tag restore write, so if
+            // that write throws mid-`undoBatch` the file/Serato keep the applied
+            // metadata with no recovery unless the reverted event can be
+            // re-synced (finding #3999974011).
             return true
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates,
-             .musicBrainzMatchReverted:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates:
             return false
         }
     }

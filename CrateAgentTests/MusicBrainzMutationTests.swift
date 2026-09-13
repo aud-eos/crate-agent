@@ -691,6 +691,53 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// A SINGLE batch containing two files that share a fingerprint+recording
+    /// but pick different releases must stay undoable (finding #3999974010).
+    /// `undoBatch` reverts newest-first, so file2's inverse unlinks it before
+    /// file1's inverse runs — dropping the reference count. The undo guard must
+    /// key on the RECORDING (unchanged: recA) and not throw on the sibling's
+    /// release drift, or the whole batch becomes permanently non-undoable.
+    func testUndoOfSingleBatchMultiReleaseDuplicatesSucceeds() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // One batch: file1 -> recA/rel1 (creates the row), file2 -> recA/rel2
+        // (adopts it, drifting releaseMBID to rel2).
+        _ = try await engine.applyBatch(
+            [
+                .applyMusicBrainzMatch(fullPayload(
+                    fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel1"
+                )),
+                .applyMusicBrainzMatch(fullPayload(
+                    fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel2"
+                )),
+            ],
+            batchId: "dup"
+        )
+
+        // Must NOT throw despite the sibling's release drift + newest-first order.
+        try await engine.undoBatch("dup")
+
+        try await database.writer.read { db in
+            XCTAssertNil(try FileRecord.fetchOne(db, key: file1)!.trackId, "file1 unlinked by undo")
+            XCTAssertNil(try FileRecord.fetchOne(db, key: file2)!.trackId, "file2 unlinked by undo")
+        }
+    }
+
     // MARK: - Identity-only confirm schedules no audio-tag write (#3999114458)
 
     /// When the user keeps every display field (artist/title/album/year all

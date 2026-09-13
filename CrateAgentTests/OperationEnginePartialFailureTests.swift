@@ -280,6 +280,65 @@ final class OperationEnginePartialFailureTests: XCTestCase {
                        "committed metadata present in database V2 after the batch + resync")
     }
 
+    // MARK: - #3999974013: resync must not replay a superseded (undone) batch
+
+    /// After a batch is undone, re-syncing that ORIGINAL batch must not replay
+    /// its forward writes — they'd resurrect the reverted artist/title/album/
+    /// year over the current (reverted) state. Its applied events are
+    /// superseded by the later revert events on the same files.
+    func testResyncOfUndoneBatchSkipsSupersededForwardWrites() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, _, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let batchId = "auto-tag-then-undone"
+        _ = try await engine.applyBatch(matchMutations(fileIds: fileIds), batchId: batchId)
+        _ = try await engine.undoBatch(batchId)
+        let writesAfterUndo = tagWriter.writtenPaths.count
+
+        let outcome = try await engine.resyncSeratoForBatch(batchId)
+        XCTAssertEqual(outcome.appliedCount, 0, "superseded forward writes are skipped")
+        XCTAssertEqual(outcome.queuedCount, 0)
+        XCTAssertEqual(
+            tagWriter.writtenPaths.count, writesAfterUndo,
+            "no stale forward tag write is replayed for an undone batch"
+        )
+    }
+
+    // MARK: - #3999974011: a failed undo restore write is recoverable via resync
+
+    /// If a tag-restore write throws partway through `undoBatch`, the SQLite
+    /// revert and its `.musicBrainzMatchReverted` event are already committed;
+    /// re-syncing the UNDO batch must replay the missing restore write, so the
+    /// file/Serato don't stay stuck with the applied metadata.
+    func testUndoRestoreWriteFailureIsRecoverableByResyncingUndoBatch() async throws {
+        let tagWriter = ThrowingTagWriter()
+        let (engine, _, _, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let batchId = "auto-tag-recoverable-undo"
+        // Apply one match — its file-tag write is call #1 and lands.
+        _ = try await engine.applyBatch(matchMutations(fileIds: [fileIds[0]]), batchId: batchId)
+
+        // Fail the undo's restore file-tag write (call #2).
+        tagWriter.throwOnCall = 2
+        var undoBatchId: String?
+        do {
+            undoBatchId = try await engine.undoBatch(batchId)
+            XCTFail("expected the undo restore write to throw after the DB revert committed")
+        } catch let OperationEngineError.externalSyncIncomplete(failedBatchId, _) {
+            undoBatchId = failedBatchId
+        }
+        let resolvedUndoBatchId = try XCTUnwrap(undoBatchId)
+
+        // Recovery: the reverted event is replayable, so re-syncing the undo
+        // batch lands the restore write that failed mid-undo.
+        tagWriter.throwOnCall = nil
+        let outcome = try await engine.resyncSeratoForBatch(resolvedUndoBatchId)
+        XCTAssertEqual(outcome.appliedCount, 1, "the reverted event's restore write is replayed")
+        XCTAssertEqual(outcome.queuedCount, 0)
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {

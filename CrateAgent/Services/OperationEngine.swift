@@ -331,10 +331,25 @@ public actor OperationEngine {
             }
         }
 
+        // Skip a metadata-projecting event that a LATER such event on the same
+        // file has superseded — the batch was undone, or the file was
+        // re-matched since. Replaying it would write the file's OLD
+        // artist/title/album/year over the current state (finding #3999974013).
+        // "Latest wins" is scoped to the file-metadata-projecting types; a
+        // rename (path-only) never supersedes a match's metadata.
+        let latestMetadataEventIdByFile = try await latestFileMetadataEventIds(for: events)
+
         var writes: [SeratoPendingWrite] = []
         var replayedEventCount = 0
         let decoder = JSONDecoder()
         for event in events {
+            if Self.fileMetadataProjectingEventTypes.contains(event.eventType),
+               let fileId = event.fileId,
+               let thisEventId = event.eventId,
+               let latest = latestMetadataEventIdByFile[fileId],
+               thisEventId < latest {
+                continue
+            }
             let reconstructed = Self.resyncWrites(
                 for: event, pathByFileId: pathByFileId, decoder: decoder
             )
@@ -346,17 +361,57 @@ public actor OperationEngine {
         return (writes, replayedEventCount)
     }
 
+    /// Event types that project the SAME file-metadata fields (artist/title/
+    /// album/year) onto Serato + the audio tag. Only the latest such event for
+    /// a file reflects the file's current metadata, so resync replays only the
+    /// latest and skips earlier (superseded) ones. Renames are excluded — they
+    /// change the path, not the metadata.
+    private static let fileMetadataProjectingEventTypes: Set<EventType> = [
+        .musicBrainzMatchApplied, .musicBrainzMatchReverted,
+        .metadataCommittedToSerato, .fileTagsWritten,
+    ]
+
+    /// For each file referenced by a metadata-projecting event in `events`,
+    /// the MAX `event_id` among ALL metadata-projecting events for that file
+    /// (across every batch) — i.e. the event that reflects the file's current
+    /// metadata. Used to drop superseded events from a resync replay.
+    private func latestFileMetadataEventIds(for events: [EventRecord]) async throws -> [Int64: Int64] {
+        let fileIds = Array(Set(events.compactMap { event -> Int64? in
+            Self.fileMetadataProjectingEventTypes.contains(event.eventType) ? event.fileId : nil
+        }))
+        guard !fileIds.isEmpty else { return [:] }
+        let typeValues = Self.fileMetadataProjectingEventTypes.map(\.rawValue)
+
+        struct LatestRow: FetchableRecord, Decodable {
+            let fileId: Int64
+            let latest: Int64
+        }
+        let sql = """
+            SELECT file_id AS fileId, MAX(event_id) AS latest
+            FROM events
+            WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
+              AND event_type IN (\(databaseQuestionMarks(count: typeValues.count)))
+            GROUP BY file_id
+            """
+        let arguments = StatementArguments(fileIds) + StatementArguments(typeValues)
+        return try await database.writer.read { db in
+            try LatestRow.fetchAll(db, sql: sql, arguments: arguments)
+                .reduce(into: [Int64: Int64]()) { $0[$1.fileId] = $1.latest }
+        }
+    }
+
     /// Whether an event's Serato writes are reconstructed against the
     /// file's CURRENT path (looked up in the DB) rather than paths
     /// carried in the event's own payload. Renames carry both paths, so
     /// they don't need the lookup; every other replayable type does.
     private static func eventNeedsCurrentFilePath(_ eventType: EventType) -> Bool {
         switch eventType {
-        case .musicBrainzMatchApplied, .metadataCommittedToSerato, .fileTagsWritten:
+        case .musicBrainzMatchApplied, .metadataCommittedToSerato, .fileTagsWritten,
+             .musicBrainzMatchReverted:
             return true
         case .fileRenamed, .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .musicBrainzMatchReverted:
+             .fileRemovedFromCrates:
             return false
         }
     }
@@ -365,12 +420,13 @@ public actor OperationEngine {
     /// The single "event → pending Serato writes" mapping every replay
     /// flows through — `resyncSeratoForBatch` then routes the result
     /// through the shared `applyConsecutiveSeratoWrites` coalescing path
-    /// (invariant #3 guard, idempotent, no re-journaling). Covers the
-    /// four event types that project onto Serato/audio-tag writes:
-    /// `fileRenamed`, `musicBrainzMatchApplied`, `metadataCommittedToSerato`,
-    /// `fileTagsWritten`. Empty for event types with no replayable Serato
-    /// projection (or when the source data needed to rebuild the write is
-    /// missing).
+    /// (invariant #3 guard, idempotent, no re-journaling). Covers the five
+    /// event types that project onto Serato/audio-tag writes: `fileRenamed`,
+    /// `musicBrainzMatchApplied`, `metadataCommittedToSerato`, `fileTagsWritten`,
+    /// and `musicBrainzMatchReverted` (which re-emits an undo's restore writes).
+    /// Empty for event types with no replayable Serato projection (or when the
+    /// source data needed to rebuild the write is missing). Kept in sync with
+    /// `EventType.hasReplayableSeratoProjection`.
     private static func resyncWrites(
         for event: EventRecord,
         pathByFileId: [Int64: String],
@@ -429,9 +485,19 @@ public actor OperationEngine {
             return [.fileTagWrite(SeratoPendingFileTagWrite(
                 absolutePath: absolutePath, metadata: payload.metadata
             ))]
+        case .musicBrainzMatchReverted:
+            // Re-emit the RESTORE writes an undo produced, so a tag restore
+            // that failed mid-`undoBatch` has a recovery path (#3999974011).
+            // The event's forward payload IS the RevertMusicBrainzMatchPayload;
+            // its `.applied` carries the captured pre-match tags to restore.
+            guard let payload = try? decoder.decode(
+                RevertMusicBrainzMatchPayload.self, from: forwardJsonData
+            ) else { return [] }
+            guard let fileId = event.fileId,
+                  let absolutePath = pathByFileId[fileId] else { return [] }
+            return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates,
-             .musicBrainzMatchReverted:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates:
             return []
         }
     }
@@ -1839,30 +1905,40 @@ public actor OperationEngine {
                 && row.musicbrainzArtistId == applied.artistMBID
                 && row.isrc == applied.isrc
         } ?? false
+        let forwardRecordingStillOnRow = track.map { row in
+            row.musicbrainzRecordingId == applied.recordingMBID
+        } ?? false
         let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
 
         // Out-of-order undo guard. A's forward matched this file to a
-        // recording on the fingerprint-keyed row. True supersession is: the
-        // row still exists, no longer carries A's exact identity, AND no other
-        // file references it — meaning a LATER batch re-matched THIS SAME file
-        // (files keep their fingerprint across a re-match) to a different
+        // *recording* on the fingerprint-keyed row. True supersession is: the
+        // row still exists, its RECORDING is no longer A's, AND no other file
+        // references it — meaning a LATER batch re-matched THIS SAME file
+        // (files keep their fingerprint across a re-match) to a DIFFERENT
         // recording. Undoing A then would relink the file away from the newer
         // match, restore A's stale DB metadata, and rewrite the audio tags —
         // corrupting the current match. Reject loudly: batch undo is atomic,
         // so throwing here rolls the whole undo back with nothing half-applied,
         // and History surfaces it so the user undoes the newer match first.
         //
-        // The `!otherFilesReferenceRow` clause is load-bearing: identity fields
-        // are cherry-picked per file, so a sibling (FLAC+MP3 of ONE recording)
-        // matched to a different RELEASE legitimately drifts the row's
-        // `releaseMBID`/`artistMBID`/`isrc` without any re-match of this file —
-        // that is not supersession, and it must still undo. And the apply-side
-        // D-C guard already rejects re-matching to a different RECORDING while
-        // another file references the row, so a drifted-identity row that is
-        // still referenced can only be a same-recording sibling, never a real
-        // supersession. When another file references it, the shared row is
-        // left intact by `thisForwardStillSolelyOwnsRow` below.
-        if track != nil, !forwardIdentityStillOnRow, !otherFilesReferenceRow {
+        // The guard keys on the RECORDING, not the full identity, and on the
+        // reference count — both load-bearing:
+        //  - Release/artist/isrc are cherry-picked per file, so a sibling
+        //    (FLAC+MP3 of ONE recording) matched to a different RELEASE
+        //    legitimately drifts those secondary fields with the recording
+        //    unchanged; that is not supersession and must still undo. Keying
+        //    on full identity here wrongly rejected such undos — and because
+        //    `undoBatch` reverts a batch newest-first, a sibling's own event
+        //    unlinks it *before* this earlier event runs, dropping the
+        //    reference and (under the old full-identity check) making a legit
+        //    same-batch multi-release-duplicate batch permanently non-undoable
+        //    (finding #3999974010).
+        //  - The apply-side D-C guard already rejects re-matching to a
+        //    different RECORDING while another file references the row, so a
+        //    recording-drifted row that is still referenced can't arise; the
+        //    reference clause keeps a shared row (protected below by
+        //    `thisForwardStillSolelyOwnsRow`) from ever tripping the throw.
+        if track != nil, !forwardRecordingStillOnRow, !otherFilesReferenceRow {
             throw OperationEngineError.undoSupersededByLaterMatch(fileId: applied.fileID)
         }
 
@@ -1943,25 +2019,35 @@ public actor OperationEngine {
             in: db
         )
 
-        // Restore the audio file's tags to their exact pre-match values.
-        // For every text field the forward actually wrote, undo must
-        // rewrite it: to its captured pre-match value, or — when that was
-        // absent — an empty string so the Rust writer *clears* it (nil
-        // would leave the just-applied value in place).
+        let seratoWrites = Self.musicBrainzRevertSeratoWrites(applied: applied, absolutePath: fileRecord.path)
+        return (eventId, seratoWrites)
+    }
+
+    /// The Serato/audio-tag writes that REVERT a MusicBrainz match: restore the
+    /// audio file's tags to their exact pre-match values. For every text field
+    /// the forward actually wrote, undo must rewrite it — to its captured
+    /// pre-match value, or (when that was absent) an empty string so the Rust
+    /// writer *clears* it; `nil` would leave the just-applied value in place.
+    /// Year rides only on the file tag: restore the file's real pre-match year,
+    /// or clear the frame outright if the match added one where none existed.
+    ///
+    /// Shared by `applyRevertMusicBrainzMatch` (undo) and `resyncWrites` (so a
+    /// reverted event whose external restore write failed mid-undo can be
+    /// re-synced — finding #3999974011).
+    private static func musicBrainzRevertSeratoWrites(
+        applied: ApplyMusicBrainzMatchPayload,
+        absolutePath: String
+    ) -> [SeratoPendingWrite] {
         let restoredTags = applied.previousFileTags ?? applied.previousMetadata ?? .empty
         let forwardWroteYear = applied.year != nil
-        let seratoWrites = musicBrainzSeratoWrites(
-            absolutePath: fileRecord.path,
+        return musicBrainzSeratoWrites(
+            absolutePath: absolutePath,
             artist: applied.artist != nil ? (restoredTags.artist ?? "") : nil,
             title: applied.title != nil ? (restoredTags.title ?? "") : nil,
             album: applied.album != nil ? (restoredTags.album ?? "") : nil,
-            // Year rides only on the file tag. Restore the file's real
-            // pre-match year; if the match added one where none existed
-            // (previousFileYear == nil), clear the frame outright.
             year: forwardWroteYear ? applied.previousFileYear : nil,
             clearFileYear: forwardWroteYear && applied.previousFileYear == nil
         )
-        return (eventId, seratoWrites)
     }
 
     private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(

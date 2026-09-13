@@ -79,6 +79,7 @@ public enum EventHistoryQuery {
             try Row.fetchAll(db, sql: sql, arguments: [limit])
         }
 
+        let allBatchIds = Set(rows.map(\.batchId))
         return rows.map { row in
             let typeList = row.eventTypes.split(separator: ",").map(String.init)
             let typeCounts = countOccurrences(in: typeList)
@@ -90,8 +91,19 @@ public enum EventHistoryQuery {
                 canUndo: canUndoBatch(typeList: typeList),
                 isUndoBatch: row.batchId.hasPrefix("undo:"),
                 canResync: canResyncBatch(typeList: typeList)
+                    && !batchHasBeenUndone(row.batchId, allBatchIds: allBatchIds)
             )
         }
+    }
+
+    /// A batch has been undone when an `undo:<batchId>:<uuid>` batch exists for
+    /// it. Offering Re-sync on such a batch would replay its old forward writes
+    /// over the reverted state (finding #3999974013), so it's not eligible. The
+    /// undo batch itself remains eligible — that's how a failed tag-restore mid-
+    /// undo is recovered.
+    static func batchHasBeenUndone(_ batchId: String, allBatchIds: Set<String>) -> Bool {
+        let undoPrefix = "undo:\(batchId):"
+        return allBatchIds.contains { $0.hasPrefix(undoPrefix) }
     }
 
     // MARK: - Pure derivations (extracted for testing)
