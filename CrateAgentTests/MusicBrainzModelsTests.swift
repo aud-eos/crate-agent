@@ -112,6 +112,7 @@ final class MusicBrainzModelsTests: XCTestCase {
             acoustID: "9ff43b6a-4f16-427c-93c2-92307ca505e0",
             recordingMBID: "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10",
             artistMBID: "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c",
+            fingerprintHash: Data([0x01, 0x02, 0x03, 0x04]),
             chosenRelease: releaseA,
             availableReleases: [releaseA, releaseB],
             releaseMBID: releaseA.id,

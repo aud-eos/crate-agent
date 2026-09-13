@@ -216,6 +216,12 @@ struct MatchCandidate: Equatable {
     let acoustID: String?
     let recordingMBID: String
     let artistMBID: String?
+    /// SHA-256 of the file's stored Chromaprint fingerprint bytes — the
+    /// value `ApplyMusicBrainzMatchPayload.fingerprintHash` needs to key
+    /// the canonical `tracks` row (invariant #4). Computed once by
+    /// `AutoTaggerService` alongside the rest of the candidate so the
+    /// review UI never has to re-derive it.
+    let fingerprintHash: Data
     /// Mutable so "pick a different release" can update it without
     /// re-resolving the whole candidate.
     var chosenRelease: MBRelease

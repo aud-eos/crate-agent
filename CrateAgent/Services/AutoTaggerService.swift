@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import GRDB
 
@@ -191,6 +192,7 @@ final class AutoTaggerService: ObservableObject {
             acoustID: topResult.id,
             recordingMBID: recordingMBID,
             artistMBID: artistCredit?.artist.id,
+            fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             releaseMBID: chosenRelease.id,

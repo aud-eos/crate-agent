@@ -11,6 +11,7 @@ struct MainWindowView: View {
         case library
         case organize
         case cleanup
+        case autoTag
         case history
 
         var id: String { rawValue }
@@ -20,6 +21,7 @@ struct MainWindowView: View {
             case .library:   return "Library"
             case .organize:  return "Organize"
             case .cleanup:   return "Library Cleanup"
+            case .autoTag:   return "Auto-Tag"
             case .history:   return "History"
             }
         }
@@ -29,6 +31,7 @@ struct MainWindowView: View {
             case .library:   return "music.note.list"
             case .organize:  return "folder.badge.gearshape"
             case .cleanup:   return "sparkles"
+            case .autoTag:   return "wand.and.stars"
             case .history:   return "clock.arrow.circlepath"
             }
         }
@@ -68,6 +71,8 @@ struct MainWindowView: View {
             OrganizeView()
         case .cleanup:
             LibraryHygieneView()
+        case .autoTag:
+            AutoTaggerView(autoTaggerService: services.autoTaggerService)
         case .history:
             HistoryView()
         }
