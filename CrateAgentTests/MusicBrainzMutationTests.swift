@@ -777,6 +777,68 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// LIFO undo of TWO batches that both adopted a pre-existing shared row must
+    /// fully restore it. On the second undo the row is already unlinked and back
+    /// at the first batch's identity, but the latest `musicBrainzMatchApplied`
+    /// still points at the (now-reverted) later file — so the latest-matcher
+    /// test alone would wrongly block restoration. The sole-owner fallback
+    /// covers it (finding #4000261456 review).
+    func testLifoUndoOfTwoAdoptersFullyRestoresPreexistingRow() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // Pre-existing row (recX/relX), not linked to either file, so BOTH
+        // matches take the existing-row branch (createdTrackRow == false).
+        try await database.writer.write { db in
+            var track = TrackRecord(
+                fingerprintHash: fingerprint, musicbrainzRecordingId: "recX",
+                musicbrainzReleaseId: "relX", artist: "X"
+            )
+            try track.insert(db)
+        }
+
+        // Batch A: file1 → recA/rel1 (previous = recX/relX).
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel1"
+            )),
+            batchId: "batchA"
+        )
+        // Batch B: file2 → recA/rel2 (previous = recA/rel1).
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel2"
+            )),
+            batchId: "batchB"
+        )
+
+        // LIFO: undo B, then A.
+        try await engine.undoBatch("batchB")
+        try await engine.undoBatch("batchA")
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(track.musicbrainzRecordingId, "recX", "fully undone → row back at the pre-existing recording")
+            XCTAssertEqual(track.musicbrainzReleaseId, "relX", "fully undone → row back at the pre-existing release")
+            XCTAssertNil(try FileRecord.fetchOne(db, key: file1)!.trackId)
+            XCTAssertNil(try FileRecord.fetchOne(db, key: file2)!.trackId)
+        }
+    }
+
     /// A sibling (FLAC+MP3 of ONE recording) matched to a DIFFERENT release
     /// drifts the shared row's `releaseMBID` — but that is NOT a supersession
     /// of the first file's match, so undoing the older batch must SUCCEED

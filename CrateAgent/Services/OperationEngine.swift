@@ -2059,9 +2059,19 @@ public actor OperationEngine {
                 // later batch relies on; leave the row alone in that case. An
                 // OLDER file that merely still references the row does NOT block
                 // restoration — its state is precisely what `previous` restores
-                // (finding #4000261456). Falls back to the sole-owner gate when
-                // the track has no match event to rank by.
-                if thisFileIsRowLatestMatcher ?? thisForwardStillSolelyOwnsRow {
+                // (finding #4000261456).
+                //
+                // OR-ed with the original sole-owner gate so a LIFO undo of two
+                // batches that both adopted a pre-existing row still restores on
+                // the SECOND undo: after the later batch is undone the row is
+                // unlinked and back at this forward's identity, but the latest
+                // `musicBrainzMatchApplied` still points at the (now-reverted)
+                // later file, so the latest-matcher test alone would wrongly
+                // block it. `thisForwardStillSolelyOwnsRow` (no surviving
+                // reference AND identity intact) safely covers that case and
+                // can't fire while a later owner is live, so it never
+                // reintroduces the clobber it originally guarded against.
+                if thisFileIsRowLatestMatcher == true || thisForwardStillSolelyOwnsRow {
                     track.acoustidId = previous.acoustID
                     track.musicbrainzRecordingId = previous.recordingMBID
                     track.musicbrainzReleaseId = previous.releaseMBID
