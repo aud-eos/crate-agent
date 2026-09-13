@@ -15,13 +15,22 @@ enum FingerprintPersistence {
     ///   basis columns untouched — callers that don't have the file's current
     ///   stat (or are clearing a failed fingerprint) fall back to
     ///   `file_size`/`mtime`.
+    /// - Parameter requirePendingStatus: when true the write only lands if the
+    ///   row is still `pending`. The background `FingerprintWorker` passes true
+    ///   so a flush that completes AFTER `AutoTaggerService` has already
+    ///   fingerprinted the same file on demand (a newer `.done` result, whose
+    ///   basis is up to date) does not clobber it with the worker's older bytes
+    ///   and a stale/absent basis (finding #4000806487). The on-demand path
+    ///   leaves it false — it is the authoritative recompute.
     static func write(
         fileID: Int64,
         fingerprint: Data?,
         status: FingerprintStatus,
         freshnessBasis: FileFreshnessSnapshot? = nil,
+        requirePendingStatus: Bool = false,
         in db: Database
     ) throws {
+        let pendingGuard = requirePendingStatus ? " AND fingerprint_status = 'pending'" : ""
         if let basis = freshnessBasis {
             try db.execute(
                 sql: """
@@ -30,7 +39,7 @@ enum FingerprintPersistence {
                     fingerprint_status = ?,
                     fingerprinted_size = ?,
                     fingerprinted_mtime = ?
-                WHERE id = ?
+                WHERE id = ?\(pendingGuard)
                 """,
                 arguments: [fingerprint, status.rawValue, basis.fileSize, basis.mtime, fileID]
             )
@@ -40,7 +49,7 @@ enum FingerprintPersistence {
                 UPDATE files
                 SET chromaprint_fingerprint = ?,
                     fingerprint_status = ?
-                WHERE id = ?
+                WHERE id = ?\(pendingGuard)
                 """,
                 arguments: [fingerprint, status.rawValue, fileID]
             )

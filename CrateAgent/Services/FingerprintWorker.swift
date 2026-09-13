@@ -250,8 +250,12 @@ public actor FingerprintWorker {
                 // already had a fingerprint in the DB. No decode work
                 // was needed; just write the same hash to this row.
                 for entry in plan.toCopyFromExistingTwin {
+                    // requirePendingStatus: don't clobber a newer on-demand
+                    // fingerprint the auto-tagger may have written for this row
+                    // since it was claimed (finding #4000806487).
                     try FingerprintPersistence.write(
-                        fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done, in: db
+                        fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done,
+                        requirePendingStatus: true, in: db
                     )
                 }
 
@@ -266,11 +270,18 @@ public actor FingerprintWorker {
                         case .failure: return (nil, .failed)
                         }
                     }()
-                    // Apply to the representative.
-                    try FingerprintPersistence.write(fileID: result.fileId, fingerprint: hash, status: status, in: db)
+                    // Apply to the representative (only while still pending, so a
+                    // newer on-demand fingerprint isn't overwritten — #4000806487).
+                    try FingerprintPersistence.write(
+                        fileID: result.fileId, fingerprint: hash, status: status,
+                        requirePendingStatus: true, in: db
+                    )
                     // Propagate to siblings.
                     for siblingId in assignment.siblingIds {
-                        try FingerprintPersistence.write(fileID: siblingId, fingerprint: hash, status: status, in: db)
+                        try FingerprintPersistence.write(
+                            fileID: siblingId, fingerprint: hash, status: status,
+                            requirePendingStatus: true, in: db
+                        )
                     }
                 }
             }
