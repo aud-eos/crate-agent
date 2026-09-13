@@ -33,6 +33,21 @@ struct AutoTagRowModel {
     var includeYear: Bool
     var titleChoice: TitleChoice
 
+    /// Set the first time the user (rather than `init`'s own automatic
+    /// default) flips the album toggle — see the `includeAlbum` binding in
+    /// `AutoTagReviewRow`, the only place this is set to `true`. Once true,
+    /// a later `selectRelease` call must leave the user's choice alone
+    /// (rather than recomputing `includeAlbum` from the newly-picked
+    /// release) — see `selectRelease`.
+    private(set) var didUserOverrideAlbum = false
+
+    /// Marks the album toggle as user-overridden — called from the
+    /// `includeAlbum` binding's `set` in `AutoTagReviewRow` whenever the
+    /// user (not `init` or `selectRelease`'s automatic default) flips it.
+    mutating func markAlbumToggleUserOverridden() {
+        didUserOverrideAlbum = true
+    }
+
     init(
         candidate: MatchCandidate,
         currentArtist: String,
@@ -72,9 +87,20 @@ struct AutoTagRowModel {
     /// Updates the chosen release (and the album it proposes) without
     /// re-resolving the rest of the candidate — mirrors
     /// `MatchCandidate.chosenRelease`'s "follows chosenRelease" contract.
+    ///
+    /// Also recomputes `includeAlbum`'s automatic default against the
+    /// newly-picked release's title — unless the user has explicitly
+    /// overridden the toggle (`didUserOverrideAlbum`), in which case their
+    /// choice is left alone even as they keep browsing releases. Without
+    /// this, a release picked after the toggle's initial "titles matched,
+    /// default off" resolution would silently write `album: nil` despite
+    /// the user explicitly choosing a different release.
     mutating func selectRelease(_ release: MBRelease) {
         candidate.chosenRelease = release
         candidate.proposedAlbum = release.title
+        if !didUserOverrideAlbum {
+            includeAlbum = release.title != currentAlbum
+        }
     }
 
     /// Assembles the mutation payload: identity fields are always
@@ -115,12 +141,26 @@ struct AutoTagReviewRow: View {
 
     @State private var showReleasePicker: Bool = false
 
+    /// Unlike the plain `$model.includeAlbum` binding, flipping this marks
+    /// the toggle user-overridden — so a later `selectRelease` (picking a
+    /// different release from `releaseDisclosure`) leaves the user's
+    /// explicit choice alone instead of recomputing its automatic default.
+    private var albumIncludeBinding: Binding<Bool> {
+        Binding(
+            get: { model.includeAlbum },
+            set: { newValue in
+                model.includeAlbum = newValue
+                model.markAlbumToggleUserOverridden()
+            }
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
             fieldDiff(name: "Artist", current: model.currentArtist, proposed: model.candidate.proposedArtist, include: $model.includeArtist)
             titleRow
-            fieldDiff(name: "Album", current: model.currentAlbum, proposed: model.candidate.proposedAlbum, include: $model.includeAlbum)
+            fieldDiff(name: "Album", current: model.currentAlbum, proposed: model.candidate.proposedAlbum, include: albumIncludeBinding)
             if model.candidate.proposedYear != nil {
                 fieldDiff(
                     name: "Year",

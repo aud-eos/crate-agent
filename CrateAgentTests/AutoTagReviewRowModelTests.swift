@@ -190,6 +190,68 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         XCTAssertEqual(model.payload().releaseMBID, "release-b")
     }
 
+    // MARK: - B3: selecting a release recomputes the automatic album default
+
+    /// The default release's title equals `currentAlbum`, so `includeAlbum`
+    /// starts `false` (nothing to change). Picking a *different* release
+    /// whose title differs from `currentAlbum` must flip `includeAlbum` on
+    /// — otherwise `payload().album` stays `nil` despite the user
+    /// explicitly choosing that release.
+    func testSelectingDifferentReleaseRecomputesIncludeAlbumWhenNotOverridden() {
+        let currentAlbum = "Current Album"
+        let defaultRelease = makeRelease(id: "release-a", title: currentAlbum)
+        let otherRelease = makeRelease(id: "release-b", title: "A Different Album")
+        let candidate = makeCandidate(
+            proposedAlbum: currentAlbum,
+            chosenRelease: defaultRelease,
+            availableReleases: [defaultRelease, otherRelease]
+        )
+        var model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Artist",
+            currentTitle: "Title",
+            currentAlbum: currentAlbum,
+            currentYear: nil
+        )
+        XCTAssertFalse(model.includeAlbum, "default release's title matches current album — starts off")
+
+        model.selectRelease(otherRelease)
+
+        XCTAssertTrue(model.includeAlbum, "a different release's title should turn the automatic default on")
+        XCTAssertEqual(model.payload().album, "A Different Album")
+    }
+
+    /// Once the user has manually flipped the album toggle, a later
+    /// `selectRelease` (browsing releases in the disclosure) must leave
+    /// their choice alone rather than recomputing the automatic default.
+    func testSelectingDifferentReleaseLeavesUserOverriddenToggleAlone() {
+        let currentAlbum = "Current Album"
+        let defaultRelease = makeRelease(id: "release-a", title: currentAlbum)
+        let otherRelease = makeRelease(id: "release-b", title: "A Different Album")
+        let candidate = makeCandidate(
+            proposedAlbum: currentAlbum,
+            chosenRelease: defaultRelease,
+            availableReleases: [defaultRelease, otherRelease]
+        )
+        var model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Artist",
+            currentTitle: "Title",
+            currentAlbum: currentAlbum,
+            currentYear: nil
+        )
+
+        // Simulate the user manually turning the toggle off (as the view's
+        // binding does via markAlbumToggleUserOverridden()).
+        model.includeAlbum = false
+        model.markAlbumToggleUserOverridden()
+
+        model.selectRelease(otherRelease)
+
+        XCTAssertFalse(model.includeAlbum, "a user override must survive selecting a different release")
+        XCTAssertNil(model.payload().album)
+    }
+
     // MARK: - No proposed year
 
     func testNoProposedYearNeverIncludesYear() {
