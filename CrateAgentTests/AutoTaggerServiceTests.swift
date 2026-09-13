@@ -201,8 +201,17 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         let fatalMessage = try XCTUnwrap(service.fatalError)
         XCTAssertTrue(fatalMessage.lowercased().contains("unauthorized"), "message was: \(fatalMessage)")
-        // The pass stops at the first file — the second is never attempted.
-        XCTAssertEqual(service.rows[fileB], .pending)
+        // The pass stops at the first file — the second is never attempted
+        // — but neither row is left looking permanently "Looking up…":
+        // both transition to the terminal .stopped state.
+        guard case let .stopped(fileAReason) = service.rows[fileA] else {
+            return XCTFail("expected fileA .stopped, got \(String(describing: service.rows[fileA]))")
+        }
+        XCTAssertEqual(fileAReason, fatalMessage)
+        guard case let .stopped(fileBReason) = service.rows[fileB] else {
+            return XCTFail("expected fileB .stopped, got \(String(describing: service.rows[fileB]))")
+        }
+        XCTAssertEqual(fileBReason, fatalMessage)
     }
 
     func testNoKeyConfiguredYieldsFatalState() async throws {
@@ -226,7 +235,10 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         let fatalMessage = try XCTUnwrap(service.fatalError)
         XCTAssertTrue(fatalMessage.lowercased().contains("key"), "message was: \(fatalMessage)")
-        XCTAssertNil(service.rows[fileID], "no row should be marked pending when the pass never starts")
+        guard case let .stopped(reason) = service.rows[fileID] else {
+            return XCTFail("expected .stopped so the row doesn't look permanently pending, got \(String(describing: service.rows[fileID]))")
+        }
+        XCTAssertEqual(reason, fatalMessage)
     }
 
     // MARK: - Keychain failure
@@ -256,7 +268,10 @@ final class AutoTaggerServiceTests: XCTestCase {
             fatalMessage.contains("No AcoustID API key is configured"),
             "a real keychain error must read differently from the no-key-configured message"
         )
-        XCTAssertNil(service.rows[fileID], "no row should be marked pending when the pass never starts")
+        guard case let .stopped(reason) = service.rows[fileID] else {
+            return XCTFail("expected .stopped so the row doesn't look permanently pending, got \(String(describing: service.rows[fileID]))")
+        }
+        XCTAssertEqual(reason, fatalMessage)
     }
 
     // MARK: - Cancellation

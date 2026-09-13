@@ -27,6 +27,11 @@ final class AutoTaggerService: ObservableObject {
         case weak(MatchCandidate)
         case noMatch
         case failed(String)
+        /// Terminal: the whole pass halted (`fatalError` was set) before
+        /// this row got a chance to resolve. Distinct from `.pending`
+        /// (still queued, the pass is still running) so the view never
+        /// renders an abandoned row as "Looking up…" forever.
+        case stopped(String)
     }
 
     /// Below this, a resolved candidate is `.weak`; at or above, `.strong`.
@@ -73,7 +78,7 @@ final class AutoTaggerService: ObservableObject {
         switch rows[fileID] {
         case let .strong(candidate), let .weak(candidate):
             return candidate
-        case .pending, .noMatch, .failed, .none:
+        case .pending, .noMatch, .failed, .stopped, .none:
             return nil
         }
     }
@@ -94,11 +99,14 @@ final class AutoTaggerService: ObservableObject {
         do {
             guard let loadedKey = try keyStore.load(), !loadedKey.isEmpty else {
                 fatalError = Self.noAPIKeyConfiguredMessage
+                stopUnresolvedRows(among: fileIDs, message: Self.noAPIKeyConfiguredMessage)
                 return
             }
             apiKey = loadedKey
         } catch {
-            fatalError = "Could not read the AcoustID API key from the Keychain: \(error)"
+            let message = "Could not read the AcoustID API key from the Keychain: \(error)"
+            fatalError = message
+            stopUnresolvedRows(among: fileIDs, message: message)
             return
         }
 
@@ -126,10 +134,29 @@ final class AutoTaggerService: ObservableObject {
                 // Only reached for .unauthorized/.server — resolveRow
                 // converts every other LookupError into a per-row .failed
                 // before it ever gets here.
-                fatalError = "Auto-tag pass stopped: \(Self.describe(lookupError))"
+                let message = "Auto-tag pass stopped: \(Self.describe(lookupError))"
+                fatalError = message
+                stopUnresolvedRows(among: fileIDs, message: message)
                 return
             } catch {
                 rows[fileID] = .failed(String(describing: error))
+            }
+        }
+    }
+
+    /// Transitions every fileID among `fileIDs` that is still unresolved —
+    /// absent from `rows` entirely (the no-key/keychain early-return,
+    /// before `run`'s `.pending` initialization loop runs) or still
+    /// `.pending` (a mid-pass fatal halt, for files not yet reached) — to
+    /// `.stopped(message)`. Already-resolved rows (`.strong`, `.weak`,
+    /// `.noMatch`, `.failed`) are left exactly as they are.
+    private func stopUnresolvedRows(among fileIDs: [Int64], message: String) {
+        for fileID in fileIDs {
+            switch rows[fileID] {
+            case nil, .pending:
+                rows[fileID] = .stopped(message)
+            case .strong, .weak, .noMatch, .failed, .stopped:
+                break
             }
         }
     }
@@ -196,7 +223,7 @@ final class AutoTaggerService: ObservableObject {
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
-            proposedArtist: artistCredit?.name ?? "",
+            proposedArtist: recording.creditedArtistName,
             proposedTitle: recording.title,
             proposedAlbum: chosenRelease.title,
             proposedYear: recording.releaseGroup?.firstReleaseDate.flatMap(Self.year(fromMusicBrainzDate:)),
