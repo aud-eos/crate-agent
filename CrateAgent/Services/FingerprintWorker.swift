@@ -250,18 +250,8 @@ public actor FingerprintWorker {
                 // already had a fingerprint in the DB. No decode work
                 // was needed; just write the same hash to this row.
                 for entry in plan.toCopyFromExistingTwin {
-                    try db.execute(
-                        sql: """
-                            UPDATE files
-                            SET chromaprint_fingerprint = ?,
-                                fingerprint_status = ?
-                            WHERE id = ?
-                            """,
-                        arguments: [
-                            entry.fingerprint,
-                            FingerprintStatus.done.rawValue,
-                            entry.fileId,
-                        ]
+                    try FingerprintPersistence.write(
+                        fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done, in: db
                     )
                 }
 
@@ -277,26 +267,10 @@ public actor FingerprintWorker {
                         }
                     }()
                     // Apply to the representative.
-                    try db.execute(
-                        sql: """
-                            UPDATE files
-                            SET chromaprint_fingerprint = ?,
-                                fingerprint_status = ?
-                            WHERE id = ?
-                            """,
-                        arguments: [hash, status.rawValue, result.fileId]
-                    )
+                    try FingerprintPersistence.write(fileID: result.fileId, fingerprint: hash, status: status, in: db)
                     // Propagate to siblings.
                     for siblingId in assignment.siblingIds {
-                        try db.execute(
-                            sql: """
-                                UPDATE files
-                                SET chromaprint_fingerprint = ?,
-                                    fingerprint_status = ?
-                                WHERE id = ?
-                                """,
-                            arguments: [hash, status.rawValue, siblingId]
-                        )
+                        try FingerprintPersistence.write(fileID: siblingId, fingerprint: hash, status: status, in: db)
                     }
                 }
             }

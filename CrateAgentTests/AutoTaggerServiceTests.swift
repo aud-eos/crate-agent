@@ -229,6 +229,83 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertNil(service.rows[fileID], "no row should be marked pending when the pass never starts")
     }
 
+    // MARK: - Keychain failure
+
+    func testKeychainErrorSetsFatalBanner() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/x.mp3")
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                XCTFail("should never look up when the key store throws")
+                return []
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in
+                XCTFail("should never look up when the key store throws")
+                throw LookupError.transport("unreachable")
+            },
+            keyStore: StubKeyProvider(errorToThrow: FakeKeychainError())
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        let fatalMessage = try XCTUnwrap(service.fatalError)
+        XCTAssertTrue(fatalMessage.lowercased().contains("keychain"), "message was: \(fatalMessage)")
+        XCTAssertFalse(
+            fatalMessage.contains("No AcoustID API key is configured"),
+            "a real keychain error must read differently from the no-key-configured message"
+        )
+        XCTAssertNil(service.rows[fileID], "no row should be marked pending when the pass never starts")
+    }
+
+    // MARK: - Cancellation
+
+    func testCancelStopsThePass() async throws {
+        let database = try makeDatabase()
+        let file1 = try insertFile(in: database, path: "/music/1.mp3", fingerprintHashes: [40, 41, 42])
+        let file2 = try insertFile(in: database, path: "/music/2.mp3", fingerprintHashes: [43, 44, 45])
+        let file3 = try insertFile(in: database, path: "/music/3.mp3", fingerprintHashes: [46, 47, 48])
+
+        let lookupStarted = AsyncGate()
+        let releaseLookup = AsyncGate()
+
+        let acoustIDClient = SuspendingAcoustIDClient(
+            onStart: {
+                await lookupStarted.open()
+                await releaseLookup.wait()
+            },
+            result: [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+        )
+        let recording = makeRecording()
+        let musicBrainzClient = StubMusicBrainzClient { _ in recording }
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        let runHandle = Task { await service.run(fileIDs: [file1, file2, file3]) }
+
+        // Wait until the pass is actually inside file1's AcoustID lookup
+        // before cancelling, so the cancellation deterministically lands
+        // between file1 (already in flight) and file2 (not yet attempted).
+        await lookupStarted.wait()
+        service.cancel()
+        await releaseLookup.open()
+
+        await runHandle.value
+
+        guard case .strong = service.rows[file1] else {
+            return XCTFail("expected the in-flight file to still resolve, got \(String(describing: service.rows[file1]))")
+        }
+        XCTAssertEqual(service.rows[file2], .pending, "cancellation should stop the pass before file2 is attempted")
+        XCTAssertEqual(service.rows[file3], .pending, "cancellation should stop the pass before file3 is attempted")
+    }
+
     // MARK: - On-demand fingerprinting
 
     func testComputesAndPersistsFingerprintWhenMissing() async throws {
@@ -303,5 +380,52 @@ private struct StubKeyProvider: AcoustIDKeyProviding {
             throw errorToThrow
         }
         return key
+    }
+}
+
+/// A distinctly-worded stand-in for a real `AcoustIDKeyStoreError`, so
+/// `testKeychainErrorSetsFatalBanner` can assert the fatal message came from
+/// this error rather than coincidentally matching the no-key-configured text.
+private struct FakeKeychainError: Error, CustomStringConvertible {
+    let description = "keychain unavailable"
+}
+
+/// An `AcoustIDLookupClient` whose single lookup call suspends on `onStart`
+/// before returning `result` — lets `testCancelStopsThePass` deterministically
+/// land a `cancel()` call while a lookup for the first file is genuinely in
+/// flight, with no real sleeping or network involved.
+private struct SuspendingAcoustIDClient: AcoustIDLookupClient {
+    let onStart: @Sendable () async -> Void
+    let result: [AcoustIDResult]
+
+    func lookup(fingerprintBase64 _: String, durationSeconds _: Int, apiKey _: String) async throws -> [AcoustIDResult] {
+        await onStart()
+        return result
+    }
+}
+
+/// A minimal async rendezvous point: `wait()` suspends until `open()` has
+/// been called (from any task), and returns immediately if `open()` already
+/// happened. Used to sequence test code and the service's in-flight lookup
+/// without any real delay.
+private actor AsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+        isOpen = true
+        for waiter in waiters {
+            waiter.resume()
+        }
+        waiters.removeAll()
+    }
+
+    func wait() async {
+        if isOpen {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
     }
 }

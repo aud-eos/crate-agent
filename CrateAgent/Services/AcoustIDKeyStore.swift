@@ -22,7 +22,7 @@ public enum AcoustIDKeyStoreError: Error, Equatable {
 /// any other non-success status is a real failure and is thrown, never
 /// silently treated as "no key" — hence `load`'s `throws -> String?`
 /// signature rather than a plain `-> String?`.
-public struct AcoustIDKeyStore {
+public struct AcoustIDKeyStore: Sendable {
     private let service: String
 
     public init(service: String = "com.crateagent.acoustid") {

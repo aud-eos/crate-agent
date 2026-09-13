@@ -270,15 +270,7 @@ final class AutoTaggerService: ObservableObject {
 
     private func persistFingerprint(fileID: Int64, bytes: Data?, status: FingerprintStatus) async throws {
         try await database.writer.write { db in
-            try db.execute(
-                sql: """
-                UPDATE files
-                SET chromaprint_fingerprint = ?,
-                    fingerprint_status = ?
-                WHERE id = ?
-                """,
-                arguments: [bytes, status.rawValue, fileID]
-            )
+            try FingerprintPersistence.write(fileID: fileID, fingerprint: bytes, status: status, in: db)
         }
     }
 }
