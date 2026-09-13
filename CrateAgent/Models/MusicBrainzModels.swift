@@ -186,16 +186,22 @@ private extension MBReleaseGroup {
     /// date sorts last (`.max`), so it never wins a "find the earliest"
     /// comparison against a release-group that has a real date.
     var sortableFirstReleaseDate: Int {
-        firstReleaseDate.flatMap(Self.parsedDateValue) ?? .max
+        firstReleaseDate.flatMap(parsedMusicBrainzDateValue) ?? .max
     }
+}
 
-    static func parsedDateValue(_ dateString: String) -> Int? {
-        let components = dateString.split(separator: "-")
-        guard let year = components.first.flatMap({ Int($0) }) else { return nil }
-        let month = components.count > 1 ? (Int(components[1]) ?? 1) : 1
-        let day = components.count > 2 ? (Int(components[2]) ?? 1) : 1
-        return year * 10000 + month * 100 + day
-    }
+/// Parses a MusicBrainz partial date (`YYYY`, `YYYY-MM`, or `YYYY-MM-DD`)
+/// into a sortable `yyyymmdd`-shaped integer (a missing month or day
+/// defaults to `01`); returns `nil` for an unparsable string. Shared by
+/// every "find the earliest date" comparison in this module —
+/// `MBReleaseGroup.sortableFirstReleaseDate` and `ReleaseSelector`'s
+/// release-date sort both use it, so date tolerance lives in one place.
+func parsedMusicBrainzDateValue(_ dateString: String) -> Int? {
+    let components = dateString.split(separator: "-")
+    guard let year = components.first.flatMap({ Int($0) }) else { return nil }
+    let month = components.count > 1 ? (Int(components[1]) ?? 1) : 1
+    let day = components.count > 2 ? (Int(components[2]) ?? 1) : 1
+    return year * 10000 + month * 100 + day
 }
 
 // MARK: - MatchCandidate
