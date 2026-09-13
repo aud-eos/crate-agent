@@ -41,8 +41,7 @@ final class MusicBrainzMutationTests: XCTestCase {
     @MainActor
     private func makeEngine(
         recorder: FileTagWriterRecorder,
-        seratoIsRunning: Bool = false,
-        fileFreshnessReader: @escaping FileFreshnessReading = { _ in nil }
+        seratoIsRunning: Bool = false
     ) throws -> (OperationEngine, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: {
@@ -53,8 +52,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { path, update in recorder.record(path, update) },
-            fileFreshnessReader: fileFreshnessReader
+            fileTagWriter: { path, update in recorder.record(path, update) }
         )
         return (engine, database)
     }
@@ -67,11 +65,10 @@ final class MusicBrainzMutationTests: XCTestCase {
         recorder: FileTagWriterRecorder,
         seratoIsRunning: Bool = false,
         path: String = "/Music/N/track.mp3",
-        inode: Int64 = 1,
-        fileFreshnessReader: @escaping FileFreshnessReading = { _ in nil }
+        inode: Int64 = 1
     ) throws -> (OperationEngine, LibraryDatabase, Int64) {
         let (engine, database) = try makeEngine(
-            recorder: recorder, seratoIsRunning: seratoIsRunning, fileFreshnessReader: fileFreshnessReader
+            recorder: recorder, seratoIsRunning: seratoIsRunning
         )
         let fileId = try database.writer.write { db -> Int64 in
             var file = FileRecord(
@@ -772,17 +769,17 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
-    /// A redo (undoing a revert) re-applies the match, but reaches `applyBatch`
-    /// without the D-A apply-time revalidation. If the audio on disk changed
-    /// since the match was computed, the redo must be refused rather than link
-    /// the current (different) audio to the old recording (finding #4001064043).
-    func testRedoRejectedWhenAudioChangedOnDisk() async throws {
+    /// A redo (undoing a revert) re-applies the match and re-links the file. It
+    /// must NOT be gated on the file's on-disk size/mtime still equaling the
+    /// pre-apply lookup snapshot: the match's own tag write (and the revert's)
+    /// legitimately advance the file's mtime/size, so such a gate would reject
+    /// every normal redo (issue #109). The only supersession guards that apply
+    /// are the value/LIFO checks in `assertNoLaterMatchSupersedes`.
+    func testRedoOfMatchAfterUndoReappliesMatch() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, database, file1) = try await MainActor.run {
             try makeEngineWithFile(
-                artist: "old", title: "old", album: "old", recorder: recorder,
-                // On-disk identity (2/2) differs from the payload's expected 1/1.
-                fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 2, mtime: 2) }
+                artist: "old", title: "old", album: "old", recorder: recorder
             )
         }
         let fingerprint = sha256(sampleFingerprintBytes)
@@ -793,42 +790,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         let undoBatchId = try await engine.undoBatch("match")
 
-        do {
-            try await engine.undoBatch(undoBatchId)
-            XCTFail("expected redoAudioIdentityChanged")
-        } catch let OperationEngineError.redoAudioIdentityChanged(fid) {
-            XCTAssertEqual(fid, file1)
-        }
-
-        try await database.writer.read { db in
-            XCTAssertNil(
-                try FileRecord.fetchOne(db, key: file1)!.trackId,
-                "redo refused — the file stays unlinked (the reverted state)"
-            )
-        }
-    }
-
-    /// The redo revalidation must NOT over-fire: when the file's on-disk
-    /// identity still matches what the match was computed for, the redo
-    /// proceeds and re-links the file (finding #4001064043).
-    func testRedoAllowedWhenAudioIdentityUnchanged() async throws {
-        let recorder = FileTagWriterRecorder()
-        let (engine, database, file1) = try await MainActor.run {
-            try makeEngineWithFile(
-                artist: "old", title: "old", album: "old", recorder: recorder,
-                // On-disk identity still matches the payload's expected 1/1.
-                fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 1, mtime: 1) }
-            )
-        }
-        let fingerprint = sha256(sampleFingerprintBytes)
-
-        try await engine.apply(
-            .applyMusicBrainzMatch(fullPayload(fileID: file1, fingerprintHash: fingerprint)),
-            batchId: "match"
-        )
-        let undoBatchId = try await engine.undoBatch("match")
-
-        // Redo must succeed and re-link the file to the match.
+        // Redo (undo of the revert) must succeed and re-link the file.
         try await engine.undoBatch(undoBatchId)
 
         try await database.writer.read { db in

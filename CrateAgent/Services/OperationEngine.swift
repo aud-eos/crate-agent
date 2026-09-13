@@ -61,12 +61,6 @@ public actor OperationEngine {
     private let fileTagWriter: FileTagWriter
     private let seratoMetadataBatchWriter: SeratoMetadataBatchWriter
     private let fileTrasher: FileTrasher
-    /// Reads a file's current on-disk size+mtime, used to revalidate a redo
-    /// (undo of a revert) against the audio actually on disk — the redo path
-    /// bypasses `AutoTaggerService.staleFileIDs`, so this is the engine-side
-    /// equivalent (finding #4001064043). Shares `FileFreshnessReading` with the
-    /// D-A/D-B checks so the stat mechanic is identical; tests inject a stub.
-    private let fileFreshnessReader: FileFreshnessReading
     private let activityLog: ActivityLog?
 
     /// Pending writes to Serato library files. Either a path
@@ -108,11 +102,6 @@ public actor OperationEngine {
             let url = URL(fileURLWithPath: path)
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         },
-        fileFreshnessReader: @escaping FileFreshnessReading = { path in
-            FileMetadataCollector.collect(at: path).map {
-                FileFreshnessSnapshot(fileSize: $0.fileSize, mtime: $0.mtime)
-            }
-        },
         activityLog: ActivityLog? = nil
     ) {
         self.database = database
@@ -121,7 +110,6 @@ public actor OperationEngine {
         self.fileTagWriter = fileTagWriter
         self.seratoMetadataBatchWriter = seratoMetadataBatchWriter
         self.fileTrasher = fileTrasher
-        self.fileFreshnessReader = fileFreshnessReader
         self.activityLog = activityLog
     }
 
@@ -649,13 +637,6 @@ public actor OperationEngine {
             try Self.decodeInverseMutation(event: event)
         }
 
-        // A redo (undoing a revert) re-applies a MusicBrainz match, but reaches
-        // `applyBatch` directly without the D-A apply-time revalidation. Confirm
-        // the on-disk audio still matches the identity the match was computed
-        // for before re-linking it — checked before any mutation so the redo
-        // fails clean (finding #4001064043).
-        try await assertRedoAudioIdentityUnchanged(inverseMutations)
-
         let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
         // One transaction for every inverse mutation in the batch.
         // Undo is conceptually atomic: either the whole batch
@@ -785,49 +766,6 @@ public actor OperationEngine {
                         throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                     }
                 }
-            }
-        }
-    }
-
-    /// Revalidates every redo (undo of a revert) in the batch against the audio
-    /// currently on disk. A redo re-applies a MusicBrainz match via
-    /// `applyMusicBrainzMatch`, but `undoBatch` routes it straight to
-    /// `applyBatch` — bypassing `AutoTaggerService.staleFileIDs`, the D-A gate
-    /// the normal Apply path runs. Without this, redoing after the file was
-    /// edited or replaced would link the current (different) audio to the old
-    /// recording and overwrite its tags (finding #4001064043). A nil stat means
-    /// we can't prove a change, so we proceed — the imminent tag write fails
-    /// loudly if the file is genuinely gone (matching the D-B post-decode
-    /// policy). Runs before any mutation so the redo fails clean.
-    private func assertRedoAudioIdentityUnchanged(_ mutations: [TrackMutation]) async throws {
-        let redoPayloads: [ApplyMusicBrainzMatchPayload] = mutations.compactMap { mutation in
-            if case .applyMusicBrainzMatch(let payload) = mutation { return payload }
-            return nil
-        }
-        guard !redoPayloads.isEmpty else { return }
-        let fileIds = redoPayloads.map(\.fileID)
-        let pathByFileId = try await database.writer.read { db in
-            try FileRecord.filter(keys: fileIds).fetchAll(db)
-                .reduce(into: [Int64: String]()) { accumulator, file in
-                    if let id = file.id { accumulator[id] = file.path }
-                }
-        }
-        for payload in redoPayloads {
-            guard let expectedFileSize = payload.expectedFileSize,
-                  let expectedMtime = payload.expectedMtime,
-                  let path = pathByFileId[payload.fileID]
-            else {
-                // Legacy payload without an on-disk snapshot, or the row is gone
-                // — nothing to revalidate against; the apply fails loudly if the
-                // row/file is truly missing.
-                continue
-            }
-            let current = await Task.detached(priority: .userInitiated) { [fileFreshnessReader] in
-                fileFreshnessReader(path)
-            }.value
-            guard let current else { continue }
-            if current.fileSize != expectedFileSize || current.mtime != expectedMtime {
-                throw OperationEngineError.redoAudioIdentityChanged(fileId: payload.fileID)
             }
         }
     }
@@ -3006,15 +2944,6 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// rather than silently corrupting the current state (findings #3999114450,
     /// #3999974010). Detected from the event log in `undoBatch`.
     case undoSupersededByLaterMatch(fileId: Int64)
-    /// Redo of a MusicBrainz match (undoing a revert) was refused because the
-    /// file's on-disk audio changed since the match was computed — its current
-    /// size/mtime no longer match the identity captured on the apply payload.
-    /// Re-applying would link the current (different) audio to the old
-    /// recording and overwrite its tags. Mirrors the D-A apply-time
-    /// revalidation (`AutoTaggerService.staleFileIDs`) for the redo path, which
-    /// goes straight from `undoBatch` to `applyBatch` and so never reaches that
-    /// gate (finding #4001064043).
-    case redoAudioIdentityChanged(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
     /// threw afterward. Distinct from a pre-commit throw so the caller
@@ -3049,8 +2978,6 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case .undoSupersededByLaterMatch(let fileId):
             return "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
-        case .redoAudioIdentityChanged(let fileId):
-            return "Can't redo this MusicBrainz match for file id \(fileId): the audio file changed on disk since the match was computed. Re-scan to fingerprint the current audio."
         case .externalSyncIncomplete(let batchId, let underlying):
             return "Batch \(batchId) was applied, but some Serato/file writes did not land: \(underlying). Re-sync the batch to finish applying them."
         }
