@@ -76,7 +76,7 @@ struct AutoTaggerView: View {
     var body: some View {
         VStack(spacing: 0) {
             if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before applying Auto-Tag matches.")
+                SeratoRunningBanner(message: "Serato is running — you can still apply matches; the library and tag writes queue and land when you quit Serato.")
                 Divider()
             }
             if let fatalMessage = autoTaggerService.fatalError {
@@ -90,6 +90,14 @@ struct AutoTaggerView: View {
         .navigationTitle("Auto-Tag")
         .frame(minWidth: 680, minHeight: 480)
         .task { await loadLibraryFileCount() }
+        // If the panel was opened while the initial library scan was still
+        // populating an empty database, the one-shot count above recorded 0 and
+        // the view would stay on "No tracks indexed yet". Re-count when the
+        // scan finishes so newly-indexed files become selectable without
+        // closing and reopening the panel (finding #4000806490).
+        .onChange(of: services.initialScanComplete) { _, complete in
+            if complete { Task { await loadLibraryFileCount() } }
+        }
         // Leaving the Auto-Tag panel entirely (not just "New Scan", which
         // already cancels via resetToSelectionStage) must also stop an
         // in-flight pass — otherwise it keeps issuing rate-limited
@@ -223,9 +231,12 @@ struct AutoTaggerView: View {
 
     private var reviewList: some View {
         List(scannedFileIDs, id: \.self) { fileID in
-            if let file = filesByID[fileID] {
-                rowContainer(fileID: fileID, path: file.path)
-            }
+            // Always render a row, even when the FileRecord is gone (deleted
+            // from SQLite between search and scan): the service still publishes
+            // a `.failed` state for it, and omitting the row would hide both the
+            // selection and its failure reason (finding #4000806493). Fall back
+            // to a placeholder label when there's no current path.
+            rowContainer(fileID: fileID, path: filesByID[fileID]?.path ?? "(file \(fileID) — no longer in the library)")
         }
         .listStyle(.inset)
     }
@@ -376,9 +387,9 @@ struct AutoTaggerView: View {
                     Task { await applyConfirmed() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(confirmedFileIDs.isEmpty || isApplying || seratoWatchdog.isSeratoRunning)
+                .disabled(confirmedFileIDs.isEmpty || isApplying)
                 .help(seratoWatchdog.isSeratoRunning
-                    ? "Quit Serato before applying — matches write to Serato library files and would be clobbered on Serato's next save."
+                    ? "Apply every confirmed match in one undoable batch. The library and tag writes queue and land when you quit Serato."
                     : "Apply every confirmed match in one undoable batch.")
             }
         }
