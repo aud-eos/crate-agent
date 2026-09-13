@@ -12,8 +12,15 @@ public enum LookupError: Error, Equatable {
     case rateLimited
     /// 5xx — the server failed, and retries (where applicable) were exhausted.
     case server
-    /// Anything else: a `URLSession`/`URLError` failure, an unparsable
-    /// response body, a non-HTTP response, or an unexpected status code.
-    /// Carries the underlying description for operator-useful context.
+    /// A connection-wide URL-loading failure: offline, DNS lookup failed,
+    /// host unreachable, connection refused/lost, or timed out. Distinct from
+    /// `.transport` — every remaining lookup in a scan would fail identically,
+    /// so callers HALT the whole pass rather than marking each file failed and
+    /// hammering a dead connection once per row. Carries the underlying
+    /// description for operator-useful context.
+    case offline(String)
+    /// Anything else: a per-request `URLSession`/`URLError` failure, an
+    /// unparsable response body, a non-HTTP response, or an unexpected status
+    /// code. Carries the underlying description for operator-useful context.
     case transport(String)
 }

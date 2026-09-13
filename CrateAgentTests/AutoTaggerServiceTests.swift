@@ -270,6 +270,46 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertEqual(fileBReason, fileAReason)
     }
 
+    /// A connection-wide `.offline` failure (machine offline / DNS down / host
+    /// unreachable) halts the whole pass like `.unauthorized`/`.server` —
+    /// every remaining file would fail identically, so the scan must not
+    /// hammer a dead connection once per row (finding #3999114468).
+    func testOfflineHaltsPassWithFatalBanner() async throws {
+        let database = try makeDatabase()
+        let fileA = try insertFile(in: database, path: "/music/a.mp3", fingerprintHashes: [20, 21, 22])
+        let fileB = try insertFile(in: database, path: "/music/b.mp3", fingerprintHashes: [23, 24, 25])
+
+        let lookupCount = FingerprintCallCounter()
+        let acoustIDClient = StubAcoustIDClient { _ in
+            lookupCount.increment()
+            throw LookupError.offline("The Internet connection appears to be offline.")
+        }
+        let musicBrainzClient = StubMusicBrainzClient { _ in
+            XCTFail("MusicBrainz should never be reached when offline")
+            throw LookupError.transport("unreachable")
+        }
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileA, fileB])
+
+        let fatalMessage = try XCTUnwrap(service.fatalError)
+        XCTAssertTrue(fatalMessage.lowercased().contains("network"), "message was: \(fatalMessage)")
+        XCTAssertEqual(lookupCount.value, 1, "the pass halts at the first offline failure, not once per file")
+        guard case .stopped = service.rows[fileA] else {
+            return XCTFail("expected fileA .stopped, got \(String(describing: service.rows[fileA]))")
+        }
+        guard case .stopped = service.rows[fileB] else {
+            return XCTFail("expected fileB .stopped (never attempted), got \(String(describing: service.rows[fileB]))")
+        }
+    }
+
     func testNoKeyConfiguredYieldsFatalState() async throws {
         let database = try makeDatabase()
         let fileID = try insertFile(in: database, path: "/music/x.mp3")
@@ -516,6 +556,53 @@ final class AutoTaggerServiceTests: XCTestCase {
             persisted?.chromaprintFingerprint, FingerprintEncoder.serialize(recomputedHashes),
             "the recomputed fingerprint must be persisted, replacing the stale bytes"
         )
+        // #3999114461: the recompute must ALSO persist the on-disk stat it was
+        // computed from as the fingerprint's freshness basis — otherwise the
+        // basis stays pinned to the stale index snapshot and every later scan
+        // re-decodes forever.
+        XCTAssertEqual(persisted?.fingerprintedSize, 2000, "recompute must record the current size as the fingerprint basis")
+        XCTAssertEqual(persisted?.fingerprintedMtime, 999, "recompute must record the current mtime as the fingerprint basis")
+    }
+
+    /// The thrash regression (#3999114461): after a recompute persists the
+    /// new freshness basis, a SECOND scan of the same (still-unchanged) file
+    /// must reuse the fingerprint rather than re-decoding — the basis now
+    /// matches the live stat, so freshness holds.
+    func testRecomputedFingerprintIsNotReDecodedOnNextScanOfUnchangedFile() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/edited-once.mp3")
+
+        let recomputedHashes: [UInt32] = [40, 41, 42]
+        let acoustIDClient = StubAcoustIDClient { _ in
+            [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+        }
+        let recording = makeRecording()
+        let musicBrainzClient = StubMusicBrainzClient { _ in recording }
+
+        let fingerprintCallCount = FingerprintCallCounter()
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in
+                fingerprintCallCount.increment()
+                return recomputedHashes
+            },
+            audioTagsReader: stubAudioTagsReader(),
+            // The file's on-disk identity is stable at (2000, 999) — differs
+            // from the index snapshot (1000, 0), so the FIRST scan recomputes.
+            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 2000, mtime: 999) }
+        )
+
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(fingerprintCallCount.value, 1, "first scan recomputes the stale fingerprint")
+
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(
+            fingerprintCallCount.value, 1,
+            "second scan of the unchanged file must NOT re-decode — the persisted basis now matches the live stat"
+        )
     }
 
     /// A `.done` file whose current on-disk size/mtime match the indexed
@@ -637,7 +724,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
         let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
 
-        let stale = await service.staleFileIDs(for: [payload])
+        let stale = try await service.staleFileIDs(for: [payload])
         XCTAssertEqual(stale, [fileID])
     }
 
@@ -651,7 +738,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
         let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
 
-        let stale = await service.staleFileIDs(for: [payload])
+        let stale = try await service.staleFileIDs(for: [payload])
         XCTAssertTrue(stale.isEmpty)
     }
 
@@ -663,7 +750,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         let service = makeService(database: database) { _ in nil }
         let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
 
-        let stale = await service.staleFileIDs(for: [payload])
+        let stale = try await service.staleFileIDs(for: [payload])
         XCTAssertEqual(stale, [fileID])
     }
 
@@ -692,9 +779,41 @@ final class AutoTaggerServiceTests: XCTestCase {
             artist: nil, title: nil, album: nil, year: nil
         )
 
-        let stale = await service.staleFileIDs(for: [payload])
+        let stale = try await service.staleFileIDs(for: [payload])
         XCTAssertTrue(stale.isEmpty, "a legacy event with no captured snapshot must not be flagged stale")
     }
+
+    /// A database read failure during apply-time revalidation must PROPAGATE,
+    /// not be swallowed into an empty path map that marks every file stale and
+    /// misreports a DB problem as "the files changed on disk" (finding
+    /// #3999114466).
+    func testStaleFileIDsThrowsWhenDatabaseReadFails() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/x.mp3")
+        let service = makeService(database: database) { _ in
+            FileFreshnessSnapshot(fileSize: 1000, mtime: 0)
+        }
+        // Drop the table the revalidation reads, so the fetch throws.
+        try await database.writer.write { db in try db.execute(sql: "DROP TABLE files") }
+        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
+
+        do {
+            _ = try await service.staleFileIDs(for: [payload])
+            XCTFail("expected the database read failure to propagate")
+        } catch {
+            // Any thrown error is correct — the point is it is not swallowed
+            // into an empty map and reported as a stale file.
+        }
+    }
+}
+
+/// Thread-safe call counter for injected `@Sendable` closures (fingerprint /
+/// lookup stubs), so tests can assert how many times a stub was invoked.
+private final class FingerprintCallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
 }
 
 // MARK: - Test doubles

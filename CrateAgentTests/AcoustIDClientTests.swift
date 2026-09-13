@@ -131,6 +131,21 @@ final class AcoustIDClientTests: XCTestCase {
         }
     }
 
+    func testConnectionWideURLErrorMapsToOffline() async {
+        // A connection-wide URLError (offline/DNS/host unreachable) is
+        // distinct from a per-request transport failure: it maps to `.offline`
+        // so the auto-tagger halts the whole pass instead of retrying every
+        // row against a dead connection (finding #3999114468).
+        let client = AcoustIDClient(loader: OfflineLoader(), limiter: .noop, cache: .memory())
+
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")) {
+            guard case .offline = $0 as? LookupError else {
+                XCTFail("expected .offline, got \($0)")
+                return
+            }
+        }
+    }
+
     func testEmptyResultsIsAValidSuccessNotAFailure() async throws {
         let loader = StubLoader(status: 200, body: fixture("acoustid_empty.json"))
         let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
@@ -349,9 +364,19 @@ private final class SequencedStubLoader: URLLoading, @unchecked Sendable {
     }
 }
 
-/// Fails every call with a transport-level error, to exercise
-/// `LookupError.transport` mapping for non-HTTP-status failures.
+/// Fails every call with a PER-REQUEST URL error (a malformed server
+/// response), to exercise `LookupError.transport` mapping for non-HTTP-status
+/// failures that are NOT connection-wide (those map to `.offline` — see
+/// `OfflineLoader`).
 private final class ThrowingLoader: URLLoading {
+    func data(for _: URLRequest) async throws -> (Data, URLResponse) {
+        throw URLError(.badServerResponse)
+    }
+}
+
+/// Fails every call with a connection-wide URL error, to exercise
+/// `LookupError.offline` mapping (offline / DNS / host unreachable).
+private final class OfflineLoader: URLLoading {
     func data(for _: URLRequest) async throws -> (Data, URLResponse) {
         throw URLError(.notConnectedToInternet)
     }

@@ -629,8 +629,17 @@ struct AutoTaggerView: View {
         // NOW. A review pass can stay open a long time; a file edited or
         // replaced since its candidate was built must NOT get the stale
         // recording/identity applied. Stale rows are excluded from the apply
-        // and surfaced (no silent drop) so the user can re-scan them.
-        let staleIDs = await autoTaggerService.staleFileIDs(for: Array(payloadByFileID.values))
+        // and surfaced (no silent drop) so the user can re-scan them. A DB
+        // read failure here is reported as itself — not misreported as "files
+        // changed on disk" — so the user isn't sent to re-scan over a database
+        // problem.
+        let staleIDs: Set<Int64>
+        do {
+            staleIDs = try await autoTaggerService.staleFileIDs(for: Array(payloadByFileID.values))
+        } catch {
+            actionError = "Couldn't verify the files against the library before applying: \(error.localizedDescription)"
+            return
+        }
         let freshPayloadByFileID = payloadByFileID.filter { !staleIDs.contains($0.key) }
         let appliedIDs = Set(freshPayloadByFileID.keys)
         let mutations: [TrackMutation] = freshPayloadByFileID.values.map { .applyMusicBrainzMatch($0) }

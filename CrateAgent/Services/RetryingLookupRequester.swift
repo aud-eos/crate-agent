@@ -73,8 +73,28 @@ public struct RetryingLookupRequester: Sendable {
     private func load(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
             return try await loader.data(for: request)
+        } catch let urlError as URLError where Self.isConnectionWide(urlError.code) {
+            // The whole connection is down, not this one request — surface it
+            // as `.offline` so a multi-file scan halts instead of retrying the
+            // same doomed request once per row.
+            throw LookupError.offline(urlError.localizedDescription)
         } catch {
             throw LookupError.transport(error.localizedDescription)
+        }
+    }
+
+    /// URL-loading failure codes that mean the connection itself is
+    /// unavailable — every subsequent request would fail identically — as
+    /// opposed to a one-off per-request failure (`.badServerResponse`,
+    /// `.cannotParseResponse`, etc.) that maps to `.transport`.
+    private static func isConnectionWide(_ code: URLError.Code) -> Bool {
+        switch code {
+        case .notConnectedToInternet, .cannotFindHost, .cannotConnectToHost,
+             .dnsLookupFailed, .networkConnectionLost, .timedOut,
+             .dataNotAllowed, .internationalRoamingOff:
+            return true
+        default:
+            return false
         }
     }
 

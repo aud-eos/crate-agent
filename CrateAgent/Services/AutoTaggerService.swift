@@ -15,10 +15,10 @@ import GRDB
 /// A single file's failure (a bad fingerprint, a transport error, a rate
 /// limit) never aborts the rest of the pass — it becomes that row's
 /// `.failed(reason)` and the loop continues (no-silent-failures: the reason
-/// is visible in `rows`, not swallowed). An `.unauthorized` or `.server`
-/// `LookupError` is different in kind — it means every remaining lookup in
-/// this pass would fail too — so it halts the whole pass and surfaces
-/// `fatalError` instead of failing every remaining row individually.
+/// is visible in `rows`, not swallowed). An `.unauthorized`, `.server`, or
+/// `.offline` `LookupError` is different in kind — it means every remaining
+/// lookup in this pass would fail too — so it halts the whole pass and
+/// surfaces `fatalError` instead of failing every remaining row individually.
 @MainActor
 final class AutoTaggerService: ObservableObject {
     enum RowState: Equatable {
@@ -58,6 +58,13 @@ final class AutoTaggerService: ObservableObject {
     private let fileFreshnessReader: FileFreshnessReading
 
     private var runTask: Task<Void, Never>?
+    /// Bumped on every `run`. A pass captures the value at start; before it
+    /// mutates shared state (`rows`/`fatalError`) after any `await`, it
+    /// confirms it's still the current generation. Cooperative cancellation
+    /// is checked only between rows, so an in-flight fingerprint/lookup can
+    /// finish and publish after a New Scan has already reset or resolved the
+    /// same file — this generation token makes a superseded pass inert.
+    private var runGeneration = 0
 
     init(
         database: LibraryDatabase,
@@ -100,6 +107,8 @@ final class AutoTaggerService: ObservableObject {
     /// to `rows` as it resolves. Replaces any previously in-flight run.
     func run(fileIDs: [Int64]) async {
         runTask?.cancel()
+        runGeneration += 1
+        let generation = runGeneration
         fatalError = nil
 
         // E-J: reset every requested row to .pending BEFORE validating the
@@ -118,47 +127,58 @@ final class AutoTaggerService: ObservableObject {
         do {
             guard let loadedKey = try keyStore.load(), !loadedKey.isEmpty else {
                 fatalError = Self.noAPIKeyConfiguredMessage
-                stopUnresolvedRows(among: fileIDs, message: Self.noAPIKeyConfiguredMessage)
+                stopUnresolvedRows(among: fileIDs, message: Self.noAPIKeyConfiguredMessage, generation: generation)
                 return
             }
             apiKey = loadedKey
         } catch {
             let message = "Could not read the AcoustID API key from the Keychain: \(error)"
             fatalError = message
-            stopUnresolvedRows(among: fileIDs, message: message)
+            stopUnresolvedRows(among: fileIDs, message: message, generation: generation)
             return
         }
 
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.processAll(fileIDs: fileIDs, apiKey: apiKey)
+            await self.processAll(fileIDs: fileIDs, apiKey: apiKey, generation: generation)
         }
         runTask = task
         await task.value
     }
 
-    private func processAll(fileIDs: [Int64], apiKey: String) async {
+    private func processAll(fileIDs: [Int64], apiKey: String, generation: Int) async {
         for fileID in fileIDs {
             if Task.isCancelled {
                 return
             }
 
+            let resolved: RowState
             do {
-                rows[fileID] = try await resolveRow(fileID: fileID, apiKey: apiKey)
+                resolved = try await resolveRow(fileID: fileID, apiKey: apiKey)
             } catch let lookupError as LookupError {
-                // Only reached for .unauthorized/.server — resolveRow
+                // Only reached for .unauthorized/.server/.offline — resolveRow
                 // converts every other LookupError into a per-row .failed
-                // before it ever gets here. The banner phrases the halt
-                // ("Auto-tag pass stopped: …"); each stopped row carries
+                // before it ever gets here. Guard after the await: a New Scan
+                // may have superseded this pass while the lookup was in
+                // flight, and its fresh rows/banner must not be clobbered by
+                // this abandoned pass's fatal halt. The banner phrases the
+                // halt ("Auto-tag pass stopped: …"); each stopped row carries
                 // only the bare reason, since the view already prefixes it
                 // with "Stopped — ".
+                guard generation == runGeneration else { return }
                 let reason = Self.describe(lookupError)
                 fatalError = "Auto-tag pass stopped: \(reason)"
-                stopUnresolvedRows(among: fileIDs, message: reason)
+                stopUnresolvedRows(among: fileIDs, message: reason, generation: generation)
                 return
             } catch {
+                guard generation == runGeneration else { return }
                 rows[fileID] = .failed(String(describing: error))
+                continue
             }
+            // The lookup completed; only publish if a newer scan hasn't taken
+            // over in the meantime.
+            guard generation == runGeneration else { return }
+            rows[fileID] = resolved
         }
     }
 
@@ -170,8 +190,11 @@ final class AutoTaggerService: ObservableObject {
     /// Already-resolved rows (`.strong`, `.weak`, `.noMatch`, `.failed`)
     /// from THIS pass are left exactly as they are. `nil` is handled only
     /// as defensive belt-and-suspenders — every requested id is always
-    /// `.pending` by the time this runs.
-    private func stopUnresolvedRows(among fileIDs: [Int64], message: String) {
+    /// `.pending` by the time this runs. A no-op when `generation` is no
+    /// longer current: a superseded pass must not stamp `.stopped` over the
+    /// rows a newer scan has already reset.
+    private func stopUnresolvedRows(among fileIDs: [Int64], message: String, generation: Int) {
+        guard generation == runGeneration else { return }
         for fileID in fileIDs {
             switch rows[fileID] {
             case nil, .pending:
@@ -192,7 +215,10 @@ final class AutoTaggerService: ObservableObject {
             return try await lookUpCandidate(fileID: fileID, apiKey: apiKey)
         } catch let lookupError as LookupError {
             switch lookupError {
-            case .unauthorized, .server:
+            case .unauthorized, .server, .offline:
+                // Connection-wide or credential/server failures make every
+                // remaining lookup pointless — halt the whole pass instead of
+                // failing (and re-hammering) each file individually.
                 throw lookupError
             case .rateLimited, .transport:
                 return .failed(Self.describe(lookupError))
@@ -291,6 +317,8 @@ final class AutoTaggerService: ObservableObject {
             return "the lookup was rate-limited and retries were exhausted"
         case .server:
             return "the lookup server returned repeated errors"
+        case let .offline(message):
+            return "the network is unavailable (\(message))"
         case let .transport(message):
             return message
         }
@@ -316,7 +344,16 @@ final class AutoTaggerService: ObservableObject {
         do {
             let hashes = try await runOffMainActor { [fingerprintFunction] in try fingerprintFunction(path) }
             let serialized = FingerprintEncoder.serialize(hashes)
-            try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done)
+            // Persist the on-disk stat the fingerprint was computed from as its
+            // freshness basis, so the NEXT scan trusts this fingerprint without
+            // re-decoding the audio. Without this, a recompute updated only the
+            // bytes and left the basis pinned to the stale index snapshot, so
+            // every later scan of an edited file failed the freshness check and
+            // re-decoded up to 120s of audio (finding #3999114461). If the file
+            // can't be stat'd we omit the basis rather than record a wrong one —
+            // the fallback to the index snapshot then applies.
+            let freshnessBasis = await onDiskFreshness(ofFileAt: path)
+            try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis)
             return serialized
         } catch {
             try? await persistFingerprint(fileID: fileID, bytes: nil, status: .failed)
@@ -324,18 +361,22 @@ final class AutoTaggerService: ObservableObject {
         }
     }
 
-    /// Whether the file's stored `.done` fingerprint can still be trusted
-    /// for a lookup (finding D-B): true when the file's CURRENT on-disk
-    /// size+mtime match the indexed snapshot the fingerprint was computed
-    /// from. No sync flow updates `FileRecord.fileSize`/`mtime` after
-    /// indexing without also resetting `fingerprintStatus`, so the indexed
-    /// snapshot is a faithful basis without a dedicated fingerprinted-basis
-    /// column. When the file can't be stat'd we can't prove it changed, so
-    /// the stored bytes are kept — the imminent tag read fails loudly if the
-    /// file is genuinely gone.
+    /// Whether the file's stored `.done` fingerprint can still be trusted for
+    /// a lookup (findings D-B, #3999114461): true when the file's CURRENT
+    /// on-disk size+mtime match the basis the fingerprint was computed from.
+    /// That basis is the fingerprint's OWN recorded snapshot
+    /// (`fingerprintedSize`/`fingerprintedMtime`), so a recompute re-syncs it
+    /// and an edited-then-recomputed file stops re-decoding on every scan. For
+    /// rows fingerprinted before migration #009 or by the background worker
+    /// those columns are nil; there the index-time `fileSize`/`mtime` snapshot
+    /// still IS the fingerprint's basis, so we fall back to it. When the file
+    /// can't be stat'd we can't prove it changed, so the stored bytes are
+    /// kept — the imminent tag read fails loudly if the file is genuinely gone.
     private func storedFingerprintIsFresh(for file: FileRecord) async -> Bool {
         guard let current = await onDiskFreshness(ofFileAt: file.path) else { return true }
-        return current.fileSize == file.fileSize && current.mtime == file.mtime
+        let basisSize = file.fingerprintedSize ?? file.fileSize
+        let basisMtime = file.fingerprintedMtime ?? file.mtime
+        return current.fileSize == basisSize && current.mtime == basisMtime
     }
 
     /// Reads the file's current on-disk size+mtime off the main actor via
@@ -367,17 +408,23 @@ final class AutoTaggerService: ObservableObject {
     /// review would mis-link a different recording. This is the REAL D-A
     /// guard; it lives here (not inside the engine's write transaction)
     /// because it needs file I/O, kept off the main actor.
-    func staleFileIDs(for payloads: [ApplyMusicBrainzMatchPayload]) async -> Set<Int64> {
+    func staleFileIDs(for payloads: [ApplyMusicBrainzMatchPayload]) async throws -> Set<Int64> {
         guard !payloads.isEmpty else { return [] }
         let fileIDs = payloads.map(\.fileID)
-        let pathByFileID = (try? await database.writer.read { db in
+        // Let a DB read failure propagate — swallowing it into an empty map
+        // ("try?  ?? [:]") would mark every payload stale and tell the user
+        // their audio files changed on disk, hiding an actual database error
+        // (e.g. the SQLite file went missing or reports corruption) behind a
+        // misleading recovery instruction. `applyConfirmed` reports it
+        // distinctly.
+        let pathByFileID = try await database.writer.read { db in
             try FileRecord.filter(keys: fileIDs).fetchAll(db)
                 .reduce(into: [Int64: String]()) { accumulator, file in
                     if let id = file.id {
                         accumulator[id] = file.path
                     }
                 }
-        }) ?? [:]
+        }
 
         var stale: Set<Int64> = []
         for payload in payloads {
@@ -411,9 +458,16 @@ final class AutoTaggerService: ObservableObject {
         }
     }
 
-    private func persistFingerprint(fileID: Int64, bytes: Data?, status: FingerprintStatus) async throws {
+    private func persistFingerprint(
+        fileID: Int64,
+        bytes: Data?,
+        status: FingerprintStatus,
+        freshnessBasis: FileFreshnessSnapshot? = nil
+    ) async throws {
         try await database.writer.write { db in
-            try FingerprintPersistence.write(fileID: fileID, fingerprint: bytes, status: status, in: db)
+            try FingerprintPersistence.write(
+                fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis, in: db
+            )
         }
     }
 }

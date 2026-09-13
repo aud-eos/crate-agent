@@ -110,6 +110,7 @@ public final class LibraryDatabase {
         AddEventsBatchAggIndexMigration.register(in: &migrator)
         AddMusicBrainzColumnsMigration.register(in: &migrator)
         ResetFingerprintsForAlgorithmTest2Migration.register(in: &migrator)
+        AddFingerprintFreshnessBasisMigration.register(in: &migrator)
         return migrator
     }
 }
