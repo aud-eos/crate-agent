@@ -471,7 +471,13 @@ public actor OperationEngine {
             bpm: write.metadata.bpm,
             musicalKey: write.metadata.musicalKey,
             comment: write.metadata.comment,
-            label: write.metadata.label
+            label: write.metadata.label,
+            // SeratoMetadata has no year field yet — no OperationEngine
+            // mutation threads a year value through. Pre-existing gap
+            // from commit 372c439 (AudioTagUpdate gained `year` on the
+            // FFI struct without a Swift-side caller); nil until a
+            // future task adds year to SeratoMetadata.
+            year: nil
         )
         do {
             try fileTagWriter(write.absolutePath, update)

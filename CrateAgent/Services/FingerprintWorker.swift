@@ -483,7 +483,7 @@ public actor FingerprintWorker {
             return ProcessResult(
                 fileId: fileId,
                 path: file.path,
-                outcome: .success(serializeHashesToBytes(hashes))
+                outcome: .success(FingerprintEncoder.serialize(hashes))
             )
         } catch {
             return ProcessResult(fileId: fileId, path: file.path, outcome: .failure)
@@ -517,35 +517,6 @@ public actor FingerprintWorker {
                 .limit(limit)
                 .fetchAll(db)
         }
-    }
-
-    // MARK: - Encoding (testable static)
-
-    /// Little-endian byte-serialization of Chromaprint's `[UInt32]`.
-    /// Length-prefix isn't needed — the blob's length divided by 4
-    /// gives the count back, and the column is opaque to SQLite.
-    static func serializeHashesToBytes(_ hashes: [UInt32]) -> Data {
-        var data = Data(capacity: hashes.count * 4)
-        for hash in hashes {
-            var littleEndian = hash.littleEndian
-            withUnsafeBytes(of: &littleEndian) { rawBuffer in
-                data.append(contentsOf: rawBuffer)
-            }
-        }
-        return data
-    }
-
-    static func deserializeHashesFromBytes(_ data: Data) -> [UInt32] {
-        guard data.count % 4 == 0 else { return [] }
-        var hashes: [UInt32] = []
-        hashes.reserveCapacity(data.count / 4)
-        data.withUnsafeBytes { rawBuffer in
-            let typedBuffer = rawBuffer.bindMemory(to: UInt32.self)
-            for hash in typedBuffer {
-                hashes.append(UInt32(littleEndian: hash))
-            }
-        }
-        return hashes
     }
 }
 
