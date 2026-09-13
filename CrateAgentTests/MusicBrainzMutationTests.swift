@@ -97,6 +97,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         currentFileTitle: String? = nil,
         currentFileAlbum: String? = nil,
         recordingMBID: String = "rec",
+        releaseMBID: String = "rel",
         // Match `makeEngineWithFile`'s indexed identity so the D-A staleness
         // check passes by default; a stale-candidate test overrides these.
         expectedFileSize: Int64 = 1,
@@ -106,7 +107,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             fileID: fileID,
             acoustID: "aid",
             recordingMBID: recordingMBID,
-            releaseMBID: "rel",
+            releaseMBID: releaseMBID,
             artistMBID: "art",
             isrc: "ISRC123",
             fingerprintHash: fingerprintHash,
@@ -633,6 +634,61 @@ final class MusicBrainzMutationTests: XCTestCase {
             )
         }
         XCTAssertEqual(recorder.calls.count, writesBeforeUndo, "a refused undo rewrites no audio tags")
+    }
+
+    /// A sibling (FLAC+MP3 of ONE recording) matched to a DIFFERENT release
+    /// drifts the shared row's `releaseMBID` — but that is NOT a supersession
+    /// of the first file's match, so undoing the older batch must SUCCEED
+    /// (unlink its file, leave the shared row for the sibling). Guards against
+    /// the out-of-order-undo check over-firing on legitimate cherry-picked
+    /// identity drift.
+    func testUndoOfSiblingWithDifferentReleaseIsNotRejected() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Batch A: file1 → recA, release rel1.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel1"
+            )),
+            batchId: "batchA"
+        )
+        // Batch B: sibling file2 → SAME recording recA but a DIFFERENT release
+        // rel2 (ReleaseSelector picks per file). The shared row's releaseMBID
+        // drifts to rel2, so forwardIdentityStillOnRow is false for A — but
+        // file2 references the row, so this is a sibling, not a supersession.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel2"
+            )),
+            batchId: "batchB"
+        )
+
+        // Must NOT throw — a legitimate sibling undo.
+        try await engine.undoBatch("batchA")
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(track.musicbrainzRecordingId, "recA", "the shared row survives for the sibling")
+            XCTAssertEqual(track.musicbrainzReleaseId, "rel2", "the sibling's release is not clobbered by A's undo")
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: file2)!.trackId, track.id, "file2 still links to the row")
+            XCTAssertNil(try FileRecord.fetchOne(db, key: file1)!.trackId, "the undone file1 is unlinked")
+        }
     }
 
     // MARK: - Identity-only confirm schedules no audio-tag write (#3999114458)

@@ -1842,19 +1842,27 @@ public actor OperationEngine {
         let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
 
         // Out-of-order undo guard. A's forward matched this file to a
-        // recording on the fingerprint-keyed row. If the row still exists but
-        // no longer carries A's exact identity, a LATER batch B re-matched
-        // this same file (files keep their fingerprint across a re-match) to a
-        // different recording. Undoing A now would relink the file away from
-        // B, restore A's stale DB metadata, and rewrite the audio tags over
-        // B's — corrupting the current match. Reject loudly: batch undo is
-        // atomic, so throwing here rolls the whole undo back with nothing
-        // half-applied, and History surfaces it so the user undoes B first. A
-        // row that still carries A's identity but is ALSO referenced by
-        // another file (FLAC+MP3 of one recording) is not superseded — this
-        // file is still A's, and the shared row is protected separately by
-        // `thisForwardStillSolelyOwnsRow` below.
-        if track != nil, !forwardIdentityStillOnRow {
+        // recording on the fingerprint-keyed row. True supersession is: the
+        // row still exists, no longer carries A's exact identity, AND no other
+        // file references it — meaning a LATER batch re-matched THIS SAME file
+        // (files keep their fingerprint across a re-match) to a different
+        // recording. Undoing A then would relink the file away from the newer
+        // match, restore A's stale DB metadata, and rewrite the audio tags —
+        // corrupting the current match. Reject loudly: batch undo is atomic,
+        // so throwing here rolls the whole undo back with nothing half-applied,
+        // and History surfaces it so the user undoes the newer match first.
+        //
+        // The `!otherFilesReferenceRow` clause is load-bearing: identity fields
+        // are cherry-picked per file, so a sibling (FLAC+MP3 of ONE recording)
+        // matched to a different RELEASE legitimately drifts the row's
+        // `releaseMBID`/`artistMBID`/`isrc` without any re-match of this file —
+        // that is not supersession, and it must still undo. And the apply-side
+        // D-C guard already rejects re-matching to a different RECORDING while
+        // another file references the row, so a drifted-identity row that is
+        // still referenced can only be a same-recording sibling, never a real
+        // supersession. When another file references it, the shared row is
+        // left intact by `thisForwardStillSolelyOwnsRow` below.
+        if track != nil, !forwardIdentityStillOnRow, !otherFilesReferenceRow {
             throw OperationEngineError.undoSupersededByLaterMatch(fileId: applied.fileID)
         }
 

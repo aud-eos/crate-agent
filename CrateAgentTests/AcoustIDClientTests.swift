@@ -146,6 +146,19 @@ final class AcoustIDClientTests: XCTestCase {
         }
     }
 
+    func testTimeoutMapsToTransportNotOffline() async {
+        // A per-request timeout must NOT halt the whole pass — it's a
+        // per-row .transport failure, not a systemic .offline outage.
+        let client = AcoustIDClient(loader: TimeoutLoader(), limiter: .noop, cache: .memory())
+
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")) {
+            guard case .transport = $0 as? LookupError else {
+                XCTFail("expected .transport, got \($0)")
+                return
+            }
+        }
+    }
+
     func testEmptyResultsIsAValidSuccessNotAFailure() async throws {
         let loader = StubLoader(status: 200, body: fixture("acoustid_empty.json"))
         let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
@@ -379,6 +392,15 @@ private final class ThrowingLoader: URLLoading {
 private final class OfflineLoader: URLLoading {
     func data(for _: URLRequest) async throws -> (Data, URLResponse) {
         throw URLError(.notConnectedToInternet)
+    }
+}
+
+/// Fails every call with a timeout — a PER-REQUEST failure (one slow response,
+/// e.g. under rate-limiting), NOT a systemic outage, so it must stay
+/// `.transport` and fail only its row rather than halting the whole scan.
+private final class TimeoutLoader: URLLoading {
+    func data(for _: URLRequest) async throws -> (Data, URLResponse) {
+        throw URLError(.timedOut)
     }
 }
 

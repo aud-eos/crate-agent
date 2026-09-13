@@ -85,12 +85,18 @@ public struct RetryingLookupRequester: Sendable {
 
     /// URL-loading failure codes that mean the connection itself is
     /// unavailable — every subsequent request would fail identically — as
-    /// opposed to a one-off per-request failure (`.badServerResponse`,
-    /// `.cannotParseResponse`, etc.) that maps to `.transport`.
+    /// opposed to a one-off per-request failure that maps to `.transport`.
+    /// Deliberately excludes `.timedOut`: a single slow response (e.g. one
+    /// lookup stalling under AcoustID rate-limiting) is per-request, not a
+    /// systemic outage, and halting the whole scan on it would be too
+    /// aggressive — it stays `.transport` and fails just that row.
+    /// `.networkConnectionLost` IS included: a dropped connection mid-scan is
+    /// the systemic case #3999114468 targets, and if it were a one-off only
+    /// this scan halts and a re-scan proceeds.
     private static func isConnectionWide(_ code: URLError.Code) -> Bool {
         switch code {
         case .notConnectedToInternet, .cannotFindHost, .cannotConnectToHost,
-             .dnsLookupFailed, .networkConnectionLost, .timedOut,
+             .dnsLookupFailed, .networkConnectionLost,
              .dataNotAllowed, .internationalRoamingOff:
             return true
         default:

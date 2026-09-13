@@ -341,18 +341,26 @@ final class AutoTaggerService: ObservableObject {
         }
 
         let path = file.path
+        // Capture the freshness basis BEFORE the decode reads the file, not
+        // after. A stat taken after the read could reflect a modification that
+        // happened during/just after the read: the basis would then match the
+        // POST-modification file while the fingerprint bytes describe the
+        // PRE-modification audio, and every future scan would see
+        // `live == basis` and trust a stale fingerprint forever. Capturing it
+        // first means any change from here on makes the next scan's stat differ
+        // and correctly triggers one more recompute (finding #3999114461).
+        let freshnessBasis = await onDiskFreshness(ofFileAt: path)
         do {
             let hashes = try await runOffMainActor { [fingerprintFunction] in try fingerprintFunction(path) }
             let serialized = FingerprintEncoder.serialize(hashes)
-            // Persist the on-disk stat the fingerprint was computed from as its
-            // freshness basis, so the NEXT scan trusts this fingerprint without
+            // Persist the pre-decode on-disk stat as the fingerprint's freshness
+            // basis, so the NEXT scan trusts this fingerprint without
             // re-decoding the audio. Without this, a recompute updated only the
             // bytes and left the basis pinned to the stale index snapshot, so
             // every later scan of an edited file failed the freshness check and
-            // re-decoded up to 120s of audio (finding #3999114461). If the file
-            // can't be stat'd we omit the basis rather than record a wrong one —
-            // the fallback to the index snapshot then applies.
-            let freshnessBasis = await onDiskFreshness(ofFileAt: path)
+            // re-decoded up to 120s of audio. If the file can't be stat'd we
+            // omit the basis rather than record a wrong one — the fallback to
+            // the index snapshot then applies.
             try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis)
             return serialized
         } catch {
