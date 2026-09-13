@@ -1576,27 +1576,32 @@ public actor OperationEngine {
             // Undoing batch A must never overwrite what a later batch B
             // established on the same fingerprint-keyed row (invariant
             // #4: FLAC+MP3 of one recording, or a re-encode, share a
-            // track row). B — applied after A — takes the existing-row
-            // branch and overwrites this row's identity, so if T's
-            // current identity no longer matches what A's forward wrote,
-            // B owns the row now and A's undo must leave it alone.
+            // track row). A's undo may touch the row's identity only when
+            // A still SOLELY owns it: no other file references it (a
+            // later batch that adopted or kept the row links its own file
+            // to it) AND its identity is still exactly what A's forward
+            // wrote. Both guards are needed — when B re-matches to the
+            // SAME recording the identity doesn't drift, so the reference
+            // count is the only signal that B now owns the row. The same
+            // predicate gates both teardown (created row) and restore
+            // (pre-existing row); the file itself has already been
+            // unlinked above.
+            let otherFilesReferenceRow = try FileRecord
+                .filter(Column("track_id") == track.id && Column("id") != applied.fileID)
+                .fetchCount(db) > 0
             let forwardIdentityStillOnRow =
                 track.acoustidId == applied.acoustID
                 && track.musicbrainzRecordingId == applied.recordingMBID
                 && track.musicbrainzReleaseId == applied.releaseMBID
                 && track.musicbrainzArtistId == applied.artistMBID
                 && track.isrc == applied.isrc
+            let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
 
             if applied.createdTrackRow {
                 // The forward created this row. Null what it set and leave
-                // the now-orphaned row in place — but ONLY when nothing
-                // else adopted it since: no other file references it AND
-                // its identity is still exactly what this forward wrote.
-                // Otherwise a later batch's match would be silently wiped.
-                let otherReferents = try FileRecord
-                    .filter(Column("track_id") == track.id && Column("id") != applied.fileID)
-                    .fetchCount(db)
-                if otherReferents == 0 && forwardIdentityStillOnRow {
+                // the now-orphaned row in place — but only while A solely
+                // owns it; otherwise a later batch's match would be wiped.
+                if thisForwardStillSolelyOwnsRow {
                     track.acoustidId = nil
                     track.musicbrainzRecordingId = nil
                     track.musicbrainzReleaseId = nil
@@ -1610,10 +1615,12 @@ public actor OperationEngine {
                 }
             } else if let previous = applied.previousTrackIdentifiers {
                 // Restore the pre-existing row's captured identity — but
-                // only if no later batch changed it since. If B re-matched
-                // the same row after A, restoring A's `previous` here would
-                // clobber B's identity; leave B's in place instead.
-                if forwardIdentityStillOnRow {
+                // only while A solely owns it. If a later batch B adopted
+                // the same fingerprint row (even to the SAME recording, so
+                // nothing drifts), file2 still references it and restoring
+                // A's `previous` here would clobber the identity B relies
+                // on; leave the row alone in that case.
+                if thisForwardStillSolelyOwnsRow {
                     track.acoustidId = previous.acoustID
                     track.musicbrainzRecordingId = previous.recordingMBID
                     track.musicbrainzReleaseId = previous.releaseMBID

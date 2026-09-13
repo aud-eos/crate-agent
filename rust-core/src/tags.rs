@@ -464,6 +464,52 @@ mod tests {
         assert_eq!(tag.date(), None, "clear_year must remove the date frame");
     }
 
+    /// End-to-end proof that the undo clears actually land on disk:
+    /// seed artist + year, then clear both (empty string + `clear_year`),
+    /// and confirm a re-read no longer reports the seeded values. A text
+    /// clear becomes an empty frame in some tag formats (RIFF INFO here)
+    /// rather than a dropped one — either way the applied value is gone,
+    /// which is what undo needs. `clear_year` drops the date outright.
+    #[test]
+    fn clear_writes_read_back_absent_through_a_real_file() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-clear-roundtrip");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("clear.wav");
+        write_silent_wav(&path, 2).unwrap();
+
+        write_tags(
+            &path,
+            &AudioTagUpdate {
+                artist: Some("Seeded Artist".to_string()),
+                year: Some(1994),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_tags(&path).unwrap().artist.as_deref(), Some("Seeded Artist"));
+        assert_eq!(read_tags(&path).unwrap().year, Some(1994));
+
+        write_tags(
+            &path,
+            &AudioTagUpdate {
+                artist: Some(String::new()),
+                clear_year: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let read_back = read_tags(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            read_back.artist.as_deref().is_none_or(str::is_empty),
+            "cleared artist must no longer carry the seeded value (empty or absent), got {:?}",
+            read_back.artist
+        );
+        assert_eq!(read_back.year, None, "cleared year reads back absent");
+    }
+
     #[test]
     fn write_tags_creates_tag_when_file_has_none() {
         let tmpdir = std::env::temp_dir().join("crate-agent-test-write-no-tag");

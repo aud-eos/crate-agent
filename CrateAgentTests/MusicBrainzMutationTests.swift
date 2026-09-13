@@ -498,6 +498,69 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// The Critical the drift guard alone misses: duplicates (FLAC+MP3)
+    /// resolve to the SAME recording, so when a later batch B re-matches
+    /// the shared row to the same MBID, nothing drifts. Only the
+    /// reference count reveals that B (via file2) now depends on the row,
+    /// so undoing A must still leave the row's identity alone.
+    func testUndoPreexistingRowSameRecordingDoesNotClobberLaterBatch() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // Pre-existing row (recX), not yet linked to either file, so batch
+        // A takes the existing-row branch with previousTrackID == nil.
+        try await database.writer.write { db in
+            var track = TrackRecord(
+                fingerprintHash: fingerprint, musicbrainzRecordingId: "recX", artist: "X"
+            )
+            try track.insert(db)
+        }
+
+        // Batch A: file1 → recA (existing-row branch, previous = recX).
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "batchA"
+        )
+        // Batch B (later): file2, same fingerprint, SAME recording — no
+        // identity drift, but file2 now depends on the row.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "batchB"
+        )
+
+        try await engine.undoBatch("batchA")
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(
+                track.musicbrainzRecordingId, "recA",
+                "same-recording B still references the row — undo A must not restore recX"
+            )
+            let f2 = try FileRecord.fetchOne(db, key: file2)!
+            XCTAssertEqual(f2.trackId, track.id, "file2 still links to the row it depends on")
+            let f1 = try FileRecord.fetchOne(db, key: file1)!
+            XCTAssertNil(f1.trackId, "the undone file (file1) is unlinked")
+        }
+    }
+
     // MARK: - Cherry-pick
 
     func testPartialFieldSetOnlyWritesChosenFields() async throws {
