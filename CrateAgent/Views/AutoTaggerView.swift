@@ -627,7 +627,15 @@ struct AutoTaggerView: View {
         }
         let freshPayloadByFileID = payloadByFileID.filter { !staleIDs.contains($0.key) }
         let appliedIDs = Set(freshPayloadByFileID.keys)
-        let mutations: [TrackMutation] = freshPayloadByFileID.values.map { .applyMusicBrainzMatch($0) }
+        // Apply in the stable review order (`scannedFileIDs`), NOT dictionary
+        // iteration order. When two confirmed files share a fingerprint+recording
+        // but chose different releases/display fields, each mutation updates the
+        // same canonical `tracks` row, so the LAST applied wins — building from
+        // `Dictionary.values` would make which selection persists depend on hash
+        // order and vary between otherwise identical applies (finding #4000668527).
+        let mutations: [TrackMutation] = scannedFileIDs
+            .compactMap { freshPayloadByFileID[$0] }
+            .map { .applyMusicBrainzMatch($0) }
 
         let staleNotice = staleIDs.isEmpty
             ? nil

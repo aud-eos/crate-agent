@@ -449,9 +449,11 @@ public actor OperationEngine {
     private static func eventNeedsCurrentFilePath(_ eventType: EventType) -> Bool {
         switch eventType {
         case .musicBrainzMatchApplied, .metadataCommittedToSerato, .fileTagsWritten,
-             .musicBrainzMatchReverted:
+             .musicBrainzMatchReverted, .fileRenamed:
+            // Renames are re-targeted to the file's CURRENT path on resync (see
+            // `resyncWrites`), so they need the DB lookup too.
             return true
-        case .fileRenamed, .trackImported, .fileRemoved, .metadataSet,
+        case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
              .fileRemovedFromCrates:
             return false
@@ -485,9 +487,18 @@ public actor OperationEngine {
             // Missing `previousPath` (older events before this field was
             // always populated) leaves no source path to rewrite from.
             guard !payload.previousPath.isEmpty else { return [] }
+            // Re-target to the file's CURRENT path, not this event's journaled
+            // `newPath`. A file renamed twice (/old→/mid then /mid→/new) whose
+            // first Serato rewrite failed would otherwise be replayed only as
+            // /old→/mid, leaving Serato at /mid while the DB/file are at /new
+            // (finding #4000668519). Rewriting every journaled old-path to the
+            // current path means whichever prior path Serato is stuck at is
+            // moved to the current one; the non-matching ones no-op. Falls back
+            // to the journaled newPath if the current path is unavailable.
+            let currentPath = event.fileId.flatMap { pathByFileId[$0] } ?? payload.newPath
             return [.rename(SeratoPendingRename(
                 oldAbsolutePath: payload.previousPath,
-                newAbsolutePath: payload.newPath
+                newAbsolutePath: currentPath
             ))]
         case .musicBrainzMatchApplied:
             guard let payload = try? decoder.decode(
@@ -588,35 +599,67 @@ public actor OperationEngine {
         return undoBatchId
     }
 
-    /// Throws `undoSupersededByLaterMatch` if any match-affecting event
-    /// (`musicBrainzMatchApplied` or `musicBrainzMatchReverted`) in the batch
-    /// being undone has a LATER match-affecting event for the same file in a
-    /// DIFFERENT batch — i.e. that file was re-matched (or separately reverted)
-    /// after this batch, so reverting this batch would be out of order and
-    /// would clobber the newer state. Reverted events are included so a REDO
-    /// (undoing an `undo:` batch, whose events are all `musicBrainzMatchReverted`
-    /// and whose inverse RE-APPLIES the original match) is guarded too — a redo
-    /// after the file was matched by a later batch would otherwise reapply the
-    /// stale original over the current link/tags (finding #4000261463). Events
-    /// in this same batch are excluded (they're being undone together, atomically).
-    private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId: String) async throws {
+    /// Throws `undoSupersededByLaterMatch` if any match-affecting event in the
+    /// batch would be reverted OUT OF ORDER — i.e. it is not the file's current
+    /// effective match state.
+    ///
+    /// The signal must be the file's *net current* state, not the mere presence
+    /// of later log rows: a later match that was itself undone leaves the log
+    /// row behind but is no longer live, and counting it kept the original
+    /// match un-undoable forever even after the LIFO recovery the guard is meant
+    /// to enable (finding #4000668517). So per file we replay its match events
+    /// as a LIFO stack (`musicBrainzMatchApplied` pushes, `musicBrainzMatchReverted`
+    /// pops):
+    ///  - Undoing an APPLY is in order iff that apply is the stack top (the
+    ///    file's current match). A later apply still on the stack (live re-match,
+    ///    same or different recording/release) blocks it; a later apply that was
+    ///    popped by its own revert does not (finding #3999974010, #4000261010).
+    ///  - Undoing a REVERT is a REDO (re-applying the reverted match); it is in
+    ///    order iff that revert is the file's LAST match event — anything after
+    ///    it (a newer match or revert) means the redo is out of order
+    ///    (finding #4000261463).
+    private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId _: String) async throws {
         let matchEvents = events.filter {
             $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
         }
         guard !matchEvents.isEmpty else { return }
-        try await database.writer.read { db in
-            for event in matchEvents {
-                guard let fileId = event.fileId, let eventId = event.eventId else { continue }
-                let laterMatchCount = try EventRecord
-                    .filter(Column("file_id") == fileId)
-                    .filter(Column("batch_id") != batchId)
-                    .filter(Column("event_id") > eventId)
-                    .filter([EventType.musicBrainzMatchApplied.rawValue,
-                             EventType.musicBrainzMatchReverted.rawValue].contains(Column("event_type")))
-                    .fetchCount(db)
-                if laterMatchCount > 0 {
+        let fileIds = Array(Set(matchEvents.compactMap(\.fileId)))
+        guard !fileIds.isEmpty else { return }
+
+        // Full per-file match-event history across ALL batches, oldest-first.
+        let typeValues = [EventType.musicBrainzMatchApplied.rawValue, EventType.musicBrainzMatchReverted.rawValue]
+        let sql = """
+            SELECT * FROM events
+            WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
+              AND event_type IN (\(databaseQuestionMarks(count: typeValues.count)))
+            ORDER BY event_id ASC
+            """
+        let arguments = StatementArguments(fileIds) + StatementArguments(typeValues)
+        let history = try await database.writer.read { db in
+            try EventRecord.fetchAll(db, sql: sql, arguments: arguments)
+        }
+        var historyByFile: [Int64: [EventRecord]] = [:]
+        for event in history {
+            if let fileId = event.fileId { historyByFile[fileId, default: []].append(event) }
+        }
+
+        for event in matchEvents {
+            guard let fileId = event.fileId, let eventId = event.eventId else { continue }
+            let fileHistory = historyByFile[fileId] ?? []
+            if event.eventType == .musicBrainzMatchApplied {
+                var stack: [Int64] = []
+                for historyEvent in fileHistory {
+                    if historyEvent.eventType == .musicBrainzMatchApplied {
+                        if let id = historyEvent.eventId { stack.append(id) }
+                    } else if !stack.isEmpty {
+                        stack.removeLast()
+                    }
+                }
+                if stack.last != eventId {
                     throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                 }
+            } else if fileHistory.last?.eventId != eventId {
+                throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
             }
         }
     }
@@ -2137,16 +2180,46 @@ public actor OperationEngine {
         applied: ApplyMusicBrainzMatchPayload,
         absolutePath: String
     ) -> [SeratoPendingWrite] {
-        let restoredTags = applied.previousFileTags ?? applied.previousMetadata ?? .empty
-        let forwardWroteYear = applied.year != nil
-        return musicBrainzSeratoWrites(
-            absolutePath: absolutePath,
-            artist: applied.artist != nil ? (restoredTags.artist ?? "") : nil,
-            title: applied.title != nil ? (restoredTags.title ?? "") : nil,
-            album: applied.album != nil ? (restoredTags.album ?? "") : nil,
-            year: forwardWroteYear ? applied.previousFileYear : nil,
-            clearFileYear: forwardWroteYear && applied.previousFileYear == nil
+        // The two external targets restore from DIFFERENT snapshots: Serato's
+        // database V2 (and the SQLite `files` row, already restored in
+        // `applyRevertMusicBrainzMatch`) go back to `previousMetadata` — the
+        // Serato-imported snapshot — while the audio file tag goes back to
+        // `previousFileTags` — the file's real pre-match on-disk tag. Sharing
+        // one snapshot for both left Serato and the sidecar DB inconsistent
+        // after undo whenever they disagreed pre-match (finding #4000405427).
+        // For each text field the forward wrote, restore that target's snapshot
+        // value, or "" to clear a field the match added from empty.
+        let dbSnapshot = applied.previousMetadata ?? .empty
+        let fileSnapshot = applied.previousFileTags ?? applied.previousMetadata ?? .empty
+
+        let v2Metadata = SeratoMetadata(
+            artist: applied.artist != nil ? (dbSnapshot.artist ?? "") : nil,
+            title: applied.title != nil ? (dbSnapshot.title ?? "") : nil,
+            album: applied.album != nil ? (dbSnapshot.album ?? "") : nil
         )
+        let fileMetadata = SeratoMetadata(
+            artist: applied.artist != nil ? (fileSnapshot.artist ?? "") : nil,
+            title: applied.title != nil ? (fileSnapshot.title ?? "") : nil,
+            album: applied.album != nil ? (fileSnapshot.album ?? "") : nil
+        )
+        let forwardWroteYear = applied.year != nil
+        let fileYear = forwardWroteYear ? applied.previousFileYear : nil
+        let clearFileYear = forwardWroteYear && applied.previousFileYear == nil
+
+        var writes: [SeratoPendingWrite] = []
+        if v2Metadata.artist != nil || v2Metadata.title != nil || v2Metadata.album != nil {
+            writes.append(.metadataUpdate(SeratoPendingMetadataUpdate(
+                absolutePath: absolutePath, metadata: v2Metadata
+            )))
+        }
+        if fileMetadata.artist != nil || fileMetadata.title != nil || fileMetadata.album != nil
+            || fileYear != nil || clearFileYear
+        {
+            writes.append(.fileTagWrite(SeratoPendingFileTagWrite(
+                absolutePath: absolutePath, metadata: fileMetadata, year: fileYear, clearYear: clearFileYear
+            )))
+        }
+        return writes
     }
 
     private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(

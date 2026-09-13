@@ -839,6 +839,46 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// After the documented LIFO recovery — re-match file, then undo the newer
+    /// match — the ORIGINAL match must become undoable again. A later match that
+    /// was itself undone leaves applied+reverted rows in the log but is no
+    /// longer live, so the out-of-order guard must not treat it as a live
+    /// supersession (finding #4000668517).
+    func testUndoOfOriginalMatchAllowedAfterLaterMatchUndone() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Batch A: file1 → recA.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "batchA"
+        )
+        // Batch B (later): re-match file1 → recB.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recB"
+            )),
+            batchId: "batchB"
+        )
+        // LIFO recovery: undo the newer match B first.
+        try await engine.undoBatch("batchB")
+
+        // Now A is the current match — undoing it must be ALLOWED (not thrown).
+        try await engine.undoBatch("batchA")
+
+        try await database.writer.read { db in
+            XCTAssertNil(
+                try FileRecord.fetchOne(db, key: file1)!.trackId,
+                "after undoing B then A, file1 is unlinked"
+            )
+        }
+    }
+
     /// A sibling (FLAC+MP3 of ONE recording) matched to a DIFFERENT release
     /// drifts the shared row's `releaseMBID` — but that is NOT a supersession
     /// of the first file's match, so undoing the older batch must SUCCEED

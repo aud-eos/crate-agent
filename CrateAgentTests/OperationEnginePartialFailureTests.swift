@@ -432,6 +432,44 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         )
     }
 
+    // MARK: - #4000405427: undo restores V2 from the DB snapshot, tag from disk
+
+    /// When Serato's snapshot (`FileRecord`/database V2) and the embedded file
+    /// tag disagreed before a match, undo must send the DB snapshot back to
+    /// database V2 (matching the restored SQLite row) and the on-disk snapshot
+    /// back to the audio file — not share one snapshot for both, which left
+    /// Serato and the sidecar DB inconsistent after undo.
+    func testUndoRestoresDatabaseV2FromDbSnapshotNotOnDiskTag() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        // The harness seeds the DB row artist = "old"; the file's embedded tag
+        // (captured into the payload) differs.
+        let file = fileIds[0]
+        try await engine.applyBatch(
+            [.applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload(
+                fileID: file, acoustID: "aid", recordingMBID: "recA", releaseMBID: "relA",
+                artistMBID: "art", isrc: "isrc", fingerprintHash: sha256(Data("fp".utf8)),
+                expectedFileSize: 1, expectedMtime: 1,
+                artist: "New Artist", title: nil, album: nil, year: nil,
+                currentFileArtist: "Disk Artist"
+            ))],
+            batchId: "batchA"
+        )
+
+        try await engine.undoBatch("batchA")
+
+        let records = try readDatabaseRecords(
+            databasePath: seratoDirectory.appendingPathComponent("database V2").path
+        )
+        let record = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertEqual(
+            record?.artist, "old",
+            "undo must restore database V2 from the DB snapshot (\"old\"), not the on-disk tag (\"Disk Artist\")"
+        )
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {
