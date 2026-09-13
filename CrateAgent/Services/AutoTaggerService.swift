@@ -55,6 +55,7 @@ final class AutoTaggerService: ObservableObject {
     private let keyStore: AcoustIDKeyProviding
     private let fingerprintFunction: FingerprintWorker.FingerprintFunction
     private let audioTagsReader: AudioTagsReading
+    private let fileFreshnessReader: FileFreshnessReading
 
     private var runTask: Task<Void, Never>?
 
@@ -64,7 +65,12 @@ final class AutoTaggerService: ObservableObject {
         musicBrainzClient: MusicBrainzLookupClient,
         keyStore: AcoustIDKeyProviding = AcoustIDKeyStore(),
         fingerprintFunction: @escaping FingerprintWorker.FingerprintFunction = { try fingerprintAudioFile(filePath: $0) },
-        audioTagsReader: @escaping AudioTagsReading = { try readAudioTags(filePath: $0) }
+        audioTagsReader: @escaping AudioTagsReading = { try readAudioTags(filePath: $0) },
+        fileFreshnessReader: @escaping FileFreshnessReading = { path in
+            FileMetadataCollector.collect(at: path).map {
+                FileFreshnessSnapshot(fileSize: $0.fileSize, mtime: $0.mtime)
+            }
+        }
     ) {
         self.database = database
         self.acoustIDClient = acoustIDClient
@@ -72,6 +78,7 @@ final class AutoTaggerService: ObservableObject {
         self.keyStore = keyStore
         self.fingerprintFunction = fingerprintFunction
         self.audioTagsReader = audioTagsReader
+        self.fileFreshnessReader = fileFreshnessReader
     }
 
     func candidate(for fileID: Int64) -> MatchCandidate? {
@@ -223,6 +230,8 @@ final class AutoTaggerService: ObservableObject {
             recordingMBID: recordingMBID,
             artistMBID: artistCredit?.artist.id,
             fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
+            expectedFileSize: file.fileSize,
+            expectedMtime: file.mtime,
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
@@ -230,7 +239,10 @@ final class AutoTaggerService: ObservableObject {
             proposedTitle: recording.title,
             proposedAlbum: chosenRelease.title,
             proposedYear: recording.releaseGroup?.firstReleaseDate.flatMap(Self.year(fromMusicBrainzDate:)),
-            currentFileYear: tags.year.map(Int.init)
+            currentFileYear: tags.year.map(Int.init),
+            currentFileArtist: tags.artist,
+            currentFileTitle: tags.title,
+            currentFileAlbum: tags.album
         )
 
         return Self.classify(candidate)
@@ -265,7 +277,8 @@ final class AutoTaggerService: ObservableObject {
     /// processed this file yet. The Chromaprint decode is CPU-bound, so it
     /// runs off the main actor to keep the UI responsive.
     private func currentFingerprint(for file: FileRecord) async throws -> Data {
-        if file.fingerprintStatus == .done, let existing = file.chromaprintFingerprint {
+        if file.fingerprintStatus == .done, let existing = file.chromaprintFingerprint,
+           await storedFingerprintIsFresh(for: file) {
             return existing
         }
         guard let fileID = file.id else {
@@ -282,6 +295,24 @@ final class AutoTaggerService: ObservableObject {
             try? await persistFingerprint(fileID: fileID, bytes: nil, status: .failed)
             throw AutoTaggerRowFailure("failed to compute fingerprint for file \(fileID): \(error)")
         }
+    }
+
+    /// Whether the file's stored `.done` fingerprint can still be trusted
+    /// for a lookup (finding D-B): true when the file's CURRENT on-disk
+    /// size+mtime match the indexed snapshot the fingerprint was computed
+    /// from. No sync flow updates `FileRecord.fileSize`/`mtime` after
+    /// indexing without also resetting `fingerprintStatus`, so the indexed
+    /// snapshot is a faithful basis without a dedicated fingerprinted-basis
+    /// column. When the file can't be stat'd we can't prove it changed, so
+    /// the stored bytes are kept — the imminent tag read fails loudly if the
+    /// file is genuinely gone.
+    private func storedFingerprintIsFresh(for file: FileRecord) async -> Bool {
+        let path = file.path
+        let current = await Task.detached(priority: .userInitiated) { [fileFreshnessReader] in
+            fileFreshnessReader(path)
+        }.value
+        guard let current else { return true }
+        return current.fileSize == file.fileSize && current.mtime == file.mtime
     }
 
     /// Runs a blocking closure off the main actor so CPU-bound FFI calls
@@ -322,6 +353,20 @@ private struct AutoTaggerRowFailure: Error, CustomStringConvertible {
 /// default is the `readAudioTags` FFI call; tests inject a stub so no real
 /// audio file is required.
 typealias AudioTagsReading = @Sendable (String) throws -> AudioTags
+
+/// Reads a file's current on-disk size + mtime, used to decide whether a
+/// stored `.done` fingerprint is still valid for the file's current bytes
+/// (finding D-B). Production reads via `FileMetadataCollector` (same `stat`
+/// path that captured the indexed snapshot, so the units match); tests
+/// inject a stub. Returns nil when the file can't be stat'd.
+typealias FileFreshnessReading = @Sendable (String) -> FileFreshnessSnapshot?
+
+/// A file's current on-disk identity, in the same units as
+/// `FileRecord.fileSize`/`mtime` (bytes; mtime seconds since the epoch).
+struct FileFreshnessSnapshot: Equatable, Sendable {
+    let fileSize: Int64
+    let mtime: Int64
+}
 
 /// Seam over `AcoustIDClient.lookup` so tests can stub AcoustID without a
 /// real network call.

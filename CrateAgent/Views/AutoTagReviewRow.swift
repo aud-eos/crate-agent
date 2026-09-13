@@ -119,14 +119,22 @@ struct AutoTagRowModel {
             artistMBID: candidate.artistMBID,
             isrc: candidate.isrc,
             fingerprintHash: candidate.fingerprintHash,
+            // The file's indexed identity at lookup time, so the mutation
+            // can reject a candidate that went stale before Apply (D-A).
+            expectedFileSize: candidate.expectedFileSize,
+            expectedMtime: candidate.expectedMtime,
             artist: includeArtist ? candidate.proposedArtist : nil,
             title: resolvedTitle,
             album: includeAlbum ? candidate.proposedAlbum : nil,
             year: includeYear ? candidate.proposedYear : nil,
-            // The file's real pre-match on-disk year, so undo restores
-            // (or clears) the exact prior value — not the canonical
-            // `tracks.year`, which is a different field (invariant #4).
-            currentFileYear: candidate.currentFileYear
+            // The file's real pre-match on-disk tags, so undo restores
+            // (or clears) the exact prior embedded values — not the
+            // canonical `tracks.year` / Serato-imported DB snapshot, which
+            // are different fields (invariant #4, findings D-D).
+            currentFileYear: candidate.currentFileYear,
+            currentFileArtist: candidate.currentFileArtist,
+            currentFileTitle: candidate.currentFileTitle,
+            currentFileAlbum: candidate.currentFileAlbum
         )
     }
 }

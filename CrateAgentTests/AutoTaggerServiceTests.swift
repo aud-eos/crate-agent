@@ -365,6 +365,91 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertEqual(persisted?.fingerprintStatus, .done)
         XCTAssertEqual(persisted?.chromaprintFingerprint, FingerprintEncoder.serialize(expectedHashes))
     }
+
+    // MARK: - D-B: stale stored fingerprint is recomputed before lookup
+
+    /// A `.done` file whose current on-disk size/mtime differ from the
+    /// indexed snapshot the fingerprint was computed from (the file was
+    /// edited/replaced since fingerprinting) must NOT reuse the stale stored
+    /// bytes — it recomputes, so the lookup identifies the current audio.
+    func testStaleStoredFingerprintIsRecomputedBeforeLookup() async throws {
+        let database = try makeDatabase()
+        // insertFile stores fingerprint [1,2,3] with indexed fileSize 1000/mtime 0.
+        let fileID = try insertFile(in: database, path: "/music/edited.mp3")
+
+        let recomputedHashes: [UInt32] = [40, 41, 42]
+        let recomputedBase64 = fingerprintBase64(for: recomputedHashes)
+
+        let acoustIDClient = StubAcoustIDClient { base64 in
+            XCTAssertEqual(
+                base64, recomputedBase64,
+                "lookup must use the recomputed fingerprint, not the stale stored bytes"
+            )
+            return [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+        }
+        let recording = makeRecording()
+        let musicBrainzClient = StubMusicBrainzClient { _ in recording }
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in recomputedHashes },
+            audioTagsReader: stubAudioTagsReader(),
+            // Current on-disk identity differs from the indexed 1000/0 → stale.
+            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 2000, mtime: 999) }
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard case .strong = service.rows[fileID] else {
+            return XCTFail("expected .strong, got \(String(describing: service.rows[fileID]))")
+        }
+
+        let persisted = try await database.writer.read { db in try FileRecord.fetchOne(db, key: fileID) }
+        XCTAssertEqual(
+            persisted?.chromaprintFingerprint, FingerprintEncoder.serialize(recomputedHashes),
+            "the recomputed fingerprint must be persisted, replacing the stale bytes"
+        )
+    }
+
+    /// A `.done` file whose current on-disk size/mtime match the indexed
+    /// snapshot is unchanged — the stored fingerprint is reused as-is, with
+    /// no recompute.
+    func testFreshStoredFingerprintIsReusedWithoutRecompute() async throws {
+        let database = try makeDatabase()
+        let storedHashes: [UInt32] = [1, 2, 3]
+        let fileID = try insertFile(in: database, path: "/music/unchanged.mp3")
+        let storedBase64 = fingerprintBase64(for: storedHashes)
+
+        let acoustIDClient = StubAcoustIDClient { base64 in
+            XCTAssertEqual(base64, storedBase64, "fresh file must reuse the stored fingerprint")
+            return [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+        }
+        let recording = makeRecording()
+        let musicBrainzClient = StubMusicBrainzClient { _ in recording }
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in
+                XCTFail("must not recompute a fingerprint for an unchanged file")
+                return []
+            },
+            audioTagsReader: stubAudioTagsReader(),
+            // Matches the indexed snapshot (fileSize 1000, mtime 0) → fresh.
+            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 0) }
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard case .strong = service.rows[fileID] else {
+            return XCTFail("expected .strong, got \(String(describing: service.rows[fileID]))")
+        }
+    }
 }
 
 // MARK: - Test doubles

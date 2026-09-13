@@ -1636,6 +1636,18 @@ public actor OperationEngine {
             throw OperationEngineError.fileNotFound(fileId: payload.fileID)
         }
 
+        // D-A: the review pass can stay open indefinitely between lookup and
+        // Apply. Reject if the file's indexed identity drifted since the
+        // candidate was built — applying stale MusicBrainz identity to
+        // changed audio would mis-link a different recording. The compared
+        // values are the indexed snapshot (`FileRecord.fileSize`/`mtime`),
+        // which no flow updates after indexing without also re-fingerprinting
+        // (see D-B), so this needs no file I/O inside the transaction.
+        if fileRecord.fileSize != payload.expectedFileSize
+            || fileRecord.mtime != payload.expectedMtime {
+            throw OperationEngineError.candidateStale(fileId: payload.fileID)
+        }
+
         // Snapshot the file's Serato metadata + track link before
         // mutating, so the inverse can restore them exactly.
         let previousMetadata = SeratoMetadata(
@@ -1661,6 +1673,27 @@ public actor OperationEngine {
         if var existingTrack = try TrackRecord
             .filter(Column("fingerprint_hash") == payload.fingerprintHash)
             .fetchOne(db) {
+            // D-C: a 120s-capped fingerprint can collide across two DIFFERENT
+            // recordings. When the row already carries a recording MBID that
+            // differs from the incoming one AND another file depends on that
+            // row, overwriting would mis-link every one of those files
+            // (invariant #4). Reject instead. A single file re-identifying
+            // its OWN row (no other references) is a legitimate correction
+            // and proceeds — the reference check is what distinguishes a
+            // collision from a re-match.
+            if let existingRecordingMBID = existingTrack.musicbrainzRecordingId,
+               existingRecordingMBID != payload.recordingMBID {
+                let otherFilesReferenceRow = try FileRecord
+                    .filter(Column("track_id") == existingTrack.id && Column("id") != payload.fileID)
+                    .fetchCount(db) > 0
+                if otherFilesReferenceRow {
+                    throw OperationEngineError.fingerprintRecordingConflict(
+                        fileId: payload.fileID,
+                        existingMBID: existingRecordingMBID,
+                        incomingMBID: payload.recordingMBID
+                    )
+                }
+            }
             previousTrackIdentifiers = TrackIdentifiers(
                 acoustID: existingTrack.acoustidId,
                 recordingMBID: existingTrack.musicbrainzRecordingId,
@@ -1720,7 +1753,17 @@ public actor OperationEngine {
         var forwardPayload = payload
         forwardPayload.previousTrackID = previousTrackID
         forwardPayload.previousMetadata = previousMetadata
-        forwardPayload.previousFileTags = previousMetadata
+        // D-D: undo rewrites the AUDIO FILE's tags back to what was actually
+        // embedded before the match — captured on-disk at lookup time — not
+        // the Serato-imported `files`-row snapshot (`previousMetadata`),
+        // which can differ from the file's real tags. The DB-row restore
+        // still uses `previousMetadata` (correct for the row); only this
+        // file-tag restore uses the on-disk capture.
+        forwardPayload.previousFileTags = SeratoMetadata(
+            artist: payload.currentFileArtist,
+            title: payload.currentFileTitle,
+            album: payload.currentFileAlbum
+        )
         forwardPayload.previousFileYear = payload.currentFileYear
         forwardPayload.previousTrackIdentifiers = previousTrackIdentifiers
         forwardPayload.createdTrackRow = createdTrackRow
@@ -2071,6 +2114,14 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public let artistMBID: String?
     public let isrc: String?
     public let fingerprintHash: Data
+    /// The file's indexed identity (`FileRecord.fileSize`/`mtime`) as seen
+    /// when the candidate was built at lookup time. Re-checked against the
+    /// current `files` row at apply time; a mismatch means the file was
+    /// replaced or edited since review, so the apply is rejected before any
+    /// mutation rather than linking stale identity to changed audio
+    /// (finding D-A).
+    public let expectedFileSize: Int64
+    public let expectedMtime: Int64
     // Cherry-picked display fields — absent (nil) means not applied:
     public let artist: String?
     public let title: String?
@@ -2083,6 +2134,16 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     /// it being threaded through here. Snapshotted into
     /// `previousFileYear` at apply time.
     public let currentFileYear: Int?
+    /// The file's actual on-disk artist/title/album tags before the match,
+    /// read by the review UI (`AudioTags`) and supplied by the caller.
+    /// These, not the Serato-imported `files`-row snapshot
+    /// (`previousMetadata`), are what undo must rewrite back into the audio
+    /// file's tags — the embedded tags can differ from the DB row, and undo
+    /// must restore the file's ORIGINAL embedded values, not the DB values
+    /// (finding D-D). Snapshotted into `previousFileTags` at apply time.
+    public let currentFileArtist: String?
+    public let currentFileTitle: String?
+    public let currentFileAlbum: String?
     // Previous-state snapshots, filled by the engine at apply time:
     public var previousTrackID: Int64?
     public var previousMetadata: SeratoMetadata?
@@ -2103,11 +2164,16 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         artistMBID: String?,
         isrc: String?,
         fingerprintHash: Data,
+        expectedFileSize: Int64,
+        expectedMtime: Int64,
         artist: String?,
         title: String?,
         album: String?,
         year: Int?,
         currentFileYear: Int? = nil,
+        currentFileArtist: String? = nil,
+        currentFileTitle: String? = nil,
+        currentFileAlbum: String? = nil,
         previousTrackID: Int64? = nil,
         previousMetadata: SeratoMetadata? = nil,
         previousFileTags: SeratoMetadata? = nil,
@@ -2122,11 +2188,16 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         self.artistMBID = artistMBID
         self.isrc = isrc
         self.fingerprintHash = fingerprintHash
+        self.expectedFileSize = expectedFileSize
+        self.expectedMtime = expectedMtime
         self.artist = artist
         self.title = title
         self.album = album
         self.year = year
         self.currentFileYear = currentFileYear
+        self.currentFileArtist = currentFileArtist
+        self.currentFileTitle = currentFileTitle
+        self.currentFileAlbum = currentFileAlbum
         self.previousTrackID = previousTrackID
         self.previousMetadata = previousMetadata
         self.previousFileTags = previousFileTags
@@ -2447,6 +2518,19 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case batchNotFound(batchId: String)
     case undoNotSupported(eventType: EventType)
     case missingPreviousTrackIdentifiers(fileId: Int64)
+    /// The reviewed candidate was built against a file whose indexed
+    /// identity (`fileSize`/`mtime`) no longer matches at apply time — the
+    /// file was replaced or edited between lookup and Apply. Rejected
+    /// before any mutation so stale MusicBrainz identity is never linked to
+    /// changed audio (finding D-A). The row must be re-scanned.
+    case candidateStale(fileId: Int64)
+    /// A 120s-capped Chromaprint fingerprint collided across two DIFFERENT
+    /// recordings: an existing `tracks` row for this fingerprint already
+    /// carries a non-nil recording MBID that other files depend on, and the
+    /// incoming match names a different recording. Rejected so the existing
+    /// canonical identity and its file links stay intact (finding D-C,
+    /// invariant #4).
+    case fingerprintRecordingConflict(fileId: Int64, existingMBID: String, incomingMBID: String)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
     /// threw afterward. Distinct from a pre-commit throw so the caller
@@ -2477,6 +2561,10 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Events of type \(eventType.rawValue) can't be undone yet."
         case .missingPreviousTrackIdentifiers(let fileId):
             return "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
+        case .candidateStale(let fileId):
+            return "The reviewed match for file id \(fileId) is stale: the file changed on disk since it was scanned. Re-scan the file and review again."
+        case .fingerprintRecordingConflict(let fileId, let existingMBID, let incomingMBID):
+            return "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case .externalSyncIncomplete(let batchId, let underlying):
             return "Batch \(batchId) was applied, but some Serato/file writes did not land: \(underlying). Re-sync the batch to finish applying them."
         }

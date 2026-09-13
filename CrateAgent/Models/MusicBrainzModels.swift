@@ -280,6 +280,12 @@ struct MatchCandidate: Equatable {
     /// `AutoTaggerService` alongside the rest of the candidate so the
     /// review UI never has to re-derive it.
     let fingerprintHash: Data
+    /// The file's indexed identity (`FileRecord.fileSize`/`mtime`) as read
+    /// at lookup time. Threaded into `ApplyMusicBrainzMatchPayload` so the
+    /// mutation can reject a candidate that went stale between review and
+    /// Apply (finding D-A).
+    let expectedFileSize: Int64
+    let expectedMtime: Int64
     /// Mutable so "pick a different release" can update it without
     /// re-resolving the whole candidate.
     var chosenRelease: MBRelease
@@ -301,4 +307,11 @@ struct MatchCandidate: Equatable {
     /// diff: unlike `tracks.year`, it's populated even on a greenfield
     /// first-pass match, before any `tracks` row exists for this file.
     let currentFileYear: Int?
+    /// The file's embedded artist/title/album tags read off disk at lookup
+    /// time (`AudioTags`). Threaded into the payload so undo restores the
+    /// file's ORIGINAL embedded tags, not the Serato-imported DB snapshot
+    /// (finding D-D).
+    let currentFileArtist: String?
+    let currentFileTitle: String?
+    let currentFileAlbum: String?
 }

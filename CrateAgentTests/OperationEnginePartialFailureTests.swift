@@ -129,6 +129,8 @@ final class OperationEnginePartialFailureTests: XCTestCase {
                 artistMBID: "art\(index)",
                 isrc: "isrc\(index)",
                 fingerprintHash: sha256(Data("fp-\(index)".utf8)),
+                expectedFileSize: 1,
+                expectedMtime: 1,
                 artist: "Artist\(index)",
                 title: "Title\(index)",
                 album: "Album\(index)",

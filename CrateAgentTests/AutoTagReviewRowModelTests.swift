@@ -24,7 +24,10 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         proposedYear: Int? = 1994,
         chosenRelease: MBRelease? = nil,
         availableReleases: [MBRelease]? = nil,
-        currentFileYear: Int? = nil
+        currentFileYear: Int? = nil,
+        currentFileArtist: String? = nil,
+        currentFileTitle: String? = nil,
+        currentFileAlbum: String? = nil
     ) -> MatchCandidate {
         let release = chosenRelease ?? makeRelease()
         return MatchCandidate(
@@ -34,6 +37,8 @@ final class AutoTagReviewRowModelTests: XCTestCase {
             recordingMBID: "recording-1",
             artistMBID: "artist-1",
             fingerprintHash: Data([0xAB, 0xCD, 0xEF]),
+            expectedFileSize: 1000,
+            expectedMtime: 42,
             chosenRelease: release,
             availableReleases: availableReleases ?? [release],
             isrc: "ISRC0000001",
@@ -41,7 +46,10 @@ final class AutoTagReviewRowModelTests: XCTestCase {
             proposedTitle: proposedTitle,
             proposedAlbum: proposedAlbum,
             proposedYear: proposedYear,
-            currentFileYear: currentFileYear
+            currentFileYear: currentFileYear,
+            currentFileArtist: currentFileArtist,
+            currentFileTitle: currentFileTitle,
+            currentFileAlbum: currentFileAlbum
         )
     }
 

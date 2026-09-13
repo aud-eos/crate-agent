@@ -94,7 +94,14 @@ final class MusicBrainzMutationTests: XCTestCase {
         album: String? = "Illmatic",
         year: Int? = 1994,
         currentFileYear: Int? = nil,
-        recordingMBID: String = "rec"
+        currentFileArtist: String? = nil,
+        currentFileTitle: String? = nil,
+        currentFileAlbum: String? = nil,
+        recordingMBID: String = "rec",
+        // Match `makeEngineWithFile`'s indexed identity so the D-A staleness
+        // check passes by default; a stale-candidate test overrides these.
+        expectedFileSize: Int64 = 1,
+        expectedMtime: Int64 = 1
     ) -> ApplyMusicBrainzMatchPayload {
         ApplyMusicBrainzMatchPayload(
             fileID: fileID,
@@ -104,11 +111,16 @@ final class MusicBrainzMutationTests: XCTestCase {
             artistMBID: "art",
             isrc: "ISRC123",
             fingerprintHash: fingerprintHash,
+            expectedFileSize: expectedFileSize,
+            expectedMtime: expectedMtime,
             artist: artist,
             title: title,
             album: album,
             year: year,
-            currentFileYear: currentFileYear
+            currentFileYear: currentFileYear,
+            currentFileArtist: currentFileArtist,
+            currentFileTitle: currentFileTitle,
+            currentFileAlbum: currentFileAlbum
         )
     }
 
@@ -173,8 +185,13 @@ final class MusicBrainzMutationTests: XCTestCase {
             try makeEngineWithFile(artist: "old", title: "old (Dirty)", album: "old", recorder: recorder)
         }
         let fingerprint = sha256(sampleFingerprintBytes)
+        // The file's real embedded tags (D-D): undo restores these to the
+        // audio file, not the Serato-imported DB snapshot.
         try await engine.apply(
-            .applyMusicBrainzMatch(fullPayload(fileID: fileId, fingerprintHash: fingerprint)),
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: fingerprint,
+                currentFileArtist: "old", currentFileTitle: "old (Dirty)", currentFileAlbum: "old"
+            )),
             batchId: "rt-new"
         )
         try await engine.undoBatch("rt-new")
@@ -362,10 +379,13 @@ final class MusicBrainzMutationTests: XCTestCase {
 
     // MARK: - C1b: undo must not clobber a later batch's match
 
-    /// Two files share one recording (FLAC+MP3 → same fingerprint, one
-    /// track row — invariant #4). Batch A creates the row; a LATER batch
-    /// B adopts it and overwrites its identity. Undoing A must not null
-    /// the identity B established.
+    /// Two files are FLAC+MP3 of one recording (same fingerprint, SAME
+    /// recording → one track row, invariant #4). Batch A creates the row;
+    /// a LATER batch B adopts it (same recording, so identity doesn't
+    /// drift). Undoing A must not null the row B now depends on — only the
+    /// reference count reveals B's dependency. (A DIFFERENT-recording B on
+    /// the same fingerprint is a collision, rejected outright — see
+    /// `testDifferentRecordingOnSharedFingerprintIsRejected`.)
     func testUndoCreatedRowDoesNotClobberLaterBatchOnSameFingerprint() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, database, file1) = try await MainActor.run {
@@ -392,10 +412,10 @@ final class MusicBrainzMutationTests: XCTestCase {
             batchId: "batchA"
         )
         // Batch B (later) matches the second file to the same fingerprint
-        // with a different recording → adopts the row, overwrites identity.
+        // and the SAME recording → adopts the row (no identity drift).
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
-                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recB"
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recA"
             )),
             batchId: "batchB"
         )
@@ -406,11 +426,11 @@ final class MusicBrainzMutationTests: XCTestCase {
             let track = try TrackRecord
                 .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
             XCTAssertEqual(
-                track.musicbrainzRecordingId, "recB",
-                "batch B's identity (applied after A) must survive undo of A"
+                track.musicbrainzRecordingId, "recA",
+                "file2 still depends on the row — undo of A must not null it"
             )
             let f2 = try FileRecord.fetchOne(db, key: file2)!
-            XCTAssertEqual(f2.trackId, track.id, "file2 still links to the row B owns")
+            XCTAssertEqual(f2.trackId, track.id, "file2 still links to the row it depends on")
             let f1 = try FileRecord.fetchOne(db, key: file1)!
             XCTAssertNil(f1.trackId, "the undone file (file1) is unlinked")
         }
@@ -440,9 +460,11 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
-    /// Pre-existing-row variant: A updates a pre-existing row, then B
-    /// updates it again. Undoing A must retain B's identity, not restore
-    /// A's captured `previous`.
+    /// Pre-existing-row variant: A re-identifies a pre-existing row it
+    /// solely owns (no other file references it yet — a legitimate
+    /// correction), then a later B adopts the row with the SAME recording.
+    /// Undoing A must retain the row B now depends on, not restore A's
+    /// captured `previous`.
     func testUndoPreexistingRowDoesNotClobberLaterUpdate() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, database, file1) = try await MainActor.run {
@@ -481,7 +503,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
-                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recB"
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recA"
             )),
             batchId: "batchB"
         )
@@ -492,8 +514,8 @@ final class MusicBrainzMutationTests: XCTestCase {
             let track = try TrackRecord
                 .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
             XCTAssertEqual(
-                track.musicbrainzRecordingId, "recB",
-                "undoing A must not restore recX over B's later recB"
+                track.musicbrainzRecordingId, "recA",
+                "undoing A must not restore recX — file2 now depends on recA"
             )
         }
     }
@@ -559,6 +581,185 @@ final class MusicBrainzMutationTests: XCTestCase {
             let f1 = try FileRecord.fetchOne(db, key: file1)!
             XCTAssertNil(f1.trackId, "the undone file (file1) is unlinked")
         }
+    }
+
+    // MARK: - D-A: apply-time candidate staleness
+
+    /// The file was edited/replaced between lookup and Apply: its indexed
+    /// identity (fileSize/mtime) no longer matches what the candidate
+    /// captured. The apply must reject before mutating anything, so stale
+    /// MusicBrainz identity is never linked to the changed audio.
+    func testApplyRejectsStaleCandidateWhenFileChangedSinceLookup() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // Simulate a post-lookup edit: bump the indexed identity away from
+        // the candidate's captured values (fileSize/mtime == 1).
+        try await database.writer.write { db in
+            try db.execute(
+                sql: "UPDATE files SET mtime = ?, file_size = ? WHERE id = ?",
+                arguments: [999, 5000, fileId]
+            )
+        }
+
+        do {
+            try await engine.apply(
+                .applyMusicBrainzMatch(fullPayload(fileID: fileId, fingerprintHash: fingerprint)),
+                batchId: "stale"
+            )
+            XCTFail("expected candidateStale")
+        } catch OperationEngineError.candidateStale(let staleFileId) {
+            XCTAssertEqual(staleFileId, fileId)
+        }
+
+        try await database.writer.read { db in
+            let file = try FileRecord.fetchOne(db, key: fileId)!
+            XCTAssertNil(file.trackId, "stale apply must not link a track")
+            XCTAssertEqual(try TrackRecord.fetchCount(db), 0, "stale apply must not create a track row")
+            XCTAssertEqual(
+                try EventRecord.filter(Column("batch_id") == "stale").fetchCount(db), 0,
+                "stale apply must journal nothing"
+            )
+        }
+        XCTAssertEqual(recorder.calls.count, 0, "stale apply must not write file tags")
+    }
+
+    // MARK: - D-C: capped-fingerprint collision between different recordings
+
+    /// Two DIFFERENT songs share their first 120s → same capped fingerprint,
+    /// but resolve to DIFFERENT recordings. The second match must be
+    /// rejected rather than overwrite the first's canonical identity that
+    /// other files depend on (invariant #4).
+    func testDifferentRecordingOnSharedFingerprintIsRejected() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // file1 → recA creates and owns the row.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "a"
+        )
+        // file2 shares the capped fingerprint but is a different recording.
+        do {
+            try await engine.apply(
+                .applyMusicBrainzMatch(fullPayload(
+                    fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recB"
+                )),
+                batchId: "b"
+            )
+            XCTFail("expected fingerprintRecordingConflict")
+        } catch OperationEngineError.fingerprintRecordingConflict(let fid, let existing, let incoming) {
+            XCTAssertEqual(fid, file2)
+            XCTAssertEqual(existing, "recA")
+            XCTAssertEqual(incoming, "recB")
+        }
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(track.musicbrainzRecordingId, "recA", "existing identity preserved")
+            XCTAssertEqual(
+                try FileRecord.fetchOne(db, key: file1)!.trackId, track.id, "file1 still linked"
+            )
+            XCTAssertNil(
+                try FileRecord.fetchOne(db, key: file2)!.trackId, "colliding file2 not linked"
+            )
+            XCTAssertEqual(
+                try EventRecord.filter(Column("batch_id") == "b").fetchCount(db), 0,
+                "rejected match journals nothing"
+            )
+        }
+    }
+
+    /// The legitimate duplicate case: FLAC+MP3 of ONE recording share a
+    /// fingerprint AND resolve to the SAME recording → merges onto one row
+    /// without conflict.
+    func testSameRecordingOnSharedFingerprintMergesWithoutConflict() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "a"
+        )
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "b"
+        )
+
+        try await database.writer.read { db in
+            let rows = try TrackRecord.filter(Column("fingerprint_hash") == fingerprint).fetchAll(db)
+            XCTAssertEqual(rows.count, 1, "one recording → one track row")
+            let track = rows[0]
+            XCTAssertEqual(track.musicbrainzRecordingId, "recA")
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: file1)!.trackId, track.id)
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: file2)!.trackId, track.id)
+        }
+    }
+
+    // MARK: - D-D: undo restores the file's real on-disk tags
+
+    /// The file's embedded artist differs from its Serato-imported DB row.
+    /// A match overwrites the artist; undo must rewrite the file's ORIGINAL
+    /// embedded artist back into the audio tags — not the DB-row value.
+    func testUndoRestoresOnDiskFileTagsNotDatabaseSnapshot() async throws {
+        let recorder = FileTagWriterRecorder()
+        // DB row (Serato snapshot) says artist "DB Artist"; the file's real
+        // embedded tag is "Disk Artist".
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "DB Artist", title: "DB Title", album: "DB Album", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: fingerprint,
+                artist: "Nas", title: "N.Y. State of Mind", album: "Illmatic", year: nil,
+                currentFileArtist: "Disk Artist",
+                currentFileTitle: "Disk Title",
+                currentFileAlbum: "Disk Album"
+            )),
+            batchId: "dd"
+        )
+        try await engine.undoBatch("dd")
+
+        let undoUpdate = recorder.calls.last!.update
+        XCTAssertEqual(undoUpdate.artist, "Disk Artist", "undo restores the file's real embedded artist, not the DB row")
+        XCTAssertEqual(undoUpdate.title, "Disk Title", "undo restores the file's real embedded title")
+        XCTAssertEqual(undoUpdate.album, "Disk Album", "undo restores the file's real embedded album")
     }
 
     // MARK: - Cherry-pick

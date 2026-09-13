@@ -171,6 +171,8 @@ final class MusicBrainzModelsTests: XCTestCase {
             recordingMBID: "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10",
             artistMBID: "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c",
             fingerprintHash: Data([0x01, 0x02, 0x03, 0x04]),
+            expectedFileSize: 5_000_000,
+            expectedMtime: 1_700_000_000,
             chosenRelease: releaseA,
             availableReleases: [releaseA, releaseB],
             isrc: "GBAAA8800001",
@@ -178,7 +180,10 @@ final class MusicBrainzModelsTests: XCTestCase {
             proposedTitle: "Voodoo Ray",
             proposedAlbum: releaseA.title,
             proposedYear: 1988,
-            currentFileYear: nil
+            currentFileYear: nil,
+            currentFileArtist: nil,
+            currentFileTitle: nil,
+            currentFileAlbum: nil
         )
 
         XCTAssertEqual(candidate.availableReleases.count, 2)
