@@ -799,6 +799,111 @@ final class AutoTaggerServiceTests: XCTestCase {
             // into an empty map and reported as a stale file.
         }
     }
+
+    // MARK: - #4000261459: release selection uses the on-disk album
+
+    /// Release selection must default from the file's ON-DISK album tag, not
+    /// the Serato-imported `FileRecord.album`. When they differ and MusicBrainz
+    /// offers pressings for both, the chosen release must match the embedded
+    /// value the review shows as current — not the stale Serato snapshot.
+    func testReleaseSelectionUsesOnDiskAlbumNotDatabaseSnapshot() async throws {
+        let database = try makeDatabase()
+        // DB snapshot says "Serato Album"; the file on disk says "File Album".
+        let fileID = try insertFile(in: database, path: "/music/x.mp3", album: "Serato Album")
+
+        let seratoRelease = MBRelease(id: "rel-serato", title: "Serato Album", date: "1990", country: "US", status: "Official")
+        let fileRelease = MBRelease(id: "rel-file", title: "File Album", date: "1994", country: "US", status: "Official")
+        let recording = MBRecording(
+            title: "Song",
+            artistCredit: [MBArtistCredit(name: "Artist", artist: MBArtist(id: "a", name: "Artist"))],
+            releases: [seratoRelease, fileRelease],
+            releaseGroup: nil,
+            isrcs: []
+        )
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+            keyStore: StubKeyProvider(),
+            audioTagsReader: { _ in
+                AudioTags(
+                    bitrateKbps: nil, title: nil, artist: nil, album: "File Album", albumArtist: nil,
+                    genre: nil, year: nil, trackNumber: nil, totalTracks: nil, bpm: nil,
+                    comment: nil, durationSeconds: 200
+                )
+            }
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard let candidate = service.candidate(for: fileID) else {
+            return XCTFail("expected a resolved candidate")
+        }
+        XCTAssertEqual(candidate.chosenRelease.id, "rel-file", "release must follow the on-disk album, not the DB snapshot")
+        XCTAssertEqual(candidate.proposedAlbum, "File Album")
+    }
+
+    // MARK: - #4000261453: reject a fingerprint from a file that changed mid-decode
+
+    /// If the file is edited/replaced WHILE its fingerprint is being computed,
+    /// the resulting fingerprint describes old-or-mixed audio while later steps
+    /// capture the NEW file's stat as the candidate's expected identity — so
+    /// apply-time validation would pass and write the old recording's match
+    /// onto the new audio. The row must fail instead.
+    func testFingerprintRejectedWhenFileChangesDuringDecode() async throws {
+        let database = try makeDatabase()
+        // .pending so currentFingerprint takes the compute path.
+        let fileID = try insertFile(
+            in: database, path: "/music/racing.mp3",
+            fingerprintHashes: nil, fingerprintStatus: .pending
+        )
+
+        // The freshness reader returns a DIFFERENT stat pre- vs post-decode,
+        // simulating the file changing while `fingerprintFunction` read it.
+        let freshness = SequencedFreshnessReader(snapshots: [
+            FileFreshnessSnapshot(fileSize: 1000, mtime: 0),   // pre-decode basis
+            FileFreshnessSnapshot(fileSize: 2000, mtime: 999), // post-decode: changed
+        ])
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                XCTFail("a mid-decode change must fail the row before any lookup")
+                return []
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in
+                XCTFail("must not reach MusicBrainz")
+                throw LookupError.transport("unreachable")
+            },
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in [9, 9, 9] },
+            audioTagsReader: stubAudioTagsReader(),
+            fileFreshnessReader: { path in freshness.next(path) }
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard case let .failed(reason) = service.rows[fileID] else {
+            return XCTFail("expected .failed, got \(String(describing: service.rows[fileID]))")
+        }
+        XCTAssertTrue(reason.contains("changed on disk"), "reason was: \(reason)")
+    }
+}
+
+/// Returns a preset sequence of freshness snapshots on successive calls (the
+/// last repeats), so a test can simulate a file changing between the pre-decode
+/// and post-decode stats.
+private final class SequencedFreshnessReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshots: [FileFreshnessSnapshot?]
+    init(snapshots: [FileFreshnessSnapshot?]) { self.snapshots = snapshots }
+    func next(_: String) -> FileFreshnessSnapshot? {
+        lock.lock(); defer { lock.unlock() }
+        guard !snapshots.isEmpty else { return nil }
+        return snapshots.count == 1 ? snapshots[0] : snapshots.removeFirst()
+    }
 }
 
 /// Thread-safe call counter for injected `@Sendable` closures (fingerprint /

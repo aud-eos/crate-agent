@@ -264,7 +264,15 @@ final class AutoTaggerService: ObservableObject {
 
         let recording = try await musicBrainzClient.recording(mbid: recordingMBID)
 
-        guard let chosenRelease = ReleaseSelector.defaultRelease(from: recording.releases, existingAlbum: file.album) else {
+        // Default the release from the file's ON-DISK album tag (just read
+        // above), not the Serato-imported `FileRecord.album` snapshot — the
+        // review baseline is the embedded tag, so release selection must agree
+        // with it, or a stale Serato album would pick (and persist, and bulk-
+        // overwrite the file with) a different pressing than the one the diff
+        // shows as current (finding #4000261459). `tags.album` is nil when the
+        // file has no album tag, and ReleaseSelector treats nil absence as
+        // "no preference" — the same absence semantics as the baseline.
+        guard let chosenRelease = ReleaseSelector.defaultRelease(from: recording.releases, existingAlbum: tags.album) else {
             throw AutoTaggerRowFailure("MusicBrainz recording \(recordingMBID) has no releases")
         }
 
@@ -353,6 +361,22 @@ final class AutoTaggerService: ObservableObject {
         do {
             let hashes = try await runOffMainActor { [fingerprintFunction] in try fingerprintFunction(path) }
             let serialized = FingerprintEncoder.serialize(hashes)
+            // Re-stat AFTER the decode and reject the fingerprint if the file
+            // changed while it was being read: the bytes would then describe
+            // old-or-mixed content, but `lookUpCandidate` goes on to read the
+            // NEW file's tags and capture its post-change size/mtime as the
+            // candidate's expected identity — so apply-time revalidation would
+            // pass and write the OLD recording's match onto the NEW audio
+            // (finding #4000261453). Failing the row is the safe outcome; a
+            // re-scan fingerprints the settled file. (A nil stat on either side
+            // means we can't prove a change, so we proceed — the imminent tag
+            // read fails loudly if the file is genuinely gone.)
+            let postDecodeFreshness = await onDiskFreshness(ofFileAt: path)
+            if let before = freshnessBasis, let after = postDecodeFreshness, before != after {
+                throw AutoTaggerRowFailure(
+                    "file \(fileID) changed on disk while its fingerprint was being computed — re-scan to fingerprint the current audio"
+                )
+            }
             // Persist the pre-decode on-disk stat as the fingerprint's freshness
             // basis, so the NEXT scan trusts this fingerprint without
             // re-decoding the audio. Without this, a recompute updated only the
@@ -363,6 +387,8 @@ final class AutoTaggerService: ObservableObject {
             // the index snapshot then applies.
             try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis)
             return serialized
+        } catch let failure as AutoTaggerRowFailure {
+            throw failure
         } catch {
             try? await persistFingerprint(fileID: fileID, bytes: nil, status: .failed)
             throw AutoTaggerRowFailure("failed to compute fingerprint for file \(fileID): \(error)")
