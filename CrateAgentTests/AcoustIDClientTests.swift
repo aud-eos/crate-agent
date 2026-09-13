@@ -195,15 +195,34 @@ final class AcoustIDClientTests: XCTestCase {
         }
     }
 
-    func testGenericInBodyErrorCodeMapsToServerError() async {
-        // Any other documented in-body error code (e.g. malformed
-        // fingerprint) is not an auth problem — map it to .server rather
-        // than crashing the decode or reporting it as .transport.
-        let errorBody = Data(#"{ "status": "error", "error": { "code": 2, "message": "Missing required parameter" } }"#.utf8)
+    func testInvalidUserAPIKeyErrorBodyMapsToUnauthorized() async {
+        // AcoustID distinguishes an invalid application key (code 4) from
+        // an invalid *user* key (code 6) — both are auth problems and both
+        // must halt the whole pass rather than retry per file.
+        let errorBody = Data(#"{ "status": "error", "error": { "code": 6, "message": "Invalid user API key" } }"#.utf8)
         let client = AcoustIDClient(loader: StubLoader(status: 200, body: errorBody), limiter: .noop, cache: .memory())
 
-        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")) {
-            XCTAssertEqual($0 as? LookupError, .server)
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "bad")) {
+            XCTAssertEqual($0 as? LookupError, .unauthorized)
+        }
+    }
+
+    func testGenericInBodyErrorCodeMapsToTransportNotServer() async {
+        // Any other in-body error code (e.g. an invalid fingerprint for
+        // this one file) is a per-file data problem, not an auth or server
+        // failure — it must map to .transport so AutoTaggerService fails
+        // only this row and continues the batch, matching the pre-existing
+        // (pre-#7-fix) behavior for every non-key in-body error.
+        let errorBody = Data(#"{ "status": "error", "error": { "code": 3, "message": "Invalid fingerprint" } }"#.utf8)
+        let client = AcoustIDClient(loader: StubLoader(status: 200, body: errorBody), limiter: .noop, cache: .memory())
+
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "secret-key")) {
+            guard case let .transport(message) = $0 as? LookupError else {
+                XCTFail("expected .transport, got \($0)")
+                return
+            }
+            XCTAssertTrue(message.contains("3"), "expected the error code in the message, got: \(message)")
+            XCTAssertFalse(message.contains("secret-key"), "the API key must never appear in an error message: \(message)")
         }
     }
 

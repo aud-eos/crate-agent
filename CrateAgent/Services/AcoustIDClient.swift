@@ -79,10 +79,14 @@ public struct AcoustIDClient: Sendable {
         return value.addingPercentEncoding(withAllowedCharacters: allowedCharacters) ?? value
     }
 
-    /// AcoustID's documented code for "invalid API key" within an in-body
-    /// error object — distinct from an HTTP 401, which `RetryingLookupRequester`
-    /// already maps to `.unauthorized` directly.
+    /// AcoustID's documented codes for a rejected API key within an
+    /// in-body error object — distinct from an HTTP 401, which
+    /// `RetryingLookupRequester` already maps to `.unauthorized` directly.
+    /// `4` is an invalid application key, `6` an invalid *user* key; both
+    /// mean every subsequent call will fail identically, so both must halt
+    /// the whole auto-tag pass rather than being retried per file.
     private static let invalidAPIKeyErrorCode = 4
+    private static let invalidUserAPIKeyErrorCode = 6
 
     private static func decodeSortedResults(from data: Data) throws -> [AcoustIDResult] {
         let response: AcoustIDResponse
@@ -92,16 +96,18 @@ public struct AcoustIDClient: Sendable {
             throw LookupError.transport("invalid AcoustID response body: \(error.localizedDescription)")
         }
         // AcoustID can answer with HTTP 200 and a body that itself reports
-        // failure (e.g. a malformed fingerprint, or an invalid/revoked API
-        // key) — that must not decode into an empty-but-successful result
-        // set, and an invalid key must not be treated as a per-file/retryable
-        // failure or the caller keeps hammering the bad key for every file.
+        // failure — that must not decode into an empty-but-successful
+        // result set. Only a rejected key is pass-fatal (every further call
+        // will fail the same way); any other in-body error (e.g. a
+        // malformed fingerprint) is specific to this one file, so it maps
+        // to `.transport` — same as before this file's key-handling was
+        // added — and AutoTaggerService fails only that row.
         guard response.status == "ok" else {
             if let errorPayload = response.error {
-                if errorPayload.code == invalidAPIKeyErrorCode {
+                if errorPayload.code == invalidAPIKeyErrorCode || errorPayload.code == invalidUserAPIKeyErrorCode {
                     throw LookupError.unauthorized
                 }
-                throw LookupError.server
+                throw LookupError.transport("AcoustID returned error code \(errorPayload.code): \(errorPayload.message)")
             }
             throw LookupError.transport("AcoustID returned status \"\(response.status)\"")
         }
