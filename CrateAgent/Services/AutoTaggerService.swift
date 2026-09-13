@@ -231,7 +231,7 @@ final class AutoTaggerService: ObservableObject {
             throw AutoTaggerRowFailure("file \(fileID) not found in the library")
         }
 
-        let fingerprintBytes = try await currentFingerprint(for: file)
+        let (fingerprintBytes, fingerprintBasis) = try await currentFingerprint(for: file)
         guard let fingerprintBase64 = FingerprintEncoder.base64(fromStoredBytes: fingerprintBytes) else {
             throw AutoTaggerRowFailure("empty or corrupt fingerprint for file \(fileID)")
         }
@@ -249,6 +249,20 @@ final class AutoTaggerService: ObservableObject {
         // tags, so that's degenerate).
         let lookupFreshness = await onDiskFreshness(ofFileAt: file.path)
             ?? FileFreshnessSnapshot(fileSize: file.fileSize, mtime: file.mtime)
+
+        // Reject the row if the file changed between when the fingerprint was
+        // taken (its basis) and this lookup snapshot — including the
+        // cached-fingerprint path, which the mid-decode guard doesn't cover.
+        // Otherwise the candidate would pair the OLD fingerprint's recording
+        // with the NEW file's captured size/mtime as its expected identity, and
+        // apply-time revalidation would pass and write that match onto the new
+        // audio (finding #4000405424). A nil basis (stat failed at fingerprint
+        // time) can't prove a change, so we proceed.
+        if let fingerprintBasis, fingerprintBasis != lookupFreshness {
+            throw AutoTaggerRowFailure(
+                "file \(fileID) changed on disk between fingerprinting and lookup — re-scan to match the current audio"
+            )
+        }
 
         let acoustIDResults = try await acoustIDClient.lookup(
             fingerprintBase64: fingerprintBase64,
@@ -305,11 +319,17 @@ final class AutoTaggerService: ObservableObject {
             currentFileAlbum: tags.album
         )
 
-        return Self.classify(candidate)
+        // An AcoustID result carrying MORE THAN ONE recording id is ambiguous:
+        // we take the first, but the result-level score says nothing about
+        // which recording is right. Never let such a match auto-classify as
+        // strong (which "Confirm All Strong Matches" would persist unseen) —
+        // downgrade to weak so the user reviews it (finding #4000668529).
+        let ambiguousRecording = topResult.recordingIDs.count > 1
+        return Self.classify(candidate, ambiguousRecording: ambiguousRecording)
     }
 
-    private static func classify(_ candidate: MatchCandidate) -> RowState {
-        candidate.score >= strongScoreThreshold ? .strong(candidate) : .weak(candidate)
+    private static func classify(_ candidate: MatchCandidate, ambiguousRecording: Bool = false) -> RowState {
+        (candidate.score >= strongScoreThreshold && !ambiguousRecording) ? .strong(candidate) : .weak(candidate)
     }
 
     /// A MusicBrainz partial date's leading year (`"1988-05-09"` → `1988`).
@@ -338,11 +358,20 @@ final class AutoTaggerService: ObservableObject {
     /// persisting one first if the background `FingerprintWorker` hasn't
     /// processed this file yet. The Chromaprint decode is CPU-bound, so it
     /// runs off the main actor to keep the UI responsive.
-    private func currentFingerprint(for file: FileRecord) async throws -> Data {
+    private func currentFingerprint(for file: FileRecord) async throws -> (bytes: Data, basis: FileFreshnessSnapshot?) {
         if file.fingerprintStatus == .done, let existing = file.chromaprintFingerprint,
            await storedFingerprintIsFresh(for: file)
         {
-            return existing
+            // The on-disk stat this stored fingerprint corresponds to (its
+            // freshness basis); `storedFingerprintIsFresh` just confirmed the
+            // live file still matches it. Returned so `lookUpCandidate` can
+            // reject a candidate whose file changes between here and the lookup
+            // snapshot (finding #4000405424).
+            let basis = FileFreshnessSnapshot(
+                fileSize: file.fingerprintedSize ?? file.fileSize,
+                mtime: file.fingerprintedMtime ?? file.mtime
+            )
+            return (existing, basis)
         }
         guard let fileID = file.id else {
             throw AutoTaggerRowFailure("file has no row id")
@@ -386,7 +415,7 @@ final class AutoTaggerService: ObservableObject {
             // omit the basis rather than record a wrong one — the fallback to
             // the index snapshot then applies.
             try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis)
-            return serialized
+            return (serialized, freshnessBasis)
         } catch let failure as AutoTaggerRowFailure {
             throw failure
         } catch {

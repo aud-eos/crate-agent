@@ -890,6 +890,80 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
         XCTAssertTrue(reason.contains("changed on disk"), "reason was: \(reason)")
     }
+
+    // MARK: - #4000668529: multi-recording AcoustID result is not auto-strong
+
+    /// When the top AcoustID result carries more than one recording id, the
+    /// choice of recording is ambiguous — such a match must never auto-classify
+    /// as strong (which "Confirm All Strong" would persist unseen); it is
+    /// downgraded to weak for review.
+    func testMultiRecordingResultDoesNotAutoClassifyStrong() async throws {
+        let database = try makeDatabase()
+        let hashes: [UInt32] = [1, 2, 3]
+        let fileID = try insertFile(in: database, path: "/music/ambiguous.mp3", fingerprintHashes: hashes)
+        let recording = makeRecording()
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                // High score, but TWO candidate recordings.
+                [AcoustIDResult(id: "a", score: 0.99, recordingIDs: ["mb-1", "mb-2"])]
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard case .weak = service.rows[fileID] else {
+            return XCTFail("a multi-recording result must be weak, got \(String(describing: service.rows[fileID]))")
+        }
+    }
+
+    // MARK: - #4000405424: cached fingerprint rejected if file changes before lookup
+
+    /// A cached (`.done`, fresh) fingerprint whose file is replaced AFTER the
+    /// freshness check but BEFORE the lookup snapshot must fail the row — the
+    /// candidate would otherwise pair the old fingerprint's recording with the
+    /// new file's captured size/mtime, and apply-time validation would pass.
+    func testCachedFingerprintRejectedWhenFileChangesBeforeLookup() async throws {
+        let database = try makeDatabase()
+        // .done + fingerprint bytes; basis falls back to fileSize 1000 / mtime 0.
+        let fileID = try insertFile(in: database, path: "/music/swapped.mp3")
+
+        // Freshness reader: the freshness check sees the unchanged file (basis),
+        // then the lookup snapshot sees the replacement.
+        let freshness = SequencedFreshnessReader(snapshots: [
+            FileFreshnessSnapshot(fileSize: 1000, mtime: 0),   // storedFingerprintIsFresh → fresh
+            FileFreshnessSnapshot(fileSize: 5000, mtime: 777), // lookup snapshot → changed
+        ])
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                XCTFail("must fail the row before any lookup")
+                return []
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in
+                XCTFail("must not reach MusicBrainz")
+                throw LookupError.transport("unreachable")
+            },
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in
+                XCTFail("cached fingerprint must not be recomputed")
+                return []
+            },
+            audioTagsReader: stubAudioTagsReader(),
+            fileFreshnessReader: { path in freshness.next(path) }
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard case let .failed(reason) = service.rows[fileID] else {
+            return XCTFail("expected .failed, got \(String(describing: service.rows[fileID]))")
+        }
+        XCTAssertTrue(reason.contains("between fingerprinting and lookup"), "reason was: \(reason)")
+    }
 }
 
 /// Returns a preset sequence of freshness snapshots on successive calls (the

@@ -57,12 +57,19 @@ public struct RetryingLookupRequester: Sendable {
                 return data
             case 401:
                 throw LookupError.unauthorized
-            case 429, 503:
+            case 429, 500, 502, 503, 504:
+                // Transient: rate-limit and the retryable gateway/server 5xx
+                // codes get the bounded backoff budget. Only after retries are
+                // exhausted does a 5xx become the pass-fatal `.server` — a
+                // single momentary 500/502/504 must not abort a whole 200-file
+                // scan (finding #4000668528). A 429 that gives up stays
+                // `.rateLimited`.
                 guard attempt < maxAttempts else {
                     throw httpResponse.statusCode == 429 ? LookupError.rateLimited : LookupError.server
                 }
                 await sleeper.sleep(seconds: retryDelay(forAttempt: attempt, response: httpResponse))
             case 500 ... 599:
+                // Non-transient 5xx (e.g. 501 Not Implemented) — no retry.
                 throw LookupError.server
             default:
                 throw LookupError.transport("unexpected status \(httpResponse.statusCode)")

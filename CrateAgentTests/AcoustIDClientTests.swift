@@ -103,12 +103,45 @@ final class AcoustIDClientTests: XCTestCase {
         XCTAssertEqual(loader.callCount, 4, "should have retried up to the default max attempts")
     }
 
-    func testServerErrorMapsToError() async {
-        let client = AcoustIDClient(loader: StubLoader(status: 500, body: Data()), limiter: .noop, cache: .memory())
+    func testServerErrorExhaustsRetriesAndMapsToServerError() async {
+        // A persistent 500 is retried (bounded backoff) and only becomes
+        // `.server` once retries are exhausted — RecordingSleeper keeps it
+        // instant. (#4000668528: transient 5xx get the retry budget.)
+        let loader = StubLoader(status: 500, body: Data())
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory(), sleeper: RecordingSleeper())
 
         await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")) {
             XCTAssertEqual($0 as? LookupError, .server)
         }
+        XCTAssertEqual(loader.callCount, 4, "a 5xx should retry up to the default max attempts before giving up")
+    }
+
+    func testTransient5xxIsRetriedThenSucceeds() async throws {
+        // A one-off 502/500/504 must NOT immediately abort the pass — it is
+        // retried, and a subsequent 200 succeeds (#4000668528).
+        let loader = SequencedStubLoader(responses: [
+            (status: 502, body: Data(), headers: [:]),
+            (status: 200, body: fixture("acoustid_multi.json"), headers: [:]),
+        ])
+        let sleeper = RecordingSleeper()
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory(), sleeper: sleeper)
+
+        let results = try await client.lookup(fingerprintBase64: "F", durationSeconds: 200, apiKey: "K")
+
+        XCTAssertEqual(loader.callCount, 2, "transient 5xx retried, second attempt succeeds")
+        XCTAssertEqual(sleeper.recordedDelays.count, 1)
+        XCTAssertEqual(results.count, 2)
+    }
+
+    func testNotImplementedIsNotRetried() async {
+        // A non-transient 5xx (501) is pass-fatal immediately — no retry.
+        let loader = StubLoader(status: 501, body: Data())
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory(), sleeper: RecordingSleeper())
+
+        await XCTAssertThrowsErrorAsync(try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")) {
+            XCTAssertEqual($0 as? LookupError, .server)
+        }
+        XCTAssertEqual(loader.callCount, 1, "501 is not transient — no retry")
     }
 
     func testServiceUnavailableExhaustsRetriesAndMapsToServerError() async {
