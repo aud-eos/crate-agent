@@ -105,7 +105,7 @@ struct HistoryView: View {
 
             Spacer(minLength: 8)
 
-            if batch.containsRenames {
+            if batch.canResync {
                 Button {
                     Task { await resync(batch: batch) }
                 } label: {
@@ -116,7 +116,7 @@ struct HistoryView: View {
                 .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil || seratoWatchdog.isSeratoRunning)
                 .help(seratoWatchdog.isSeratoRunning
                       ? "Quit Serato before re-syncing — writes would queue in memory and disappear on app restart."
-                      : "Re-run the Serato library rewrite for every renamed file in this batch. Idempotent — safe to re-run if the original sync only partially succeeded.")
+                      : "Re-run this batch's Serato library and audio-tag writes. Idempotent — safe to re-run if the original sync only partially succeeded.")
             }
 
             Button("Undo") {

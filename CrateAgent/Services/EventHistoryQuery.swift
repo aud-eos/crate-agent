@@ -23,10 +23,15 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     /// batch was itself produced by an undoBatch call. Surfaced so
     /// the UI can label "Undo of …" rows differently if desired.
     public let isUndoBatch: Bool
-    /// `true` when at least one event in the batch is a
-    /// `fileRenamed`. Drives the "Re-sync Serato" button visibility
-    /// — the recovery primitive only does anything for renames.
-    public let containsRenames: Bool
+    /// `true` when at least one event in the batch projects onto
+    /// Serato/audio-file writes that `resyncSeratoForBatch` can replay
+    /// (`EventType.hasReplayableSeratoProjection`). Drives the "Re-sync
+    /// Serato" button visibility. Previously this tracked only renames, which
+    /// left an Auto-Tag-only batch whose external writes partially failed with
+    /// no reachable recovery once the user navigated away from the review
+    /// panel (finding #3999114447) — the recovery is idempotent, so exposing
+    /// it for every re-syncable batch is safe.
+    public let canResync: Bool
 
     public var timestamp: Date {
         Date(timeIntervalSince1970: TimeInterval(firstTimestampMillis) / 1000)
@@ -84,7 +89,7 @@ public enum EventHistoryQuery {
                 description: describeBatch(typeCounts: typeCounts),
                 canUndo: canUndoBatch(typeList: typeList),
                 isUndoBatch: row.batchId.hasPrefix("undo:"),
-                containsRenames: typeList.contains(EventType.fileRenamed.rawValue)
+                canResync: canResyncBatch(typeList: typeList)
             )
         }
     }
@@ -115,6 +120,16 @@ public enum EventHistoryQuery {
             EventType.fileRemovedFromCrates.rawValue,
         ]
         return !typeList.contains(where: unsupportedRaw.contains)
+    }
+
+    /// A batch is re-syncable when at least one of its events projects onto
+    /// Serato/audio-file writes that `resyncSeratoForBatch` can idempotently
+    /// replay — the same set the engine reconstructs. Unknown raw values
+    /// (from a newer schema) are conservatively ignored.
+    static func canResyncBatch(typeList: [String]) -> Bool {
+        typeList.contains { raw in
+            EventType(rawValue: raw)?.hasReplayableSeratoProjection ?? false
+        }
     }
 
     private static func countOccurrences(in typeRawValues: [String]) -> [(EventType, Int)] {

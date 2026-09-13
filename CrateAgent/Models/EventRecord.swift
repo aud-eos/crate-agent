@@ -76,4 +76,24 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case fileRemovedFromCrates = "file_removed_from_crates"
     case musicBrainzMatchApplied = "music_brainz_match_applied"
     case musicBrainzMatchReverted = "music_brainz_match_reverted"
+
+    /// Whether this event type projects onto Serato/audio-file writes that
+    /// `OperationEngine.resyncSeratoForBatch` can idempotently replay from the
+    /// journal. The single source of truth for "is a batch re-syncable": the
+    /// engine's `resyncWrites` reconstructs exactly these types, and
+    /// `EventHistoryQuery` uses this to decide whether to offer History's
+    /// "Re-sync Serato" recovery action (so a partial-apply of an
+    /// Auto-Tag-only batch stays recoverable after navigation — finding
+    /// #3999114447). Exhaustive on purpose: a new event type must declare
+    /// whether it has a replayable Serato projection.
+    public var hasReplayableSeratoProjection: Bool {
+        switch self {
+        case .fileRenamed, .musicBrainzMatchApplied, .metadataCommittedToSerato, .fileTagsWritten:
+            return true
+        case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates,
+             .musicBrainzMatchReverted:
+            return false
+        }
+    }
 }
