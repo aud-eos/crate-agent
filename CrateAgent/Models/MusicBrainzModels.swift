@@ -3,7 +3,7 @@ import Foundation
 // MARK: - AcoustID
 
 /// Top-level payload from AcoustID's `/v2/lookup` endpoint.
-struct AcoustIDResponse: Codable, Equatable {
+public struct AcoustIDResponse: Codable, Equatable {
     let status: String
     let results: [AcoustIDResult]
 }
@@ -14,7 +14,7 @@ struct AcoustIDResponse: Codable, Equatable {
 /// AcoustID nests recordings as `{ "id": <mbid> }` objects; we flatten
 /// that to plain MBID strings on decode since nothing downstream needs
 /// anything else AcoustID reports per recording.
-struct AcoustIDResult: Codable, Equatable {
+public struct AcoustIDResult: Codable, Equatable {
     let id: String
     let score: Double
     let recordingIDs: [String]
@@ -27,13 +27,13 @@ struct AcoustIDResult: Codable, Equatable {
         let id: String
     }
 
-    init(id: String, score: Double, recordingIDs: [String]) {
+    public init(id: String, score: Double, recordingIDs: [String]) {
         self.id = id
         self.score = score
         self.recordingIDs = recordingIDs
     }
 
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         score = try container.decode(Double.self, forKey: .score)
@@ -41,7 +41,7 @@ struct AcoustIDResult: Codable, Equatable {
         recordingIDs = recordings.map(\.id)
     }
 
-    func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(score, forKey: .score)

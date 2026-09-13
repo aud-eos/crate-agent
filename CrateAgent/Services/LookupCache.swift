@@ -14,7 +14,7 @@ import Foundation
 /// is why reads swallow errors (`try?`) and return `nil` instead of
 /// throwing; it is not the "no silent failures" rule being bent, because
 /// a cache miss isn't a failure.
-public final class LookupCache {
+public final class LookupCache: Sendable {
     private let backend: LookupCacheBackend
 
     /// - Parameter directory: root directory for cache files, created if
