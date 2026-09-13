@@ -245,6 +245,58 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertEqual(reason, fatalMessage)
     }
 
+    // MARK: - E-J: a no-key re-scan never shows a stale prior-pass result
+
+    /// Scan two files once (with a key) so one resolves `.strong` and the
+    /// other `.noMatch`. Re-scan the SAME ids with the key now missing:
+    /// neither may still show the prior pass's `.strong`/`.noMatch` —
+    /// both must read as `.stopped` for THIS pass.
+    func testNoKeyRescanNeverShowsStalePriorPassResult() async throws {
+        let database = try makeDatabase()
+        let matchHashes: [UInt32] = [50, 51, 52]
+        let noMatchHashes: [UInt32] = [53, 54, 55]
+        let matchFileID = try insertFile(in: database, path: "/music/match.mp3", fingerprintHashes: matchHashes)
+        let noMatchFileID = try insertFile(in: database, path: "/music/nomatch.mp3", fingerprintHashes: noMatchHashes)
+
+        let matchBase64 = fingerprintBase64(for: matchHashes)
+        let noMatchBase64 = fingerprintBase64(for: noMatchHashes)
+        let acoustIDClient = StubAcoustIDClient { base64 in
+            base64 == matchBase64 ? [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])] : []
+        }
+        let recording = makeRecording()
+        let musicBrainzClient = StubMusicBrainzClient { _ in recording }
+        let keyStore = MutableKeyProvider(key: "TESTKEY")
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: keyStore,
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [matchFileID, noMatchFileID])
+        guard case .strong = service.rows[matchFileID] else {
+            return XCTFail("setup: expected .strong, got \(String(describing: service.rows[matchFileID]))")
+        }
+        XCTAssertEqual(service.rows[noMatchFileID], .noMatch, "setup: expected .noMatch")
+
+        // Now the key goes missing; re-scan the SAME two ids.
+        keyStore.key = nil
+        await service.run(fileIDs: [matchFileID, noMatchFileID])
+
+        guard case .stopped = service.rows[matchFileID] else {
+            return XCTFail(
+                "stale .strong survived a keyless re-scan: \(String(describing: service.rows[matchFileID]))"
+            )
+        }
+        guard case .stopped = service.rows[noMatchFileID] else {
+            return XCTFail(
+                "stale .noMatch survived a keyless re-scan: \(String(describing: service.rows[noMatchFileID]))"
+            )
+        }
+    }
+
     // MARK: - Keychain failure
 
     func testKeychainErrorSetsFatalBanner() async throws {
@@ -596,6 +648,21 @@ private struct StubKeyProvider: AcoustIDKeyProviding {
             throw errorToThrow
         }
         return key
+    }
+}
+
+/// A key provider whose `key` can be flipped between two `run` calls in
+/// the same test — `StubKeyProvider` is fixed at construction, which
+/// can't express "resolved with a key, then re-scanned with none" (E-J).
+private final class MutableKeyProvider: AcoustIDKeyProviding, @unchecked Sendable {
+    var key: String?
+
+    init(key: String?) {
+        self.key = key
+    }
+
+    func load() throws -> String? {
+        key
     }
 }
 

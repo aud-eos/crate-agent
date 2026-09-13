@@ -102,6 +102,18 @@ final class AutoTaggerService: ObservableObject {
         runTask?.cancel()
         fatalError = nil
 
+        // E-J: reset every requested row to .pending BEFORE validating the
+        // key. `stopUnresolvedRows` deliberately preserves terminal states
+        // (.strong/.weak/.noMatch/.failed) so a mid-pass fatal halt doesn't
+        // clobber rows already resolved THIS pass — but that same rule
+        // means a no-key/keychain failure below would otherwise find these
+        // IDs still carrying a STALE result from a PRIOR pass and leave it
+        // standing. Resetting first ensures the only thing left standing
+        // for a keyless pass is .stopped, for every requested row.
+        for fileID in fileIDs {
+            rows[fileID] = .pending
+        }
+
         let apiKey: String
         do {
             guard let loadedKey = try keyStore.load(), !loadedKey.isEmpty else {
@@ -115,10 +127,6 @@ final class AutoTaggerService: ObservableObject {
             fatalError = message
             stopUnresolvedRows(among: fileIDs, message: message)
             return
-        }
-
-        for fileID in fileIDs {
-            rows[fileID] = .pending
         }
 
         let task = Task { @MainActor [weak self] in
@@ -154,12 +162,15 @@ final class AutoTaggerService: ObservableObject {
         }
     }
 
-    /// Transitions every fileID among `fileIDs` that is still unresolved —
-    /// absent from `rows` entirely (the no-key/keychain early-return,
-    /// before `run`'s `.pending` initialization loop runs) or still
-    /// `.pending` (a mid-pass fatal halt, for files not yet reached) — to
-    /// `.stopped(message)`. Already-resolved rows (`.strong`, `.weak`,
-    /// `.noMatch`, `.failed`) are left exactly as they are.
+    /// Transitions every fileID among `fileIDs` that is still `.pending` —
+    /// either the no-key/keychain early-return (E-J: `run` resets every
+    /// requested row to `.pending` before validating the key, so a stale
+    /// prior-pass result never survives a keyless re-scan) or a mid-pass
+    /// fatal halt, for files not yet reached — to `.stopped(message)`.
+    /// Already-resolved rows (`.strong`, `.weak`, `.noMatch`, `.failed`)
+    /// from THIS pass are left exactly as they are. `nil` is handled only
+    /// as defensive belt-and-suspenders — every requested id is always
+    /// `.pending` by the time this runs.
     private func stopUnresolvedRows(among fileIDs: [Int64], message: String) {
         for fileID in fileIDs {
             switch rows[fileID] {
