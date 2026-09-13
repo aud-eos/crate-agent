@@ -58,6 +58,37 @@ final class ReleaseSelectorTests: XCTestCase {
         XCTAssertEqual(picked?.id, "r-first")
     }
 
+    // MARK: - E-I: the exact-title subset is ranked, not first-array-element
+
+    /// Three releases all share the on-file album's exact title —
+    /// official, bootleg, and a later reissue — deliberately out of date
+    /// order and with the official one NOT first in the array. The
+    /// official/earliest pressing must win, not `releases.first`.
+    func testExactTitleSubsetIsRankedOfficialThenEarliestNotFirstElement() {
+        let exactTitleReleases: [MBRelease] = [
+            MBRelease(id: "r-bootleg", title: "Illmatic", date: "1993-12-01", status: "Bootleg"),
+            MBRelease(id: "r-reissue", title: "Illmatic", date: "2004-05-18", status: "Official"),
+            MBRelease(id: "r-official", title: "Illmatic", date: "1994-04-19", status: "Official"),
+        ]
+
+        let picked = ReleaseSelector.defaultRelease(from: exactTitleReleases, existingAlbum: "illmatic")
+
+        XCTAssertEqual(picked?.id, "r-official", "the earliest OFFICIAL exact-title release must win, not the first array element")
+    }
+
+    /// Within the exact-title subset, when none are official the
+    /// earliest by date still wins over array order.
+    func testExactTitleSubsetFallsBackToEarliestWhenNoneOfficial() {
+        let exactTitleReleases: [MBRelease] = [
+            MBRelease(id: "r-later", title: "Illmatic", date: "1999-01-01", status: "Bootleg"),
+            MBRelease(id: "r-earlier", title: "Illmatic", date: "1994-04-19", status: "Bootleg"),
+        ]
+
+        let picked = ReleaseSelector.defaultRelease(from: exactTitleReleases, existingAlbum: "illmatic")
+
+        XCTAssertEqual(picked?.id, "r-earlier")
+    }
+
     func testEmptyReturnsNil() {
         XCTAssertNil(ReleaseSelector.defaultRelease(from: [], existingAlbum: "x"))
     }
