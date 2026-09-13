@@ -724,6 +724,49 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// A redo (undoing a revert re-applies the match's values) must be refused
+    /// when a later edit changed a field the match touched AFTER the revert —
+    /// redoing would write the match value back over that edit. Symmetric to
+    /// the apply-branch value guard (#4000806477); found reviewing that fix.
+    func testRedoOfMatchRejectedAfterLaterEditOfRestoredField() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Apply a match (artist "old" → "Matched Artist").
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint,
+                artist: "Matched Artist", title: nil, album: nil, year: nil
+            )),
+            batchId: "match"
+        )
+        // Undo it (revert) — artist returns to "old".
+        let undoBatchId = try await engine.undoBatch("match")
+        // A later edit changes the restored field.
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(fileId: file1, metadata: SeratoMetadata(artist: "UserEdit"))),
+            batchId: "edit"
+        )
+
+        // Redo = undo the undo batch. Must be refused — it would clobber "UserEdit".
+        do {
+            try await engine.undoBatch(undoBatchId)
+            XCTFail("expected undoSupersededByLaterMatch for the redo")
+        } catch let OperationEngineError.undoSupersededByLaterMatch(fid) {
+            XCTAssertEqual(fid, file1)
+        }
+
+        try await database.writer.read { db in
+            XCTAssertEqual(
+                try FileRecord.fetchOne(db, key: file1)!.artist, "UserEdit",
+                "the later edit survives the refused redo"
+            )
+        }
+    }
+
     /// Undoing a match on a shared pre-existing row must restore the row's
     /// captured previous identity even when an OLDER file still references it —
     /// that older file's state is exactly what `previousTrackIdentifiers`
@@ -915,6 +958,81 @@ final class MusicBrainzMutationTests: XCTestCase {
             XCTAssertEqual(
                 try FileRecord.fetchOne(db, key: file1)!.artist, "Manually Edited",
                 "the later manual edit survives the refused undo"
+            )
+        }
+    }
+
+    /// A later non-match write that RE-AFFIRMS the match's value (as
+    /// `LibraryScanner`'s drift `setMetadata` does — it re-writes the full
+    /// artist/title/album snapshot when any one field drifts) must NOT block
+    /// the undo: the field's current value still equals what the match
+    /// applied, so restoring the pre-apply value clobbers nothing. Guards
+    /// against the presence-based check that #4000806477's first fix used
+    /// (which rejected on the mere existence of a later overlapping event).
+    func testUndoOfMatchAllowedAfterLaterEditReaffirmsSameValue() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint,
+                artist: "Matched Artist", title: nil, album: nil, year: nil
+            )),
+            batchId: "match"
+        )
+        // A later scanner-style write re-affirms the SAME artist value.
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(fileId: file1, metadata: SeratoMetadata(artist: "Matched Artist"))),
+            batchId: "reaffirm"
+        )
+
+        // Must NOT throw — the field still holds the match's value.
+        try await engine.undoBatch("match")
+
+        try await database.writer.read { db in
+            XCTAssertEqual(
+                try FileRecord.fetchOne(db, key: file1)!.artist, "old",
+                "undoing the match restores the pre-apply value"
+            )
+        }
+    }
+
+    /// A later non-match edit that is itself UNDONE must not permanently block
+    /// the match's undo: the log still holds the later event rows, but the
+    /// field's current value is back to the match's value, so the undo is
+    /// safe. A presence-based check would have seen the later rows and wrongly
+    /// rejected forever (#4000806477).
+    func testUndoOfMatchAllowedAfterLaterEditWasItselfUndone() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint,
+                artist: "Matched Artist", title: nil, album: nil, year: nil
+            )),
+            batchId: "match"
+        )
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(fileId: file1, metadata: SeratoMetadata(artist: "Edited"))),
+            batchId: "edit"
+        )
+        // The edit is undone — artist returns to the match's value.
+        try await engine.undoBatch("edit")
+
+        // Now undoing the match must be ALLOWED (the edit no longer stands).
+        try await engine.undoBatch("match")
+
+        try await database.writer.read { db in
+            XCTAssertEqual(
+                try FileRecord.fetchOne(db, key: file1)!.artist, "old",
+                "undoing the match restores the pre-apply value"
             )
         }
     }

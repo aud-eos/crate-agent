@@ -667,10 +667,20 @@ public actor OperationEngine {
     ///    it (a newer match or revert) means the redo is out of order
     ///    (finding #4000261463).
     ///
-    /// Additionally, undoing an APPLY is rejected if a later NON-match event
-    /// (`metadataSet`, `metadataCommittedToSerato`, `fileTagsWritten`) wrote a
-    /// field the match applied: the inverse would restore the match's pre-apply
-    /// value and clobber that newer edit (finding #4000806477).
+    /// Additionally, undoing an APPLY is rejected if the file's CURRENT value of
+    /// a field the match applied differs from what the match applied — a later
+    /// edit changed it, and the inverse would restore the match's pre-apply
+    /// value and clobber that edit (finding #4000806477). This compares the
+    /// current VALUE (not the mere presence of a later event), so an edit that
+    /// was itself undone, or that merely re-affirmed the match's value (as
+    /// `LibraryScanner`'s drift `setMetadata` does — it re-writes the full
+    /// artist/title/album snapshot on any field's drift), does not block the
+    /// undo (the presence-based check would have — review of #4000806477).
+    ///
+    /// The redo direction (undoing a REVERT re-applies the match's values) is
+    /// guarded symmetrically: it is rejected when a field the match touched no
+    /// longer holds the value the revert restored, since redoing would write
+    /// the match value back over a later edit.
     private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId _: String) async throws {
         let matchEvents = events.filter {
             $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
@@ -679,14 +689,9 @@ public actor OperationEngine {
         let fileIds = Array(Set(matchEvents.compactMap(\.fileId)))
         guard !fileIds.isEmpty else { return }
 
-        // Full per-file history of every FIELD-WRITING event across ALL batches,
-        // oldest-first: match applies/reverts (for the LIFO stack) plus the
-        // non-match metadata writers (for the field-overlap check).
-        let typeValues = [
-            EventType.musicBrainzMatchApplied.rawValue, EventType.musicBrainzMatchReverted.rawValue,
-            EventType.metadataSet.rawValue, EventType.metadataCommittedToSerato.rawValue,
-            EventType.fileTagsWritten.rawValue,
-        ]
+        // Per-file MATCH-event history (for the LIFO stack), plus each file's
+        // CURRENT row (for the value comparison), read together.
+        let typeValues = [EventType.musicBrainzMatchApplied.rawValue, EventType.musicBrainzMatchReverted.rawValue]
         let sql = """
             SELECT * FROM events
             WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
@@ -694,23 +699,26 @@ public actor OperationEngine {
             ORDER BY event_id ASC
             """
         let arguments = StatementArguments(fileIds) + StatementArguments(typeValues)
-        let history = try await database.writer.read { db in
-            try EventRecord.fetchAll(db, sql: sql, arguments: arguments)
+        let (history, currentFiles): ([EventRecord], [Int64: FileRecord]) = try await database.writer.read { db in
+            let hist = try EventRecord.fetchAll(db, sql: sql, arguments: arguments)
+            let files = try FileRecord.filter(keys: fileIds).fetchAll(db)
+                .reduce(into: [Int64: FileRecord]()) { accumulator, file in
+                    if let id = file.id { accumulator[id] = file }
+                }
+            return (hist, files)
         }
         var historyByFile: [Int64: [EventRecord]] = [:]
         for event in history {
             if let fileId = event.fileId { historyByFile[fileId, default: []].append(event) }
         }
+        let decoder = JSONDecoder()
 
         for event in matchEvents {
             guard let fileId = event.fileId, let eventId = event.eventId else { continue }
             let fileHistory = historyByFile[fileId] ?? []
-            let matchHistory = fileHistory.filter {
-                $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
-            }
             if event.eventType == .musicBrainzMatchApplied {
                 var stack: [Int64] = []
-                for historyEvent in matchHistory {
+                for historyEvent in fileHistory {
                     if historyEvent.eventType == .musicBrainzMatchApplied {
                         if let id = historyEvent.eventId { stack.append(id) }
                     } else if !stack.isEmpty {
@@ -720,61 +728,45 @@ public actor OperationEngine {
                 if stack.last != eventId {
                     throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                 }
-                // A later non-match edit to a field this match applied would be
-                // clobbered by restoring the match's pre-apply value.
-                let restoredFields = Self.appliedMetadataFields(forwardPayloadJson: event.payloadJson)
-                if !restoredFields.isEmpty {
-                    for later in fileHistory
-                        where (later.eventId ?? 0) > eventId
-                        && Self.nonMatchFieldWritingTypes.contains(later.eventType)
-                        && !restoredFields.isDisjoint(with: Self.writtenMetadataFields(of: later))
-                    {
+                // Value comparison against the current row: a field the match
+                // applied that no longer holds the applied value has been
+                // changed since, so undoing would clobber that change.
+                if let data = event.payloadJson.data(using: .utf8),
+                   let applied = try? decoder.decode(ApplyMusicBrainzMatchPayload.self, from: data),
+                   let file = currentFiles[fileId] {
+                    let clobbersLaterEdit =
+                        (applied.artist != nil && file.artist != applied.artist)
+                        || (applied.title != nil && file.title != applied.title)
+                        || (applied.album != nil && file.album != applied.album)
+                    if clobbersLaterEdit {
                         throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                     }
                 }
-            } else if matchHistory.last?.eventId != eventId {
-                throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
+            } else {
+                // Redo (undoing a revert re-applies the match's values). It is
+                // in order only if the revert is the file's LAST match event…
+                if fileHistory.last?.eventId != eventId {
+                    throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
+                }
+                // …and safe only if each field the match touched still holds
+                // the value the revert RESTORED (its pre-apply value). If a
+                // later edit changed it after the revert, redoing would write
+                // the match value back over that edit — the same clobber the
+                // apply branch guards, in the opposite direction.
+                if let data = event.payloadJson.data(using: .utf8),
+                   let revert = try? decoder.decode(RevertMusicBrainzMatchPayload.self, from: data),
+                   let restored = revert.applied.previousMetadata,
+                   let file = currentFiles[fileId] {
+                    let applied = revert.applied
+                    let clobbersLaterEdit =
+                        (applied.artist != nil && file.artist != restored.artist)
+                        || (applied.title != nil && file.title != restored.title)
+                        || (applied.album != nil && file.album != restored.album)
+                    if clobbersLaterEdit {
+                        throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
+                    }
+                }
             }
-        }
-    }
-
-    /// Non-match event types that write file-metadata fields — checked for
-    /// field overlap when deciding whether an older match can be undone.
-    private static let nonMatchFieldWritingTypes: Set<EventType> = [
-        .metadataSet, .metadataCommittedToSerato, .fileTagsWritten,
-    ]
-
-    /// The Serato-metadata fields a MusicBrainz match applied (whose inverse an
-    /// undo would restore), decoded from the forward `musicBrainzMatchApplied`
-    /// payload.
-    private static func appliedMetadataFields(forwardPayloadJson json: String) -> Set<String> {
-        guard let data = json.data(using: .utf8),
-              let payload = try? JSONDecoder().decode(ApplyMusicBrainzMatchPayload.self, from: data)
-        else { return [] }
-        var fields: Set<String> = []
-        if payload.artist != nil { fields.insert("artist") }
-        if payload.title != nil { fields.insert("title") }
-        if payload.album != nil { fields.insert("album") }
-        return fields
-    }
-
-    /// The Serato-metadata fields a non-match field-writing event wrote,
-    /// decoded from its forward payload.
-    private static func writtenMetadataFields(of event: EventRecord) -> Set<String> {
-        guard let data = event.payloadJson.data(using: .utf8) else { return [] }
-        let decoder = JSONDecoder()
-        switch event.eventType {
-        case .metadataSet:
-            guard let payload = try? decoder.decode(SetMetadataPayload.self, from: data) else { return [] }
-            return Set(metadataFieldMap(payload.metadata).keys)
-        case .metadataCommittedToSerato:
-            guard let payload = try? decoder.decode(CommitMetadataToSeratoPayload.self, from: data) else { return [] }
-            return Set(metadataFieldMap(payload.metadata).keys)
-        case .fileTagsWritten:
-            guard let payload = try? decoder.decode(WriteFileTagsPayload.self, from: data) else { return [] }
-            return Set(metadataFieldMap(payload.metadata).keys)
-        default:
-            return []
         }
     }
 
