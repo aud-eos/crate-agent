@@ -391,6 +391,67 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         XCTAssertEqual(model.payload().year, 1994)
     }
 
+    // MARK: - On-disk embedded tags are the review baseline (not the DB snapshot)
+
+    /// The file's embedded artist/title/album (`candidate.currentFile*`) is
+    /// the baseline for the include-toggle defaults and the diff — not the
+    /// Serato/DB `files` snapshot the caller passes. When Serato already
+    /// stores the correct artist but the audio file's tag is wrong, defaulting
+    /// the toggle off against the DB value would leave the file tag unfixed.
+    func testOnDiskEmbeddedTagsAreTheBaselineOverDatabaseSnapshot() {
+        // Serato/DB already says the right thing ("Nas"), but the file on disk
+        // is wrong ("Unknown Artist" / blank album), and MusicBrainz proposes
+        // the correct values. The diff must be file→proposed, and the toggles
+        // must default ON so Apply fixes the file.
+        let candidate = makeCandidate(
+            proposedArtist: "Nas",
+            proposedTitle: "N.Y. State of Mind",
+            proposedAlbum: "Illmatic",
+            proposedYear: 1994,
+            currentFileArtist: "Unknown Artist",
+            currentFileTitle: "Track 03",
+            currentFileAlbum: ""
+        )
+        let model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Nas",
+            currentTitle: "N.Y. State of Mind",
+            currentAlbum: "Illmatic",
+            currentYear: 1994
+        )
+
+        XCTAssertEqual(model.currentArtist, "Unknown Artist", "baseline is the file's embedded tag, not the DB value")
+        XCTAssertEqual(model.currentTitle, "Track 03")
+        XCTAssertEqual(model.currentAlbum, "")
+        XCTAssertTrue(model.includeArtist, "file tag differs from proposed — Apply must fix it")
+        XCTAssertTrue(model.includeAlbum, "blank file album differs from proposed — Apply must fix it")
+
+        let payload = model.payload()
+        XCTAssertEqual(payload.artist, "Nas")
+        XCTAssertEqual(payload.album, "Illmatic")
+    }
+
+    /// When the file has no embedded artist tag (`currentFileArtist` nil), the
+    /// caller-supplied Serato/DB value is the honest fallback for the baseline.
+    func testFallsBackToDatabaseSnapshotWhenOnDiskTagMissing() {
+        let candidate = makeCandidate(
+            proposedArtist: "Nas",
+            currentFileArtist: nil,
+            currentFileTitle: nil,
+            currentFileAlbum: nil
+        )
+        let model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Nas",
+            currentTitle: "N.Y. State of Mind",
+            currentAlbum: "Illmatic",
+            currentYear: 1994
+        )
+
+        XCTAssertEqual(model.currentArtist, "Nas", "no embedded tag — fall back to the DB snapshot")
+        XCTAssertFalse(model.includeArtist, "DB fallback matches proposed — nothing to change")
+    }
+
     /// When the on-disk read didn't produce a year (`currentFileYear` nil,
     /// e.g. the tag has no year frame), the caller-supplied `tracks.year`
     /// is still an honest fallback for the diff.

@@ -56,21 +56,33 @@ struct AutoTagRowModel {
         currentYear: Int?
     ) {
         self.candidate = candidate
-        self.currentArtist = currentArtist
-        self.currentTitle = currentTitle
-        self.currentAlbum = currentAlbum
+        // The review baseline is the file's ACTUAL on-disk embedded tag —
+        // `candidate.currentFile*`, read from the file at scan time — with
+        // the caller-supplied Serato/DB value (`currentArtist` etc.) only as
+        // a fallback when the file had no such tag. Serato's `files` snapshot
+        // can disagree with the audio file: if Serato says "Nas" but the file
+        // tag is wrong/blank, defaulting `includeArtist` off against the DB
+        // value would leave the wrong file tag unfixed and show an inaccurate
+        // current→proposed diff. Mirrors the year resolution just below (and
+        // the on-disk-tag capture used for undo in `payload()`).
+        let resolvedCurrentArtist = candidate.currentFileArtist ?? currentArtist
+        let resolvedCurrentTitle = candidate.currentFileTitle ?? currentTitle
+        let resolvedCurrentAlbum = candidate.currentFileAlbum ?? currentAlbum
+        self.currentArtist = resolvedCurrentArtist
+        self.currentTitle = resolvedCurrentTitle
+        self.currentAlbum = resolvedCurrentAlbum
         let resolvedCurrentYear = candidate.currentFileYear ?? currentYear
         self.currentYear = resolvedCurrentYear
 
-        let decision = TitleMatcher.decide(current: currentTitle, proposed: candidate.proposedTitle)
+        let decision = TitleMatcher.decide(current: resolvedCurrentTitle, proposed: candidate.proposedTitle)
         titleTier = decision.tier
         titleChoice = decision.defaultChoice
 
         // E-A: a nil proposedArtist means MusicBrainz had no artist
         // credit to propose — never defaults to "included" even though
-        // nil != currentArtist, mirroring includeYear below.
-        includeArtist = candidate.proposedArtist != nil && candidate.proposedArtist != currentArtist
-        includeAlbum = candidate.proposedAlbum != currentAlbum
+        // nil != resolvedCurrentArtist, mirroring includeYear below.
+        includeArtist = candidate.proposedArtist != nil && candidate.proposedArtist != resolvedCurrentArtist
+        includeAlbum = candidate.proposedAlbum != resolvedCurrentAlbum
         // A nil proposedYear means MusicBrainz had nothing to propose —
         // never defaults to "included" even though nil != resolvedCurrentYear.
         includeYear = candidate.proposedYear != nil && candidate.proposedYear != resolvedCurrentYear
