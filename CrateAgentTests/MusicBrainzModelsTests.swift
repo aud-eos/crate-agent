@@ -31,19 +31,34 @@ final class MusicBrainzModelsTests: XCTestCase {
         XCTAssertEqual(recording.artistCredit.first?.name, "A Guy Called Gerald")
         XCTAssertEqual(recording.artistCredit.first?.artist.id, "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c")
 
-        let firstRelease = try XCTUnwrap(recording.releases.first)
-        XCTAssertEqual(firstRelease.id, "b1c2d3e4-1111-2222-3333-444455556666")
-        XCTAssertEqual(firstRelease.date, "1988")
-        XCTAssertEqual(firstRelease.country, "GB")
-        XCTAssertEqual(firstRelease.status, "Official")
-
-        // MusicBrainz nests `release-group` under each release, not on the
-        // recording — MBRecording.releaseGroup surfaces the first release's
-        // group as the recording's canonical year source.
-        XCTAssertEqual(recording.releaseGroup?.id, "c7d8e9f0-aaaa-bbbb-cccc-ddddeeeeffff")
-        XCTAssertEqual(recording.releaseGroup?.firstReleaseDate, "1988-05-09")
+        // The fixture lists the 2011 remaster before the 1988 original —
+        // MusicBrainz does not return releases date-ordered.
+        let remaster = try XCTUnwrap(recording.releases.first)
+        XCTAssertEqual(remaster.id, "e2f3a4b5-2222-3333-4444-555566667777")
+        XCTAssertEqual(remaster.date, "2011-03-01")
+        XCTAssertEqual(remaster.country, "GB")
+        XCTAssertEqual(remaster.status, "Official")
 
         XCTAssertEqual(recording.isrcs, ["GBAAA8800001", "GBAAA8800002"])
+    }
+
+    func testEachReleaseCarriesItsOwnReleaseGroup() throws {
+        let recording = try JSONDecoder().decode(MBRecording.self, from: fixture("mb_recording.json"))
+
+        XCTAssertEqual(recording.releases[0].releaseGroup?.id, "9f8e7d6c-9999-8888-7777-666655554444")
+        XCTAssertEqual(recording.releases[0].releaseGroup?.firstReleaseDate, "2011-03-01")
+        XCTAssertEqual(recording.releases[1].releaseGroup?.id, "c7d8e9f0-aaaa-bbbb-cccc-ddddeeeeffff")
+        XCTAssertEqual(recording.releases[1].releaseGroup?.firstReleaseDate, "1988-05-09")
+    }
+
+    func testRecordingReleaseGroupIsEarliestAcrossReleasesNotFirstInArray() throws {
+        let recording = try JSONDecoder().decode(MBRecording.self, from: fixture("mb_recording.json"))
+
+        // The 1988 original's release-group must win even though the 2011
+        // remaster is listed first in "releases" — the original release
+        // year, not a reissue's, is what downstream tagging needs.
+        XCTAssertEqual(recording.releaseGroup?.id, "c7d8e9f0-aaaa-bbbb-cccc-ddddeeeeffff")
+        XCTAssertEqual(recording.releaseGroup?.firstReleaseDate, "1988-05-09")
     }
 
     func testRecordingWithNoISRC() throws {

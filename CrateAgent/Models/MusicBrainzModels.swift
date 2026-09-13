@@ -60,9 +60,15 @@ struct MBRecording: Codable, Equatable {
     let title: String
     let artistCredit: [MBArtistCredit]
     let releases: [MBRelease]
-    /// The release-group MusicBrainz treats as this recording's canonical
-    /// dating source — see `ReleaseWire` below for why this isn't decoded
-    /// directly from a top-level JSON key.
+    /// The earliest `firstReleaseDate` across every release's
+    /// release-group — i.e. the *original* release year, not a
+    /// reissue's or compilation's. There is no top-level `release-group`
+    /// on a MusicBrainz recording resource (a recording can appear on
+    /// releases from different release-groups); MusicBrainz nests
+    /// `release-group` under each release instead, and does not return
+    /// releases in date order, so this is computed as the minimum across
+    /// `releases`, not decoded from any single JSON key or "first
+    /// found". See `MBReleaseGroup.sortableFirstReleaseDate`.
     let releaseGroup: MBReleaseGroup?
     let isrcs: [String]
 
@@ -87,38 +93,14 @@ struct MBRecording: Codable, Equatable {
         case isrcs
     }
 
-    /// MusicBrainz nests `release-group` under each release, not on the
-    /// recording itself — a recording can appear on releases from
-    /// different release-groups (original album vs. a compilation). This
-    /// wire-only shape captures that nesting so we can derive
-    /// `MBRecording.releaseGroup` (the first release's group) while
-    /// keeping the public `MBRelease` release-detail-only, matching what
-    /// downstream mutation code consumes.
-    private struct ReleaseWire: Codable {
-        let id: String
-        let title: String
-        let date: String?
-        let country: String?
-        let status: String?
-        let releaseGroup: MBReleaseGroup?
-
-        private enum CodingKeys: String, CodingKey {
-            case id, title, date, country, status
-            case releaseGroup = "release-group"
-        }
-
-        var release: MBRelease {
-            MBRelease(id: id, title: title, date: date, country: country, status: status)
-        }
-    }
-
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         title = try container.decode(String.self, forKey: .title)
         artistCredit = try container.decodeIfPresent([MBArtistCredit].self, forKey: .artistCredit) ?? []
-        let releaseWires = try container.decodeIfPresent([ReleaseWire].self, forKey: .releases) ?? []
-        releases = releaseWires.map(\.release)
-        releaseGroup = releaseWires.first { $0.releaseGroup != nil }?.releaseGroup
+        releases = try container.decodeIfPresent([MBRelease].self, forKey: .releases) ?? []
+        releaseGroup = releases
+            .compactMap(\.releaseGroup)
+            .min { $0.sortableFirstReleaseDate < $1.sortableFirstReleaseDate }
         isrcs = try container.decodeIfPresent([String].self, forKey: .isrcs) ?? []
     }
 }
@@ -141,6 +123,33 @@ struct MBRelease: Codable, Equatable {
     let date: String?
     let country: String?
     let status: String?
+    /// This release's own release-group, exactly as MusicBrainz nests
+    /// it. Kept on every release (not collapsed into a single
+    /// recording-level pick) so a consumer can compute the true
+    /// "original year" — see `MBRecording.releaseGroup`, which is the
+    /// earliest `firstReleaseDate` across all of these.
+    let releaseGroup: MBReleaseGroup?
+
+    init(
+        id: String,
+        title: String,
+        date: String? = nil,
+        country: String? = nil,
+        status: String? = nil,
+        releaseGroup: MBReleaseGroup? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.date = date
+        self.country = country
+        self.status = status
+        self.releaseGroup = releaseGroup
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, date, country, status
+        case releaseGroup = "release-group"
+    }
 }
 
 /// A release-group's identity plus its `first-release-date`, the source
@@ -152,6 +161,25 @@ struct MBReleaseGroup: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case id
         case firstReleaseDate = "first-release-date"
+    }
+}
+
+private extension MBReleaseGroup {
+    /// `firstReleaseDate` as a sortable `yyyymmdd`-shaped integer,
+    /// tolerant of `YYYY`, `YYYY-MM`, and `YYYY-MM-DD` precision (a
+    /// missing month or day defaults to `01`). A missing or unparsable
+    /// date sorts last (`.max`), so it never wins a "find the earliest"
+    /// comparison against a release-group that has a real date.
+    var sortableFirstReleaseDate: Int {
+        firstReleaseDate.flatMap(Self.parsedDateValue) ?? .max
+    }
+
+    static func parsedDateValue(_ dateString: String) -> Int? {
+        let components = dateString.split(separator: "-")
+        guard let year = components.first.flatMap({ Int($0) }) else { return nil }
+        let month = components.count > 1 ? (Int(components[1]) ?? 1) : 1
+        let day = components.count > 2 ? (Int(components[2]) ?? 1) : 1
+        return year * 10000 + month * 100 + day
     }
 }
 
@@ -179,7 +207,8 @@ struct MatchCandidate: Equatable {
     /// Follows `chosenRelease` — update together when the user picks a
     /// different release.
     var proposedAlbum: String
-    /// Year from the release-group's `first-release-date`; fixed once
-    /// resolved, independent of which release is chosen.
+    /// Year from the earliest release-group's `first-release-date`
+    /// (the original release, not a reissue); fixed once resolved,
+    /// independent of which release is chosen.
     let proposedYear: Int?
 }
