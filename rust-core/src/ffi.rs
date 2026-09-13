@@ -18,6 +18,16 @@ pub struct SeratoPathRename {
     pub new_path: String,
 }
 
+/// One track's metadata update in a `batch_update_database_records`
+/// call. UniFFI doesn't take maps of structs, so the `(path, update)`
+/// pair is wrapped in a dictionary — the batch twin of
+/// `SeratoPathRename`.
+#[derive(Debug, Clone)]
+pub struct SeratoTrackMetadataUpdate {
+    pub track_path: String,
+    pub update: SeratoMetadataUpdate,
+}
+
 fn rename_map(renames: &[SeratoPathRename]) -> HashMap<String, String> {
     renames
         .iter()
@@ -216,6 +226,31 @@ pub fn update_database_record(
     let path = PathBuf::from(database_path);
     let mut database = serato::DatabaseV2::read_from_path(&path)?;
     let count = database.update_track_metadata(&track_path, &update);
+    if count > 0 {
+        database.write_to_path(&path)?;
+    }
+    Ok(u32::try_from(count).expect("update count exceeded u32"))
+}
+
+/// Bulk variant of `update_database_record`. One file read + one file
+/// write regardless of how many tracks are updated. Used by the SP-2
+/// Auto-Tag apply, which confirms many MusicBrainz matches at once —
+/// each would otherwise read+rewrite the (multi-MB) `database V2` file
+/// on its own. Returns the number of otrks actually changed.
+pub fn batch_update_database_records(
+    database_path: String,
+    updates: Vec<SeratoTrackMetadataUpdate>,
+) -> Result<u32, CoreError> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    let path = PathBuf::from(database_path);
+    let mut database = serato::DatabaseV2::read_from_path(&path)?;
+    let map: HashMap<String, SeratoMetadataUpdate> = updates
+        .into_iter()
+        .map(|entry| (entry.track_path, entry.update))
+        .collect();
+    let count = database.batch_update_track_metadata(&map);
     if count > 0 {
         database.write_to_path(&path)?;
     }

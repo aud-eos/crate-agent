@@ -67,6 +67,12 @@ struct AutoTaggerView: View {
     @State private var loadError: String?
     @State private var actionError: String?
     @State private var lastResult: String?
+    /// Set when `applyBatch` committed the batch to the DB but one or
+    /// more external Serato/file-tag writes failed afterward (issue
+    /// #836). The batch IS applied; this holds its id so the user can
+    /// Re-sync to finish the external writes — a plain re-Apply would
+    /// re-journal against the already-mutated rows and corrupt undo.
+    @State private var pendingResyncBatchId: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -346,6 +352,14 @@ struct AutoTaggerView: View {
             }
             .controlSize(.small)
             .disabled(isApplying)
+            if pendingResyncBatchId != nil {
+                Button("Re-sync") {
+                    Task { await resyncPartialApply() }
+                }
+                .controlSize(.small)
+                .disabled(isApplying)
+                .help("Finish applying the last batch — replays the Serato/file writes that didn't land, without re-applying (which would corrupt undo).")
+            }
             if !rowModels.isEmpty {
                 Button("Confirm All Strong Matches") {
                     confirmAllStrongMatches()
@@ -542,6 +556,7 @@ struct AutoTaggerView: View {
         rowModels.removeAll()
         actionError = nil
         lastResult = nil
+        pendingResyncBatchId = nil
         await loadCurrentMetadata(forFileIDs: idsToScan)
         await autoTaggerService.run(fileIDs: idsToScan)
     }
@@ -556,6 +571,7 @@ struct AutoTaggerView: View {
         searchQuery = ""
         actionError = nil
         lastResult = nil
+        pendingResyncBatchId = nil
     }
 
     private func applyConfirmed() async {
@@ -563,6 +579,7 @@ struct AutoTaggerView: View {
         defer { isApplying = false }
         actionError = nil
         lastResult = nil
+        pendingResyncBatchId = nil
 
         let confirmedIDs = confirmedFileIDs
         let mutations: [TrackMutation] = confirmedIDs.compactMap { fileID in
@@ -574,24 +591,72 @@ struct AutoTaggerView: View {
         do {
             _ = try await services.operationEngine.applyBatch(mutations, batchId: batchId)
             let appliedCount = mutations.count
+            markConfirmedApplied(confirmedIDs)
             lastResult = "Applied \(appliedCount) match\(appliedCount == 1 ? "" : "es")"
-            appliedFileIDs.formUnion(confirmedIDs)
-            confirmedFileIDs.subtract(confirmedIDs)
-            for fileID in confirmedIDs {
-                rowModels.removeValue(forKey: fileID)
+            await refreshCurrentMetadataAfterApply()
+        } catch let error as OperationEngineError {
+            // A committed batch whose external writes partially failed is
+            // still APPLIED (issue #836). Move the rows to applied and
+            // offer a Re-sync that replays the missing external writes
+            // idempotently from the journal — never a plain re-Apply,
+            // which would re-journal against the mutated rows and corrupt
+            // undo (invariant #2).
+            if case let .externalSyncIncomplete(failedBatchId, _) = error {
+                markConfirmedApplied(confirmedIDs)
+                await refreshCurrentMetadataAfterApply()
+                pendingResyncBatchId = failedBatchId
+                actionError = "Applied to the library, but some Serato/file writes didn't land. Use Re-sync to finish."
+            } else {
+                actionError = "Apply failed: \(error.localizedDescription)"
             }
-            // Refresh the cached current-tag baseline (filesByID /
-            // currentYearByFileID) for exactly the files this scan
-            // covered, so a later "New Scan" over the same files —
-            // including these just-applied ones, if re-selected —
-            // diffs against what's actually in the DB now, not against
-            // stale pre-apply values. Without this, `syncRowModels`
-            // rebuilds a re-scanned row's `AutoTagRowModel` from outdated
-            // current-artist/title/album/year, undermining the review
-            // UI's whole current→proposed diff.
-            await loadCurrentMetadata(forFileIDs: scannedFileIDs)
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Move a set of confirmed rows into the applied state: mark them
+    /// applied, clear them from the confirmed set, and drop their review
+    /// models. Shared by the full-success and partial-failure paths —
+    /// both mean the rows are committed in the DB.
+    private func markConfirmedApplied(_ confirmedIDs: Set<Int64>) {
+        appliedFileIDs.formUnion(confirmedIDs)
+        confirmedFileIDs.subtract(confirmedIDs)
+        for fileID in confirmedIDs {
+            rowModels.removeValue(forKey: fileID)
+        }
+    }
+
+    /// Refresh the cached current-tag baseline (filesByID /
+    /// currentYearByFileID) for exactly the files this scan covered, so
+    /// a later "New Scan" over the same files — including these
+    /// just-applied ones, if re-selected — diffs against what's actually
+    /// in the DB now, not against stale pre-apply values. Without this,
+    /// `syncRowModels` rebuilds a re-scanned row's `AutoTagRowModel` from
+    /// outdated current-artist/title/album/year, undermining the review
+    /// UI's whole current→proposed diff.
+    private func refreshCurrentMetadataAfterApply() async {
+        await loadCurrentMetadata(forFileIDs: scannedFileIDs)
+    }
+
+    /// Finish a partially-applied batch by replaying its still-missing
+    /// external writes from the journal (idempotent, no re-journaling).
+    private func resyncPartialApply() async {
+        guard let batchId = pendingResyncBatchId else { return }
+        isApplying = true
+        defer { isApplying = false }
+        do {
+            let outcome = try await services.operationEngine.resyncSeratoForBatch(batchId)
+            if outcome.appliedCount > 0 && outcome.queuedCount == 0 {
+                pendingResyncBatchId = nil
+                actionError = nil
+                lastResult = outcome.summaryMessage
+            } else {
+                // Nothing landed on disk (e.g. Serato started up), or the
+                // writes queued — keep the recovery affordance available.
+                actionError = outcome.summaryMessage
+            }
+        } catch {
+            actionError = "Re-sync failed: \(error.localizedDescription)"
         }
     }
 }

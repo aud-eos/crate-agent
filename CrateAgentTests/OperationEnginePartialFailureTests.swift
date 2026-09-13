@@ -1,0 +1,268 @@
+import CryptoKit
+import GRDB
+import XCTest
+@testable import CrateAgent
+
+/// Group C2 (#836 + #3998713590): the batch-apply / external-write path.
+///
+/// `applyBatch` commits the SQLite transaction (events + inverse
+/// payloads + row updates) BEFORE the external Serato-library and
+/// audio-tag writes run. A post-commit external-write failure must NOT
+/// read as "nothing happened" — the batch IS applied. These tests pin:
+///
+///   1. A mid-external-write failure (Serato closed) surfaces the typed
+///      `.externalSyncIncomplete` outcome carrying the batchId, with the
+///      whole batch committed to the DB.
+///   2. A subsequent `resyncSeratoForBatch` finishes the missing external
+///      writes idempotently WITHOUT inserting duplicate events.
+///   3. A fully-successful batch journals exactly once and does not throw.
+///   4. An N-row apply coalesces the `database V2` metadata updates into
+///      exactly ONE read/rewrite pass (C2b), not N.
+final class OperationEnginePartialFailureTests: XCTestCase {
+    /// Records successful file-tag writes and can be told to throw on a
+    /// chosen call number, simulating a read-only file / permissions
+    /// error partway through the external-write phase.
+    private final class ThrowingTagWriter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var callCount = 0
+        private var storedPaths: [String] = []
+        var throwOnCall: Int?
+
+        var writtenPaths: [String] {
+            lock.lock(); defer { lock.unlock() }
+            return storedPaths
+        }
+
+        func write(_ path: String) throws {
+            lock.lock(); defer { lock.unlock() }
+            callCount += 1
+            if let target = throwOnCall, callCount == target {
+                throw NSError(domain: "test", code: 13, userInfo: [
+                    NSLocalizedDescriptionKey: "simulated read-only file",
+                ])
+            }
+            storedPaths.append(path)
+        }
+    }
+
+    /// Counts calls to the injected `database V2` metadata batch writer
+    /// (one call == one V2 read+rewrite pass) and delegates to the real
+    /// Rust FFI so the on-disk file is still updated for content checks.
+    private final class MetadataBatchWriterSpy: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var callCount = 0
+
+        func write(_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> UInt32 {
+            lock.lock(); callCount += 1; lock.unlock()
+            return try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+        }
+    }
+
+    private let seratoPaths = ["Music/A/one.mp3", "Music/A/two.mp3", "Music/A/three.mp3"]
+
+    private func sha256(_ data: Data) -> Data {
+        Data(SHA256.hash(data: data))
+    }
+
+    /// Build an engine over a real synthesized `database V2` seeded with
+    /// the three otrks, plus three matching file rows in the sidecar DB.
+    @MainActor
+    private func makeEngineWithLibrary(
+        tagWriter: ThrowingTagWriter,
+        metadataSpy: MetadataBatchWriterSpy? = nil,
+        seratoIsRunning: Bool = false
+    ) throws -> (OperationEngine, LibraryDatabase, URL, [Int64]) {
+        let rootDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("crate-agent-c2-\(UUID().uuidString)", isDirectory: true)
+        let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let databaseV2 = seratoDirectory.appendingPathComponent("database V2")
+        try OperationEngineTests.synthesizeDatabaseV2BytesForTest(withTrackPaths: seratoPaths)
+            .write(to: databaseV2)
+
+        let database = try LibraryDatabase.openInMemory()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: {
+            seratoIsRunning ? ["com.serato.djpro"] : []
+        })
+        let locator = SeratoLibraryLocator(seratoDirectory: seratoDirectory)
+        let metadataWriter: OperationEngine.SeratoMetadataBatchWriter
+        if let spy = metadataSpy {
+            metadataWriter = { databasePath, updates in try spy.write(databasePath, updates) }
+        } else {
+            metadataWriter = { databasePath, updates in
+                try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+            }
+        }
+        let engine = OperationEngine(
+            database: database,
+            seratoWatchdog: watchdog,
+            seratoLocator: locator,
+            fileTagWriter: { path, _ in try tagWriter.write(path) },
+            seratoMetadataBatchWriter: metadataWriter
+        )
+
+        // Absolute paths shaped so seratoRelativePath strips the leading
+        // slash back to the fixture's Serato-relative form.
+        let fileIds = try database.writer.write { db -> [Int64] in
+            try seratoPaths.enumerated().map { index, seratoPath in
+                var file = FileRecord(
+                    path: "/\(seratoPath)", volumeUuid: "v1", inode: Int64(index + 1),
+                    fileSize: 1, mtime: 1, artist: "old", title: "old", album: "old"
+                )
+                try file.insert(db)
+                return file.id!
+            }
+        }
+        return (engine, database, seratoDirectory, fileIds)
+    }
+
+    private func matchMutations(fileIds: [Int64]) -> [TrackMutation] {
+        fileIds.enumerated().map { index, fileId in
+            .applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload(
+                fileID: fileId,
+                acoustID: "aid\(index)",
+                recordingMBID: "rec\(index)",
+                releaseMBID: "rel\(index)",
+                artistMBID: "art\(index)",
+                isrc: "isrc\(index)",
+                fingerprintHash: sha256(Data("fp-\(index)".utf8)),
+                artist: "Artist\(index)",
+                title: "Title\(index)",
+                album: "Album\(index)",
+                year: 1994 + index
+            ))
+        }
+    }
+
+    private func eventCount(
+        in database: LibraryDatabase, batchId: String
+    ) async throws -> Int {
+        try await database.writer.read { db in
+            try EventRecord.filter(Column("batch_id") == batchId).fetchCount(db)
+        }
+    }
+
+    // MARK: - #836: partial external-write failure
+
+    func testPartialExternalFailureCommitsBatchAndSurfacesTypedOutcome() async throws {
+        let tagWriter = ThrowingTagWriter()
+        tagWriter.throwOnCall = 2 // fail the 2nd of 3 file-tag writes
+        let (engine, database, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let batchId = "auto-tag-partial"
+        let mutations = matchMutations(fileIds: fileIds)
+
+        var caughtBatchId: String?
+        do {
+            _ = try await engine.applyBatch(mutations, batchId: batchId)
+            XCTFail("expected external write to throw after the DB commit")
+        } catch let OperationEngineError.externalSyncIncomplete(failedBatchId, _) {
+            caughtBatchId = failedBatchId
+        }
+        XCTAssertEqual(caughtBatchId, batchId,
+                       "partial failure must surface the batchId, not an opaque total-failure throw")
+
+        // The DB transaction committed ALL three matches despite the
+        // external write failing partway.
+        try await database.writer.read { db in
+            let events = try EventRecord
+                .filter(Column("batch_id") == batchId)
+                .filter(Column("event_type") == EventType.musicBrainzMatchApplied.rawValue)
+                .fetchCount(db)
+            XCTAssertEqual(events, 3, "every match's event must be journaled (batch committed)")
+            for fileId in fileIds {
+                let file = try FileRecord.fetchOne(db, key: fileId)!
+                XCTAssertNotNil(file.trackId, "every file row linked to its track (committed)")
+            }
+        }
+
+        // Recovery: the writer now succeeds; resync finishes the missing
+        // external writes WITHOUT inserting duplicate events.
+        let eventsBeforeResync = try await eventCount(in: database, batchId: batchId)
+        tagWriter.throwOnCall = nil
+        let outcome = try await engine.resyncSeratoForBatch(batchId)
+        XCTAssertEqual(outcome.appliedCount, 3, "all three matches replayed to disk")
+        XCTAssertEqual(outcome.queuedCount, 0, "Serato closed — nothing queued")
+
+        let eventsAfterResync = try await eventCount(in: database, batchId: batchId)
+        XCTAssertEqual(eventsAfterResync, eventsBeforeResync,
+                       "resync must not re-journal — event count unchanged")
+
+        // Every file's tag write eventually landed, and V2 metadata is set.
+        let distinctWritten = Set(tagWriter.writtenPaths)
+        XCTAssertEqual(distinctWritten, Set(fileIds.map { "/Music/A/\(nameForFileIndex(fileIds, $0))" }),
+                       "all three file-tag writes landed after resync")
+
+        let records = try readDatabaseRecords(
+            databasePath: seratoDirectory.appendingPathComponent("database V2").path
+        )
+        XCTAssertEqual(records.compactMap(\.artist).sorted(), ["Artist0", "Artist1", "Artist2"],
+                       "database V2 metadata updated for every track after resync")
+    }
+
+    private func nameForFileIndex(_ fileIds: [Int64], _ fileId: Int64) -> String {
+        let index = fileIds.firstIndex(of: fileId)!
+        return ["one.mp3", "two.mp3", "three.mp3"][index]
+    }
+
+    // MARK: - Regression: full success
+
+    func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, database, _, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let batchId = "auto-tag-ok"
+        let eventIds = try await engine.applyBatch(matchMutations(fileIds: fileIds), batchId: batchId)
+        XCTAssertEqual(eventIds.count, 3)
+
+        let events = try await eventCount(in: database, batchId: batchId)
+        XCTAssertEqual(events, 3, "exactly one event per match — journaled once")
+        XCTAssertEqual(Set(tagWriter.writtenPaths).count, 3, "every file tagged")
+    }
+
+    // MARK: - C2b: metadata coalescing
+
+    func testBatchCoalescesMetadataIntoSingleDatabaseV2Rewrite() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let metadataSpy = MetadataBatchWriterSpy()
+        let (engine, database, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter, metadataSpy: metadataSpy)
+        }
+        let batchId = "auto-tag-coalesce"
+        _ = try await engine.applyBatch(matchMutations(fileIds: fileIds), batchId: batchId)
+
+        XCTAssertEqual(metadataSpy.callCount, 1,
+                       "a 3-row apply must coalesce into ONE database V2 read/rewrite pass, not 3")
+
+        // The single pass still updated every track's metadata.
+        let records = try readDatabaseRecords(
+            databasePath: seratoDirectory.appendingPathComponent("database V2").path
+        )
+        XCTAssertEqual(records.compactMap(\.album).sorted(), ["Album0", "Album1", "Album2"])
+
+        let events = try await eventCount(in: database, batchId: batchId)
+        XCTAssertEqual(events, 3)
+    }
+
+    // MARK: - Serato-running path unchanged
+
+    func testSeratoRunningQueuesBatchWritesWithoutRewritingOrThrowing() async throws {
+        let tagWriter = ThrowingTagWriter()
+        let metadataSpy = MetadataBatchWriterSpy()
+        let (engine, _, _, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter, metadataSpy: metadataSpy, seratoIsRunning: true)
+        }
+        // Must NOT throw and must NOT touch disk while Serato runs.
+        _ = try await engine.applyBatch(matchMutations(fileIds: fileIds), batchId: "auto-tag-running")
+
+        XCTAssertEqual(metadataSpy.callCount, 0, "no V2 rewrite while Serato is running")
+        XCTAssertEqual(tagWriter.writtenPaths.count, 0, "no file-tag writes while Serato is running")
+        let queueDepth = await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queueDepth, 6, "3 metadata updates + 3 file-tag writes queued")
+    }
+}

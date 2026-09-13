@@ -40,6 +40,15 @@ public actor OperationEngine {
     /// real audio files on disk.
     public typealias FileTagWriter = @Sendable (String, AudioTagUpdate) throws -> Void
 
+    /// Injectable database-V2 metadata batch writer. Production wires
+    /// in the Rust `batchUpdateDatabaseRecords` FFI (one file read +
+    /// one file write covering every track in the batch); tests inject
+    /// a counter to assert that an N-row apply coalesces into ONE V2
+    /// rewrite rather than N (issue C2b / #3998713590). Returns the
+    /// number of otrks actually changed.
+    public typealias SeratoMetadataBatchWriter =
+        @Sendable (_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> UInt32
+
     /// Injectable file-to-Trash mover. Production uses
     /// `FileManager.trashItem`; tests inject a no-op or recorder so
     /// the resolution flow can be exercised without actually moving
@@ -50,6 +59,7 @@ public actor OperationEngine {
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
     private let fileTagWriter: FileTagWriter
+    private let seratoMetadataBatchWriter: SeratoMetadataBatchWriter
     private let fileTrasher: FileTrasher
     private let activityLog: ActivityLog?
 
@@ -85,6 +95,9 @@ public actor OperationEngine {
         fileTagWriter: @escaping FileTagWriter = { path, update in
             try writeAudioTags(filePath: path, update: update)
         },
+        seratoMetadataBatchWriter: @escaping SeratoMetadataBatchWriter = { databasePath, updates in
+            try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+        },
         fileTrasher: @escaping FileTrasher = { path in
             let url = URL(fileURLWithPath: path)
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
@@ -95,6 +108,7 @@ public actor OperationEngine {
         self.seratoWatchdog = seratoWatchdog
         self.seratoLocator = seratoLocator
         self.fileTagWriter = fileTagWriter
+        self.seratoMetadataBatchWriter = seratoMetadataBatchWriter
         self.fileTrasher = fileTrasher
         self.activityLog = activityLog
     }
@@ -121,15 +135,7 @@ public actor OperationEngine {
             try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
         }
 
-        if !executionResult.seratoWrites.isEmpty {
-            let isSeratoRunning = await seratoWatchdog.isSeratoRunning
-            if isSeratoRunning {
-                pendingSeratoWrites.append(contentsOf: executionResult.seratoWrites)
-                queueDepthSubject.send(pendingSeratoWrites.count)
-            } else {
-                try await applyConsecutiveSeratoWrites(executionResult.seratoWrites)
-            }
-        }
+        try await routeSeratoWrites(executionResult.seratoWrites, batchId: batchId)
 
         return executionResult.eventId
     }
@@ -158,17 +164,47 @@ public actor OperationEngine {
         }
 
         let pendingWrites = executionResults.flatMap { $0.seratoWrites }
-        if !pendingWrites.isEmpty {
-            let isSeratoRunning = await seratoWatchdog.isSeratoRunning
-            if isSeratoRunning {
-                pendingSeratoWrites.append(contentsOf: pendingWrites)
-                queueDepthSubject.send(pendingSeratoWrites.count)
-            } else {
-                try await applyConsecutiveSeratoWrites(pendingWrites)
-            }
-        }
+        try await routeSeratoWrites(pendingWrites, batchId: batchId)
 
         return executionResults.map(\.eventId)
+    }
+
+    /// Route a committed batch's Serato-side writes: queue them if
+    /// Serato is running (they drain on Serato exit — invariant #3),
+    /// otherwise apply them now (coalesced — see
+    /// `applyConsecutiveSeratoWrites`).
+    ///
+    /// The DB transaction has ALREADY committed by the time this runs:
+    /// the mutations ARE applied and journaled. The SQLite commit and
+    /// the external file writes are physically separate and cannot join
+    /// one transaction, so a post-commit external-write failure can
+    /// never mean "nothing happened." It is surfaced as a DISTINCT typed
+    /// error — `.externalSyncIncomplete`, carrying the batchId — so the
+    /// caller treats the batch as applied and finishes the external side
+    /// via `resyncSeratoForBatch(batchId)`, NEVER a re-`applyBatch`
+    /// (which would re-journal against the already-mutated rows and
+    /// corrupt the undo baseline — invariant #2, issue #836). The queued
+    /// (Serato-running) path never throws for external writes; only the
+    /// Serato-not-running, write-throws path does.
+    private func routeSeratoWrites(
+        _ writes: [SeratoPendingWrite],
+        batchId: String
+    ) async throws {
+        guard !writes.isEmpty else { return }
+        let isSeratoRunning = await seratoWatchdog.isSeratoRunning
+        if isSeratoRunning {
+            pendingSeratoWrites.append(contentsOf: writes)
+            queueDepthSubject.send(pendingSeratoWrites.count)
+            return
+        }
+        do {
+            try await applyConsecutiveSeratoWrites(writes)
+        } catch {
+            throw OperationEngineError.externalSyncIncomplete(
+                batchId: batchId,
+                underlying: String(describing: error)
+            )
+        }
     }
 
     /// Number of Serato library writes (renames + metadata updates)
@@ -197,23 +233,36 @@ public actor OperationEngine {
     /// Returns the new batch id so the caller (UI) can offer "Undo the
     /// undo" without having to scan the events table.
 
-    /// Replay the Serato-side writes for every `fileRenamed` event
-    /// in a batch. Recovery primitive for the case where the
-    /// original `applySeratoRename` failed mid-loop (e.g., a
-    /// corrupted .crate file aborted the rewrite before
-    /// `database V2` got updated). The file move on disk and the
-    /// DB row update are already done; this just re-fires the
-    /// Serato library rewrite so `database V2` and the .crate
-    /// files catch up to the current DB state.
+    /// Replay a batch's Serato-side writes from the journaled forward
+    /// events. Forward-recovery primitive for two cases:
     ///
-    /// Idempotent — re-applying a successful rewrite is a no-op
-    /// (the path is already what we'd be setting it to).
+    /// - The original external write failed mid-flight (a corrupted
+    ///   .crate aborted a rename rewrite; a read-only file rejected a
+    ///   tag write) after the DB transaction had already committed —
+    ///   see `routeSeratoWrites` / `.externalSyncIncomplete` (issue
+    ///   #836). The rows are already mutated in the DB; this brings the
+    ///   Serato library + audio tags back in step with that DB state.
+    /// - A user manually re-syncs from the History view.
     ///
-    /// Reports applied vs queued counts so the UI can tell the
-    /// user whether anything actually landed on disk. When Serato
-    /// is running, replays queue in memory and drain on Serato
-    /// exit — "Re-sync complete" without that distinction was
-    /// misleading and bit a user (issue #64).
+    /// Covers `fileRenamed` (path rewrites) and `musicBrainzMatchApplied`
+    /// (a `database V2` metadata update + an audio file-tag write,
+    /// reconstructed from the forward payload + the file's CURRENT path
+    /// in the DB — the DB is the source of truth). Other event types
+    /// have no reconstructable Serato projection here and are skipped.
+    ///
+    /// Idempotent — re-writing a tag or record that already holds the
+    /// target value is a no-op (the Rust writers return 0 and skip the
+    /// file write), so re-journaling never happens: replay reads the
+    /// journal, it never appends to it.
+    ///
+    /// Reuses the same coalescing write path as `applyBatch` (renames
+    /// batched, metadata updates collapsed into ONE `database V2`
+    /// rewrite, tag writes per-file) and honors the Serato-running guard
+    /// exactly (invariant #3): when Serato is running the replay queues
+    /// in memory and drains on Serato exit. Reports applied vs queued
+    /// counts (per replayed event) so the UI can tell the user whether
+    /// anything actually landed on disk — "Re-sync complete" while
+    /// nothing did bit a user before (issue #64).
     @discardableResult
     public func resyncSeratoForBatch(_ batchId: String) async throws -> ResyncOutcome {
         let events: [EventRecord] = try await database.writer.read { db in
@@ -228,46 +277,114 @@ public actor OperationEngine {
 
         await note("Re-syncing Serato library for batch — \(events.count) event\(events.count == 1 ? "" : "s") to inspect")
 
-        var appliedCount = 0
-        var queuedCount = 0
-        for event in events {
-            guard event.eventType == .fileRenamed else { continue }
-            guard let forwardJsonData = event.payloadJson.data(using: .utf8) else {
-                continue
-            }
-            let payload: RenameFilePayload
-            do {
-                payload = try JSONDecoder().decode(
-                    RenameFilePayload.self, from: forwardJsonData
-                )
-            } catch {
-                continue
-            }
-            // The forward payload's `previousPath` is the
-            // pre-rename absolute path; if it's missing (older
-            // events before this field was always populated),
-            // skip — we have no source to rewrite from.
-            guard !payload.previousPath.isEmpty else { continue }
-            let rename = SeratoPendingRename(
-                oldAbsolutePath: payload.previousPath,
-                newAbsolutePath: payload.newPath
-            )
-            // Honor the Serato-running guard the same way
-            // `apply` does — queue if Serato is up.
-            let isSeratoRunning = await seratoWatchdog.isSeratoRunning
-            if isSeratoRunning {
-                pendingSeratoWrites.append(.rename(rename))
-                queueDepthSubject.send(pendingSeratoWrites.count)
-                queuedCount += 1
-            } else {
-                try await applySeratoRename(rename)
-                appliedCount += 1
+        let (writes, replayedEventCount) = try await reconstructResyncWrites(from: events)
+        guard !writes.isEmpty else {
+            let outcome = ResyncOutcome(appliedCount: 0, queuedCount: 0)
+            await note(outcome.summaryMessage)
+            return outcome
+        }
+
+        // Route once, exactly like a fresh apply: check the Serato-
+        // running guard a single time so the metadata updates can
+        // coalesce into one V2 rewrite rather than being split by an
+        // interleaved per-event guard check.
+        let isSeratoRunning = await seratoWatchdog.isSeratoRunning
+        let outcome: ResyncOutcome
+        if isSeratoRunning {
+            pendingSeratoWrites.append(contentsOf: writes)
+            queueDepthSubject.send(pendingSeratoWrites.count)
+            outcome = ResyncOutcome(appliedCount: 0, queuedCount: replayedEventCount)
+        } else {
+            try await applyConsecutiveSeratoWrites(writes)
+            outcome = ResyncOutcome(appliedCount: replayedEventCount, queuedCount: 0)
+        }
+        await note(outcome.summaryMessage)
+        return outcome
+    }
+
+    /// Rebuild the Serato-side writes for a batch's replayable events
+    /// from their journaled forward payloads. Returns the writes (in
+    /// event order) plus the count of events that contributed at least
+    /// one write, which drives the applied/queued figures in
+    /// `ResyncOutcome`.
+    private func reconstructResyncWrites(
+        from events: [EventRecord]
+    ) async throws -> (writes: [SeratoPendingWrite], replayedEventCount: Int) {
+        // MusicBrainz replays need the file's CURRENT absolute path
+        // (the DB is the source of truth — the file may have been
+        // renamed since). Batch-read every referenced file row once
+        // rather than per event.
+        let matchFileIds = events.compactMap { event -> Int64? in
+            event.eventType == .musicBrainzMatchApplied ? event.fileId : nil
+        }
+        let pathByFileId: [Int64: String]
+        if matchFileIds.isEmpty {
+            pathByFileId = [:]
+        } else {
+            pathByFileId = try await database.writer.read { db in
+                try FileRecord
+                    .filter(keys: matchFileIds)
+                    .fetchAll(db)
+                    .reduce(into: [Int64: String]()) { accumulator, file in
+                        if let id = file.id { accumulator[id] = file.path }
+                    }
             }
         }
 
-        let outcome = ResyncOutcome(appliedCount: appliedCount, queuedCount: queuedCount)
-        await note(outcome.summaryMessage)
-        return outcome
+        var writes: [SeratoPendingWrite] = []
+        var replayedEventCount = 0
+        let decoder = JSONDecoder()
+        for event in events {
+            let reconstructed = Self.resyncWrites(
+                for: event, pathByFileId: pathByFileId, decoder: decoder
+            )
+            if !reconstructed.isEmpty {
+                writes.append(contentsOf: reconstructed)
+                replayedEventCount += 1
+            }
+        }
+        return (writes, replayedEventCount)
+    }
+
+    /// Reconstruct one event's Serato writes from its forward payload.
+    /// Empty for event types with no replayable Serato projection (or
+    /// when the source data needed to rebuild the write is missing).
+    private static func resyncWrites(
+        for event: EventRecord,
+        pathByFileId: [Int64: String],
+        decoder: JSONDecoder
+    ) -> [SeratoPendingWrite] {
+        guard let forwardJsonData = event.payloadJson.data(using: .utf8) else {
+            return []
+        }
+        switch event.eventType {
+        case .fileRenamed:
+            guard let payload = try? decoder.decode(
+                RenameFilePayload.self, from: forwardJsonData
+            ) else { return [] }
+            // Missing `previousPath` (older events before this field was
+            // always populated) leaves no source path to rewrite from.
+            guard !payload.previousPath.isEmpty else { return [] }
+            return [.rename(SeratoPendingRename(
+                oldAbsolutePath: payload.previousPath,
+                newAbsolutePath: payload.newPath
+            ))]
+        case .musicBrainzMatchApplied:
+            guard let payload = try? decoder.decode(
+                ApplyMusicBrainzMatchPayload.self, from: forwardJsonData
+            ) else { return [] }
+            guard let fileId = event.fileId,
+                  let absolutePath = pathByFileId[fileId] else { return [] }
+            return musicBrainzSeratoWrites(
+                absolutePath: absolutePath,
+                artist: payload.artist,
+                title: payload.title,
+                album: payload.album,
+                year: payload.year
+            )
+        default:
+            return []
+        }
     }
 
     @discardableResult
@@ -799,47 +916,79 @@ public actor OperationEngine {
         }
     }
 
-    /// Coalesce consecutive `.rename` writes into one
-    /// `applySeratoRenameBatch` call; non-rename writes apply
-    /// individually. Used by `applyBatch` when Serato is not
-    /// running — for a bulk Organize batch (all renames) this
-    /// turns N full V2 read+write cycles into one.
+    /// Apply a batch's Serato writes with the two full-`database V2`
+    /// rewrite kinds coalesced into one read+write pass each:
+    ///
+    /// - Renames: consecutive `.rename` runs → one `applySeratoRenameBatch`.
+    /// - Metadata updates: EVERY `.metadataUpdate` in the batch → one
+    ///   `applySeratoMetadataUpdateBatch`. A MusicBrainz match emits a
+    ///   `.metadataUpdate` + `.fileTagWrite` pair per row, so the
+    ///   metadata updates arrive interleaved with tag writes, not
+    ///   consecutively — hence they're hoisted out by kind rather than
+    ///   coalesced by adjacency. Metadata touches only `t*` fields keyed
+    ///   by path, independent of renames (`pfil`) and per-file tag
+    ///   writes, so applying them first is order-safe (issue C2b).
+    ///
+    /// Without this, a 200-row Auto-Tag apply would trigger 200 serial
+    /// full-library `database V2` rewrites.
     private func applyConsecutiveSeratoWrites(
         _ writes: [SeratoPendingWrite]
     ) async throws {
+        var metadataUpdates: [SeratoPendingMetadataUpdate] = []
+        var remaining: [SeratoPendingWrite] = []
+        for write in writes {
+            if case .metadataUpdate(let update) = write {
+                metadataUpdates.append(update)
+            } else {
+                remaining.append(write)
+            }
+        }
+
+        if !metadataUpdates.isEmpty {
+            try await applySeratoMetadataUpdateBatch(metadataUpdates)
+        }
+
         var index = 0
-        while index < writes.count {
-            if case .rename = writes[index] {
+        while index < remaining.count {
+            if case .rename = remaining[index] {
                 var renames: [SeratoPendingRename] = []
-                while index < writes.count, case .rename(let rename) = writes[index] {
+                while index < remaining.count, case .rename(let rename) = remaining[index] {
                     renames.append(rename)
                     index += 1
                 }
                 try await applySeratoRenameBatch(renames)
             } else {
-                try await applySeratoWrite(writes[index])
+                try await applySeratoWrite(remaining[index])
                 index += 1
             }
         }
     }
 
+    /// Single-update entry point — used by the queued-write drain path
+    /// (`drainPendingSeratoUpdates` → `applySeratoWrite`), which
+    /// processes one queued write at a time. Delegates to the batch
+    /// writer so every `database V2` metadata write goes through one
+    /// seam.
     private func applySeratoMetadataUpdate(_ update: SeratoPendingMetadataUpdate) async throws {
+        try await applySeratoMetadataUpdateBatch([update])
+    }
+
+    /// Write every metadata update in one `database V2` read+rewrite
+    /// pass via the injected `seratoMetadataBatchWriter`. Tolerant of a
+    /// missing `database V2` (Serato never ran here) the same way the
+    /// single-update path always was — nothing for Serato to "see" yet.
+    private func applySeratoMetadataUpdateBatch(
+        _ updates: [SeratoPendingMetadataUpdate]
+    ) async throws {
+        guard !updates.isEmpty else { return }
         let databaseV2Path = seratoLocator.databaseV2Url.path
-        guard FileManager.default.fileExists(atPath: databaseV2Path) else {
-            // No database V2 exists yet — Serato has never run on
-            // this machine. The metadata update is a no-op (nothing
-            // for Serato to "see").
-            return
-        }
+        guard FileManager.default.fileExists(atPath: databaseV2Path) else { return }
 
-        let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
-            fromAbsolute: update.absolutePath
-        )
-
-        do {
-            _ = try updateDatabaseRecord(
-                databasePath: databaseV2Path,
-                trackPath: seratoRelativePath,
+        let trackUpdates = updates.map { update in
+            SeratoTrackMetadataUpdate(
+                trackPath: SeratoLibraryLocator.seratoRelativePath(
+                    fromAbsolute: update.absolutePath
+                ),
                 update: SeratoMetadataUpdate(
                     artist: update.metadata.artist,
                     title: update.metadata.title,
@@ -852,6 +1001,10 @@ public actor OperationEngine {
                     label: update.metadata.label
                 )
             )
+        }
+
+        do {
+            _ = try seratoMetadataBatchWriter(databaseV2Path, trackUpdates)
         } catch {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
@@ -1739,13 +1892,13 @@ public struct ResyncOutcome: Sendable, Equatable {
 
     public var summaryMessage: String {
         if totalCount == 0 {
-            return "Re-sync inspected the batch — no rename events to replay."
+            return "Re-sync inspected the batch — no Serato changes to replay."
         }
         if queuedCount == 0 {
-            return "Re-sync complete — wrote \(appliedCount) rename\(appliedCount == 1 ? "" : "s") to Serato library."
+            return "Re-sync complete — wrote \(appliedCount) change\(appliedCount == 1 ? "" : "s") to the Serato library."
         }
         if appliedCount == 0 {
-            return "Re-sync queued \(queuedCount) rename\(queuedCount == 1 ? "" : "s") — Serato is running, quit Serato to apply."
+            return "Re-sync queued \(queuedCount) change\(queuedCount == 1 ? "" : "s") — Serato is running, quit Serato to apply."
         }
         return "Re-sync wrote \(appliedCount), queued \(queuedCount) (Serato started during the sweep)."
     }
@@ -2245,6 +2398,13 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case batchNotFound(batchId: String)
     case undoNotSupported(eventType: EventType)
     case missingPreviousTrackIdentifiers(fileId: Int64)
+    /// The DB transaction committed (the batch IS applied and
+    /// journaled) but one or more external Serato/audio-tag writes
+    /// threw afterward. Distinct from a pre-commit throw so the caller
+    /// treats the batch as applied and finishes the external side via
+    /// `resyncSeratoForBatch(batchId)` — never a re-`applyBatch`, which
+    /// would double-journal (issue #836, invariant #2).
+    case externalSyncIncomplete(batchId: String, underlying: String)
 
     public var errorDescription: String? {
         switch self {
@@ -2268,6 +2428,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Events of type \(eventType.rawValue) can't be undone yet."
         case .missingPreviousTrackIdentifiers(let fileId):
             return "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
+        case .externalSyncIncomplete(let batchId, let underlying):
+            return "Batch \(batchId) was applied, but some Serato/file writes did not land: \(underlying). Re-sync the batch to finish applying them."
         }
     }
 }
