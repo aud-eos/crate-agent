@@ -460,19 +460,57 @@ struct AutoTaggerView: View {
     /// Runs the debounced search behind the selection stage. Bounded by
     /// `AutoTagFileSearch.resultCap` — this never loads the whole
     /// library, on the main thread or otherwise.
+    ///
+    /// `.task(id: searchQuery)` cancels the previous task when the query
+    /// changes, but cancellation is cooperative: a slower, older query's
+    /// `database.writer.read` can still complete after a newer query's
+    /// read already published its results. Guarding only on
+    /// `Task.isCancelled` right after the `await` is not enough — by the
+    /// time an old task resumes post-await it may already have raced past
+    /// its own cancellation check. So the guard also compares the query
+    /// this call ran for against the current `searchQuery`: if a newer
+    /// query has since taken over, this call's result is stale and must
+    /// be dropped rather than published, however it got here.
     private func performSearch(query: String) async {
         isSearching = true
         defer { isSearching = false }
         searchError = nil
+
+        let outcome: Result<AutoTagFileSearch.Results, Error>
         do {
             let results = try await services.database.writer.read { db in
                 try AutoTagFileSearch.search(query: query, in: db)
             }
+            outcome = .success(results)
+        } catch {
+            outcome = .failure(error)
+        }
+
+        guard Self.shouldPublishSearchResult(
+            queryTaskRanFor: query,
+            currentQuery: searchQuery,
+            isCancelled: Task.isCancelled
+        ) else { return }
+
+        switch outcome {
+        case let .success(results):
             searchResults = results.matches
             searchTotalMatchCount = results.totalMatchCount
-        } catch {
+        case let .failure(error):
             searchError = "\(error.localizedDescription)"
         }
+    }
+
+    /// Pure "should this completed search's results still be published"
+    /// guard, extracted so it's unit-testable without the SwiftUI/`Task`
+    /// machinery around it. Both the task's own cancellation and a
+    /// query-mismatch (a newer search has since taken over the search
+    /// box) must block publishing — either alone is insufficient, since
+    /// cancellation is cooperative and can lose the race.
+    static func shouldPublishSearchResult(queryTaskRanFor: String, currentQuery: String, isCancelled: Bool) -> Bool {
+        guard !isCancelled else { return false }
+        let trimmedCurrentQuery = currentQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return queryTaskRanFor == trimmedCurrentQuery
     }
 
     /// Loads (or refreshes) the "current" tag baseline — `filesByID`
