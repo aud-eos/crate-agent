@@ -141,28 +141,17 @@ final class AcoustIDClientTests: XCTestCase {
     }
 }
 
-/// Awaitable `XCTAssertThrowsError` — the synchronous stdlib version can't
-/// take an `async throws` autoclosure.
-private func XCTAssertThrowsErrorAsync<T>(
-    _ expression: @autoclosure () async throws -> T,
-    file: StaticString = #filePath,
-    line: UInt = #line,
-    _ errorHandler: (Error) -> Void = { _ in }
-) async {
-    do {
-        _ = try await expression()
-        XCTFail("expected an error to be thrown", file: file, line: line)
-    } catch {
-        errorHandler(error)
-    }
-}
-
-/// Returns a fixed status/body on every call.
-private final class StubLoader: URLLoading, @unchecked Sendable {
+/// Returns a fixed status/body on every call, and records the most recent
+/// request so callers can assert on headers (e.g. `MusicBrainzClientTests`
+/// asserting `User-Agent`). Shared across lookup-client test files rather
+/// than duplicated per client — not `private`, so it's visible to any test
+/// file in this module.
+final class StubLoader: URLLoading, @unchecked Sendable {
     private let status: Int
     private let body: Data
     private let lock = NSLock()
     private var count = 0
+    private var capturedLastRequest: URLRequest?
 
     init(status: Int, body: Data) {
         self.status = status
@@ -173,8 +162,15 @@ private final class StubLoader: URLLoading, @unchecked Sendable {
         lock.withLock { count }
     }
 
+    var lastRequest: URLRequest? {
+        lock.withLock { capturedLastRequest }
+    }
+
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-        lock.withLock { count += 1 }
+        lock.withLock {
+            count += 1
+            capturedLastRequest = request
+        }
         let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
         return (body, response)
     }

@@ -56,7 +56,7 @@ public struct AcoustIDResult: Codable, Equatable {
 /// Decoding is lenient: a sparse response (no releases, no ISRCs, no
 /// artist credit) never throws — every collection defaults to empty
 /// and `releaseGroup` to nil.
-struct MBRecording: Codable, Equatable {
+public struct MBRecording: Codable, Equatable {
     let title: String
     let artistCredit: [MBArtistCredit]
     let releases: [MBRelease]
@@ -72,7 +72,7 @@ struct MBRecording: Codable, Equatable {
     let releaseGroup: MBReleaseGroup?
     let isrcs: [String]
 
-    init(
+    public init(
         title: String,
         artistCredit: [MBArtistCredit],
         releases: [MBRelease],
@@ -93,7 +93,7 @@ struct MBRecording: Codable, Equatable {
         case isrcs
     }
 
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         title = try container.decode(String.self, forKey: .title)
         artistCredit = try container.decodeIfPresent([MBArtistCredit].self, forKey: .artistCredit) ?? []
@@ -105,19 +105,29 @@ struct MBRecording: Codable, Equatable {
     }
 }
 
-struct MBArtistCredit: Codable, Equatable {
+public struct MBArtistCredit: Codable, Equatable {
     let name: String
     let artist: MBArtist
+
+    public init(name: String, artist: MBArtist) {
+        self.name = name
+        self.artist = artist
+    }
 }
 
-struct MBArtist: Codable, Equatable {
+public struct MBArtist: Codable, Equatable {
     let id: String
     let name: String
+
+    public init(id: String, name: String) {
+        self.id = id
+        self.name = name
+    }
 }
 
 /// One release a recording appears on. Detail fields are all optional —
 /// MusicBrainz omits them for sparsely-cataloged releases.
-struct MBRelease: Codable, Equatable {
+public struct MBRelease: Codable, Equatable {
     let id: String
     let title: String
     let date: String?
@@ -130,7 +140,7 @@ struct MBRelease: Codable, Equatable {
     /// earliest `firstReleaseDate` across all of these.
     let releaseGroup: MBReleaseGroup?
 
-    init(
+    public init(
         id: String,
         title: String,
         date: String? = nil,
@@ -154,9 +164,14 @@ struct MBRelease: Codable, Equatable {
 
 /// A release-group's identity plus its `first-release-date`, the source
 /// of `MatchCandidate.proposedYear`.
-struct MBReleaseGroup: Codable, Equatable {
+public struct MBReleaseGroup: Codable, Equatable {
     let id: String
     let firstReleaseDate: String?
+
+    public init(id: String, firstReleaseDate: String?) {
+        self.id = id
+        self.firstReleaseDate = firstReleaseDate
+    }
 
     private enum CodingKeys: String, CodingKey {
         case id
