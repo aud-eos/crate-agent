@@ -331,56 +331,90 @@ public actor OperationEngine {
             }
         }
 
-        // Skip a metadata-projecting event that a LATER such event on the same
-        // file has superseded — the batch was undone, or the file was
-        // re-matched since. Replaying it would write the file's OLD
-        // artist/title/album/year over the current state (finding #3999974013).
-        // "Latest wins" is scoped to the file-metadata-projecting types; a
-        // rename (path-only) never supersedes a match's metadata.
-        let latestMetadataEventIdByFile = try await latestFileMetadataEventIds(for: events)
+        // Drop a projected write that a LATER event on the same file has
+        // superseded — the batch was undone, or the file was re-matched since.
+        // Replaying it would write the file's OLD artist/title/album/year over
+        // the current state (finding #3999974013). "Latest wins" is tracked
+        // INDEPENDENTLY per projection target: Serato's database V2 and the
+        // audio file tag are different external stores, and one event type can
+        // patch only one of them. A hygiene batch journals
+        // `commitMetadataToSerato` (V2 only) then `fileTagsWritten` (tag only)
+        // for the same file, so treating the later tag event as superseding the
+        // earlier V2 event would permanently drop the V2 re-sync (finding
+        // #4000261452). Renames (path-only) are in neither set and always replay.
+        let latestSeratoMetadataEventIdByFile = try await latestEventIdsByFile(
+            for: events, amongTypes: Self.seratoMetadataProjectingEventTypes
+        )
+        let latestFileTagEventIdByFile = try await latestEventIdsByFile(
+            for: events, amongTypes: Self.fileTagProjectingEventTypes
+        )
 
         var writes: [SeratoPendingWrite] = []
         var replayedEventCount = 0
         let decoder = JSONDecoder()
         for event in events {
-            if Self.fileMetadataProjectingEventTypes.contains(event.eventType),
-               let fileId = event.fileId,
-               let thisEventId = event.eventId,
-               let latest = latestMetadataEventIdByFile[fileId],
-               thisEventId < latest {
-                continue
-            }
             let reconstructed = Self.resyncWrites(
                 for: event, pathByFileId: pathByFileId, decoder: decoder
             )
-            if !reconstructed.isEmpty {
-                writes.append(contentsOf: reconstructed)
+            let kept = Self.dropSupersededWrites(
+                reconstructed,
+                event: event,
+                latestSeratoMetadataEventIdByFile: latestSeratoMetadataEventIdByFile,
+                latestFileTagEventIdByFile: latestFileTagEventIdByFile
+            )
+            if !kept.isEmpty {
+                writes.append(contentsOf: kept)
                 replayedEventCount += 1
             }
         }
         return (writes, replayedEventCount)
     }
 
-    /// Event types that project the SAME file-metadata fields (artist/title/
-    /// album/year) onto Serato + the audio tag. Only the latest such event for
-    /// a file reflects the file's current metadata, so resync replays only the
-    /// latest and skips earlier (superseded) ones. Renames are excluded — they
-    /// change the path, not the metadata.
-    private static let fileMetadataProjectingEventTypes: Set<EventType> = [
-        .musicBrainzMatchApplied, .musicBrainzMatchReverted,
-        .metadataCommittedToSerato, .fileTagsWritten,
+    /// Event types whose replay writes Serato's `database V2` metadata.
+    private static let seratoMetadataProjectingEventTypes: Set<EventType> = [
+        .musicBrainzMatchApplied, .musicBrainzMatchReverted, .metadataCommittedToSerato,
+    ]
+    /// Event types whose replay writes the audio file's tags.
+    private static let fileTagProjectingEventTypes: Set<EventType> = [
+        .musicBrainzMatchApplied, .musicBrainzMatchReverted, .fileTagsWritten,
     ]
 
-    /// For each file referenced by a metadata-projecting event in `events`,
-    /// the MAX `event_id` among ALL metadata-projecting events for that file
-    /// (across every batch) — i.e. the event that reflects the file's current
-    /// metadata. Used to drop superseded events from a resync replay.
-    private func latestFileMetadataEventIds(for events: [EventRecord]) async throws -> [Int64: Int64] {
+    /// Filters an event's reconstructed writes, dropping any whose projection
+    /// target has a newer event for the same file: a `.metadataUpdate` unless
+    /// this event is the latest Serato-metadata event for the file, and a
+    /// `.fileTagWrite` unless it is the latest file-tag event. Path-only writes
+    /// (rename, etc.) are never suppressed.
+    private static func dropSupersededWrites(
+        _ writes: [SeratoPendingWrite],
+        event: EventRecord,
+        latestSeratoMetadataEventIdByFile: [Int64: Int64],
+        latestFileTagEventIdByFile: [Int64: Int64]
+    ) -> [SeratoPendingWrite] {
+        guard let fileId = event.fileId, let thisEventId = event.eventId else { return writes }
+        return writes.filter { write in
+            switch write {
+            case .metadataUpdate:
+                return latestSeratoMetadataEventIdByFile[fileId].map { thisEventId >= $0 } ?? true
+            case .fileTagWrite:
+                return latestFileTagEventIdByFile[fileId].map { thisEventId >= $0 } ?? true
+            case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile:
+                return true
+            }
+        }
+    }
+
+    /// For each file referenced by an event of one of `types` in `events`, the
+    /// MAX `event_id` among ALL events of those types for that file (across
+    /// every batch) — i.e. the event that currently owns that projection for
+    /// the file. Used to drop superseded writes from a resync replay.
+    private func latestEventIdsByFile(
+        for events: [EventRecord], amongTypes types: Set<EventType>
+    ) async throws -> [Int64: Int64] {
         let fileIds = Array(Set(events.compactMap { event -> Int64? in
-            Self.fileMetadataProjectingEventTypes.contains(event.eventType) ? event.fileId : nil
+            types.contains(event.eventType) ? event.fileId : nil
         }))
         guard !fileIds.isEmpty else { return [:] }
-        let typeValues = Self.fileMetadataProjectingEventTypes.map(\.rawValue)
+        let typeValues = types.map(\.rawValue)
 
         struct LatestRow: FetchableRecord, Decodable {
             let fileId: Int64
@@ -546,18 +580,24 @@ public actor OperationEngine {
         return undoBatchId
     }
 
-    /// Throws `undoSupersededByLaterMatch` if any `musicBrainzMatchApplied`
-    /// event in the batch being undone has a LATER match-affecting event
-    /// (`musicBrainzMatchApplied`/`musicBrainzMatchReverted`) for the same file
-    /// in a DIFFERENT batch — i.e. that file was re-matched (or separately
-    /// reverted) after this batch, so reverting this batch's match would be out
-    /// of order and would clobber the newer state. Events in this same batch
-    /// are excluded (they're being undone together, atomically).
+    /// Throws `undoSupersededByLaterMatch` if any match-affecting event
+    /// (`musicBrainzMatchApplied` or `musicBrainzMatchReverted`) in the batch
+    /// being undone has a LATER match-affecting event for the same file in a
+    /// DIFFERENT batch — i.e. that file was re-matched (or separately reverted)
+    /// after this batch, so reverting this batch would be out of order and
+    /// would clobber the newer state. Reverted events are included so a REDO
+    /// (undoing an `undo:` batch, whose events are all `musicBrainzMatchReverted`
+    /// and whose inverse RE-APPLIES the original match) is guarded too — a redo
+    /// after the file was matched by a later batch would otherwise reapply the
+    /// stale original over the current link/tags (finding #4000261463). Events
+    /// in this same batch are excluded (they're being undone together, atomically).
     private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId: String) async throws {
-        let appliedEvents = events.filter { $0.eventType == .musicBrainzMatchApplied }
-        guard !appliedEvents.isEmpty else { return }
+        let matchEvents = events.filter {
+            $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
+        }
+        guard !matchEvents.isEmpty else { return }
         try await database.writer.read { db in
-            for event in appliedEvents {
+            for event in matchEvents {
                 guard let fileId = event.fileId, let eventId = event.eventId else { continue }
                 let laterMatchCount = try EventRecord
                     .filter(Column("file_id") == fileId)
@@ -1948,6 +1988,28 @@ public actor OperationEngine {
         } ?? false
         let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
 
+        // Whether THIS file is the row's current identity owner: the latest
+        // `musicBrainzMatchApplied` event for the track is this file's. This
+        // distinguishes the two cases the reference count conflates for a
+        // PRE-EXISTING row (finding #4000261456): an OLDER file that already
+        // referenced the row before this match — whose captured state is
+        // exactly what `previousTrackIdentifiers` restores, so it must NOT
+        // block restoration — versus a LATER batch that re-owned the row with
+        // its own file's match, which must. (The out-of-order guard in
+        // `undoBatch` already rejects the case where THIS file was itself
+        // re-matched later, so a later event for this same file can't reach
+        // here.) `nil` — no match event for the track (e.g. a row seeded
+        // outside the match path) — falls back to the reference-count gate.
+        let thisFileIsRowLatestMatcher: Bool? = try track.flatMap { row -> Bool? in
+            guard let trackID = row.id else { return nil }
+            let latestMatcherFileId = try Int64.fetchOne(db, sql: """
+                SELECT file_id FROM events
+                WHERE track_id = ? AND event_type = ?
+                ORDER BY event_id DESC LIMIT 1
+                """, arguments: [trackID, EventType.musicBrainzMatchApplied.rawValue])
+            return latestMatcherFileId.map { $0 == applied.fileID }
+        }
+
         // The out-of-order undo guard (rejecting a revert whose file was
         // re-matched by a LATER batch) lives in `undoBatch`, keyed on the event
         // log — the authoritative signal. Row/reference state can't be used
@@ -1990,13 +2052,16 @@ public actor OperationEngine {
                     try track.update(db)
                 }
             } else if let previous = applied.previousTrackIdentifiers {
-                // Restore the pre-existing row's captured identity — but
-                // only while A solely owns it. If a later batch B adopted
-                // the same fingerprint row (even to the SAME recording, so
-                // nothing drifts), file2 still references it and restoring
-                // A's `previous` here would clobber the identity B relies
-                // on; leave the row alone in that case.
-                if thisForwardStillSolelyOwnsRow {
+                // Restore the pre-existing row's captured identity — but only
+                // while THIS file is still the row's latest matcher. If a later
+                // batch re-owned the row with a different file's match,
+                // restoring A's `previous` would clobber the identity that
+                // later batch relies on; leave the row alone in that case. An
+                // OLDER file that merely still references the row does NOT block
+                // restoration — its state is precisely what `previous` restores
+                // (finding #4000261456). Falls back to the sole-owner gate when
+                // the track has no match event to rank by.
+                if thisFileIsRowLatestMatcher ?? thisForwardStillSolelyOwnsRow {
                     track.acoustidId = previous.acoustID
                     track.musicbrainzRecordingId = previous.recordingMBID
                     track.musicbrainzReleaseId = previous.releaseMBID

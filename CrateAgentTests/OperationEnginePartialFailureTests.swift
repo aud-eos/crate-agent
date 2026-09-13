@@ -339,6 +339,48 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         XCTAssertEqual(outcome.queuedCount, 0)
     }
 
+    // MARK: - #4000261452: per-projection-target resync supersession
+
+    /// A hygiene batch journals `commitMetadataToSerato` (Serato V2) then
+    /// `fileTagsWritten` (audio tag) for the SAME file — different external
+    /// stores. Re-sync must replay BOTH; a global "latest metadata event per
+    /// file wins" wrongly treats the later tag event as superseding the earlier
+    /// V2 event and permanently drops the V2 re-sync.
+    func testResyncReplaysBothV2AndTagForSameFileHygieneBatch() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let batchId = "hygiene-same-file"
+        let mutations: [TrackMutation] = [
+            .commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                fileId: fileIds[0],
+                metadata: SeratoMetadata(artist: "H0", title: "Committed0"),
+                previousMetadata: SeratoMetadata(artist: "old", title: "old")
+            )),
+            .writeFileTags(WriteFileTagsPayload(
+                fileId: fileIds[0],
+                metadata: SeratoMetadata(artist: "H0", title: "Tagged0"),
+                previousMetadata: SeratoMetadata(artist: "old", title: "old")
+            )),
+        ]
+        _ = try await engine.applyBatch(mutations, batchId: batchId)
+
+        let outcome = try await engine.resyncSeratoForBatch(batchId)
+        XCTAssertEqual(
+            outcome.appliedCount, 2,
+            "both the V2-metadata and file-tag events replay; the later tag event must not suppress the V2 one"
+        )
+        XCTAssertEqual(outcome.queuedCount, 0)
+
+        let records = try readDatabaseRecords(
+            databasePath: seratoDirectory.appendingPathComponent("database V2").path
+        )
+        let record = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertEqual(record?.artist, "H0", "V2 metadata present after resync (not dropped as superseded)")
+        XCTAssertTrue(tagWriter.writtenPaths.contains("/Music/A/one.mp3"), "the file-tag write replayed too")
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {
