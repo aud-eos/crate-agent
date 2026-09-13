@@ -310,20 +310,20 @@ public actor OperationEngine {
     private func reconstructResyncWrites(
         from events: [EventRecord]
     ) async throws -> (writes: [SeratoPendingWrite], replayedEventCount: Int) {
-        // MusicBrainz replays need the file's CURRENT absolute path
-        // (the DB is the source of truth — the file may have been
-        // renamed since). Batch-read every referenced file row once
-        // rather than per event.
-        let matchFileIds = events.compactMap { event -> Int64? in
-            event.eventType == .musicBrainzMatchApplied ? event.fileId : nil
+        // Every replay except a rename needs the file's CURRENT absolute
+        // path (the DB is the source of truth — the file may have been
+        // renamed since; a rename carries both paths in its own payload).
+        // Batch-read every referenced file row once rather than per event.
+        let pathDependentFileIds = events.compactMap { event -> Int64? in
+            Self.eventNeedsCurrentFilePath(event.eventType) ? event.fileId : nil
         }
         let pathByFileId: [Int64: String]
-        if matchFileIds.isEmpty {
+        if pathDependentFileIds.isEmpty {
             pathByFileId = [:]
         } else {
             pathByFileId = try await database.writer.read { db in
                 try FileRecord
-                    .filter(keys: matchFileIds)
+                    .filter(keys: pathDependentFileIds)
                     .fetchAll(db)
                     .reduce(into: [Int64: String]()) { accumulator, file in
                         if let id = file.id { accumulator[id] = file.path }
@@ -346,9 +346,31 @@ public actor OperationEngine {
         return (writes, replayedEventCount)
     }
 
+    /// Whether an event's Serato writes are reconstructed against the
+    /// file's CURRENT path (looked up in the DB) rather than paths
+    /// carried in the event's own payload. Renames carry both paths, so
+    /// they don't need the lookup; every other replayable type does.
+    private static func eventNeedsCurrentFilePath(_ eventType: EventType) -> Bool {
+        switch eventType {
+        case .musicBrainzMatchApplied, .metadataCommittedToSerato, .fileTagsWritten:
+            return true
+        case .fileRenamed, .trackImported, .fileRemoved, .metadataSet,
+             .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
+             .fileRemovedFromCrates, .musicBrainzMatchReverted:
+            return false
+        }
+    }
+
     /// Reconstruct one event's Serato writes from its forward payload.
-    /// Empty for event types with no replayable Serato projection (or
-    /// when the source data needed to rebuild the write is missing).
+    /// The single "event → pending Serato writes" mapping every replay
+    /// flows through — `resyncSeratoForBatch` then routes the result
+    /// through the shared `applyConsecutiveSeratoWrites` coalescing path
+    /// (invariant #3 guard, idempotent, no re-journaling). Covers the
+    /// four event types that project onto Serato/audio-tag writes:
+    /// `fileRenamed`, `musicBrainzMatchApplied`, `metadataCommittedToSerato`,
+    /// `fileTagsWritten`. Empty for event types with no replayable Serato
+    /// projection (or when the source data needed to rebuild the write is
+    /// missing).
     private static func resyncWrites(
         for event: EventRecord,
         pathByFileId: [Int64: String],
@@ -382,7 +404,34 @@ public actor OperationEngine {
                 album: payload.album,
                 year: payload.year
             )
-        default:
+        case .metadataCommittedToSerato:
+            // Hygiene / importer path: re-emit the database-V2 metadata
+            // update the forward `commitMetadataToSerato` produced.
+            guard let payload = try? decoder.decode(
+                CommitMetadataToSeratoPayload.self, from: forwardJsonData
+            ) else { return [] }
+            guard let fileId = event.fileId,
+                  let absolutePath = pathByFileId[fileId] else { return [] }
+            return [.metadataUpdate(SeratoPendingMetadataUpdate(
+                absolutePath: absolutePath, metadata: payload.metadata
+            ))]
+        case .fileTagsWritten:
+            // Hygiene / importer path: re-emit the audio file-tag write the
+            // forward `writeFileTags` produced. Year rides through the
+            // audio-tag frames Serato itself doesn't store; the forward
+            // mutation carried none here (its pending write left year nil),
+            // so the replay mirrors that.
+            guard let payload = try? decoder.decode(
+                WriteFileTagsPayload.self, from: forwardJsonData
+            ) else { return [] }
+            guard let fileId = event.fileId,
+                  let absolutePath = pathByFileId[fileId] else { return [] }
+            return [.fileTagWrite(SeratoPendingFileTagWrite(
+                absolutePath: absolutePath, metadata: payload.metadata
+            ))]
+        case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates,
+             .musicBrainzMatchReverted:
             return []
         }
     }

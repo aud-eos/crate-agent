@@ -209,6 +209,75 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         return ["one.mp3", "two.mp3", "three.mp3"][index]
     }
 
+    // MARK: - #836: Hygiene / importer event types (metadataCommittedToSerato + fileTagsWritten)
+
+    /// The blast-radius gap: `.externalSyncIncomplete` is universal across
+    /// every post-commit external-write failure, but `resyncSeratoForBatch`
+    /// must be able to replay the writes for the Hygiene/importer event
+    /// types too — otherwise the offered Re-sync returns (0,0) "no changes
+    /// to replay" while the writes genuinely did not land.
+    func testHygieneStylePartialFailureResyncReplaysMetadataAndTagWrites() async throws {
+        let tagWriter = ThrowingTagWriter()
+        tagWriter.throwOnCall = 1 // fail the file-tag write
+        let (engine, database, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let batchId = "hygiene-partial"
+        // A commitMetadataToSerato (→ database-V2 metadata update event)
+        // plus a writeFileTags (→ audio file-tag write event): the two
+        // Serato-projecting event types the hygiene/importer paths emit.
+        let mutations: [TrackMutation] = [
+            .commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                fileId: fileIds[0],
+                metadata: SeratoMetadata(artist: "Hygiene0", title: "Committed0"),
+                previousMetadata: SeratoMetadata(artist: "old", title: "old")
+            )),
+            .writeFileTags(WriteFileTagsPayload(
+                fileId: fileIds[1],
+                metadata: SeratoMetadata(artist: "Hygiene1", title: "Tagged1"),
+                previousMetadata: SeratoMetadata(artist: "old", title: "old")
+            )),
+        ]
+
+        var caughtBatchId: String?
+        do {
+            _ = try await engine.applyBatch(mutations, batchId: batchId)
+            XCTFail("expected the file-tag write to throw after the DB commit")
+        } catch let OperationEngineError.externalSyncIncomplete(failedBatchId, _) {
+            caughtBatchId = failedBatchId
+        }
+        XCTAssertEqual(caughtBatchId, batchId,
+                       "Hygiene-path partial failure must surface the batchId too")
+
+        // Both events committed to the DB despite the external failure.
+        let committedEvents = try await eventCount(in: database, batchId: batchId)
+        XCTAssertEqual(committedEvents, 2)
+        // The failed file-tag write genuinely did not land during apply.
+        XCTAssertFalse(tagWriter.writtenPaths.contains("/Music/A/two.mp3"),
+                       "the file-tag write threw, so it did not land during apply")
+
+        // Recovery must replay BOTH Hygiene event types — not return (0,0).
+        tagWriter.throwOnCall = nil
+        let outcome = try await engine.resyncSeratoForBatch(batchId)
+        XCTAssertEqual(outcome.appliedCount, 2,
+                       "both the committed-metadata and file-tags events replay (no (0,0) false promise)")
+        XCTAssertEqual(outcome.queuedCount, 0)
+        let eventsAfterResync = try await eventCount(in: database, batchId: batchId)
+        XCTAssertEqual(eventsAfterResync, committedEvents,
+                       "resync must not re-journal Hygiene events either")
+
+        // The previously-missing file-tag write landed on resync, and the
+        // committed metadata is present in database V2.
+        XCTAssertTrue(tagWriter.writtenPaths.contains("/Music/A/two.mp3"),
+                      "the failed file-tag write is replayed by resync")
+        let records = try readDatabaseRecords(
+            databasePath: seratoDirectory.appendingPathComponent("database V2").path
+        )
+        let firstRecord = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertEqual(firstRecord?.artist, "Hygiene0",
+                       "committed metadata present in database V2 after the batch + resync")
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {
