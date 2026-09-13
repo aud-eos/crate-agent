@@ -138,7 +138,19 @@ pub fn write_tags(path: impl AsRef<Path>, update: &AudioTagUpdate) -> Result<(),
 
     if tagged_file.primary_tag().is_none() {
         let primary_type = tagged_file.primary_tag_type();
-        tagged_file.insert_tag(Tag::new(primary_type));
+        // The file has no primary tag but may carry a legacy/secondary one
+        // (e.g. an MP3 with only ID3v1). Seed the new primary FROM that tag,
+        // re-mapped to the primary type, so a partial field patch followed by
+        // `remove_others(true)` below doesn't strip the unselected fields that
+        // lived only in the secondary tag (finding #4000261460). `re_map`
+        // carries over every field the primary type also supports; when there
+        // is no existing tag it starts empty.
+        let mut primary = tagged_file
+            .first_tag()
+            .cloned()
+            .unwrap_or_else(|| Tag::new(primary_type));
+        primary.re_map(primary_type);
+        tagged_file.insert_tag(primary);
     }
 
     let tag = tagged_file
@@ -508,6 +520,28 @@ mod tests {
         assert_eq!(restored.year, 1994);
         assert_eq!(restored.month, Some(5), "undo preserves the month");
         assert_eq!(restored.day, Some(9), "undo preserves the day");
+    }
+
+    /// `write_tags` seeds a new primary tag from the file's existing (possibly
+    /// legacy/secondary) tag via `re_map`, so a partial patch doesn't strip
+    /// fields that lived only in that tag (finding #4000261460). This pins the
+    /// mechanism the seeding relies on: re-mapping a secondary tag to the
+    /// primary type carries the standard fields across.
+    #[test]
+    fn re_mapping_a_secondary_tag_preserves_standard_fields() {
+        use lofty::prelude::Accessor;
+        use lofty::tag::{Tag, TagType};
+
+        let mut legacy = Tag::new(TagType::Id3v1);
+        legacy.set_artist("Legacy Artist".to_string());
+        legacy.set_title("Legacy Title".to_string());
+        legacy.set_album("Legacy Album".to_string());
+
+        legacy.re_map(TagType::Id3v2);
+
+        assert_eq!(legacy.artist().as_deref(), Some("Legacy Artist"));
+        assert_eq!(legacy.title().as_deref(), Some("Legacy Title"));
+        assert_eq!(legacy.album().as_deref(), Some("Legacy Album"));
     }
 
     /// End-to-end proof that the undo clears actually land on disk:
