@@ -131,6 +131,58 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertNil(service.fatalError)
     }
 
+    // MARK: - E-A: an empty ASSEMBLED artist name is nil, not just an empty credit array
+
+    /// A recording whose `artistCredit` is NON-empty but whose entries all
+    /// resolve to an empty display name (e.g. every credited artist's name
+    /// is itself empty) must still propose `nil`, not `""` — the nil check
+    /// has to be on the assembled string (`creditedArtistName`), not just
+    /// `artistCredit.isEmpty`, or this narrow case reopens the exact
+    /// artist-blanking bug E-A exists to close.
+    func testEmptyAssembledArtistNameFromNonEmptyCreditProposesNil() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/sparse.mp3")
+
+        let acoustIDClient = StubAcoustIDClient { _ in
+            [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+        }
+        // Non-empty artistCredit array, but the one entry's name is empty —
+        // creditedArtistName assembles to "".
+        let recording = makeRecording(artistName: "")
+        let musicBrainzClient = StubMusicBrainzClient { _ in recording }
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        // Sanity: the recording's credit array itself is non-empty (one
+        // entry, whose name is empty) — the array-level check alone would
+        // have let this case slip through as `.artistCredit.isEmpty ==
+        // false`.
+        XCTAssertFalse(recording.artistCredit.isEmpty)
+
+        guard let candidate = service.candidate(for: fileID) else {
+            return XCTFail("expected a resolved candidate, got \(String(describing: service.rows[fileID]))")
+        }
+        XCTAssertNil(candidate.proposedArtist, "an empty assembled name must propose nil, never \"\"")
+
+        let model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Existing Real Artist",
+            currentTitle: "Some Title",
+            currentAlbum: "Album",
+            currentYear: nil
+        )
+        XCTAssertFalse(model.includeArtist, "nil proposal must never default to included")
+        XCTAssertNil(model.payload().artist, "Confirm-All must never blank the existing artist")
+    }
+
     // MARK: - Per-row failure isolation
 
     func testPerRowFailureIsolated() async throws {

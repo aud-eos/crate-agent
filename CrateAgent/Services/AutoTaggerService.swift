@@ -255,10 +255,13 @@ final class AutoTaggerService: ObservableObject {
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
-            // E-A: an empty artist-credit has nothing to propose — nil,
-            // never "", so a sparse match can never default to blanking
-            // an existing artist on Confirm-All.
-            proposedArtist: recording.artistCredit.isEmpty ? nil : recording.creditedArtistName,
+            // E-A: nothing to propose when the assembled display name is
+            // empty — nil, never "", so a sparse match can never default
+            // to blanking an existing artist on Confirm-All. Checked on
+            // the assembled STRING, not just `artistCredit.isEmpty`: a
+            // non-empty credit array whose entries all resolve to empty
+            // names would otherwise still produce proposedArtist == "".
+            proposedArtist: recording.creditedArtistName.isEmpty ? nil : recording.creditedArtistName,
             proposedTitle: recording.title,
             proposedAlbum: chosenRelease.title,
             proposedYear: recording.releaseGroup?.firstReleaseDate.flatMap(Self.year(fromMusicBrainzDate:)),
