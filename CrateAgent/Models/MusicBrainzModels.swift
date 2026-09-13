@@ -132,15 +132,44 @@ public struct MBRecording: Codable, Equatable {
             .min { $0.sortableFirstReleaseDate < $1.sortableFirstReleaseDate }
         isrcs = try container.decodeIfPresent([String].self, forKey: .isrcs) ?? []
     }
+
+    /// The full, ordered multi-artist credit as MusicBrainz displays it —
+    /// e.g. `"Artist A feat. Artist B"` — assembled by concatenating each
+    /// credit's `name` with its `joinPhrase` in array order. Empty when
+    /// `artistCredit` is empty. Use this (not `artistCredit.first?.name`)
+    /// for any user-facing artist display name; `artistCredit.first`
+    /// remains the right source for the *lead* artist's MBID.
+    var creditedArtistName: String {
+        artistCredit.map { $0.name + $0.joinPhrase }.joined()
+    }
 }
 
 public struct MBArtistCredit: Codable, Equatable {
     let name: String
     let artist: MBArtist
+    /// The literal text MusicBrainz inserts after this credit to join it
+    /// to the next one in the array (" feat. ", " & ", ", ", …), or `""`
+    /// for the last (or only) credit. See `MBRecording.creditedArtistName`,
+    /// which concatenates `name + joinPhrase` across the whole array to
+    /// assemble the full multi-artist display name.
+    let joinPhrase: String
 
-    public init(name: String, artist: MBArtist) {
+    public init(name: String, artist: MBArtist, joinPhrase: String = "") {
         self.name = name
         self.artist = artist
+        self.joinPhrase = joinPhrase
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, artist
+        case joinPhrase = "joinphrase"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        artist = try container.decode(MBArtist.self, forKey: .artist)
+        joinPhrase = try container.decodeIfPresent(String.self, forKey: .joinPhrase) ?? ""
     }
 }
 

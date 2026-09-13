@@ -69,6 +69,64 @@ final class MusicBrainzModelsTests: XCTestCase {
         XCTAssertEqual(recording.releaseGroup?.firstReleaseDate, "1995-01-01")
     }
 
+    // MARK: - B4: full artist credit
+
+    func testCreditedArtistNameJoinsMultipleCreditsInOrder() {
+        let recording = MBRecording(
+            title: "Collab Track",
+            artistCredit: [
+                MBArtistCredit(name: "A", artist: MBArtist(id: "artist-a", name: "A"), joinPhrase: " feat. "),
+                MBArtistCredit(name: "B", artist: MBArtist(id: "artist-b", name: "B"), joinPhrase: ""),
+            ],
+            releases: [],
+            releaseGroup: nil,
+            isrcs: []
+        )
+
+        XCTAssertEqual(recording.creditedArtistName, "A feat. B")
+    }
+
+    func testCreditedArtistNameWithSingleCreditIsJustTheName() {
+        let recording = MBRecording(
+            title: "Solo Track",
+            artistCredit: [MBArtistCredit(name: "Solo Artist", artist: MBArtist(id: "artist-1", name: "Solo Artist"))],
+            releases: [],
+            releaseGroup: nil,
+            isrcs: []
+        )
+
+        XCTAssertEqual(recording.creditedArtistName, "Solo Artist")
+    }
+
+    func testCreditedArtistNameWithNoCreditsIsEmpty() {
+        let recording = MBRecording(
+            title: "Untitled",
+            artistCredit: [],
+            releases: [],
+            releaseGroup: nil,
+            isrcs: []
+        )
+
+        XCTAssertEqual(recording.creditedArtistName, "")
+    }
+
+    func testDecodesJoinPhraseFromArtistCreditJSON() throws {
+        let recording = try JSONDecoder().decode(MBRecording.self, from: fixture("mb_recording_multi_artist.json"))
+
+        XCTAssertEqual(recording.artistCredit.count, 2)
+        XCTAssertEqual(recording.artistCredit[0].joinPhrase, " feat. ")
+        XCTAssertEqual(recording.artistCredit[1].joinPhrase, "")
+        XCTAssertEqual(recording.creditedArtistName, "Artist One feat. Artist Two")
+    }
+
+    func testJoinPhraseDefaultsToEmptyWhenAbsentFromJSON() throws {
+        // mb_recording.json's single-element artist-credit has no
+        // "joinphrase" key at all — decoding must default to "", not throw.
+        let recording = try JSONDecoder().decode(MBRecording.self, from: fixture("mb_recording.json"))
+
+        XCTAssertEqual(recording.artistCredit.first?.joinPhrase, "")
+    }
+
     // MARK: - AcoustIDResponse
 
     func testEmptyAcoustIDResults() throws {
