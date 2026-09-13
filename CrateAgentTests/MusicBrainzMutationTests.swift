@@ -1,7 +1,7 @@
+@testable import CrateAgent
 import CryptoKit
 import GRDB
 import XCTest
-@testable import CrateAgent
 
 /// The correctness core for SP-2: the `applyMusicBrainzMatch` mutation
 /// and its full inverse. Every state change routes through
@@ -10,7 +10,6 @@ import XCTest
 /// library writes on the watchdog (invariant #3), and keys the canonical
 /// `tracks` row by Chromaprint fingerprint hash (invariant #4).
 final class MusicBrainzMutationTests: XCTestCase {
-
     /// Captures `fileTagWriter` invocations so tests can assert exactly
     /// what would be written to (or restored on) disk, including the
     /// year field that only reaches the file-tag path.
@@ -170,7 +169,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
 
         XCTAssertEqual(recorder.calls.count, 1, "file-tag write dispatched immediately (Serato closed)")
-        let update = recorder.calls.first!.update
+        let update = try XCTUnwrap(recorder.calls.first?.update)
         XCTAssertEqual(update.artist, "Nas")
         XCTAssertEqual(update.title, "N.Y. State of Mind")
         XCTAssertEqual(update.album, "Illmatic")
@@ -213,7 +212,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
 
         // Undo re-issued the file-tag writer with the previous state.
-        let lastCall = recorder.calls.last!
+        let lastCall = try XCTUnwrap(recorder.calls.last)
         XCTAssertEqual(lastCall.update.artist, "old")
         XCTAssertEqual(lastCall.update.title, "old (Dirty)")
         XCTAssertEqual(lastCall.update.album, "old")
@@ -243,7 +242,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         try await engine.undoBatch("add-album")
 
-        let undoUpdate = recorder.calls.last!.update
+        let undoUpdate = try XCTUnwrap(recorder.calls.last?.update)
         XCTAssertEqual(
             undoUpdate.album, "",
             "album added from empty must be cleared (empty string), not left unchanged (nil)"
@@ -269,7 +268,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         try await engine.undoBatch("year-new")
 
-        let undoUpdate = recorder.calls.last!.update
+        let undoUpdate = try XCTUnwrap(recorder.calls.last?.update)
         XCTAssertEqual(undoUpdate.year, 2001, "undo restores the file's real pre-match year, not nil/1994")
         XCTAssertFalse(undoUpdate.clearYear, "there was a prior year to restore → not a clear")
     }
@@ -306,7 +305,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         try await engine.undoBatch("year-pre")
 
-        let undoUpdate = recorder.calls.last!.update
+        let undoUpdate = try XCTUnwrap(recorder.calls.last?.update)
         XCTAssertEqual(
             undoUpdate.year, 2001,
             "restore the file's captured year (2001), not the track row's year (2000)"
@@ -622,7 +621,7 @@ final class MusicBrainzMutationTests: XCTestCase {
                 batchId: "b"
             )
             XCTFail("expected fingerprintRecordingConflict")
-        } catch OperationEngineError.fingerprintRecordingConflict(let fid, let existing, let incoming) {
+        } catch let OperationEngineError.fingerprintRecordingConflict(fid, existing, incoming) {
             XCTAssertEqual(fid, file2)
             XCTAssertEqual(existing, "recA")
             XCTAssertEqual(incoming, "recB")
@@ -713,7 +712,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         try await engine.undoBatch("dd")
 
-        let undoUpdate = recorder.calls.last!.update
+        let undoUpdate = try XCTUnwrap(recorder.calls.last?.update)
         XCTAssertEqual(undoUpdate.artist, "Disk Artist", "undo restores the file's real embedded artist, not the DB row")
         XCTAssertEqual(undoUpdate.title, "Disk Title", "undo restores the file's real embedded title")
         XCTAssertEqual(undoUpdate.album, "Disk Album", "undo restores the file's real embedded album")
@@ -755,11 +754,65 @@ final class MusicBrainzMutationTests: XCTestCase {
             XCTAssertNil(track.artist, "absent artist not written to the new track row")
         }
 
-        let update = recorder.calls.first!.update
+        let update = try XCTUnwrap(recorder.calls.first?.update)
         XCTAssertNil(update.artist)
         XCTAssertNil(update.title)
         XCTAssertEqual(update.album, "NewAlbum")
         XCTAssertEqual(update.year, 1994)
+    }
+
+    // MARK: - E-K: a nil title (from a review-row `.keep`) never touches an existing canonical title
+
+    /// A re-match against a file already linked to an EXISTING canonical
+    /// `tracks` row, with `payload.title == nil` (what `AutoTagRowModel`
+    /// now sends for `.keep`) must leave that row's `title` — and the
+    /// user's cherry-picked `(Clean)/(Dirty)/(Radio Version)` flags it
+    /// carries — completely untouched.
+    func testNilTitleLeavesExistingCanonicalTrackTitleUntouched() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "origA", title: "origT", album: "origAl", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Seed a pre-existing canonical track row carrying a DJ-preserved
+        // title with a version flag.
+        try await database.writer.write { db in
+            var track = TrackRecord(
+                fingerprintHash: fingerprint,
+                musicbrainzRecordingId: "orig-rec",
+                title: "N.Y. State of Mind (Clean)"
+            )
+            try track.insert(db)
+            try db.execute(
+                sql: "UPDATE files SET track_id = ? WHERE id = ?",
+                arguments: [track.id!, fileId]
+            )
+        }
+
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId,
+                fingerprintHash: fingerprint,
+                artist: nil,
+                title: nil,
+                album: nil,
+                year: nil
+            )),
+            batchId: "keep-title"
+        )
+
+        try await database.writer.read { db in
+            let file = try FileRecord.fetchOne(db, key: fileId)!
+            let track = try TrackRecord.fetchOne(db, key: file.trackId!)!
+            XCTAssertEqual(
+                track.title, "N.Y. State of Mind (Clean)",
+                "nil title must leave the canonical track title untouched"
+            )
+            XCTAssertEqual(file.title, "origT", "nil title must leave the file's title untouched too")
+        }
+
+        XCTAssertNil(recorder.calls.first?.update.title, "nil title must not reach the file-tag write either")
     }
 
     // MARK: - Serato-running gate

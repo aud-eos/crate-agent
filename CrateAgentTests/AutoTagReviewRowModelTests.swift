@@ -82,7 +82,7 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         XCTAssertNil(model.payload().album)
 
         model.titleChoice = .keep
-        XCTAssertEqual(model.payload().title, model.currentTitle)
+        XCTAssertNil(model.payload().title, "E-K: .keep must omit the title, not write the current title back")
 
         // Identity is always present regardless of toggles.
         let payload = model.payload()
@@ -91,6 +91,44 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         XCTAssertEqual(payload.artistMBID, candidate.artistMBID)
         XCTAssertEqual(payload.isrc, candidate.isrc)
         XCTAssertEqual(payload.fingerprintHash, candidate.fingerprintHash)
+    }
+
+    // MARK: - E-K: .keep omits the title from the payload entirely
+
+    /// `.keep` must encode as an OMITTED title update (`payload().title
+    /// == nil`), not the current-title written back — otherwise
+    /// `applyMusicBrainzMatch` overwrites the canonical `tracks.title`
+    /// (and the user's `(Clean)/(Dirty)/(Radio Version)` flags) even
+    /// though the user chose Keep.
+    func testKeepTitleChoiceOmitsTitleFromPayload() {
+        let candidate = makeCandidate(proposedTitle: "Corrected Title")
+        var model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Artist",
+            currentTitle: "Original (Clean)",
+            currentAlbum: "Album",
+            currentYear: 1994
+        )
+        model.titleChoice = .keep
+
+        XCTAssertNil(model.payload().title)
+        XCTAssertEqual(model.resolvedTitle, "Original (Clean)", "the review row still shows the current title live")
+    }
+
+    func testMergeTitleChoiceIncludesResolvedTitleInPayload() {
+        // Base-match: MB's title is a literal prefix of the DJ's tagged one.
+        let candidate = makeCandidate(proposedTitle: "Foo Song Title")
+        var model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Artist",
+            currentTitle: "Foo Song Title [DJ foobar remix - radio version]",
+            currentAlbum: "Album",
+            currentYear: 1994
+        )
+        model.titleChoice = .merge
+
+        XCTAssertEqual(model.payload().title, model.resolvedTitle)
+        XCTAssertNotNil(model.payload().title)
     }
 
     func testTitleChoiceTakeUsesProposedTitleVerbatim() {

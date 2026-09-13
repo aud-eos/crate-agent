@@ -108,10 +108,14 @@ struct AutoTagRowModel {
 
     /// Assembles the mutation payload: identity fields are always
     /// present (invariant #4 — the track link must never be partial),
-    /// title is always resolved from `titleChoice` (there is no separate
-    /// title toggle — `.keep` already means "no change"), and the
-    /// remaining display fields are only included when their toggle is
-    /// on. The release id comes from `candidate.chosenRelease`, so a
+    /// title is omitted (`nil`) for `.keep` — E-K: passing the current
+    /// title back as an "applied" value is NOT equivalent to "no
+    /// change"; it overwrites the canonical `tracks.title` (and the
+    /// user's cherry-picked `(Clean)/(Dirty)/(Radio Version)` flags) on
+    /// every re-match even when the user chose Keep. `.merge`/`.take`
+    /// resolve to the actual proposed/merged string, same as before.
+    /// The remaining display fields are only included when their toggle
+    /// is on. The release id comes from `candidate.chosenRelease`, so a
     /// "pick a different release" selection is reflected here.
     func payload() -> ApplyMusicBrainzMatchPayload {
         ApplyMusicBrainzMatchPayload(
@@ -127,7 +131,7 @@ struct AutoTagRowModel {
             expectedFileSize: candidate.expectedFileSize,
             expectedMtime: candidate.expectedMtime,
             artist: includeArtist ? candidate.proposedArtist : nil,
-            title: resolvedTitle,
+            title: titleChoice == .keep ? nil : resolvedTitle,
             album: includeAlbum ? candidate.proposedAlbum : nil,
             year: includeYear ? candidate.proposedYear : nil,
             // The file's real pre-match on-disk tags, so undo restores
