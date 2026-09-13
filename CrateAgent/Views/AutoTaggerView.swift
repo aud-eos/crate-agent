@@ -1,11 +1,20 @@
 import GRDB
 import SwiftUI
 
-/// SP-2's Auto-Tag review surface. Scans the library against
-/// AcoustID/MusicBrainz via `AutoTaggerService`, then lets the user
-/// review and selectively confirm each resolved match before applying
-/// every confirmed row in one undoable batch through `OperationEngine`.
-/// Models the scan → preview → apply skeleton from `LibraryHygieneView`.
+/// SP-2's Auto-Tag review surface. Lets the user pick a set of tracks,
+/// looks those (and only those) up against AcoustID/MusicBrainz via
+/// `AutoTaggerService`, then lets the user review and selectively confirm
+/// each resolved match before applying every confirmed row in one
+/// undoable batch through `OperationEngine`. Models the select → scan →
+/// preview → apply skeleton from `LibraryHygieneView`.
+///
+/// Ruling M: a pass must never fan out to the whole library unprompted.
+/// Nothing is looked up until the user has explicitly selected tracks —
+/// selection starts empty, "Scan Selected" is disabled at zero
+/// selections, and "Select All" (the only path to a library-wide pass)
+/// is gated behind a confirmation showing the track count and a rough
+/// time estimate against the shared ≤1 req/sec AcoustID/MusicBrainz
+/// rate limit.
 ///
 /// `autoTaggerService` is taken as an explicit `@ObservedObject` init
 /// parameter (rather than reached via `services.autoTaggerService`
@@ -20,13 +29,29 @@ struct AutoTaggerView: View {
     @State private var files: [FileRecord] = []
     @State private var filesByID: [Int64: FileRecord] = [:]
     @State private var currentYearByFileID: [Int64: Int?] = [:]
+
+    /// The user's checkbox picks on the pre-scan selection list. Starts
+    /// empty on every launch of this view — never defaults to "all".
+    @State private var selectedFileIDs: Set<Int64> = []
+    /// The exact file IDs the most recent scan was run against, in
+    /// library order. Drives which rows `reviewList` renders — NOT
+    /// `autoTaggerService.rows`' full key set, which is shared,
+    /// long-lived service state that can carry entries from a prior
+    /// scan the current view instance never asked for.
+    @State private var scannedFileIDs: [Int64] = []
     @State private var rowModels: [Int64: AutoTagRowModel] = [:]
     @State private var confirmedFileIDs: Set<Int64> = []
+    /// File IDs whose match has already been written via `applyBatch`.
+    /// Kept (rather than just deleting the row) so the row shows an
+    /// "Applied" indicator instead of silently vanishing from the list.
+    @State private var appliedFileIDs: Set<Int64> = []
+
     @State private var isLoadingFiles: Bool = false
     @State private var isApplying: Bool = false
     @State private var loadError: String?
     @State private var actionError: String?
     @State private var lastResult: String?
+    @State private var showSelectAllConfirmation: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,36 +89,60 @@ struct AutoTaggerView: View {
                 headline: "No tracks indexed yet",
                 detail: "Auto-Tag needs files in your library before it can look up matches."
             )
-        } else if autoTaggerService.rows.isEmpty {
-            scanPrompt
+        } else if scannedFileIDs.isEmpty {
+            selectionList
         } else {
             reviewList
         }
     }
 
-    private var scanPrompt: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "wand.and.stars")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
-            Text("\(files.count) track\(files.count == 1 ? "" : "s") ready to scan")
-                .font(.headline)
-            Text("Looks up each file's audio fingerprint against AcoustID and MusicBrainz to propose corrected tags. You review and confirm every field before anything is written.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
-            Button("Scan Library") {
-                Task { await startScan() }
-            }
-            .keyboardShortcut(.defaultAction)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
+    // MARK: - Selection stage
 
-    private var reviewList: some View {
+    private var selectionList: some View {
         List(files, id: \.id) { file in
             if let fileID = file.id {
+                selectionRow(fileID: fileID, file: file)
+            }
+        }
+        .listStyle(.inset)
+    }
+
+    private func selectionRow(fileID: Int64, file: FileRecord) -> some View {
+        HStack(spacing: 10) {
+            Toggle(isOn: selectionBinding(for: fileID)) { EmptyView() }
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayTitle(for: file))
+                    .font(.caption)
+                    .lineLimit(1)
+                Text((file.path as NSString).lastPathComponent)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onTapGesture { toggleSelection(fileID) }
+    }
+
+    private func displayTitle(for file: FileRecord) -> String {
+        switch (file.artist, file.title) {
+        case let (artist?, title?): return "\(artist) — \(title)"
+        case let (artist?, nil): return artist
+        case let (nil, title?): return title
+        case (nil, nil): return (file.path as NSString).lastPathComponent
+        }
+    }
+
+    // MARK: - Review stage
+
+    private var reviewList: some View {
+        List(scannedFileIDs, id: \.self) { fileID in
+            if let file = filesByID[fileID] {
                 rowContainer(fileID: fileID, path: file.path)
             }
         }
@@ -102,22 +151,26 @@ struct AutoTaggerView: View {
 
     @ViewBuilder
     private func rowContainer(fileID: Int64, path: String) -> some View {
-        switch autoTaggerService.rows[fileID] {
-        case .none, .pending:
-            statusRow(path: path, systemImage: "hourglass", text: "Looking up…", tint: .secondary)
-        case .noMatch:
-            statusRow(path: path, systemImage: "questionmark.circle", text: "No match", tint: .secondary)
-        case let .failed(reason):
-            statusRow(path: path, systemImage: "exclamationmark.triangle", text: reason, tint: .orange)
-        case .strong, .weak:
-            if let binding = rowModelBinding(for: fileID) {
-                AutoTagReviewRow(
-                    path: path,
-                    score: autoTaggerService.candidate(for: fileID)?.score ?? 0,
-                    isStrong: isStrongMatch(fileID: fileID),
-                    model: binding,
-                    isConfirmed: confirmedBinding(for: fileID)
-                )
+        if appliedFileIDs.contains(fileID) {
+            statusRow(path: path, systemImage: "checkmark.circle.fill", text: "Applied", tint: .green)
+        } else {
+            switch autoTaggerService.rows[fileID] {
+            case .none, .pending:
+                statusRow(path: path, systemImage: "hourglass", text: "Looking up…", tint: .secondary)
+            case .noMatch:
+                statusRow(path: path, systemImage: "questionmark.circle", text: "No match", tint: .secondary)
+            case let .failed(reason):
+                statusRow(path: path, systemImage: "exclamationmark.triangle", text: reason, tint: .orange)
+            case .strong, .weak:
+                if let binding = rowModelBinding(for: fileID) {
+                    AutoTagReviewRow(
+                        path: path,
+                        score: autoTaggerService.candidate(for: fileID)?.score ?? 0,
+                        isStrong: isStrongMatch(fileID: fileID),
+                        model: binding,
+                        isConfirmed: confirmedBinding(for: fileID)
+                    )
+                }
             }
         }
     }
@@ -155,7 +208,55 @@ struct AutoTaggerView: View {
 
     // MARK: - Footer
 
+    @ViewBuilder
     private var footer: some View {
+        if !isLoadingFiles && loadError == nil && !files.isEmpty {
+            if scannedFileIDs.isEmpty {
+                selectionFooter
+            } else {
+                reviewFooter
+            }
+        }
+    }
+
+    private var selectionFooter: some View {
+        HStack(spacing: 12) {
+            Text("\(selectedFileIDs.count) of \(files.count) selected")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Select All") {
+                showSelectAllConfirmation = true
+            }
+            .controlSize(.small)
+            Button("Select None") {
+                selectedFileIDs.removeAll()
+            }
+            .controlSize(.small)
+            .disabled(selectedFileIDs.isEmpty)
+            Button("Scan Selected (\(selectedFileIDs.count))") {
+                Task { await startScan() }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(selectedFileIDs.isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .alert("Scan all \(files.count) tracks?", isPresented: $showSelectAllConfirmation) {
+            Button("Select All \(files.count)") {
+                selectedFileIDs = Set(files.compactMap(\.id))
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("""
+            Auto-Tag looks up every selected track against AcoustID and MusicBrainz through a shared rate limit of about 1 request per second (2 requests per track). \
+            At \(files.count) track\(files.count == 1 ? "" : "s"), that's roughly \(Self.estimatedDuration(trackCount: files.count)). \
+            You'll still review and confirm every match before anything is written — this only starts the lookup pass.
+            """)
+        }
+    }
+
+    private var reviewFooter: some View {
         HStack(spacing: 12) {
             if let actionError {
                 Label(actionError, systemImage: "exclamationmark.triangle.fill")
@@ -166,12 +267,17 @@ struct AutoTaggerView: View {
                 Label(lastResult, systemImage: "checkmark.circle")
                     .font(.caption)
                     .foregroundStyle(.green)
-            } else if !rowModels.isEmpty {
-                Text("\(confirmedFileIDs.count) of \(rowModels.count) confirmed")
+            } else {
+                Text(reviewStatusText)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button("New Scan") {
+                resetToSelectionStage()
+            }
+            .controlSize(.small)
+            .disabled(isApplying)
             if !rowModels.isEmpty {
                 Button("Confirm All Strong Matches") {
                     confirmAllStrongMatches()
@@ -199,7 +305,36 @@ struct AutoTaggerView: View {
         .padding(.vertical, 10)
     }
 
+    private var reviewStatusText: String {
+        var parts = ["\(confirmedFileIDs.count) of \(rowModels.count) confirmed"]
+        if !appliedFileIDs.isEmpty {
+            parts.append("\(appliedFileIDs.count) applied")
+        }
+        return parts.joined(separator: " · ")
+    }
+
     // MARK: - Bindings
+
+    private func selectionBinding(for fileID: Int64) -> Binding<Bool> {
+        Binding(
+            get: { selectedFileIDs.contains(fileID) },
+            set: { include in
+                if include {
+                    selectedFileIDs.insert(fileID)
+                } else {
+                    selectedFileIDs.remove(fileID)
+                }
+            }
+        )
+    }
+
+    private func toggleSelection(_ fileID: Int64) {
+        if selectedFileIDs.contains(fileID) {
+            selectedFileIDs.remove(fileID)
+        } else {
+            selectedFileIDs.insert(fileID)
+        }
+    }
 
     private func rowModelBinding(for fileID: Int64) -> Binding<AutoTagRowModel>? {
         guard rowModels[fileID] != nil else { return nil }
@@ -267,14 +402,18 @@ struct AutoTaggerView: View {
         }
     }
 
-    /// Builds an `AutoTagRowModel` for every newly-resolved candidate in
-    /// `autoTaggerService.rows`, without touching rows that already have
-    /// one — preserves the user's field toggles / title choice / release
-    /// pick across the service publishing updates for other, still-in-
-    /// flight files.
+    /// Builds an `AutoTagRowModel` for every newly-resolved candidate
+    /// among `scannedFileIDs` — deliberately scoped to the current
+    /// scan's selection, not to every key in `autoTaggerService.rows`
+    /// (shared, long-lived service state that can carry entries from a
+    /// scan this view instance never asked for). Skips fileIDs that
+    /// already have a model, and ones already marked applied — preserves
+    /// the user's field toggles / title choice / release pick across the
+    /// service publishing updates for other, still-in-flight files.
     private func syncRowModels() {
-        for (fileID, state) in autoTaggerService.rows {
-            guard rowModels[fileID] == nil else { continue }
+        for fileID in scannedFileIDs {
+            guard rowModels[fileID] == nil, !appliedFileIDs.contains(fileID) else { continue }
+            guard let state = autoTaggerService.rows[fileID] else { continue }
 
             let candidate: MatchCandidate?
             switch state {
@@ -297,11 +436,30 @@ struct AutoTaggerView: View {
 
     // MARK: - Actions
 
+    /// Runs the lookup pass over exactly `selectedFileIDs` — never over
+    /// every loaded file. Preserves the library's display order so the
+    /// review list reads top-to-bottom the same way the selection list did.
     private func startScan() async {
+        let idsToScan = files.compactMap(\.id).filter { selectedFileIDs.contains($0) }
+        guard !idsToScan.isEmpty else { return }
+
+        scannedFileIDs = idsToScan
         confirmedFileIDs.removeAll()
+        appliedFileIDs.removeAll()
         rowModels.removeAll()
-        let fileIDs = files.compactMap(\.id)
-        await autoTaggerService.run(fileIDs: fileIDs)
+        actionError = nil
+        lastResult = nil
+        await autoTaggerService.run(fileIDs: idsToScan)
+    }
+
+    private func resetToSelectionStage() {
+        scannedFileIDs.removeAll()
+        selectedFileIDs.removeAll()
+        confirmedFileIDs.removeAll()
+        appliedFileIDs.removeAll()
+        rowModels.removeAll()
+        actionError = nil
+        lastResult = nil
     }
 
     private func applyConfirmed() async {
@@ -310,7 +468,8 @@ struct AutoTaggerView: View {
         actionError = nil
         lastResult = nil
 
-        let mutations: [TrackMutation] = confirmedFileIDs.compactMap { fileID in
+        let confirmedIDs = confirmedFileIDs
+        let mutations: [TrackMutation] = confirmedIDs.compactMap { fileID in
             rowModels[fileID].map { .applyMusicBrainzMatch($0.payload()) }
         }
         guard !mutations.isEmpty else { return }
@@ -320,14 +479,28 @@ struct AutoTaggerView: View {
             _ = try await services.operationEngine.applyBatch(mutations, batchId: batchId)
             let appliedCount = mutations.count
             lastResult = "Applied \(appliedCount) match\(appliedCount == 1 ? "" : "es")"
-            for fileID in confirmedFileIDs {
+            appliedFileIDs.formUnion(confirmedIDs)
+            confirmedFileIDs.subtract(confirmedIDs)
+            for fileID in confirmedIDs {
                 rowModels.removeValue(forKey: fileID)
             }
-            confirmedFileIDs.removeAll()
-            await loadFiles()
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
         }
+    }
+
+    /// Rough wall-clock estimate for scanning `trackCount` tracks: 2
+    /// sequential lookups per track (AcoustID, then MusicBrainz), both
+    /// routed through one shared rate limiter capped at ≤1 request/second
+    /// (MusicBrainz's own ceiling; `AppServices` shares it with AcoustID
+    /// too, conservatively).
+    private static func estimatedDuration(trackCount: Int) -> String {
+        let totalSeconds = TimeInterval(trackCount * 2)
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.unitsStyle = .abbreviated
+        formatter.maximumUnitCount = 2
+        return formatter.string(from: totalSeconds) ?? "\(Int(totalSeconds))s"
     }
 }
 
