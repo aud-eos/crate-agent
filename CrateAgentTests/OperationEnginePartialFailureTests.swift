@@ -381,6 +381,57 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         XCTAssertTrue(tagWriter.writtenPaths.contains("/Music/A/one.mp3"), "the file-tag write replayed too")
     }
 
+    // MARK: - #104 reground: resync ranks by ACTUAL writes, not event type
+
+    /// A later year-only re-match of a file produces NO Serato-V2 write (only a
+    /// file-tag write). Re-syncing the EARLIER full match's batch must still
+    /// replay that batch's V2 metadata — it is the file's current V2 state,
+    /// since the later match didn't touch V2. Ranking supersession by event
+    /// TYPE (both are musicBrainzMatchApplied) would wrongly drop it.
+    func testResyncKeepsEarlierV2WhenLaterMatchTouchesOnlyTheTag() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let fingerprint = sha256(Data("shared-fp".utf8))
+        let file = fileIds[0]
+
+        // Batch A: a full match — writes V2 metadata (Nas/…/Illmatic) + tag.
+        try await engine.applyBatch(
+            [.applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload(
+                fileID: file, acoustID: "aid", recordingMBID: "recA", releaseMBID: "relA",
+                artistMBID: "art", isrc: "isrc", fingerprintHash: fingerprint,
+                expectedFileSize: 1, expectedMtime: 1,
+                artist: "Nas", title: "N.Y. State of Mind", album: "Illmatic", year: 1994
+            ))],
+            batchId: "batchA"
+        )
+        // Batch B (later): a YEAR-ONLY re-match of the same file — no V2 write.
+        try await engine.applyBatch(
+            [.applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload(
+                fileID: file, acoustID: "aid", recordingMBID: "recA", releaseMBID: "relA",
+                artistMBID: "art", isrc: "isrc", fingerprintHash: fingerprint,
+                expectedFileSize: 1, expectedMtime: 1,
+                artist: nil, title: nil, album: nil, year: 1995
+            ))],
+            batchId: "batchB"
+        )
+
+        // Re-sync batch A: its V2 metadata must replay (A is the latest event
+        // that actually produced a V2 write — B produced none).
+        let outcome = try await engine.resyncSeratoForBatch("batchA")
+        XCTAssertEqual(outcome.appliedCount, 1, "A's V2 metadata write still replays")
+
+        let records = try readDatabaseRecords(
+            databasePath: seratoDirectory.appendingPathComponent("database V2").path
+        )
+        let record = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertEqual(
+            record?.artist, "Nas",
+            "the earlier full match's V2 metadata is current (the later year-only match didn't touch V2) and must survive resync"
+        )
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {

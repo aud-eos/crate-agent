@@ -331,23 +331,22 @@ public actor OperationEngine {
             }
         }
 
-        // Drop a projected write that a LATER event on the same file has
-        // superseded — the batch was undone, or the file was re-matched since.
-        // Replaying it would write the file's OLD artist/title/album/year over
-        // the current state (finding #3999974013). "Latest wins" is tracked
-        // INDEPENDENTLY per projection target: Serato's database V2 and the
-        // audio file tag are different external stores, and one event type can
-        // patch only one of them. A hygiene batch journals
-        // `commitMetadataToSerato` (V2 only) then `fileTagsWritten` (tag only)
-        // for the same file, so treating the later tag event as superseding the
-        // earlier V2 event would permanently drop the V2 re-sync (finding
-        // #4000261452). Renames (path-only) are in neither set and always replay.
-        let latestSeratoMetadataEventIdByFile = try await latestEventIdsByFile(
-            for: events, amongTypes: Self.seratoMetadataProjectingEventTypes
-        )
-        let latestFileTagEventIdByFile = try await latestEventIdsByFile(
-            for: events, amongTypes: Self.fileTagProjectingEventTypes
-        )
+        // Re-sync must project each file's CURRENT external state, not blindly
+        // replay this batch's journaled writes. A batch may have been undone or
+        // a file re-matched since, and Serato's `database V2` and the audio tag
+        // are INDEPENDENT stores that different events patch separately. Rather
+        // than approximate "current" by ranking events by TYPE (which a later
+        // year-only/identity-only match — journaled but producing no metadata
+        // write — would corrupt, silently dropping an earlier event's
+        // still-current metadata: finding #4000261xxx), we reconstruct the
+        // ACTUAL writes and, per file and per target, keep only the write from
+        // the event that most recently PRODUCED a write for that target. That
+        // latest actual write is the file's current intended state, carrying
+        // clears and exact values straight from its journaled payload — so this
+        // is correct by construction for undone batches, re-matches, hygiene
+        // V2+tag pairs, and partial-metadata matches alike (issue #104).
+        let (latestMetadataWriteByFile, latestFileTagWriteByFile) =
+            try await latestProjectedWriteEventIds(pathByFileId: pathByFileId)
 
         var writes: [SeratoPendingWrite] = []
         var replayedEventCount = 0
@@ -359,8 +358,8 @@ public actor OperationEngine {
             let kept = Self.dropSupersededWrites(
                 reconstructed,
                 event: event,
-                latestSeratoMetadataEventIdByFile: latestSeratoMetadataEventIdByFile,
-                latestFileTagEventIdByFile: latestFileTagEventIdByFile
+                latestMetadataWriteByFile: latestMetadataWriteByFile,
+                latestFileTagWriteByFile: latestFileTagWriteByFile
             )
             if !kept.isEmpty {
                 writes.append(contentsOf: kept)
@@ -370,68 +369,77 @@ public actor OperationEngine {
         return (writes, replayedEventCount)
     }
 
-    /// Event types whose replay writes Serato's `database V2` metadata.
-    private static let seratoMetadataProjectingEventTypes: Set<EventType> = [
-        .musicBrainzMatchApplied, .musicBrainzMatchReverted, .metadataCommittedToSerato,
-    ]
-    /// Event types whose replay writes the audio file's tags.
-    private static let fileTagProjectingEventTypes: Set<EventType> = [
-        .musicBrainzMatchApplied, .musicBrainzMatchReverted, .fileTagsWritten,
+    /// Event types whose journaled payload can reconstruct a Serato/audio-tag
+    /// write (the same set `resyncWrites` handles, minus rename which is a
+    /// path-only transition ranked separately). Used to gather the candidate
+    /// events for latest-actual-write ranking.
+    private static let metadataOrTagProjectingEventTypes: Set<EventType> = [
+        .musicBrainzMatchApplied, .musicBrainzMatchReverted,
+        .metadataCommittedToSerato, .fileTagsWritten,
     ]
 
-    /// Filters an event's reconstructed writes, dropping any whose projection
-    /// target has a newer event for the same file: a `.metadataUpdate` unless
-    /// this event is the latest Serato-metadata event for the file, and a
-    /// `.fileTagWrite` unless it is the latest file-tag event. Path-only writes
-    /// (rename, etc.) are never suppressed.
+    /// Keeps an event's write only when it is the file's CURRENT state for that
+    /// write's target: a `.metadataUpdate` iff this event is the latest to have
+    /// produced a Serato-V2 write for the file, a `.fileTagWrite` iff the latest
+    /// to have produced a file-tag write. Path-only writes always replay.
     private static func dropSupersededWrites(
         _ writes: [SeratoPendingWrite],
         event: EventRecord,
-        latestSeratoMetadataEventIdByFile: [Int64: Int64],
-        latestFileTagEventIdByFile: [Int64: Int64]
+        latestMetadataWriteByFile: [Int64: Int64],
+        latestFileTagWriteByFile: [Int64: Int64]
     ) -> [SeratoPendingWrite] {
         guard let fileId = event.fileId, let thisEventId = event.eventId else { return writes }
         return writes.filter { write in
             switch write {
             case .metadataUpdate:
-                return latestSeratoMetadataEventIdByFile[fileId].map { thisEventId >= $0 } ?? true
+                return latestMetadataWriteByFile[fileId] == thisEventId
             case .fileTagWrite:
-                return latestFileTagEventIdByFile[fileId].map { thisEventId >= $0 } ?? true
+                return latestFileTagWriteByFile[fileId] == thisEventId
             case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile:
                 return true
             }
         }
     }
 
-    /// For each file referenced by an event of one of `types` in `events`, the
-    /// MAX `event_id` among ALL events of those types for that file (across
-    /// every batch) — i.e. the event that currently owns that projection for
-    /// the file. Used to drop superseded writes from a resync replay.
-    private func latestEventIdsByFile(
-        for events: [EventRecord], amongTypes types: Set<EventType>
-    ) async throws -> [Int64: Int64] {
-        let fileIds = Array(Set(events.compactMap { event -> Int64? in
-            types.contains(event.eventType) ? event.fileId : nil
-        }))
-        guard !fileIds.isEmpty else { return [:] }
-        let typeValues = types.map(\.rawValue)
-
-        struct LatestRow: FetchableRecord, Decodable {
-            let fileId: Int64
-            let latest: Int64
-        }
+    /// For each file in `pathByFileId`, the event ids of the latest events that
+    /// ACTUALLY produce a Serato-V2 metadata write and a file-tag write
+    /// (respectively), across EVERY batch. Ranks by reconstructed writes rather
+    /// than by event type, so an event that is a projecting type but produces
+    /// no write for a target (e.g. a year-only match emits no `.metadataUpdate`)
+    /// does not falsely supersede an earlier event that did. The latest actual
+    /// producer's write is the file's current intended state for that target.
+    private func latestProjectedWriteEventIds(
+        pathByFileId: [Int64: String]
+    ) async throws -> (metadata: [Int64: Int64], fileTag: [Int64: Int64]) {
+        let fileIds = Array(pathByFileId.keys)
+        guard !fileIds.isEmpty else { return ([:], [:]) }
+        let typeValues = Self.metadataOrTagProjectingEventTypes.map(\.rawValue)
         let sql = """
-            SELECT file_id AS fileId, MAX(event_id) AS latest
-            FROM events
+            SELECT * FROM events
             WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
               AND event_type IN (\(databaseQuestionMarks(count: typeValues.count)))
-            GROUP BY file_id
+            ORDER BY event_id ASC
             """
         let arguments = StatementArguments(fileIds) + StatementArguments(typeValues)
-        return try await database.writer.read { db in
-            try LatestRow.fetchAll(db, sql: sql, arguments: arguments)
-                .reduce(into: [Int64: Int64]()) { $0[$1.fileId] = $1.latest }
+        let history = try await database.writer.read { db in
+            try EventRecord.fetchAll(db, sql: sql, arguments: arguments)
         }
+
+        var metadata: [Int64: Int64] = [:]
+        var fileTag: [Int64: Int64] = [:]
+        let decoder = JSONDecoder()
+        for event in history {
+            guard let fileId = event.fileId, let eventId = event.eventId else { continue }
+            // ASC order → last write producer seen per file is the latest.
+            for write in Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder) {
+                switch write {
+                case .metadataUpdate: metadata[fileId] = eventId
+                case .fileTagWrite: fileTag[fileId] = eventId
+                case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile: break
+                }
+            }
+        }
+        return (metadata, fileTag)
     }
 
     /// Whether an event's Serato writes are reconstructed against the
