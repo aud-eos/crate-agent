@@ -5,6 +5,10 @@ import XCTest
 /// behind the Auto-Tag review row. Exercises payload assembly only;
 /// the SwiftUI layer (`AutoTagReviewRow`, `AutoTaggerView`) is verified
 /// by build, not by these tests.
+///
+/// The model's current-tag baseline comes entirely from the candidate's
+/// on-disk snapshot (`currentFile*`), so the fixtures set those fields to
+/// express "what the file currently has" (findings #3999114442 / #3999974015).
 final class AutoTagReviewRowModelTests: XCTestCase {
     // MARK: - Fixtures
 
@@ -63,15 +67,13 @@ final class AutoTagReviewRowModelTests: XCTestCase {
             proposedArtist: "Foo Artist",
             proposedTitle: "Foo Song Title",
             proposedAlbum: "Foo Album",
-            proposedYear: 2000
+            proposedYear: 2000,
+            currentFileYear: 1999,
+            currentFileArtist: "Foo Artist (feat. Bar)",
+            currentFileTitle: "Foo Song Title [DJ foobar remix - radio version]",
+            currentFileAlbum: "Old Album"
         )
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Foo Artist (feat. Bar)",
-            currentTitle: "Foo Song Title [DJ foobar remix - radio version]",
-            currentAlbum: "Old Album",
-            currentYear: 1999
-        )
+        var model = AutoTagRowModel(candidate: candidate)
 
         XCTAssertEqual(
             model.payload().title,
@@ -101,14 +103,8 @@ final class AutoTagReviewRowModelTests: XCTestCase {
     /// (and the user's `(Clean)/(Dirty)/(Radio Version)` flags) even
     /// though the user chose Keep.
     func testKeepTitleChoiceOmitsTitleFromPayload() {
-        let candidate = makeCandidate(proposedTitle: "Corrected Title")
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Original (Clean)",
-            currentAlbum: "Album",
-            currentYear: 1994
-        )
+        let candidate = makeCandidate(proposedTitle: "Corrected Title", currentFileTitle: "Original (Clean)")
+        var model = AutoTagRowModel(candidate: candidate)
         model.titleChoice = .keep
 
         XCTAssertNil(model.payload().title)
@@ -117,14 +113,11 @@ final class AutoTagReviewRowModelTests: XCTestCase {
 
     func testMergeTitleChoiceIncludesResolvedTitleInPayload() {
         // Base-match: MB's title is a literal prefix of the DJ's tagged one.
-        let candidate = makeCandidate(proposedTitle: "Foo Song Title")
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Foo Song Title [DJ foobar remix - radio version]",
-            currentAlbum: "Album",
-            currentYear: 1994
+        let candidate = makeCandidate(
+            proposedTitle: "Foo Song Title",
+            currentFileTitle: "Foo Song Title [DJ foobar remix - radio version]"
         )
+        var model = AutoTagRowModel(candidate: candidate)
         model.titleChoice = .merge
 
         XCTAssertEqual(model.payload().title, model.resolvedTitle)
@@ -132,14 +125,8 @@ final class AutoTagReviewRowModelTests: XCTestCase {
     }
 
     func testTitleChoiceTakeUsesProposedTitleVerbatim() {
-        let candidate = makeCandidate(proposedTitle: "Corrected Title")
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Totally Different Title",
-            currentAlbum: "Album",
-            currentYear: 1994
-        )
+        let candidate = makeCandidate(proposedTitle: "Corrected Title", currentFileTitle: "Totally Different Title")
+        var model = AutoTagRowModel(candidate: candidate)
         model.titleChoice = .take
         XCTAssertEqual(model.payload().title, "Corrected Title")
     }
@@ -150,15 +137,13 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         let candidate = makeCandidate(
             proposedArtist: "Same Artist",
             proposedAlbum: "Same Album",
-            proposedYear: 1994
+            proposedYear: 1994,
+            currentFileYear: 1994,
+            currentFileArtist: "Same Artist",
+            currentFileTitle: "Some Title",
+            currentFileAlbum: "Same Album"
         )
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Same Artist",
-            currentTitle: "Some Title",
-            currentAlbum: "Same Album",
-            currentYear: 1994
-        )
+        let model = AutoTagRowModel(candidate: candidate)
 
         XCTAssertFalse(model.includeArtist, "artist matches current — should default off")
         XCTAssertFalse(model.includeAlbum, "album matches current — should default off")
@@ -174,15 +159,13 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         let candidate = makeCandidate(
             proposedArtist: "New Artist",
             proposedAlbum: "New Album",
-            proposedYear: 2001
+            proposedYear: 2001,
+            currentFileYear: 1994,
+            currentFileArtist: "Old Artist",
+            currentFileTitle: "Some Title",
+            currentFileAlbum: "Old Album"
         )
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Old Artist",
-            currentTitle: "Some Title",
-            currentAlbum: "Old Album",
-            currentYear: 1994
-        )
+        let model = AutoTagRowModel(candidate: candidate)
 
         XCTAssertTrue(model.includeArtist)
         XCTAssertTrue(model.includeAlbum)
@@ -197,14 +180,14 @@ final class AutoTagReviewRowModelTests: XCTestCase {
     // MARK: - Toggling artist off omits it independent of title/album
 
     func testTogglingArtistOffOmitsItButLeavesOtherFieldsIntact() {
-        let candidate = makeCandidate(proposedArtist: "New Artist", proposedAlbum: "New Album")
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Old Artist",
-            currentTitle: "Some Title",
-            currentAlbum: "Old Album",
-            currentYear: nil
+        let candidate = makeCandidate(
+            proposedArtist: "New Artist",
+            proposedAlbum: "New Album",
+            currentFileArtist: "Old Artist",
+            currentFileTitle: "Some Title",
+            currentFileAlbum: "Old Album"
         )
+        var model = AutoTagRowModel(candidate: candidate)
         model.includeArtist = false
 
         let payload = model.payload()
@@ -220,15 +203,10 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         let candidate = makeCandidate(
             proposedAlbum: "Album A",
             chosenRelease: originalRelease,
-            availableReleases: [originalRelease, otherRelease]
+            availableReleases: [originalRelease, otherRelease],
+            currentFileAlbum: "Old Album"
         )
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Title",
-            currentAlbum: "Old Album",
-            currentYear: nil
-        )
+        var model = AutoTagRowModel(candidate: candidate)
 
         model.selectRelease(otherRelease)
 
@@ -250,15 +228,10 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         let candidate = makeCandidate(
             proposedAlbum: currentAlbum,
             chosenRelease: defaultRelease,
-            availableReleases: [defaultRelease, otherRelease]
+            availableReleases: [defaultRelease, otherRelease],
+            currentFileAlbum: currentAlbum
         )
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Title",
-            currentAlbum: currentAlbum,
-            currentYear: nil
-        )
+        var model = AutoTagRowModel(candidate: candidate)
         XCTAssertFalse(model.includeAlbum, "default release's title matches current album — starts off")
 
         model.selectRelease(otherRelease)
@@ -277,15 +250,10 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         let candidate = makeCandidate(
             proposedAlbum: currentAlbum,
             chosenRelease: defaultRelease,
-            availableReleases: [defaultRelease, otherRelease]
+            availableReleases: [defaultRelease, otherRelease],
+            currentFileAlbum: currentAlbum
         )
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Title",
-            currentAlbum: currentAlbum,
-            currentYear: nil
-        )
+        var model = AutoTagRowModel(candidate: candidate)
 
         // Simulate the user manually turning the toggle off (as the view's
         // binding does via markAlbumToggleUserOverridden()).
@@ -305,14 +273,13 @@ final class AutoTagReviewRowModelTests: XCTestCase {
     /// would blank the file's real artist on Confirm-All) and must never
     /// be applied as an empty string.
     func testNilProposedArtistNeverDefaultsIncludedOrAppliesBlank() {
-        let candidate = makeCandidate(proposedArtist: nil)
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Existing Real Artist",
-            currentTitle: "Some Title",
-            currentAlbum: "Album",
-            currentYear: 1994
+        let candidate = makeCandidate(
+            proposedArtist: nil,
+            currentFileArtist: "Existing Real Artist",
+            currentFileTitle: "Some Title",
+            currentFileAlbum: "Album"
         )
+        let model = AutoTagRowModel(candidate: candidate)
 
         XCTAssertFalse(model.includeArtist, "an unavailable proposed artist must never default to included")
         XCTAssertNil(model.payload().artist, "Confirm-All must never blank the existing artist")
@@ -322,14 +289,13 @@ final class AutoTagReviewRowModelTests: XCTestCase {
     /// proposal, `payload()` must not fabricate an empty-string artist —
     /// there's nothing to apply.
     func testForcingIncludeArtistOnWithNilProposalNeverAppliesBlank() {
-        let candidate = makeCandidate(proposedArtist: nil)
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Existing Real Artist",
-            currentTitle: "Some Title",
-            currentAlbum: "Album",
-            currentYear: 1994
+        let candidate = makeCandidate(
+            proposedArtist: nil,
+            currentFileArtist: "Existing Real Artist",
+            currentFileTitle: "Some Title",
+            currentFileAlbum: "Album"
         )
+        var model = AutoTagRowModel(candidate: candidate)
         model.includeArtist = true
 
         XCTAssertNil(model.payload().artist, "toggling on a nil proposed artist must not fabricate one")
@@ -338,71 +304,23 @@ final class AutoTagReviewRowModelTests: XCTestCase {
     // MARK: - No proposed year
 
     func testNoProposedYearNeverIncludesYear() {
-        let candidate = makeCandidate(proposedYear: nil)
-        var model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Title",
-            currentAlbum: "Album",
-            currentYear: 1990
-        )
+        let candidate = makeCandidate(proposedYear: nil, currentFileYear: 1990)
+        var model = AutoTagRowModel(candidate: candidate)
         XCTAssertFalse(model.includeYear)
         model.includeYear = true
         XCTAssertNil(model.payload().year, "toggling on a nil proposed year must not fabricate one")
     }
 
-    // MARK: - On-disk current year (greenfield first-pass match)
-
-    /// A greenfield first-pass match: no `tracks` row exists yet, so the
-    /// caller-supplied `tracks.year` (here `currentYear: nil`) is nil, but
-    /// the file's on-disk tag (`candidate.currentFileYear`) already carries
-    /// the correct year. `includeYear` must default OFF — the tag is
-    /// already correct, there's nothing to change.
-    func testOnDiskCurrentYearEqualToProposedDefaultsIncludeYearOff() {
-        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: 1994)
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Title",
-            currentAlbum: "Album",
-            currentYear: nil
-        )
-
-        XCTAssertFalse(model.includeYear, "on-disk year already matches proposed — nothing to change")
-        XCTAssertEqual(model.currentYear, 1994)
-        XCTAssertNil(model.payload().year)
-    }
-
-    /// Same greenfield scenario, but the on-disk tag disagrees with the
-    /// proposed year: `includeYear` must default ON so the honest diff
-    /// ("1990 → 1994") is what the review row shows and applies.
-    func testOnDiskCurrentYearDifferingFromProposedDefaultsIncludeYearOn() {
-        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: 1990)
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Title",
-            currentAlbum: "Album",
-            currentYear: nil
-        )
-
-        XCTAssertTrue(model.includeYear, "on-disk year differs from proposed — should default on")
-        XCTAssertEqual(model.currentYear, 1990)
-        XCTAssertEqual(model.payload().year, 1994)
-    }
-
     // MARK: - On-disk embedded tags are the review baseline (not the DB snapshot)
 
     /// The file's embedded artist/title/album (`candidate.currentFile*`) is
-    /// the baseline for the include-toggle defaults and the diff — not the
-    /// Serato/DB `files` snapshot the caller passes. When Serato already
-    /// stores the correct artist but the audio file's tag is wrong, defaulting
-    /// the toggle off against the DB value would leave the file tag unfixed.
-    func testOnDiskEmbeddedTagsAreTheBaselineOverDatabaseSnapshot() {
-        // Serato/DB already says the right thing ("Nas"), but the file on disk
-        // is wrong ("Unknown Artist" / blank album), and MusicBrainz proposes
-        // the correct values. The diff must be file→proposed, and the toggles
-        // must default ON so Apply fixes the file.
+    /// the baseline for the include-toggle defaults and the diff — not any
+    /// Serato/DB `files` snapshot. When the audio file's tag is wrong, the
+    /// toggles must default ON so Apply fixes the file.
+    func testOnDiskEmbeddedTagsAreTheBaseline() {
+        // The file on disk is wrong ("Unknown Artist" / blank album), and
+        // MusicBrainz proposes the correct values. The diff must be
+        // file→proposed, and the toggles must default ON so Apply fixes it.
         let candidate = makeCandidate(
             proposedArtist: "Nas",
             proposedTitle: "N.Y. State of Mind",
@@ -412,15 +330,9 @@ final class AutoTagReviewRowModelTests: XCTestCase {
             currentFileTitle: "Track 03",
             currentFileAlbum: ""
         )
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Nas",
-            currentTitle: "N.Y. State of Mind",
-            currentAlbum: "Illmatic",
-            currentYear: 1994
-        )
+        let model = AutoTagRowModel(candidate: candidate)
 
-        XCTAssertEqual(model.currentArtist, "Unknown Artist", "baseline is the file's embedded tag, not the DB value")
+        XCTAssertEqual(model.currentArtist, "Unknown Artist", "baseline is the file's embedded tag")
         XCTAssertEqual(model.currentTitle, "Track 03")
         XCTAssertEqual(model.currentAlbum, "")
         XCTAssertTrue(model.includeArtist, "file tag differs from proposed — Apply must fix it")
@@ -431,41 +343,65 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         XCTAssertEqual(payload.album, "Illmatic")
     }
 
-    /// When the file has no embedded artist tag (`currentFileArtist` nil), the
-    /// caller-supplied Serato/DB value is the honest fallback for the baseline.
-    func testFallsBackToDatabaseSnapshotWhenOnDiskTagMissing() {
+    // MARK: - #3999974015: a definitively-absent embedded tag stays absent
+
+    /// When the file has NO embedded artist/album tag (`currentFile* == nil`),
+    /// the baseline is treated as absent (""), NOT backfilled from any DB
+    /// snapshot. So even if the proposal equals what Serato already stored,
+    /// the include-toggle defaults ON — Confirm-All must WRITE the missing tag
+    /// to the file, and the diff must show the honest "«» → proposed".
+    func testMissingEmbeddedTagDefaultsIncludeOnSoTheFileGetsWritten() {
         let candidate = makeCandidate(
             proposedArtist: "Nas",
+            proposedAlbum: "Illmatic",
             currentFileArtist: nil,
-            currentFileTitle: nil,
             currentFileAlbum: nil
         )
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Nas",
-            currentTitle: "N.Y. State of Mind",
-            currentAlbum: "Illmatic",
-            currentYear: 1994
-        )
+        let model = AutoTagRowModel(candidate: candidate)
 
-        XCTAssertEqual(model.currentArtist, "Nas", "no embedded tag — fall back to the DB snapshot")
-        XCTAssertFalse(model.includeArtist, "DB fallback matches proposed — nothing to change")
+        XCTAssertEqual(model.currentArtist, "", "a missing file tag reads as absent, not the DB value")
+        XCTAssertEqual(model.currentAlbum, "")
+        XCTAssertTrue(model.includeArtist, "a missing file tag must default ON so Apply writes it")
+        XCTAssertTrue(model.includeAlbum)
+
+        let payload = model.payload()
+        XCTAssertEqual(payload.artist, "Nas")
+        XCTAssertEqual(payload.album, "Illmatic")
     }
 
-    /// When the on-disk read didn't produce a year (`currentFileYear` nil,
-    /// e.g. the tag has no year frame), the caller-supplied `tracks.year`
-    /// is still an honest fallback for the diff.
-    func testFallsBackToTracksYearWhenOnDiskYearMissing() {
-        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: nil)
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Artist",
-            currentTitle: "Title",
-            currentAlbum: "Album",
-            currentYear: 1994
-        )
+    // MARK: - On-disk current year
 
-        XCTAssertFalse(model.includeYear, "tracks.year fallback matches proposed — nothing to change")
+    /// The file's on-disk year already matches proposed → `includeYear` off,
+    /// nothing to change.
+    func testOnDiskCurrentYearEqualToProposedDefaultsIncludeYearOff() {
+        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: 1994)
+        let model = AutoTagRowModel(candidate: candidate)
+
+        XCTAssertFalse(model.includeYear, "on-disk year already matches proposed — nothing to change")
         XCTAssertEqual(model.currentYear, 1994)
+        XCTAssertNil(model.payload().year)
+    }
+
+    /// The on-disk tag disagrees with the proposed year: `includeYear` must
+    /// default ON so the honest diff ("1990 → 1994") is what applies.
+    func testOnDiskCurrentYearDifferingFromProposedDefaultsIncludeYearOn() {
+        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: 1990)
+        let model = AutoTagRowModel(candidate: candidate)
+
+        XCTAssertTrue(model.includeYear, "on-disk year differs from proposed — should default on")
+        XCTAssertEqual(model.currentYear, 1990)
+        XCTAssertEqual(model.payload().year, 1994)
+    }
+
+    /// #3999974015 (year): a file with NO year tag but a proposed year must
+    /// default `includeYear` ON — the file's missing year is written, not
+    /// left absent because some canonical `tracks.year` happened to match.
+    func testMissingOnDiskYearWithProposedYearDefaultsIncludeYearOn() {
+        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: nil)
+        let model = AutoTagRowModel(candidate: candidate)
+
+        XCTAssertTrue(model.includeYear, "a missing file year with a proposed year must default on")
+        XCTAssertNil(model.currentYear, "the baseline reflects the file's absent year, not a DB value")
+        XCTAssertEqual(model.payload().year, 1994)
     }
 }

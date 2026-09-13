@@ -30,7 +30,6 @@ struct AutoTaggerView: View {
     /// have been scanned at least once — never the whole library. See
     /// `loadCurrentMetadata(forFileIDs:)`.
     @State private var filesByID: [Int64: FileRecord] = [:]
-    @State private var currentYearByFileID: [Int64: Int?] = [:]
 
     /// Total row count in the `files` table, used only to distinguish
     /// "library is genuinely empty" from "nothing matches the current
@@ -513,32 +512,21 @@ struct AutoTaggerView: View {
         return queryTaskRanFor == trimmedCurrentQuery
     }
 
-    /// Loads (or refreshes) the "current" tag baseline — `filesByID`
-    /// and `currentYearByFileID` — for exactly `fileIDs`, never the
-    /// whole library. Called before a scan starts (so the review stage
-    /// has current values to diff the proposed match against) and
-    /// again after a successful apply (so a later re-scan of the same
-    /// files diffs against what's actually in the DB now, not stale
-    /// pre-apply values).
+    /// Loads (or refreshes) `filesByID` for exactly `fileIDs`, never the
+    /// whole library. Called before a scan starts and again after a
+    /// successful apply. The review baseline itself comes from each
+    /// candidate's on-disk tag snapshot (see `AutoTagRowModel`), so this no
+    /// longer loads canonical `tracks.year` — `filesByID` is retained only
+    /// for the non-review lookups elsewhere in the view.
     private func loadCurrentMetadata(forFileIDs fileIDs: [Int64]) async {
         guard !fileIDs.isEmpty else { return }
         do {
             let loadedFiles = try await services.database.writer.read { db in
                 try FileRecord.filter(keys: fileIDs).fetchAll(db)
             }
-            let trackIDs = Set(loadedFiles.compactMap(\.trackId))
-            let tracks = try await services.database.writer.read { db in
-                try TrackRecord.filter(keys: trackIDs).fetchAll(db)
-            }
-            let yearByTrackID: [Int64: Int] = Dictionary(uniqueKeysWithValues: tracks.compactMap { track in
-                guard let trackID = track.id, let year = track.year else { return nil }
-                return (trackID, year)
-            })
-
             for file in loadedFiles {
                 guard let fileID = file.id else { continue }
                 filesByID[fileID] = file
-                currentYearByFileID[fileID] = file.trackId.flatMap { yearByTrackID[$0] }
             }
         } catch {
             loadError = "\(error.localizedDescription)"
@@ -565,15 +553,12 @@ struct AutoTaggerView: View {
             case .pending, .noMatch, .failed, .stopped:
                 candidate = nil
             }
-            guard let candidate, let file = filesByID[fileID] else { continue }
+            // The model's current-tag baseline comes entirely from the
+            // candidate's on-disk snapshot (read at scan time), so no
+            // FileRecord/DB value is threaded in here.
+            guard let candidate else { continue }
 
-            rowModels[fileID] = AutoTagRowModel(
-                candidate: candidate,
-                currentArtist: file.artist ?? "",
-                currentTitle: file.title ?? "",
-                currentAlbum: file.album ?? "",
-                currentYear: currentYearByFileID[fileID] ?? nil
-            )
+            rowModels[fileID] = AutoTagRowModel(candidate: candidate)
         }
     }
 
@@ -694,14 +679,12 @@ struct AutoTaggerView: View {
         }
     }
 
-    /// Refresh the cached current-tag baseline (filesByID /
-    /// currentYearByFileID) for exactly the files this scan covered, so
-    /// a later "New Scan" over the same files — including these
-    /// just-applied ones, if re-selected — diffs against what's actually
-    /// in the DB now, not against stale pre-apply values. Without this,
-    /// `syncRowModels` rebuilds a re-scanned row's `AutoTagRowModel` from
-    /// outdated current-artist/title/album/year, undermining the review
-    /// UI's whole current→proposed diff.
+    /// Refresh the cached `filesByID` for exactly the files this scan
+    /// covered, so a later "New Scan" over the same files diffs against
+    /// what's actually in the DB now, not against stale pre-apply values.
+    /// (A re-scanned row's `AutoTagRowModel` takes its current-tag baseline
+    /// from the freshly re-read candidate's on-disk snapshot; this refresh
+    /// keeps the view's other `filesByID` lookups current.)
     private func refreshCurrentMetadataAfterApply() async {
         await loadCurrentMetadata(forFileIDs: scannedFileIDs)
     }

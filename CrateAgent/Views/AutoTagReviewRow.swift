@@ -6,21 +6,23 @@ import SwiftUI
 /// SwiftUI shell that renders it and is verified by build only.
 ///
 /// Holds the "current" (pre-match) tag values alongside the resolved
-/// `MatchCandidate` because `MatchCandidate` (Task 5) only carries the
-/// *proposed* side of the diff — the current side lives on `FileRecord`
-/// and is supplied by the caller (`AutoTaggerView`) at construction time.
+/// `MatchCandidate`. The current side is the file's ACTUAL on-disk embedded
+/// tags — carried on the candidate as `currentFile*`, read from the file at
+/// scan time — NOT Serato's `files`-row snapshot. The diff and the
+/// include-toggle defaults are about what will change ON THE FILE, so the
+/// file's tags (including their absence) are the source of truth; substituting
+/// the DB snapshot would hide a genuinely-missing or wrong file tag.
 struct AutoTagRowModel {
     private(set) var candidate: MatchCandidate
     let currentArtist: String
     let currentTitle: String
     let currentAlbum: String
     /// The "current" year shown in the review diff and used to default
-    /// `includeYear`. Prefers `candidate.currentFileYear` — the file's
-    /// on-disk tag, read at scan time — over the caller-supplied
-    /// `tracks.year` fallback, since `tracks.year` is nil on a
-    /// greenfield first-pass match (no `tracks` row exists yet), which
-    /// used to make the diff show "— → 1994" even when the file already
-    /// had a correct year tag.
+    /// `includeYear` — the file's on-disk year tag (`candidate.currentFileYear`),
+    /// or nil when the file has no year frame. Deliberately NOT backfilled from
+    /// the canonical `tracks.year`: if the file tag is absent but the DB/track
+    /// already holds the proposed year, backfilling would default `includeYear`
+    /// off and leave the file's year unwritten (finding #3999974015).
     let currentYear: Int?
 
     /// The tier `TitleMatcher.decide` resolved for this row's title pair,
@@ -48,31 +50,22 @@ struct AutoTagRowModel {
         didUserOverrideAlbum = true
     }
 
-    init(
-        candidate: MatchCandidate,
-        currentArtist: String,
-        currentTitle: String,
-        currentAlbum: String,
-        currentYear: Int?
-    ) {
+    init(candidate: MatchCandidate) {
         self.candidate = candidate
-        // The review baseline is the file's ACTUAL on-disk embedded tag —
-        // `candidate.currentFile*`, read from the file at scan time — with
-        // the caller-supplied Serato/DB value (`currentArtist` etc.) only as
-        // a fallback when the file had no such tag. Serato's `files` snapshot
-        // can disagree with the audio file: if Serato says "Nas" but the file
-        // tag is wrong/blank, defaulting `includeArtist` off against the DB
-        // value would leave the wrong file tag unfixed and show an inaccurate
-        // current→proposed diff. Mirrors the year resolution just below (and
-        // the on-disk-tag capture used for undo in `payload()`).
-        let resolvedCurrentArtist = candidate.currentFileArtist ?? currentArtist
-        let resolvedCurrentTitle = candidate.currentFileTitle ?? currentTitle
-        let resolvedCurrentAlbum = candidate.currentFileAlbum ?? currentAlbum
+        // The baseline is the file's ACTUAL on-disk embedded tag, read at scan
+        // time. A nil `currentFile*` means the file has NO such tag — treated
+        // as absent (""), never backfilled from Serato's DB snapshot. If the
+        // file tag is wrong/blank/missing while Serato already equals the
+        // MusicBrainz proposal, backfilling the DB value would default the
+        // include-toggle OFF and leave the file tag unfixed, and would show an
+        // inaccurate current→proposed diff (findings #3999114442, #3999974015).
+        let resolvedCurrentArtist = candidate.currentFileArtist ?? ""
+        let resolvedCurrentTitle = candidate.currentFileTitle ?? ""
+        let resolvedCurrentAlbum = candidate.currentFileAlbum ?? ""
         self.currentArtist = resolvedCurrentArtist
         self.currentTitle = resolvedCurrentTitle
         self.currentAlbum = resolvedCurrentAlbum
-        let resolvedCurrentYear = candidate.currentFileYear ?? currentYear
-        self.currentYear = resolvedCurrentYear
+        self.currentYear = candidate.currentFileYear
 
         let decision = TitleMatcher.decide(current: resolvedCurrentTitle, proposed: candidate.proposedTitle)
         titleTier = decision.tier
@@ -84,8 +77,8 @@ struct AutoTagRowModel {
         includeArtist = candidate.proposedArtist != nil && candidate.proposedArtist != resolvedCurrentArtist
         includeAlbum = candidate.proposedAlbum != resolvedCurrentAlbum
         // A nil proposedYear means MusicBrainz had nothing to propose —
-        // never defaults to "included" even though nil != resolvedCurrentYear.
-        includeYear = candidate.proposedYear != nil && candidate.proposedYear != resolvedCurrentYear
+        // never defaults to "included" even though nil != currentFileYear.
+        includeYear = candidate.proposedYear != nil && candidate.proposedYear != candidate.currentFileYear
     }
 
     /// The title string `titleChoice` currently resolves to — shown live

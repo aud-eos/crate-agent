@@ -172,13 +172,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
         XCTAssertNil(candidate.proposedArtist, "an empty assembled name must propose nil, never \"\"")
 
-        let model = AutoTagRowModel(
-            candidate: candidate,
-            currentArtist: "Existing Real Artist",
-            currentTitle: "Some Title",
-            currentAlbum: "Album",
-            currentYear: nil
-        )
+        let model = AutoTagRowModel(candidate: candidate)
         XCTAssertFalse(model.includeArtist, "nil proposal must never default to included")
         XCTAssertNil(model.payload().artist, "Confirm-All must never blank the existing artist")
     }
