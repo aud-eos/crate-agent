@@ -48,6 +48,24 @@ final class MusicBrainzClientTests: XCTestCase {
         }
     }
 
+    func testCorruptCacheEntryIsEvictedAndFallsThroughToNetwork() async throws {
+        // Same as AcoustIDClientTests' equivalent: a cached recording that
+        // no longer decodes must be treated as a MISS — evicted and
+        // re-fetched — not replayed as a permanent decode failure.
+        let mbid = "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10"
+        let cache = LookupCache.memory()
+        let cacheKey = MusicBrainzClient.cacheKey(forMBID: mbid)
+        cache.store(Data("not valid json".utf8), forKey: cacheKey)
+        let loader = StubLoader(status: 200, body: fixture("mb_recording.json"))
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache, appVersion: "1.2.3")
+
+        let recording = try await client.recording(mbid: mbid)
+
+        XCTAssertEqual(loader.callCount, 1, "the corrupt hit must fall through to the network")
+        XCTAssertEqual(recording.title, "Voodoo Ray")
+        XCTAssertNotEqual(cache.data(forKey: cacheKey), Data("not valid json".utf8), "the healthy response must be re-cached over the corrupt bytes")
+    }
+
     func testNotFoundMapsToTransportError() async {
         let loader = StubLoader(status: 404, body: Data())
         let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory(), appVersion: "1.2.3")

@@ -40,6 +40,30 @@ public final class LookupCache: Sendable {
     public func store(_ data: Data, forKey key: String) {
         backend.store(data, forKey: key)
     }
+
+    /// Evicts a cache entry outright. Used when a cache hit turns out to
+    /// be undecodable (corrupt bytes, or bytes written by an older,
+    /// incompatible model) — the bad entry must not keep answering every
+    /// future lookup for this key with the same failure.
+    public func remove(forKey key: String) {
+        backend.remove(forKey: key)
+    }
+
+    /// Reads a cache hit and decodes it with `decode`. If decoding fails,
+    /// the entry is treated as a MISS rather than a permanent failure: it
+    /// is evicted here so the caller falls through to a fresh network
+    /// fetch instead of replaying the same undecodable bytes forever.
+    /// Shared by `AcoustIDClient.lookup` and `MusicBrainzClient.recording`
+    /// — both are "decode a cache hit; on failure evict + miss," differing
+    /// only in their decode function.
+    public func cachedValue<Value>(forKey key: String, decode: (Data) throws -> Value) -> Value? {
+        guard let cachedData = data(forKey: key) else { return nil }
+        guard let value = try? decode(cachedData) else {
+            remove(forKey: key)
+            return nil
+        }
+        return value
+    }
 }
 
 /// The storage mechanic `LookupCache` delegates to. Kept private: callers
@@ -48,6 +72,7 @@ public final class LookupCache: Sendable {
 private protocol LookupCacheBackend: Sendable {
     func data(forKey key: String) -> Data?
     func store(_ data: Data, forKey key: String)
+    func remove(forKey key: String)
 }
 
 /// `FileManager` itself isn't `Sendable`, but every method here just reads
@@ -71,6 +96,10 @@ private final class DiskLookupCacheBackend: LookupCacheBackend, @unchecked Senda
 
     func store(_ data: Data, forKey key: String) {
         try? data.write(to: fileURL(forKey: key), options: .atomic)
+    }
+
+    func remove(forKey key: String) {
+        try? fileManager.removeItem(at: fileURL(forKey: key))
     }
 
     /// Logical keys (e.g. `"acoustid:<fingerprint>"`, `"mb:<mbid>"`) can
@@ -97,5 +126,9 @@ private final class MemoryLookupCacheBackend: LookupCacheBackend, @unchecked Sen
 
     func store(_ data: Data, forKey key: String) {
         lock.withLock { storage[key] = data }
+    }
+
+    func remove(forKey key: String) {
+        lock.withLock { storage.removeValue(forKey: key) }
     }
 }

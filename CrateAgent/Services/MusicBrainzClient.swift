@@ -36,8 +36,8 @@ public struct MusicBrainzClient: Sendable {
 
     public func recording(mbid: String) async throws -> MBRecording {
         let cacheKey = Self.cacheKey(forMBID: mbid)
-        if let cachedData = cache.data(forKey: cacheKey) {
-            return try Self.decodeRecording(from: cachedData)
+        if let cachedRecording = cache.cachedValue(forKey: cacheKey, decode: Self.decodeRecording) {
+            return cachedRecording
         }
 
         let request = makeRequest(mbid: mbid)
@@ -63,7 +63,10 @@ public struct MusicBrainzClient: Sendable {
         }
     }
 
-    private static func cacheKey(forMBID mbid: String) -> String {
+    /// Not `private`: the test target computes the same key to seed a
+    /// corrupt cache entry (`@testable import` only lifts `private` up to
+    /// `internal`, not below it).
+    static func cacheKey(forMBID mbid: String) -> String {
         "mb:\(mbid)"
     }
 

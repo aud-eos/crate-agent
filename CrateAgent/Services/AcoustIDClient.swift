@@ -25,8 +25,8 @@ public struct AcoustIDClient: Sendable {
     /// - Returns: candidates sorted by AcoustID confidence score, descending.
     public func lookup(fingerprintBase64: String, durationSeconds: Int, apiKey: String) async throws -> [AcoustIDResult] {
         let cacheKey = Self.cacheKey(forFingerprint: fingerprintBase64, durationSeconds: durationSeconds)
-        if let cachedData = cache.data(forKey: cacheKey) {
-            return try Self.decodeSortedResults(from: cachedData)
+        if let cachedResults = cache.cachedValue(forKey: cacheKey, decode: Self.decodeSortedResults) {
+            return cachedResults
         }
 
         let request = Self.makeRequest(apiKey: apiKey, durationSeconds: durationSeconds, fingerprintBase64: fingerprintBase64)
@@ -119,7 +119,10 @@ public struct AcoustIDClient: Sendable {
     /// the same fingerprint while needing a different `duration` param —
     /// keying on fingerprint alone would let the second lookup wrongly
     /// reuse the first's cached candidates.
-    private static func cacheKey(forFingerprint fingerprintBase64: String, durationSeconds: Int) -> String {
+    /// Not `private`: the test target computes the same key to seed a
+    /// corrupt cache entry (`@testable import` only lifts `private` up to
+    /// `internal`, not below it).
+    static func cacheKey(forFingerprint fingerprintBase64: String, durationSeconds: Int) -> String {
         let digest = SHA256.hash(data: Data("\(fingerprintBase64)|\(durationSeconds)".utf8))
         let hexDigest = digest.map { String(format: "%02x", $0) }.joined()
         return "acoustid:\(hexDigest)"

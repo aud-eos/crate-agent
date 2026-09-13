@@ -70,4 +70,60 @@ final class LookupCacheTests: XCTestCase {
         XCTAssertEqual(cache.data(forKey: "fp:one"), Data("first".utf8))
         XCTAssertEqual(cache.data(forKey: "fp:two"), Data("second".utf8))
     }
+
+    func testRemoveDeletesAStoredEntry() {
+        let cache = LookupCache(directory: tempDirectory)
+        cache.store(Data("value".utf8), forKey: "fp:removable")
+
+        cache.remove(forKey: "fp:removable")
+
+        XCTAssertNil(cache.data(forKey: "fp:removable"))
+    }
+
+    func testRemoveOnMissingKeyDoesNotThrowOrAffectOtherEntries() {
+        let cache = LookupCache(directory: tempDirectory)
+        cache.store(Data("kept".utf8), forKey: "fp:kept")
+
+        cache.remove(forKey: "fp:never-stored")
+
+        XCTAssertEqual(cache.data(forKey: "fp:kept"), Data("kept".utf8))
+    }
+
+    func testCachedValueReturnsDecodedValueOnHealthyHit() {
+        let cache = LookupCache.memory()
+        cache.store(Data("42".utf8), forKey: "k")
+
+        let value = cache.cachedValue(forKey: "k") { data in
+            try XCTUnwrap(Int(String(decoding: data, as: UTF8.self)))
+        }
+
+        XCTAssertEqual(value, 42)
+    }
+
+    func testCachedValueReturnsNilOnMiss() {
+        let cache = LookupCache.memory()
+
+        let value = cache.cachedValue(forKey: "missing") { data in data }
+
+        XCTAssertNil(value)
+    }
+
+    /// The corrupt-cache-hit case at the heart of G-cache: a decode
+    /// failure on a hit must not surface as a thrown error — it must
+    /// evict the bad entry and behave exactly like a miss, so the caller
+    /// falls through to a fresh network fetch instead of failing on the
+    /// same bytes forever.
+    func testCachedValueEvictsAndReturnsNilOnDecodeFailure() {
+        struct DecodeFailure: Error {}
+        let cache = LookupCache.memory()
+        cache.store(Data("not an int".utf8), forKey: "k")
+
+        let value = cache.cachedValue(forKey: "k") { data -> Int in
+            guard let decoded = Int(String(decoding: data, as: UTF8.self)) else { throw DecodeFailure() }
+            return decoded
+        }
+
+        XCTAssertNil(value)
+        XCTAssertNil(cache.data(forKey: "k"), "the corrupt entry must be evicted, not left to fail every future read")
+    }
 }

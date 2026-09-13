@@ -246,6 +246,24 @@ final class AcoustIDClientTests: XCTestCase {
         XCTAssertTrue(second.isEmpty)
     }
 
+    func testCorruptCacheEntryIsEvictedAndFallsThroughToNetwork() async throws {
+        // A cached entry that no longer decodes (truncated on disk, or
+        // written by an older/incompatible model) must be treated as a
+        // MISS — evicted and re-fetched — not as a permanent failure that
+        // replays the same decode error on every future lookup.
+        let cache = LookupCache.memory()
+        let cacheKey = AcoustIDClient.cacheKey(forFingerprint: "F", durationSeconds: 200)
+        cache.store(Data("not valid json".utf8), forKey: cacheKey)
+        let loader = StubLoader(status: 200, body: fixture("acoustid_multi.json"))
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: cache)
+
+        let results = try await client.lookup(fingerprintBase64: "F", durationSeconds: 200, apiKey: "K")
+
+        XCTAssertEqual(loader.callCount, 1, "the corrupt hit must fall through to the network")
+        XCTAssertEqual(results.count, 2)
+        XCTAssertNotEqual(cache.data(forKey: cacheKey), Data("not valid json".utf8), "the healthy response must be re-cached over the corrupt bytes")
+    }
+
     func testRequestBodyPinsResponseFormatToJSON() async throws {
         // AcoustID's default response format is JSON, but it's ambiguous
         // historically and decodeSortedResults unconditionally
