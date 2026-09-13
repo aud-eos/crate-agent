@@ -1,0 +1,26 @@
+{
+  "id": "a5b6c7d8-9e0f-1a2b-3c4d-5e6f7a8b9c0d",
+  "title": "Untitled Groove",
+  "artist-credit": [
+    {
+      "name": "Unknown Artist",
+      "artist": {
+        "id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+        "name": "Unknown Artist"
+      }
+    }
+  ],
+  "releases": [
+    {
+      "id": "9c8b7a6f-5e4d-3c2b-1a09-8f7e6d5c4b3a",
+      "title": "Untitled Groove",
+      "status": "Official",
+      "date": "1995",
+      "country": "US",
+      "release-group": {
+        "id": "2e3f4a5b-6c7d-8e9f-0a1b-2c3d4e5f6a7b",
+        "first-release-date": "1995-01-01"
+      }
+    }
+  ]
+}

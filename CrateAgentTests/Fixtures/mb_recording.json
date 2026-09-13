@@ -1,0 +1,38 @@
+{
+  "id": "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10",
+  "title": "Voodoo Ray",
+  "artist-credit": [
+    {
+      "name": "A Guy Called Gerald",
+      "artist": {
+        "id": "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c",
+        "name": "A Guy Called Gerald"
+      }
+    }
+  ],
+  "releases": [
+    {
+      "id": "b1c2d3e4-1111-2222-3333-444455556666",
+      "title": "Voodoo Ray",
+      "status": "Official",
+      "date": "1988",
+      "country": "GB",
+      "release-group": {
+        "id": "c7d8e9f0-aaaa-bbbb-cccc-ddddeeeeffff",
+        "first-release-date": "1988-05-09"
+      }
+    },
+    {
+      "id": "d4e5f6a7-5555-6666-7777-888899990000",
+      "title": "Hot Lemonade",
+      "status": "Official",
+      "date": "1988-06",
+      "country": "GB",
+      "release-group": {
+        "id": "1a2b3c4d-1234-5678-9abc-def012345678",
+        "first-release-date": "1988-06-01"
+      }
+    }
+  ],
+  "isrcs": ["GBAAA8800001", "GBAAA8800002"]
+}

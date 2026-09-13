@@ -1,0 +1,113 @@
+@testable import CrateAgent
+import XCTest
+
+final class MusicBrainzModelsTests: XCTestCase {
+    /// Loads a fixture file from `CrateAgentTests/Fixtures`, which
+    /// xcodegen wires into the test bundle as a resource.
+    private func fixture(_ name: String) -> Data {
+        let bundle = Bundle(for: Self.self)
+        guard let url = bundle.url(forResource: name, withExtension: nil) else {
+            XCTFail("Missing fixture: \(name)")
+            return Data()
+        }
+        return (try? Data(contentsOf: url)) ?? Data()
+    }
+
+    // MARK: - MBRecording
+
+    func testParsesMultiReleaseRecording() throws {
+        let data = fixture("mb_recording.json")
+        let recording = try JSONDecoder().decode(MBRecording.self, from: data)
+
+        XCTAssertEqual(recording.title, "Voodoo Ray")
+        XCTAssertGreaterThan(recording.releases.count, 1)
+        XCTAssertNotNil(recording.releaseGroup?.firstReleaseDate)
+        XCTAssertFalse(recording.isrcs.isEmpty)
+    }
+
+    func testRecordingArtistCreditAndReleaseDetails() throws {
+        let recording = try JSONDecoder().decode(MBRecording.self, from: fixture("mb_recording.json"))
+
+        XCTAssertEqual(recording.artistCredit.first?.name, "A Guy Called Gerald")
+        XCTAssertEqual(recording.artistCredit.first?.artist.id, "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c")
+
+        let firstRelease = try XCTUnwrap(recording.releases.first)
+        XCTAssertEqual(firstRelease.id, "b1c2d3e4-1111-2222-3333-444455556666")
+        XCTAssertEqual(firstRelease.date, "1988")
+        XCTAssertEqual(firstRelease.country, "GB")
+        XCTAssertEqual(firstRelease.status, "Official")
+
+        // MusicBrainz nests `release-group` under each release, not on the
+        // recording — MBRecording.releaseGroup surfaces the first release's
+        // group as the recording's canonical year source.
+        XCTAssertEqual(recording.releaseGroup?.id, "c7d8e9f0-aaaa-bbbb-cccc-ddddeeeeffff")
+        XCTAssertEqual(recording.releaseGroup?.firstReleaseDate, "1988-05-09")
+
+        XCTAssertEqual(recording.isrcs, ["GBAAA8800001", "GBAAA8800002"])
+    }
+
+    func testRecordingWithNoISRC() throws {
+        let recording = try JSONDecoder().decode(MBRecording.self, from: fixture("mb_recording_no_isrc.json"))
+
+        XCTAssertTrue(recording.isrcs.isEmpty)
+        XCTAssertEqual(recording.releases.count, 1)
+        XCTAssertEqual(recording.releaseGroup?.firstReleaseDate, "1995-01-01")
+    }
+
+    // MARK: - AcoustIDResponse
+
+    func testEmptyAcoustIDResults() throws {
+        let response = try JSONDecoder().decode(AcoustIDResponse.self, from: fixture("acoustid_empty.json"))
+
+        XCTAssertEqual(response.status, "ok")
+        XCTAssertTrue(response.results.isEmpty)
+    }
+
+    func testParsesMultipleAcoustIDResults() throws {
+        let response = try JSONDecoder().decode(AcoustIDResponse.self, from: fixture("acoustid_multi.json"))
+
+        XCTAssertEqual(response.results.count, 2)
+
+        let best = try XCTUnwrap(response.results.first)
+        XCTAssertEqual(best.id, "9ff43b6a-4f16-427c-93c2-92307ca505e0")
+        XCTAssertEqual(best.score, 0.93)
+        XCTAssertEqual(best.recordingIDs, [
+            "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10",
+            "a1b2c3d4-1234-4a5b-8c9d-0e1f2a3b4c5d",
+        ])
+    }
+
+    // MARK: - MatchCandidate
+
+    func testMatchCandidateHoldsResolvedFieldsAndSupportsReleasePicking() {
+        let releaseA = MBRelease(id: "release-a", title: "Album A", date: "1988", country: "GB", status: "Official")
+        let releaseB = MBRelease(id: "release-b", title: "Album B", date: "1988-06", country: "GB", status: "Official")
+
+        var candidate = MatchCandidate(
+            fileID: 42,
+            score: 0.93,
+            acoustID: "9ff43b6a-4f16-427c-93c2-92307ca505e0",
+            recordingMBID: "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10",
+            artistMBID: "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c",
+            chosenRelease: releaseA,
+            availableReleases: [releaseA, releaseB],
+            releaseMBID: releaseA.id,
+            isrc: "GBAAA8800001",
+            proposedArtist: "A Guy Called Gerald",
+            proposedTitle: "Voodoo Ray",
+            proposedAlbum: releaseA.title,
+            proposedYear: 1988
+        )
+
+        XCTAssertEqual(candidate.availableReleases.count, 2)
+
+        // Picking a different release updates the mutable fields that
+        // follow it; the resolved identity fields stay fixed.
+        candidate.chosenRelease = releaseB
+        candidate.proposedAlbum = releaseB.title
+
+        XCTAssertEqual(candidate.chosenRelease.id, "release-b")
+        XCTAssertEqual(candidate.proposedAlbum, "Album B")
+        XCTAssertEqual(candidate.recordingMBID, "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10")
+    }
+}
