@@ -133,10 +133,13 @@ final class AutoTaggerService: ObservableObject {
             } catch let lookupError as LookupError {
                 // Only reached for .unauthorized/.server — resolveRow
                 // converts every other LookupError into a per-row .failed
-                // before it ever gets here.
-                let message = "Auto-tag pass stopped: \(Self.describe(lookupError))"
-                fatalError = message
-                stopUnresolvedRows(among: fileIDs, message: message)
+                // before it ever gets here. The banner phrases the halt
+                // ("Auto-tag pass stopped: …"); each stopped row carries
+                // only the bare reason, since the view already prefixes it
+                // with "Stopped — ".
+                let reason = Self.describe(lookupError)
+                fatalError = "Auto-tag pass stopped: \(reason)"
+                stopUnresolvedRows(among: fileIDs, message: reason)
                 return
             } catch {
                 rows[fileID] = .failed(String(describing: error))

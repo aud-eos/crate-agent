@@ -204,14 +204,18 @@ final class AutoTaggerServiceTests: XCTestCase {
         // The pass stops at the first file — the second is never attempted
         // — but neither row is left looking permanently "Looking up…":
         // both transition to the terminal .stopped state.
+        // Each stopped row carries only the bare reason; the banner wraps
+        // it as "Auto-tag pass stopped: …" so the view (which prefixes
+        // "Stopped — ") never reads "Stopped — Auto-tag pass stopped: …".
         guard case let .stopped(fileAReason) = service.rows[fileA] else {
             return XCTFail("expected fileA .stopped, got \(String(describing: service.rows[fileA]))")
         }
-        XCTAssertEqual(fileAReason, fatalMessage)
+        XCTAssertEqual(fatalMessage, "Auto-tag pass stopped: \(fileAReason)")
+        XCTAssertFalse(fileAReason.contains("Auto-tag pass stopped"))
         guard case let .stopped(fileBReason) = service.rows[fileB] else {
             return XCTFail("expected fileB .stopped, got \(String(describing: service.rows[fileB]))")
         }
-        XCTAssertEqual(fileBReason, fatalMessage)
+        XCTAssertEqual(fileBReason, fileAReason)
     }
 
     func testNoKeyConfiguredYieldsFatalState() async throws {
