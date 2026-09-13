@@ -20,7 +20,6 @@ use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::*;
 use lofty::probe::Probe;
-use lofty::tag::items::Timestamp;
 use lofty::tag::{ItemKey, Tag};
 use thiserror::Error;
 
@@ -192,16 +191,25 @@ fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) {
         // `Timestamp::year` is a `u16`; release years never approach that
         // range, but clamp rather than panic on an out-of-range input.
         let year = u16::try_from(year).unwrap_or(u16::MAX);
-        tag.set_date(Timestamp {
-            year,
-            ..Timestamp::default()
-        });
+        // Edit ONLY the year component: start from the file's existing date so
+        // a full recording date like `1994-05-09` keeps its month/day when the
+        // user applies a different year. Rebuilding from `Timestamp::default()`
+        // would collapse it to a year-only value and lose the month/day
+        // irrecoverably — the reader and the inverse payload capture only the
+        // year, so undo could never restore them. Because both this forward
+        // edit and undo (which comes back through here with the previous year)
+        // touch only `.year`, the month/day round-trip correctly. Falls back to
+        // a year-only timestamp when the file had no date frame.
+        let mut timestamp = tag.date().unwrap_or_default();
+        timestamp.year = year;
+        tag.set_date(timestamp);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lofty::tag::items::Timestamp;
     use std::io::Write;
 
     const SAMPLE_RATE: u32 = 44_100;
@@ -462,6 +470,44 @@ mod tests {
             },
         );
         assert_eq!(tag.date(), None, "clear_year must remove the date frame");
+    }
+
+    /// Editing only the year must preserve an existing full date's month/day
+    /// rather than collapsing `1994-05-09` to a year-only value — the reader
+    /// and inverse payload capture only the year, so a lost month/day could
+    /// never be restored (finding #3999974017). Because both the forward edit
+    /// and undo touch only `.year`, the month/day round-trip.
+    #[test]
+    fn editing_year_preserves_existing_month_and_day() {
+        use lofty::tag::{Tag, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_date(Timestamp {
+            year: 1994,
+            month: Some(5),
+            day: Some(9),
+            ..Timestamp::default()
+        });
+
+        // Forward: apply a different year only.
+        apply_update_to_tag(
+            &mut tag,
+            &AudioTagUpdate { year: Some(1995), ..Default::default() },
+        );
+        let edited = tag.date().expect("date frame must survive a year edit");
+        assert_eq!(edited.year, 1995, "the year is updated");
+        assert_eq!(edited.month, Some(5), "the month must be preserved");
+        assert_eq!(edited.day, Some(9), "the day must be preserved");
+
+        // Undo: restore the previous year, still preserving month/day.
+        apply_update_to_tag(
+            &mut tag,
+            &AudioTagUpdate { year: Some(1994), ..Default::default() },
+        );
+        let restored = tag.date().expect("date frame must survive undo");
+        assert_eq!(restored.year, 1994);
+        assert_eq!(restored.month, Some(5), "undo preserves the month");
+        assert_eq!(restored.day, Some(9), "undo preserves the day");
     }
 
     /// End-to-end proof that the undo clears actually land on disk:
