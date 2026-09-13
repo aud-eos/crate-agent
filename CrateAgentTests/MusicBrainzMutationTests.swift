@@ -360,6 +360,144 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    // MARK: - C1b: undo must not clobber a later batch's match
+
+    /// Two files share one recording (FLAC+MP3 → same fingerprint, one
+    /// track row — invariant #4). Batch A creates the row; a LATER batch
+    /// B adopts it and overwrites its identity. Undoing A must not null
+    /// the identity B established.
+    func testUndoCreatedRowDoesNotClobberLaterBatchOnSameFingerprint() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Batch A creates the fingerprint-keyed row.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "batchA"
+        )
+        // Batch B (later) matches the second file to the same fingerprint
+        // with a different recording → adopts the row, overwrites identity.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recB"
+            )),
+            batchId: "batchB"
+        )
+
+        try await engine.undoBatch("batchA")
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(
+                track.musicbrainzRecordingId, "recB",
+                "batch B's identity (applied after A) must survive undo of A"
+            )
+            let f2 = try FileRecord.fetchOne(db, key: file2)!
+            XCTAssertEqual(f2.trackId, track.id, "file2 still links to the row B owns")
+            let f1 = try FileRecord.fetchOne(db, key: file1)!
+            XCTAssertNil(f1.trackId, "the undone file (file1) is unlinked")
+        }
+    }
+
+    /// The genuinely-solo case still orphans correctly: A created the row,
+    /// nothing else references it, identity unchanged → undo nulls it.
+    func testUndoSoloCreatedRowStillOrphans() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(fileID: fileId, fingerprintHash: fingerprint)),
+            batchId: "solo"
+        )
+        try await engine.undoBatch("solo")
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertNil(track.musicbrainzRecordingId, "solo orphan row identity nulled")
+            XCTAssertNil(track.isrc)
+            XCTAssertNil(track.acoustidId)
+            XCTAssertNil(try FileRecord.fetchOne(db, key: fileId)!.trackId, "file unlinked")
+        }
+    }
+
+    /// Pre-existing-row variant: A updates a pre-existing row, then B
+    /// updates it again. Undoing A must retain B's identity, not restore
+    /// A's captured `previous`.
+    func testUndoPreexistingRowDoesNotClobberLaterUpdate() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a1", title: "t1", album: "al1",
+                recorder: recorder, path: "/Music/A/one.mp3", inode: 1
+            )
+        }
+        let file2 = try await database.writer.write { db -> Int64 in
+            var file = FileRecord(
+                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
+            )
+            try file.insert(db)
+            return file.id!
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        // Seed a pre-existing row (recX) and link file1, so batch A hits
+        // the existing-row branch rather than creating a row.
+        try await database.writer.write { db in
+            var track = TrackRecord(
+                fingerprintHash: fingerprint, musicbrainzRecordingId: "recX", artist: "X"
+            )
+            try track.insert(db)
+            try db.execute(
+                sql: "UPDATE files SET track_id = ? WHERE id = ?",
+                arguments: [track.id!, file1]
+            )
+        }
+
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "batchA"
+        )
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file2, fingerprintHash: fingerprint, recordingMBID: "recB"
+            )),
+            batchId: "batchB"
+        )
+
+        try await engine.undoBatch("batchA")
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(
+                track.musicbrainzRecordingId, "recB",
+                "undoing A must not restore recX over B's later recB"
+            )
+        }
+    }
+
     // MARK: - Cherry-pick
 
     func testPartialFieldSetOnlyWritesChosenFields() async throws {

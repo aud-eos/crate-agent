@@ -1573,28 +1573,58 @@ public actor OperationEngine {
         if var track = try TrackRecord
             .filter(Column("fingerprint_hash") == applied.fingerprintHash)
             .fetchOne(db) {
+            // Undoing batch A must never overwrite what a later batch B
+            // established on the same fingerprint-keyed row (invariant
+            // #4: FLAC+MP3 of one recording, or a re-encode, share a
+            // track row). B — applied after A — takes the existing-row
+            // branch and overwrites this row's identity, so if T's
+            // current identity no longer matches what A's forward wrote,
+            // B owns the row now and A's undo must leave it alone.
+            let forwardIdentityStillOnRow =
+                track.acoustidId == applied.acoustID
+                && track.musicbrainzRecordingId == applied.recordingMBID
+                && track.musicbrainzReleaseId == applied.releaseMBID
+                && track.musicbrainzArtistId == applied.artistMBID
+                && track.isrc == applied.isrc
+
             if applied.createdTrackRow {
-                // The forward created this row — null what it set and
-                // leave the now-orphaned row in place.
-                track.acoustidId = nil
-                track.musicbrainzRecordingId = nil
-                track.musicbrainzReleaseId = nil
-                track.musicbrainzArtistId = nil
-                track.isrc = nil
-                if applied.artist != nil { track.artist = nil }
-                if applied.title != nil { track.title = nil }
-                if applied.album != nil { track.album = nil }
-                if applied.year != nil { track.year = nil }
+                // The forward created this row. Null what it set and leave
+                // the now-orphaned row in place — but ONLY when nothing
+                // else adopted it since: no other file references it AND
+                // its identity is still exactly what this forward wrote.
+                // Otherwise a later batch's match would be silently wiped.
+                let otherReferents = try FileRecord
+                    .filter(Column("track_id") == track.id && Column("id") != applied.fileID)
+                    .fetchCount(db)
+                if otherReferents == 0 && forwardIdentityStillOnRow {
+                    track.acoustidId = nil
+                    track.musicbrainzRecordingId = nil
+                    track.musicbrainzReleaseId = nil
+                    track.musicbrainzArtistId = nil
+                    track.isrc = nil
+                    if applied.artist != nil { track.artist = nil }
+                    if applied.title != nil { track.title = nil }
+                    if applied.album != nil { track.album = nil }
+                    if applied.year != nil { track.year = nil }
+                    try track.update(db)
+                }
             } else if let previous = applied.previousTrackIdentifiers {
-                track.acoustidId = previous.acoustID
-                track.musicbrainzRecordingId = previous.recordingMBID
-                track.musicbrainzReleaseId = previous.releaseMBID
-                track.musicbrainzArtistId = previous.artistMBID
-                track.isrc = previous.isrc
-                track.artist = previous.artist
-                track.title = previous.title
-                track.album = previous.album
-                track.year = previous.year
+                // Restore the pre-existing row's captured identity — but
+                // only if no later batch changed it since. If B re-matched
+                // the same row after A, restoring A's `previous` here would
+                // clobber B's identity; leave B's in place instead.
+                if forwardIdentityStillOnRow {
+                    track.acoustidId = previous.acoustID
+                    track.musicbrainzRecordingId = previous.recordingMBID
+                    track.musicbrainzReleaseId = previous.releaseMBID
+                    track.musicbrainzArtistId = previous.artistMBID
+                    track.isrc = previous.isrc
+                    track.artist = previous.artist
+                    track.title = previous.title
+                    track.album = previous.album
+                    track.year = previous.year
+                    try track.update(db)
+                }
             } else {
                 // Unreachable: a pre-existing track row (createdTrackRow
                 // == false) always captures previousTrackIdentifiers in
@@ -1607,7 +1637,6 @@ public actor OperationEngine {
                 )
                 throw OperationEngineError.missingPreviousTrackIdentifiers(fileId: applied.fileID)
             }
-            try track.update(db)
         }
 
         // Journal the revert; its inverse is the original forward match
