@@ -46,6 +46,23 @@ final class LookupCacheTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempDirectory.path))
     }
 
+    func testUnreadablePathReturnsNilWithoutThrowing() throws {
+        let cache = LookupCache(directory: tempDirectory)
+        cache.store(Data("placeholder".utf8), forKey: "fp:corrupt")
+
+        // Replace the cache file that key hashed to with a directory —
+        // reading a directory as Data always fails, regardless of
+        // permissions or the user running the test, so this deterministically
+        // exercises the "unreadable" path without touching file permissions.
+        let cachedFileURL = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(at: tempDirectory, includingPropertiesForKeys: nil).first
+        )
+        try FileManager.default.removeItem(at: cachedFileURL)
+        try FileManager.default.createDirectory(at: cachedFileURL, withIntermediateDirectories: false)
+
+        XCTAssertNil(cache.data(forKey: "fp:corrupt"))
+    }
+
     func testDistinctKeysDoNotCollideOnDisk() {
         let cache = LookupCache(directory: tempDirectory)
         cache.store(Data("first".utf8), forKey: "fp:one")

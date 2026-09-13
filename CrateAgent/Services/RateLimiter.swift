@@ -44,11 +44,15 @@ private extension Duration {
 /// `minInterval` apart — MusicBrainz requires ≤1 request/second, and
 /// AcoustID is routed through the same limiter conservatively.
 ///
-/// Being an `actor` is what makes this correct under concurrent callers:
-/// each `acquire()` reserves the next available slot (`nextAvailableTime`)
-/// before awaiting the clock, so a second caller queued behind a sleeping
-/// first caller reserves a *later* slot rather than racing it for the same
-/// one.
+/// Being an `actor` is necessary but not sufficient here: actors are
+/// *reentrant* at suspension points, so a caller parked in `await
+/// clock.sleep(until:)` does not block a second caller from entering
+/// `acquire()` and running its own synchronous body in the meantime. That
+/// is why the reservation (`nextAvailableTime`) is written *before* this
+/// caller ever awaits anything — the read-then-write of the shared slot
+/// happens as one uninterrupted (non-suspending) step, so each caller
+/// claims a distinct, strictly later slot instead of two callers reading
+/// the same stale slot and waking at the same instant.
 public actor RateLimiter {
     private let minInterval: TimeInterval
     private let clock: RateLimiterClock
@@ -66,11 +70,19 @@ public actor RateLimiter {
         // client tests aren't coupled to real elapsed time at all.
         guard minInterval > 0 else { return }
 
-        let reservedTime = nextAvailableTime ?? clock.now
+        // A stale slot (limiter idle long enough that the last reservation
+        // is now in the past) must not under-count — clamp to `clock.now`
+        // so an idle caller still proceeds immediately.
+        let reservedTime = max(clock.now, nextAvailableTime ?? clock.now)
+
+        // Reserve the *next* slot now, before suspending, so a caller that
+        // enters while this one is asleep sees this reservation rather
+        // than the stale one.
+        nextAvailableTime = reservedTime + minInterval
+
         if clock.now < reservedTime {
             await clock.sleep(until: reservedTime)
         }
-        nextAvailableTime = max(clock.now, reservedTime) + minInterval
     }
 }
 
