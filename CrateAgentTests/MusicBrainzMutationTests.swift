@@ -636,6 +636,50 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(recorder.calls.count, writesBeforeUndo, "a refused undo rewrites no audio tags")
     }
 
+    /// The cross-batch hole a row-state guard can't see: the SAME file is
+    /// re-matched by a later batch to the SAME recording but a DIFFERENT
+    /// release. At the earlier batch's revert the row looks identical to a
+    /// legitimate sibling (recording unchanged, release drifted, no surviving
+    /// reference), so only the EVENT LOG distinguishes them. Undoing the older
+    /// batch out of order must still be rejected (finding #3999974010 review).
+    func testUndoOfSameFileRematchedToSameRecordingDifferentReleaseIsRejected() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Batch A: file1 → recA / rel1.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel1"
+            )),
+            batchId: "batchA"
+        )
+        // Batch B (later): the SAME file1, SAME recording recA, DIFFERENT
+        // release rel2 — a self-correction the apply-side guard allows.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel2"
+            )),
+            batchId: "batchB"
+        )
+
+        do {
+            try await engine.undoBatch("batchA")
+            XCTFail("expected undoSupersededByLaterMatch")
+        } catch let OperationEngineError.undoSupersededByLaterMatch(fid) {
+            XCTAssertEqual(fid, file1)
+        }
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(track.musicbrainzReleaseId, "rel2", "B's current release must survive the refused undo")
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: file1)!.trackId, track.id, "file1 still linked to B's row")
+        }
+    }
+
     /// A sibling (FLAC+MP3 of ONE recording) matched to a DIFFERENT release
     /// drifts the shared row's `releaseMBID` — but that is NOT a supersession
     /// of the first file's match, so undoing the older batch must SUCCEED

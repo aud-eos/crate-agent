@@ -515,6 +515,20 @@ public actor OperationEngine {
             throw OperationEngineError.batchNotFound(batchId: batchId)
         }
 
+        // Out-of-order undo guard (finding #3999974010 / follow-up). A
+        // MusicBrainz match in this batch cannot be cleanly reverted if the
+        // same file was re-matched — or reverted — by a LATER event in a
+        // DIFFERENT batch: undoing it would unlink the file from its current
+        // match and rewrite its audio tags past that match. The authoritative
+        // signal is the event log, NOT the fingerprint row's identity/reference
+        // state — a same-batch sibling (a different file sharing the row) and a
+        // cross-batch re-match of THIS file (even to the same recording, a
+        // different release) leave identical row state, yet one must undo and
+        // the other must be rejected. Checked before any mutation so the atomic
+        // undo fails clean, and History surfaces it so the user undoes the
+        // newer match first (LIFO).
+        try await assertNoLaterMatchSupersedes(events: events, batchId: batchId)
+
         // Pre-decode every inverse before mutating anything. If any
         // event in the batch is non-reversible, we fail clean — no
         // partial undo state lands in the DB.
@@ -530,6 +544,33 @@ public actor OperationEngine {
         // one inverse hit a fileNotFound mid-loop.
         _ = try await applyBatch(inverseMutations, batchId: undoBatchId)
         return undoBatchId
+    }
+
+    /// Throws `undoSupersededByLaterMatch` if any `musicBrainzMatchApplied`
+    /// event in the batch being undone has a LATER match-affecting event
+    /// (`musicBrainzMatchApplied`/`musicBrainzMatchReverted`) for the same file
+    /// in a DIFFERENT batch — i.e. that file was re-matched (or separately
+    /// reverted) after this batch, so reverting this batch's match would be out
+    /// of order and would clobber the newer state. Events in this same batch
+    /// are excluded (they're being undone together, atomically).
+    private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId: String) async throws {
+        let appliedEvents = events.filter { $0.eventType == .musicBrainzMatchApplied }
+        guard !appliedEvents.isEmpty else { return }
+        try await database.writer.read { db in
+            for event in appliedEvents {
+                guard let fileId = event.fileId, let eventId = event.eventId else { continue }
+                let laterMatchCount = try EventRecord
+                    .filter(Column("file_id") == fileId)
+                    .filter(Column("batch_id") != batchId)
+                    .filter(Column("event_id") > eventId)
+                    .filter([EventType.musicBrainzMatchApplied.rawValue,
+                             EventType.musicBrainzMatchReverted.rawValue].contains(Column("event_type")))
+                    .fetchCount(db)
+                if laterMatchCount > 0 {
+                    throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
+                }
+            }
+        }
     }
 
     private static func decodeInverseMutation(event: EventRecord) throws -> TrackMutation {
@@ -1905,42 +1946,17 @@ public actor OperationEngine {
                 && row.musicbrainzArtistId == applied.artistMBID
                 && row.isrc == applied.isrc
         } ?? false
-        let forwardRecordingStillOnRow = track.map { row in
-            row.musicbrainzRecordingId == applied.recordingMBID
-        } ?? false
         let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
 
-        // Out-of-order undo guard. A's forward matched this file to a
-        // *recording* on the fingerprint-keyed row. True supersession is: the
-        // row still exists, its RECORDING is no longer A's, AND no other file
-        // references it — meaning a LATER batch re-matched THIS SAME file
-        // (files keep their fingerprint across a re-match) to a DIFFERENT
-        // recording. Undoing A then would relink the file away from the newer
-        // match, restore A's stale DB metadata, and rewrite the audio tags —
-        // corrupting the current match. Reject loudly: batch undo is atomic,
-        // so throwing here rolls the whole undo back with nothing half-applied,
-        // and History surfaces it so the user undoes the newer match first.
-        //
-        // The guard keys on the RECORDING, not the full identity, and on the
-        // reference count — both load-bearing:
-        //  - Release/artist/isrc are cherry-picked per file, so a sibling
-        //    (FLAC+MP3 of ONE recording) matched to a different RELEASE
-        //    legitimately drifts those secondary fields with the recording
-        //    unchanged; that is not supersession and must still undo. Keying
-        //    on full identity here wrongly rejected such undos — and because
-        //    `undoBatch` reverts a batch newest-first, a sibling's own event
-        //    unlinks it *before* this earlier event runs, dropping the
-        //    reference and (under the old full-identity check) making a legit
-        //    same-batch multi-release-duplicate batch permanently non-undoable
-        //    (finding #3999974010).
-        //  - The apply-side D-C guard already rejects re-matching to a
-        //    different RECORDING while another file references the row, so a
-        //    recording-drifted row that is still referenced can't arise; the
-        //    reference clause keeps a shared row (protected below by
-        //    `thisForwardStillSolelyOwnsRow`) from ever tripping the throw.
-        if track != nil, !forwardRecordingStillOnRow, !otherFilesReferenceRow {
-            throw OperationEngineError.undoSupersededByLaterMatch(fileId: applied.fileID)
-        }
+        // The out-of-order undo guard (rejecting a revert whose file was
+        // re-matched by a LATER batch) lives in `undoBatch`, keyed on the event
+        // log — the authoritative signal. Row/reference state can't be used
+        // here: a same-batch sibling (a different file sharing the row) and a
+        // cross-batch re-match of THIS file to the same recording/different
+        // release present identical row state (recording unchanged, release
+        // drifted, no surviving reference), yet one must undo and the other
+        // must be rejected (finding #3999974010). So this method assumes the
+        // revert is in-order and only gates the shared-row teardown below.
 
         // Restore the file link + Serato snapshot for exactly the
         // display fields the forward changed.
@@ -2659,13 +2675,12 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// invariant #4).
     case fingerprintRecordingConflict(fileId: Int64, existingMBID: String, incomingMBID: String)
     /// Undo of a MusicBrainz match was refused because a LATER batch
-    /// re-matched the same file to a different recording (files keep their
-    /// fingerprint across a re-match, so both matches land on one `tracks`
-    /// row). Reverting the older match now would relink the file away from
-    /// the current match and overwrite its DB metadata + on-disk tags. The
-    /// user must undo the newer match first (LIFO), so this is surfaced
-    /// loudly rather than silently corrupting the current identity
-    /// (finding #3999114450).
+    /// re-matched (or separately reverted) the same file — to any recording or
+    /// release. Reverting the older match now would unlink the file from its
+    /// current match and overwrite its DB metadata + on-disk tags. The user
+    /// must undo the newer match first (LIFO), so this is surfaced loudly
+    /// rather than silently corrupting the current state (findings #3999114450,
+    /// #3999974010). Detected from the event log in `undoBatch`.
     case undoSupersededByLaterMatch(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
