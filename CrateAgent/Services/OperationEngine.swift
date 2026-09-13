@@ -121,13 +121,13 @@ public actor OperationEngine {
             try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
         }
 
-        if let pendingWrite = executionResult.seratoWrite {
+        if !executionResult.seratoWrites.isEmpty {
             let isSeratoRunning = await seratoWatchdog.isSeratoRunning
             if isSeratoRunning {
-                pendingSeratoWrites.append(pendingWrite)
+                pendingSeratoWrites.append(contentsOf: executionResult.seratoWrites)
                 queueDepthSubject.send(pendingSeratoWrites.count)
             } else {
-                try await applySeratoWrite(pendingWrite)
+                try await applyConsecutiveSeratoWrites(executionResult.seratoWrites)
             }
         }
 
@@ -157,7 +157,7 @@ public actor OperationEngine {
             }
         }
 
-        let pendingWrites = executionResults.compactMap { $0.seratoWrite }
+        let pendingWrites = executionResults.flatMap { $0.seratoWrites }
         if !pendingWrites.isEmpty {
             let isSeratoRunning = await seratoWatchdog.isSeratoRunning
             if isSeratoRunning {
@@ -352,6 +352,21 @@ public actor OperationEngine {
                 throw OperationEngineError.undoNotSupported(eventType: event.eventType)
             }
             return .writeFileTags(payload)
+        case .musicBrainzMatchApplied:
+            // Inverse restores prior state from the snapshots captured
+            // at apply time (invariant #2). The forward apply always
+            // captures them, so the match is unconditionally undoable.
+            let payload = try decoder.decode(
+                RevertMusicBrainzMatchPayload.self, from: inverseJsonData
+            )
+            return .revertMusicBrainzMatch(payload)
+        case .musicBrainzMatchReverted:
+            // Redo (undo of the undo): re-issue the original forward
+            // match. The forward apply re-captures fresh snapshots.
+            let payload = try decoder.decode(
+                ApplyMusicBrainzMatchPayload.self, from: inverseJsonData
+            )
+            return .applyMusicBrainzMatch(payload)
         }
     }
 
@@ -472,12 +487,11 @@ public actor OperationEngine {
             musicalKey: write.metadata.musicalKey,
             comment: write.metadata.comment,
             label: write.metadata.label,
-            // SeratoMetadata has no year field yet — no OperationEngine
-            // mutation threads a year value through. Pre-existing gap
-            // from commit 372c439 (AudioTagUpdate gained `year` on the
-            // FFI struct without a Swift-side caller); nil until a
-            // future task adds year to SeratoMetadata.
-            year: nil
+            // Year lives on the pending write, not on SeratoMetadata:
+            // Serato's database V2 has no year field, so the MusicBrainz
+            // match routes year to the file tags only. `writeFileTags`
+            // leaves it nil.
+            year: write.year.flatMap { $0 >= 0 ? UInt32($0) : nil }
         )
         do {
             try fileTagWriter(write.absolutePath, update)
@@ -849,7 +863,11 @@ public actor OperationEngine {
 
     private struct ExecutionResult: Sendable {
         let eventId: Int64
-        let seratoWrite: SeratoPendingWrite?
+        /// Serato-gated writes this mutation produced, applied in order.
+        /// Most mutations emit zero or one; `applyMusicBrainzMatch`
+        /// emits two (a database-V2 metadata update and a file-tag
+        /// write).
+        let seratoWrites: [SeratoPendingWrite]
     }
 
     private static func executeAndLog(
@@ -863,32 +881,32 @@ public actor OperationEngine {
             let eventId = try applyIndexNewFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
-            return ExecutionResult(eventId: eventId, seratoWrite: nil)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         case .renameFile(let payload):
             let (eventId, seratoRename) = try applyRenameFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(
                 eventId: eventId,
-                seratoWrite: .rename(seratoRename)
+                seratoWrites: [.rename(seratoRename)]
             )
         case .removeFile(let payload):
             let eventId = try applyRemoveFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
-            return ExecutionResult(eventId: eventId, seratoWrite: nil)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         case .setMetadata(let payload):
             let eventId = try applySetMetadata(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
-            return ExecutionResult(eventId: eventId, seratoWrite: nil)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         case .commitMetadataToSerato(let payload):
             let (eventId, seratoUpdate) = try applyCommitMetadataToSerato(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(
                 eventId: eventId,
-                seratoWrite: .metadataUpdate(seratoUpdate)
+                seratoWrites: [.metadataUpdate(seratoUpdate)]
             )
         case .addTrackToSerato(let payload):
             let (eventId, seratoAdd) = try applyAddTrackToSerato(
@@ -896,7 +914,7 @@ public actor OperationEngine {
             )
             return ExecutionResult(
                 eventId: eventId,
-                seratoWrite: .addTrack(seratoAdd)
+                seratoWrites: [.addTrack(seratoAdd)]
             )
         case .writeFileTags(let payload):
             let (eventId, fileTagWrite) = try applyWriteFileTags(
@@ -904,20 +922,20 @@ public actor OperationEngine {
             )
             return ExecutionResult(
                 eventId: eventId,
-                seratoWrite: .fileTagWrite(fileTagWrite)
+                seratoWrites: [.fileTagWrite(fileTagWrite)]
             )
         case .trashFile(let payload):
             let (eventId, trash) = try applyTrashFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
-            return ExecutionResult(eventId: eventId, seratoWrite: .trashFile(trash))
+            return ExecutionResult(eventId: eventId, seratoWrites: [.trashFile(trash)])
         case .removeTrackFromSerato(let payload):
             let (eventId, removal) = try applyRemoveTrackFromSerato(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(
                 eventId: eventId,
-                seratoWrite: .removeFromDatabase(removal)
+                seratoWrites: [.removeFromDatabase(removal)]
             )
         case .removeFileFromCrates(let payload):
             let (eventId, removal) = try applyRemoveFileFromCrates(
@@ -925,8 +943,18 @@ public actor OperationEngine {
             )
             return ExecutionResult(
                 eventId: eventId,
-                seratoWrite: .removeFromCrates(removal)
+                seratoWrites: [.removeFromCrates(removal)]
             )
+        case .applyMusicBrainzMatch(let payload):
+            let (eventId, seratoWrites) = try applyMusicBrainzMatch(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(eventId: eventId, seratoWrites: seratoWrites)
+        case .revertMusicBrainzMatch(let payload):
+            let (eventId, seratoWrites) = try applyRevertMusicBrainzMatch(
+                payload, batchId: batchId, timestamp: timestampMillis, in: db
+            )
+            return ExecutionResult(eventId: eventId, seratoWrites: seratoWrites)
         }
     }
 
@@ -1367,10 +1395,233 @@ public actor OperationEngine {
         return (eventId, pending)
     }
 
+    /// The paired Serato-side writes a MusicBrainz match (or its
+    /// revert) produces: a `database V2` metadata update and an audio
+    /// file-tag write. Year rides only on the file-tag write —
+    /// `SeratoMetadata`, and thus `database V2`, has no year field. This
+    /// is the shared mechanic both the forward apply and the inverse
+    /// revert call with different values (applied vs. restored).
+    private static func musicBrainzSeratoWrites(
+        absolutePath: String,
+        artist: String?,
+        title: String?,
+        album: String?,
+        year: Int?
+    ) -> [SeratoPendingWrite] {
+        let metadata = SeratoMetadata(artist: artist, title: title, album: album)
+        return [
+            .metadataUpdate(SeratoPendingMetadataUpdate(
+                absolutePath: absolutePath, metadata: metadata
+            )),
+            .fileTagWrite(SeratoPendingFileTagWrite(
+                absolutePath: absolutePath, metadata: metadata, year: year
+            )),
+        ]
+    }
+
+    private static func applyMusicBrainzMatch(
+        _ payload: ApplyMusicBrainzMatchPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, [SeratoPendingWrite]) {
+        guard var fileRecord = try FileRecord.fetchOne(db, key: payload.fileID) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileID)
+        }
+
+        // Snapshot the file's Serato metadata + track link before
+        // mutating, so the inverse can restore them exactly.
+        let previousMetadata = SeratoMetadata(
+            artist: fileRecord.artist,
+            title: fileRecord.title,
+            album: fileRecord.album,
+            genre: fileRecord.genre,
+            bpm: fileRecord.bpm,
+            musicalKey: fileRecord.musicalKey,
+            comment: fileRecord.comment,
+            length: fileRecord.length,
+            label: fileRecord.label
+        )
+        let previousTrackID = fileRecord.trackId
+
+        // Upsert the canonical track row keyed by fingerprint (invariant
+        // #4): identity fields always applied, display fields cherry-
+        // picked (nil leaves the prior value).
+        var previousTrackIdentifiers: TrackIdentifiers?
+        let createdTrackRow: Bool
+        let trackID: Int64
+
+        if var existingTrack = try TrackRecord
+            .filter(Column("fingerprint_hash") == payload.fingerprintHash)
+            .fetchOne(db) {
+            previousTrackIdentifiers = TrackIdentifiers(
+                acoustID: existingTrack.acoustidId,
+                recordingMBID: existingTrack.musicbrainzRecordingId,
+                releaseMBID: existingTrack.musicbrainzReleaseId,
+                artistMBID: existingTrack.musicbrainzArtistId,
+                isrc: existingTrack.isrc,
+                artist: existingTrack.artist,
+                title: existingTrack.title,
+                album: existingTrack.album,
+                year: existingTrack.year
+            )
+            createdTrackRow = false
+            existingTrack.acoustidId = payload.acoustID
+            existingTrack.musicbrainzRecordingId = payload.recordingMBID
+            existingTrack.musicbrainzReleaseId = payload.releaseMBID
+            existingTrack.musicbrainzArtistId = payload.artistMBID
+            existingTrack.isrc = payload.isrc
+            if let artist = payload.artist { existingTrack.artist = artist }
+            if let title = payload.title { existingTrack.title = title }
+            if let album = payload.album { existingTrack.album = album }
+            if let year = payload.year { existingTrack.year = year }
+            try existingTrack.update(db)
+            guard let existingId = existingTrack.id else {
+                throw OperationEngineError.insertDidNotReturnRowId
+            }
+            trackID = existingId
+        } else {
+            previousTrackIdentifiers = nil
+            createdTrackRow = true
+            var newTrack = TrackRecord(
+                fingerprintHash: payload.fingerprintHash,
+                acoustidId: payload.acoustID,
+                musicbrainzRecordingId: payload.recordingMBID,
+                musicbrainzReleaseId: payload.releaseMBID,
+                musicbrainzArtistId: payload.artistMBID,
+                isrc: payload.isrc,
+                artist: payload.artist,
+                title: payload.title,
+                album: payload.album,
+                year: payload.year
+            )
+            try newTrack.insert(db)
+            guard let newId = newTrack.id else {
+                throw OperationEngineError.insertDidNotReturnRowId
+            }
+            trackID = newId
+        }
+
+        // Link the file and apply the cherry-picked display fields to
+        // its Serato snapshot.
+        fileRecord.trackId = trackID
+        if let artist = payload.artist { fileRecord.artist = artist }
+        if let title = payload.title { fileRecord.title = title }
+        if let album = payload.album { fileRecord.album = album }
+        try fileRecord.update(db)
+
+        var forwardPayload = payload
+        forwardPayload.previousTrackID = previousTrackID
+        forwardPayload.previousMetadata = previousMetadata
+        forwardPayload.previousFileTags = previousMetadata
+        forwardPayload.previousTrackIdentifiers = previousTrackIdentifiers
+        forwardPayload.createdTrackRow = createdTrackRow
+
+        let inversePayload = RevertMusicBrainzMatchPayload(applied: forwardPayload)
+
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: payload.fileID,
+            trackId: trackID,
+            eventType: .musicBrainzMatchApplied,
+            forwardPayload: forwardPayload,
+            inversePayload: inversePayload,
+            in: db
+        )
+
+        let seratoWrites = musicBrainzSeratoWrites(
+            absolutePath: fileRecord.path,
+            artist: payload.artist,
+            title: payload.title,
+            album: payload.album,
+            year: payload.year
+        )
+        return (eventId, seratoWrites)
+    }
+
+    private static func applyRevertMusicBrainzMatch(
+        _ payload: RevertMusicBrainzMatchPayload,
+        batchId: String,
+        timestamp: Int64,
+        in db: GRDB.Database
+    ) throws -> (Int64, [SeratoPendingWrite]) {
+        let applied = payload.applied
+        guard var fileRecord = try FileRecord.fetchOne(db, key: applied.fileID) else {
+            throw OperationEngineError.fileNotFound(fileId: applied.fileID)
+        }
+
+        // Restore the file link + Serato snapshot for exactly the
+        // display fields the forward changed.
+        fileRecord.trackId = applied.previousTrackID
+        if let previousMetadata = applied.previousMetadata {
+            if applied.artist != nil { fileRecord.artist = previousMetadata.artist }
+            if applied.title != nil { fileRecord.title = previousMetadata.title }
+            if applied.album != nil { fileRecord.album = previousMetadata.album }
+        }
+        try fileRecord.update(db)
+
+        // Restore or null the canonical track row (found by fingerprint;
+        // it always exists here — the forward created it or it pre-
+        // existed).
+        if var track = try TrackRecord
+            .filter(Column("fingerprint_hash") == applied.fingerprintHash)
+            .fetchOne(db) {
+            if applied.createdTrackRow {
+                // The forward created this row — null what it set and
+                // leave the now-orphaned row in place.
+                track.acoustidId = nil
+                track.musicbrainzRecordingId = nil
+                track.musicbrainzReleaseId = nil
+                track.musicbrainzArtistId = nil
+                track.isrc = nil
+                if applied.artist != nil { track.artist = nil }
+                if applied.title != nil { track.title = nil }
+                if applied.album != nil { track.album = nil }
+                if applied.year != nil { track.year = nil }
+            } else if let previous = applied.previousTrackIdentifiers {
+                track.acoustidId = previous.acoustID
+                track.musicbrainzRecordingId = previous.recordingMBID
+                track.musicbrainzReleaseId = previous.releaseMBID
+                track.musicbrainzArtistId = previous.artistMBID
+                track.isrc = previous.isrc
+                track.artist = previous.artist
+                track.title = previous.title
+                track.album = previous.album
+                track.year = previous.year
+            }
+            try track.update(db)
+        }
+
+        // Journal the revert; its inverse is the original forward match
+        // so redo (undo of the undo) re-applies it.
+        let eventId = try insertEvent(
+            batchId: batchId,
+            timestamp: timestamp,
+            fileId: applied.fileID,
+            trackId: applied.previousTrackID,
+            eventType: .musicBrainzMatchReverted,
+            forwardPayload: payload,
+            inversePayload: applied,
+            in: db
+        )
+
+        let restoredTags = applied.previousFileTags ?? applied.previousMetadata ?? .empty
+        let seratoWrites = musicBrainzSeratoWrites(
+            absolutePath: fileRecord.path,
+            artist: applied.artist != nil ? restoredTags.artist : nil,
+            title: applied.title != nil ? restoredTags.title : nil,
+            album: applied.album != nil ? restoredTags.album : nil,
+            year: applied.year != nil ? applied.previousTrackIdentifiers?.year : nil
+        )
+        return (eventId, seratoWrites)
+    }
+
     private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
         batchId: String,
         timestamp: Int64,
         fileId: Int64?,
+        trackId: Int64? = nil,
         eventType: EventType,
         forwardPayload: ForwardPayload,
         inversePayload: InversePayload,
@@ -1391,7 +1642,7 @@ public actor OperationEngine {
             batchId: batchId,
             timestamp: timestamp,
             fileId: fileId,
-            trackId: nil,
+            trackId: trackId,
             eventType: eventType,
             payloadJson: forwardJsonString,
             inversePayloadJson: inverseJsonString
@@ -1450,6 +1701,11 @@ public enum TrackMutation: Sendable {
     case trashFile(TrashFilePayload)
     case removeTrackFromSerato(RemoveTrackFromSeratoPayload)
     case removeFileFromCrates(RemoveFileFromCratesPayload)
+    case applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload)
+    /// Inverse of `applyMusicBrainzMatch`, produced only by
+    /// `decodeInverseMutation` during undo. Never constructed by
+    /// feature code directly.
+    case revertMusicBrainzMatch(RevertMusicBrainzMatchPayload)
 }
 
 /// Move the file at `fileId` to the user's Trash via
@@ -1481,6 +1737,134 @@ public struct RemoveTrackFromSeratoPayload: Codable, Sendable, Equatable {
 public struct RemoveFileFromCratesPayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public init(fileId: Int64) { self.fileId = fileId }
+}
+
+/// Snapshot of the canonical `tracks` row's identity + display fields
+/// as they stood immediately before an `applyMusicBrainzMatch`. Filled
+/// by the engine at apply time only when the match landed on a
+/// pre-existing row; `nil` when the match created the row (undo nulls
+/// the row's fields instead of restoring them). Captures every column
+/// the mutation may overwrite so undo restores the row exactly.
+public struct TrackIdentifiers: Codable, Sendable, Equatable {
+    public let acoustID: String?
+    public let recordingMBID: String?
+    public let releaseMBID: String?
+    public let artistMBID: String?
+    public let isrc: String?
+    public let artist: String?
+    public let title: String?
+    public let album: String?
+    public let year: Int?
+
+    public init(
+        acoustID: String?,
+        recordingMBID: String?,
+        releaseMBID: String?,
+        artistMBID: String?,
+        isrc: String?,
+        artist: String?,
+        title: String?,
+        album: String?,
+        year: Int?
+    ) {
+        self.acoustID = acoustID
+        self.recordingMBID = recordingMBID
+        self.releaseMBID = releaseMBID
+        self.artistMBID = artistMBID
+        self.isrc = isrc
+        self.artist = artist
+        self.title = title
+        self.album = album
+        self.year = year
+    }
+}
+
+/// Writes a confirmed MusicBrainz match: upserts the canonical `tracks`
+/// row (keyed by Chromaprint fingerprint — invariant #4), links the
+/// file to it, and applies the cherry-picked display fields to the
+/// file's Serato snapshot, Serato's `database V2`, and the audio file's
+/// tags.
+///
+/// Identity fields (`acoustID`, `recordingMBID`, `releaseMBID`,
+/// `artistMBID`, `isrc`) are ALWAYS written to the track row. Display
+/// fields (`artist`, `title`, `album`, `year`) are cherry-picked — a
+/// `nil` field is not applied, leaving the prior value in place.
+///
+/// `year` reaches ONLY the audio file's tags and `tracks.year`;
+/// `SeratoMetadata` (and therefore Serato's `database V2`) has no year
+/// field, so it is deliberately not threaded through the Serato write.
+///
+/// The `previous…` fields are populated by the engine at apply time to
+/// make the event fully undoable (invariant #2). Callers leave them at
+/// their defaults.
+public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
+    public let fileID: Int64
+    // Identity — always applied:
+    public let acoustID: String?
+    public let recordingMBID: String
+    public let releaseMBID: String?
+    public let artistMBID: String?
+    public let isrc: String?
+    public let fingerprintHash: Data
+    // Cherry-picked display fields — absent (nil) means not applied:
+    public let artist: String?
+    public let title: String?
+    public let album: String?
+    public let year: Int?
+    // Previous-state snapshots, filled by the engine at apply time:
+    public var previousTrackID: Int64?
+    public var previousMetadata: SeratoMetadata?
+    public var previousFileTags: SeratoMetadata?
+    public var previousTrackIdentifiers: TrackIdentifiers?
+    public var createdTrackRow: Bool
+
+    public init(
+        fileID: Int64,
+        acoustID: String?,
+        recordingMBID: String,
+        releaseMBID: String?,
+        artistMBID: String?,
+        isrc: String?,
+        fingerprintHash: Data,
+        artist: String?,
+        title: String?,
+        album: String?,
+        year: Int?,
+        previousTrackID: Int64? = nil,
+        previousMetadata: SeratoMetadata? = nil,
+        previousFileTags: SeratoMetadata? = nil,
+        previousTrackIdentifiers: TrackIdentifiers? = nil,
+        createdTrackRow: Bool = false
+    ) {
+        self.fileID = fileID
+        self.acoustID = acoustID
+        self.recordingMBID = recordingMBID
+        self.releaseMBID = releaseMBID
+        self.artistMBID = artistMBID
+        self.isrc = isrc
+        self.fingerprintHash = fingerprintHash
+        self.artist = artist
+        self.title = title
+        self.album = album
+        self.year = year
+        self.previousTrackID = previousTrackID
+        self.previousMetadata = previousMetadata
+        self.previousFileTags = previousFileTags
+        self.previousTrackIdentifiers = previousTrackIdentifiers
+        self.createdTrackRow = createdTrackRow
+    }
+}
+
+/// Inverse of `applyMusicBrainzMatch`. Wraps the fully-populated
+/// forward payload (with its `previous…` snapshots) so the revert can
+/// restore prior state exactly, and so redo (undo of the undo) can
+/// re-issue the original forward match.
+public struct RevertMusicBrainzMatchPayload: Codable, Sendable, Equatable {
+    public let applied: ApplyMusicBrainzMatchPayload
+
+    public init(applied: ApplyMusicBrainzMatchPayload) {
+        self.applied = applied
+    }
 }
 
 /// Writes metadata into the audio file's primary tag (ID3v2.4 for
@@ -1725,6 +2109,17 @@ struct SeratoPendingTrash: Sendable, Equatable {
 struct SeratoPendingFileTagWrite: Sendable, Equatable {
     let absolutePath: String
     let metadata: SeratoMetadata
+    /// Year to write into the audio file's tags. Lives here rather than
+    /// on `SeratoMetadata` because Serato's `database V2` has no year
+    /// field — only the file-tag path carries it. `nil` for callers
+    /// that don't set a year (e.g. `writeFileTags`).
+    let year: Int?
+
+    init(absolutePath: String, metadata: SeratoMetadata, year: Int? = nil) {
+        self.absolutePath = absolutePath
+        self.metadata = metadata
+        self.year = year
+    }
 }
 
 /// A Serato-side rewrite scheduled by `renameFile`. Carries absolute

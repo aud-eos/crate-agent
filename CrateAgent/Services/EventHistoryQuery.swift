@@ -155,6 +155,10 @@ public enum EventHistoryQuery {
             return "Removed \(count) file\(pluralS) from Serato crates"
         case .trackAddedToSerato:
             return "Added \(count) track\(pluralS) to Serato"
+        case .musicBrainzMatchApplied:
+            return "Applied MusicBrainz match to \(count) track\(pluralS)"
+        case .musicBrainzMatchReverted:
+            return "Reverted MusicBrainz match on \(count) track\(pluralS)"
         }
     }
 }

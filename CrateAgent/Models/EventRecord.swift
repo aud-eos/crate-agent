@@ -74,4 +74,6 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case fileTrashed = "file_trashed"
     case trackRemovedFromSerato = "track_removed_from_serato"
     case fileRemovedFromCrates = "file_removed_from_crates"
+    case musicBrainzMatchApplied = "music_brainz_match_applied"
+    case musicBrainzMatchReverted = "music_brainz_match_reverted"
 }
