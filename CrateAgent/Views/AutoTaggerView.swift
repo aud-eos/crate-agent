@@ -484,6 +484,15 @@ struct AutoTaggerView: View {
             for fileID in confirmedIDs {
                 rowModels.removeValue(forKey: fileID)
             }
+            // Refresh the cached current-tag baseline (filesByID /
+            // currentYearByFileID) so a later "New Scan" over the same
+            // files — including these just-applied ones, if re-selected —
+            // diffs against what's actually in the DB now, not against
+            // stale pre-apply values. Without this, `syncRowModels`
+            // rebuilds a re-scanned row's `AutoTagRowModel` from outdated
+            // current-artist/title/album/year, undermining the review
+            // UI's whole current→proposed diff.
+            await loadFiles()
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
         }
