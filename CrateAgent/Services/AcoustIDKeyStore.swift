@@ -17,11 +17,13 @@ public enum AcoustIDKeyStoreError: Error, Equatable {
 /// generic-password item, keyed by `service`. The key is a secret and MUST
 /// live only here — never in SQLite, the event log, UserDefaults, or logs.
 ///
-/// `save` upserts (delete-then-add) so calling it twice never fails with
-/// `errSecDuplicateItem`. `load` returns `nil` only when no item exists;
-/// any other non-success status is a real failure and is thrown, never
-/// silently treated as "no key" — hence `load`'s `throws -> String?`
-/// signature rather than a plain `-> String?`.
+/// `save` upserts non-destructively (update-existing, add-if-missing) so
+/// calling it twice never fails with `errSecDuplicateItem` and a failed
+/// replacement never destroys the key that was already working. `load`
+/// returns `nil` only when no item exists; any other non-success status is
+/// a real failure and is thrown, never silently treated as "no key" —
+/// hence `load`'s `throws -> String?` signature rather than a plain
+/// `-> String?`.
 public struct AcoustIDKeyStore: Sendable {
     private let service: String
 
@@ -34,13 +36,19 @@ public struct AcoustIDKeyStore: Sendable {
             throw AcoustIDKeyStoreError.invalidEncoding
         }
 
-        // Upsert via delete-then-add: SecItemAdd fails with
-        // errSecDuplicateItem if an item for this service already exists,
-        // so a plain "save" call must always succeed regardless of
-        // whether a previous key is already stored.
-        let deleteStatus = SecItemDelete(query() as CFDictionary)
-        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-            throw AcoustIDKeyStoreError.keychain(deleteStatus)
+        // Non-destructive upsert: try to update the existing item's value
+        // in place first. Only when there is no existing item do we add a
+        // new one. Deleting before the new value is confirmed written
+        // would leave the user with NO key at all if the add/update step
+        // then failed for any reason (a transient Keychain error, a
+        // permissions prompt dismissal, etc.) — this way the prior,
+        // working key survives any failure of this call.
+        let updateStatus = SecItemUpdate(query() as CFDictionary, [kSecValueData as String: keyData] as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
+        }
+        guard updateStatus == errSecItemNotFound else {
+            throw AcoustIDKeyStoreError.keychain(updateStatus)
         }
 
         var addQuery = query()
