@@ -85,6 +85,12 @@ struct AutoTaggerView: View {
         .navigationTitle("Auto-Tag")
         .frame(minWidth: 680, minHeight: 480)
         .task { await loadLibraryFileCount() }
+        // Leaving the Auto-Tag panel entirely (not just "New Scan", which
+        // already cancels via resetToSelectionStage) must also stop an
+        // in-flight pass — otherwise it keeps issuing rate-limited
+        // AcoustID/MusicBrainz requests, invisibly, for as long as it takes
+        // to finish the selection it was given.
+        .onDisappear { autoTaggerService.cancel() }
         .onChange(of: autoTaggerService.rows) { _, _ in syncRowModels() }
         // Debounce: every keystroke restarts this task; the sleep +
         // cancellation check coalesces a burst of typing into one
@@ -231,6 +237,8 @@ struct AutoTaggerView: View {
                 statusRow(path: path, systemImage: "questionmark.circle", text: "No match", tint: .secondary)
             case let .failed(reason):
                 statusRow(path: path, systemImage: "exclamationmark.triangle", text: reason, tint: .orange)
+            case let .stopped(reason):
+                statusRow(path: path, systemImage: "stop.circle", text: "Stopped — \(reason)", tint: .secondary)
             case .strong, .weak:
                 if let binding = rowModelBinding(for: fileID) {
                     AutoTagReviewRow(
@@ -502,7 +510,7 @@ struct AutoTaggerView: View {
             switch state {
             case let .strong(value), let .weak(value):
                 candidate = value
-            case .pending, .noMatch, .failed:
+            case .pending, .noMatch, .failed, .stopped:
                 candidate = nil
             }
             guard let candidate, let file = filesByID[fileID] else { continue }
@@ -539,11 +547,13 @@ struct AutoTaggerView: View {
     }
 
     private func resetToSelectionStage() {
+        autoTaggerService.cancel()
         scannedFileIDs.removeAll()
         selectedFileIDs.removeAll()
         confirmedFileIDs.removeAll()
         appliedFileIDs.removeAll()
         rowModels.removeAll()
+        searchQuery = ""
         actionError = nil
         lastResult = nil
     }
