@@ -582,6 +582,91 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    // MARK: - Out-of-order undo is rejected (#3999114450)
+
+    /// The SAME file is matched by batch A, then re-matched by a later batch B
+    /// to a DIFFERENT recording (a legitimate self-correction — no other file
+    /// references the row, so B is not a collision). Undoing the OLDER batch A
+    /// now would relink the file away from B and overwrite B's DB metadata +
+    /// on-disk tags. It must be refused loudly, leaving B's match intact, so
+    /// the user undoes the newer match first (LIFO).
+    func testUndoOfMatchSupersededOnSameFileIsRejected() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Batch A: file1 → recA.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recA"
+            )),
+            batchId: "batchA"
+        )
+        // Batch B (later): the SAME file1, re-matched to a DIFFERENT recording.
+        // Only file1 references the row, so this is a self-correction, not a
+        // collision — it proceeds and moves the row to recB.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint, recordingMBID: "recB"
+            )),
+            batchId: "batchB"
+        )
+
+        let writesBeforeUndo = recorder.calls.count
+        do {
+            try await engine.undoBatch("batchA")
+            XCTFail("expected undoSupersededByLaterMatch")
+        } catch let OperationEngineError.undoSupersededByLaterMatch(fid) {
+            XCTAssertEqual(fid, file1)
+        }
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(track.musicbrainzRecordingId, "recB", "B's current identity must survive the refused undo")
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: file1)!.trackId, track.id, "file1 still links to B's row")
+            XCTAssertEqual(
+                try EventRecord.filter(Column("batch_id").like("undo:batchA%")).fetchCount(db), 0,
+                "a refused undo journals nothing"
+            )
+        }
+        XCTAssertEqual(recorder.calls.count, writesBeforeUndo, "a refused undo rewrites no audio tags")
+    }
+
+    // MARK: - Identity-only confirm schedules no audio-tag write (#3999114458)
+
+    /// When the user keeps every display field (artist/title/album/year all
+    /// nil, no year clear) and confirms only the recording identity, the DB
+    /// link is still established but NO audio-file write is scheduled — an
+    /// empty patch would still rewrite the file (Rust `remove_others(true)`),
+    /// bump its mtime, and strip secondary ID3v1/APE tags.
+    func testIdentityOnlyConfirmSchedulesNoFileTagWrite() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: fingerprint,
+                artist: nil, title: nil, album: nil, year: nil
+            )),
+            batchId: "identity-only"
+        )
+
+        XCTAssertEqual(recorder.calls.count, 0, "identity-only confirm must not rewrite the audio file")
+
+        try await database.writer.read { db in
+            let file = try FileRecord.fetchOne(db, key: fileId)!
+            XCTAssertNotNil(file.trackId, "the recording link is still established in the DB")
+            let track = try TrackRecord.fetchOne(db, key: file.trackId!)!
+            XCTAssertEqual(track.musicbrainzRecordingId, "rec", "identity is recorded")
+            XCTAssertEqual(file.artist, "old", "the display fields the user kept are untouched")
+        }
+    }
+
     // MARK: - D-A: legacy event decode (fields added mid-branch)
 
     /// An event JOURNALED by an earlier build of this branch — before D-A

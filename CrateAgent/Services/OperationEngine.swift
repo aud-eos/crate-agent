@@ -1613,17 +1613,32 @@ public actor OperationEngine {
         clearFileYear: Bool = false
     ) -> [SeratoPendingWrite] {
         let metadata = SeratoMetadata(artist: artist, title: title, album: album)
-        return [
+        // An identity-only confirmation (the user kept every display field:
+        // artist/title/album/year all nil, no year clear) has NOTHING to
+        // project onto Serato or the audio file — the recording link lives in
+        // the DB alone. Scheduling a file-tag write anyway is not harmless:
+        // the Rust writer saves with `remove_others(true)` unconditionally
+        // (tags.rs), so an empty patch still rewrites the file, bumps its
+        // mtime, and can strip secondary ID3v1/APE tags. Emit each write only
+        // when it actually carries a change.
+        let hasSeratoMetadataFields = artist != nil || title != nil || album != nil
+        let fileTagNeedsWrite = hasSeratoMetadataFields || year != nil || clearFileYear
+
+        var writes: [SeratoPendingWrite] = []
+        if hasSeratoMetadataFields {
             // Serato's database V2 has no year field, so `clearFileYear`
             // is irrelevant to the metadata update — it only affects the
             // file-tag write.
-            .metadataUpdate(SeratoPendingMetadataUpdate(
+            writes.append(.metadataUpdate(SeratoPendingMetadataUpdate(
                 absolutePath: absolutePath, metadata: metadata
-            )),
-            .fileTagWrite(SeratoPendingFileTagWrite(
+            )))
+        }
+        if fileTagNeedsWrite {
+            writes.append(.fileTagWrite(SeratoPendingFileTagWrite(
                 absolutePath: absolutePath, metadata: metadata, year: year, clearYear: clearFileYear
-            )),
-        ]
+            )))
+        }
+        return writes
     }
 
     private static func applyMusicBrainzMatch(
@@ -1798,6 +1813,51 @@ public actor OperationEngine {
             throw OperationEngineError.fileNotFound(fileId: applied.fileID)
         }
 
+        // The canonical track row keyed by this file's fingerprint (the
+        // forward created it or it pre-existed). Fetch and evaluate it BEFORE
+        // mutating anything so an out-of-order undo can be rejected cleanly.
+        let track = try TrackRecord
+            .filter(Column("fingerprint_hash") == applied.fingerprintHash)
+            .fetchOne(db)
+
+        // Undoing batch A must never overwrite what a later batch B
+        // established on the same fingerprint-keyed row (invariant #4:
+        // FLAC+MP3 of one recording, or a re-encode, share a track row). A's
+        // undo may touch the row's identity only when A still SOLELY owns it:
+        // no other file references it (a later batch that adopted or kept the
+        // row links its own file to it) AND its identity is still exactly what
+        // A's forward wrote. Both guards are needed — when B re-matches to the
+        // SAME recording the identity doesn't drift, so the reference count is
+        // the only signal that B now owns the row.
+        let otherFilesReferenceRow = try track.map { row in
+            try FileRecord.hasOtherFilesReferencingTrack(row.id, excluding: applied.fileID, in: db)
+        } ?? false
+        let forwardIdentityStillOnRow = track.map { row in
+            row.acoustidId == applied.acoustID
+                && row.musicbrainzRecordingId == applied.recordingMBID
+                && row.musicbrainzReleaseId == applied.releaseMBID
+                && row.musicbrainzArtistId == applied.artistMBID
+                && row.isrc == applied.isrc
+        } ?? false
+        let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
+
+        // Out-of-order undo guard. A's forward matched this file to a
+        // recording on the fingerprint-keyed row. If the row still exists but
+        // no longer carries A's exact identity, a LATER batch B re-matched
+        // this same file (files keep their fingerprint across a re-match) to a
+        // different recording. Undoing A now would relink the file away from
+        // B, restore A's stale DB metadata, and rewrite the audio tags over
+        // B's — corrupting the current match. Reject loudly: batch undo is
+        // atomic, so throwing here rolls the whole undo back with nothing
+        // half-applied, and History surfaces it so the user undoes B first. A
+        // row that still carries A's identity but is ALSO referenced by
+        // another file (FLAC+MP3 of one recording) is not superseded — this
+        // file is still A's, and the shared row is protected separately by
+        // `thisForwardStillSolelyOwnsRow` below.
+        if track != nil, !forwardIdentityStillOnRow {
+            throw OperationEngineError.undoSupersededByLaterMatch(fileId: applied.fileID)
+        }
+
         // Restore the file link + Serato snapshot for exactly the
         // display fields the forward changed.
         fileRecord.trackId = applied.previousTrackID
@@ -1808,36 +1868,11 @@ public actor OperationEngine {
         }
         try fileRecord.update(db)
 
-        // Restore or null the canonical track row (found by fingerprint;
-        // it always exists here — the forward created it or it pre-
-        // existed).
-        if var track = try TrackRecord
-            .filter(Column("fingerprint_hash") == applied.fingerprintHash)
-            .fetchOne(db) {
-            // Undoing batch A must never overwrite what a later batch B
-            // established on the same fingerprint-keyed row (invariant
-            // #4: FLAC+MP3 of one recording, or a re-encode, share a
-            // track row). A's undo may touch the row's identity only when
-            // A still SOLELY owns it: no other file references it (a
-            // later batch that adopted or kept the row links its own file
-            // to it) AND its identity is still exactly what A's forward
-            // wrote. Both guards are needed — when B re-matches to the
-            // SAME recording the identity doesn't drift, so the reference
-            // count is the only signal that B now owns the row. The same
-            // predicate gates both teardown (created row) and restore
-            // (pre-existing row); the file itself has already been
-            // unlinked above.
-            let otherFilesReferenceRow = try FileRecord.hasOtherFilesReferencingTrack(
-                track.id, excluding: applied.fileID, in: db
-            )
-            let forwardIdentityStillOnRow =
-                track.acoustidId == applied.acoustID
-                && track.musicbrainzRecordingId == applied.recordingMBID
-                && track.musicbrainzReleaseId == applied.releaseMBID
-                && track.musicbrainzArtistId == applied.artistMBID
-                && track.isrc == applied.isrc
-            let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
-
+        // Restore or null the canonical track row, gated by the ownership
+        // predicate computed above; the file itself has already been
+        // unlinked. It always exists here in practice — the forward created
+        // it or it pre-existed.
+        if var track {
             if applied.createdTrackRow {
                 // The forward created this row. Null what it set and leave
                 // the now-orphaned row in place — but only while A solely
@@ -2529,6 +2564,15 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// canonical identity and its file links stay intact (finding D-C,
     /// invariant #4).
     case fingerprintRecordingConflict(fileId: Int64, existingMBID: String, incomingMBID: String)
+    /// Undo of a MusicBrainz match was refused because a LATER batch
+    /// re-matched the same file to a different recording (files keep their
+    /// fingerprint across a re-match, so both matches land on one `tracks`
+    /// row). Reverting the older match now would relink the file away from
+    /// the current match and overwrite its DB metadata + on-disk tags. The
+    /// user must undo the newer match first (LIFO), so this is surfaced
+    /// loudly rather than silently corrupting the current identity
+    /// (finding #3999114450).
+    case undoSupersededByLaterMatch(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
     /// threw afterward. Distinct from a pre-commit throw so the caller
@@ -2561,6 +2605,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
         case .fingerprintRecordingConflict(let fileId, let existingMBID, let incomingMBID):
             return "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
+        case .undoSupersededByLaterMatch(let fileId):
+            return "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
         case .externalSyncIncomplete(let batchId, let underlying):
             return "Batch \(batchId) was applied, but some Serato/file writes did not land: \(underlying). Re-sync the batch to finish applying them."
         }
