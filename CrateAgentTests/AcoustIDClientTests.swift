@@ -139,6 +139,24 @@ final class AcoustIDClientTests: XCTestCase {
 
         XCTAssertTrue(results.isEmpty)
     }
+
+    func testRequestBodyPinsResponseFormatToJSON() async throws {
+        // AcoustID's default response format is JSON, but it's ambiguous
+        // historically and decodeSortedResults unconditionally
+        // JSON-decodes — pin it explicitly rather than rely on the
+        // server-side default.
+        let loader = StubLoader(status: 200, body: fixture("acoustid_multi.json"))
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
+
+        _ = try await client.lookup(fingerprintBase64: "F", durationSeconds: 200, apiKey: "K")
+
+        let body = try XCTUnwrap(loader.lastRequest?.httpBody)
+        let bodyString = try XCTUnwrap(String(data: body, encoding: .utf8))
+        XCTAssertTrue(
+            bodyString.contains("format=json"),
+            "expected the form-encoded body to pin format=json, got: \(bodyString)"
+        )
+    }
 }
 
 /// Returns a fixed status/body on every call, and records the most recent

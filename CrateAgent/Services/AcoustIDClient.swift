@@ -58,6 +58,7 @@ public struct AcoustIDClient: Sendable {
             ("duration", String(durationSeconds)),
             ("fingerprint", fingerprintBase64),
             ("meta", "recordings+recordingids"),
+            ("format", "json"),
         ]
         .map { key, value in "\(key)=\(formURLEncodedValue(value))" }
         .joined(separator: "&")
