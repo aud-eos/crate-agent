@@ -244,7 +244,10 @@ final class AutoTaggerService: ObservableObject {
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
-            proposedArtist: recording.creditedArtistName,
+            // E-A: an empty artist-credit has nothing to propose — nil,
+            // never "", so a sparse match can never default to blanking
+            // an existing artist on Confirm-All.
+            proposedArtist: recording.artistCredit.isEmpty ? nil : recording.creditedArtistName,
             proposedTitle: recording.title,
             proposedAlbum: chosenRelease.title,
             proposedYear: recording.releaseGroup?.firstReleaseDate.flatMap(Self.year(fromMusicBrainzDate:)),
@@ -287,7 +290,8 @@ final class AutoTaggerService: ObservableObject {
     /// runs off the main actor to keep the UI responsive.
     private func currentFingerprint(for file: FileRecord) async throws -> Data {
         if file.fingerprintStatus == .done, let existing = file.chromaprintFingerprint,
-           await storedFingerprintIsFresh(for: file) {
+           await storedFingerprintIsFresh(for: file)
+        {
             return existing
         }
         guard let fileID = file.id else {
@@ -355,7 +359,9 @@ final class AutoTaggerService: ObservableObject {
         let pathByFileID = (try? await database.writer.read { db in
             try FileRecord.filter(keys: fileIDs).fetchAll(db)
                 .reduce(into: [Int64: String]()) { accumulator, file in
-                    if let id = file.id { accumulator[id] = file.path }
+                    if let id = file.id {
+                        accumulator[id] = file.path
+                    }
                 }
         }) ?? [:]
 
@@ -370,7 +376,8 @@ final class AutoTaggerService: ObservableObject {
                 continue
             }
             if current.fileSize != payload.expectedFileSize
-                || current.mtime != payload.expectedMtime {
+                || current.mtime != payload.expectedMtime
+            {
                 stale.insert(payload.fileID) // edited/replaced since review
             }
         }

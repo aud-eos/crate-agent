@@ -197,4 +197,35 @@ final class MusicBrainzModelsTests: XCTestCase {
         XCTAssertEqual(candidate.proposedAlbum, "Album B")
         XCTAssertEqual(candidate.recordingMBID, "f3d1e2a0-5b2b-4b8e-9b8a-7a3e2f8c9d10")
     }
+
+    // MARK: - E-A: unavailable artist credit is nil, never blank
+
+    func testMatchCandidateAllowsNilProposedArtistForSparseCredit() {
+        let release = MBRelease(id: "release-a", title: "Album A", date: "1988", country: "GB", status: "Official")
+
+        let candidate = MatchCandidate(
+            fileID: 42,
+            score: 0.93,
+            acoustID: "acoustid-1",
+            recordingMBID: "recording-1",
+            artistMBID: nil,
+            fingerprintHash: Data([0x01, 0x02, 0x03, 0x04]),
+            expectedFileSize: 5_000_000,
+            expectedMtime: 1_700_000_000,
+            chosenRelease: release,
+            availableReleases: [release],
+            isrc: nil,
+            proposedArtist: nil,
+            proposedTitle: "Untitled",
+            proposedAlbum: release.title,
+            proposedYear: nil,
+            currentFileYear: nil,
+            currentFileArtist: nil,
+            currentFileTitle: nil,
+            currentFileAlbum: nil
+        )
+
+        XCTAssertNil(candidate.proposedArtist)
+        XCTAssertNil(candidate.artistMBID)
+    }
 }

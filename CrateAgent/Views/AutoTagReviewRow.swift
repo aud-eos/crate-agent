@@ -66,7 +66,10 @@ struct AutoTagRowModel {
         titleTier = decision.tier
         titleChoice = decision.defaultChoice
 
-        includeArtist = candidate.proposedArtist != currentArtist
+        // E-A: a nil proposedArtist means MusicBrainz had no artist
+        // credit to propose — never defaults to "included" even though
+        // nil != currentArtist, mirroring includeYear below.
+        includeArtist = candidate.proposedArtist != nil && candidate.proposedArtist != currentArtist
         includeAlbum = candidate.proposedAlbum != currentAlbum
         // A nil proposedYear means MusicBrainz had nothing to propose —
         // never defaults to "included" even though nil != resolvedCurrentYear.
@@ -170,7 +173,10 @@ struct AutoTagReviewRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
-            fieldDiff(name: "Artist", current: model.currentArtist, proposed: model.candidate.proposedArtist, include: $model.includeArtist)
+            // E-A: an unavailable (nil) proposed artist renders as
+            // current → current — a visible no-op, never an empty "→ "
+            // overwrite — matching includeArtist's "never included" default.
+            fieldDiff(name: "Artist", current: model.currentArtist, proposed: model.candidate.proposedArtist ?? model.currentArtist, include: $model.includeArtist)
             titleRow
             fieldDiff(name: "Album", current: model.currentAlbum, proposed: model.candidate.proposedAlbum, include: albumIncludeBinding)
             if model.candidate.proposedYear != nil {

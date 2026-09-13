@@ -292,7 +292,12 @@ struct MatchCandidate: Equatable {
     let availableReleases: [MBRelease]
     let isrc: String?
     // Proposed tag values shown to the user before applying the mutation.
-    let proposedArtist: String
+    /// `nil` when MusicBrainz's recording has an empty `artist-credit` —
+    /// there is nothing to propose. Never an empty string: a sparse
+    /// recording must never look like a proposal to blank the artist
+    /// (see `AutoTagRowModel.includeArtist`, which mirrors `includeYear`'s
+    /// "nil proposal never defaults to included" rule).
+    let proposedArtist: String?
     let proposedTitle: String
     /// Follows `chosenRelease` — update together when the user picks a
     /// different release.

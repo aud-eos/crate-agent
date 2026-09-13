@@ -18,7 +18,7 @@ final class AutoTagReviewRowModelTests: XCTestCase {
     }
 
     private func makeCandidate(
-        proposedArtist: String = "Test Artist",
+        proposedArtist: String? = "Test Artist",
         proposedTitle: String = "Test Title",
         proposedAlbum: String = "Test Album",
         proposedYear: Int? = 1994,
@@ -258,6 +258,43 @@ final class AutoTagReviewRowModelTests: XCTestCase {
 
         XCTAssertFalse(model.includeAlbum, "a user override must survive selecting a different release")
         XCTAssertNil(model.payload().album)
+    }
+
+    // MARK: - E-A: unavailable (nil) proposed artist is never applied as blank
+
+    /// A sparse MusicBrainz recording with an empty artist-credit yields
+    /// `proposedArtist == nil` — must never default to "included" (which
+    /// would blank the file's real artist on Confirm-All) and must never
+    /// be applied as an empty string.
+    func testNilProposedArtistNeverDefaultsIncludedOrAppliesBlank() {
+        let candidate = makeCandidate(proposedArtist: nil)
+        let model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Existing Real Artist",
+            currentTitle: "Some Title",
+            currentAlbum: "Album",
+            currentYear: 1994
+        )
+
+        XCTAssertFalse(model.includeArtist, "an unavailable proposed artist must never default to included")
+        XCTAssertNil(model.payload().artist, "Confirm-All must never blank the existing artist")
+    }
+
+    /// Even if a caller force-toggles `includeArtist` on for a nil
+    /// proposal, `payload()` must not fabricate an empty-string artist —
+    /// there's nothing to apply.
+    func testForcingIncludeArtistOnWithNilProposalNeverAppliesBlank() {
+        let candidate = makeCandidate(proposedArtist: nil)
+        var model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Existing Real Artist",
+            currentTitle: "Some Title",
+            currentAlbum: "Album",
+            currentYear: 1994
+        )
+        model.includeArtist = true
+
+        XCTAssertNil(model.payload().artist, "toggling on a nil proposed artist must not fabricate one")
     }
 
     // MARK: - No proposed year
