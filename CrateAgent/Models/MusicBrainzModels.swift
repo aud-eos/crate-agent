@@ -226,7 +226,6 @@ struct MatchCandidate: Equatable {
     /// re-resolving the whole candidate.
     var chosenRelease: MBRelease
     let availableReleases: [MBRelease]
-    let releaseMBID: String
     let isrc: String?
     // Proposed tag values shown to the user before applying the mutation.
     let proposedArtist: String
@@ -238,4 +237,10 @@ struct MatchCandidate: Equatable {
     /// (the original release, not a reissue); fixed once resolved,
     /// independent of which release is chosen.
     let proposedYear: Int?
+    /// The file's year tag as read directly off disk (`AudioTags.year`,
+    /// already fetched by `AutoTaggerService` for the track duration —
+    /// no extra I/O). This is the honest "current" year for the review
+    /// diff: unlike `tracks.year`, it's populated even on a greenfield
+    /// first-pass match, before any `tracks` row exists for this file.
+    let currentFileYear: Int?
 }

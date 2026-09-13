@@ -115,12 +115,12 @@ final class MusicBrainzModelsTests: XCTestCase {
             fingerprintHash: Data([0x01, 0x02, 0x03, 0x04]),
             chosenRelease: releaseA,
             availableReleases: [releaseA, releaseB],
-            releaseMBID: releaseA.id,
             isrc: "GBAAA8800001",
             proposedArtist: "A Guy Called Gerald",
             proposedTitle: "Voodoo Ray",
             proposedAlbum: releaseA.title,
-            proposedYear: 1988
+            proposedYear: 1988,
+            currentFileYear: nil
         )
 
         XCTAssertEqual(candidate.availableReleases.count, 2)

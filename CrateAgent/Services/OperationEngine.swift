@@ -1589,6 +1589,17 @@ public actor OperationEngine {
                 track.title = previous.title
                 track.album = previous.album
                 track.year = previous.year
+            } else {
+                // Unreachable: a pre-existing track row (createdTrackRow
+                // == false) always captures previousTrackIdentifiers in
+                // the forward apply. If this ever fires, the forward's
+                // invariant broke silently, and no-oping here would
+                // leave the row's identifiers unchanged instead of
+                // restored — fail loudly instead.
+                assertionFailure(
+                    "applyRevertMusicBrainzMatch: pre-existing track row for file \(applied.fileID) has no previousTrackIdentifiers to restore"
+                )
+                throw OperationEngineError.missingPreviousTrackIdentifiers(fileId: applied.fileID)
             }
             try track.update(db)
         }
@@ -2159,6 +2170,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case trashFailed(path: String, underlying: String)
     case batchNotFound(batchId: String)
     case undoNotSupported(eventType: EventType)
+    case missingPreviousTrackIdentifiers(fileId: Int64)
 
     public var errorDescription: String? {
         switch self {
@@ -2180,6 +2192,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "No events were found for batch \(batchId); nothing to undo."
         case .undoNotSupported(let eventType):
             return "Events of type \(eventType.rawValue) can't be undone yet."
+        case .missingPreviousTrackIdentifiers(let fileId):
+            return "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
         }
     }
 }

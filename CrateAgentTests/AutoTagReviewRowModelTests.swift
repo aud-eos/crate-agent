@@ -23,7 +23,8 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         proposedAlbum: String = "Test Album",
         proposedYear: Int? = 1994,
         chosenRelease: MBRelease? = nil,
-        availableReleases: [MBRelease]? = nil
+        availableReleases: [MBRelease]? = nil,
+        currentFileYear: Int? = nil
     ) -> MatchCandidate {
         let release = chosenRelease ?? makeRelease()
         return MatchCandidate(
@@ -35,12 +36,12 @@ final class AutoTagReviewRowModelTests: XCTestCase {
             fingerprintHash: Data([0xAB, 0xCD, 0xEF]),
             chosenRelease: release,
             availableReleases: availableReleases ?? [release],
-            releaseMBID: release.id,
             isrc: "ISRC0000001",
             proposedArtist: proposedArtist,
             proposedTitle: proposedTitle,
             proposedAlbum: proposedAlbum,
-            proposedYear: proposedYear
+            proposedYear: proposedYear,
+            currentFileYear: currentFileYear
         )
     }
 
@@ -203,5 +204,62 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         XCTAssertFalse(model.includeYear)
         model.includeYear = true
         XCTAssertNil(model.payload().year, "toggling on a nil proposed year must not fabricate one")
+    }
+
+    // MARK: - On-disk current year (greenfield first-pass match)
+
+    /// A greenfield first-pass match: no `tracks` row exists yet, so the
+    /// caller-supplied `tracks.year` (here `currentYear: nil`) is nil, but
+    /// the file's on-disk tag (`candidate.currentFileYear`) already carries
+    /// the correct year. `includeYear` must default OFF — the tag is
+    /// already correct, there's nothing to change.
+    func testOnDiskCurrentYearEqualToProposedDefaultsIncludeYearOff() {
+        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: 1994)
+        let model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Artist",
+            currentTitle: "Title",
+            currentAlbum: "Album",
+            currentYear: nil
+        )
+
+        XCTAssertFalse(model.includeYear, "on-disk year already matches proposed — nothing to change")
+        XCTAssertEqual(model.currentYear, 1994)
+        XCTAssertNil(model.payload().year)
+    }
+
+    /// Same greenfield scenario, but the on-disk tag disagrees with the
+    /// proposed year: `includeYear` must default ON so the honest diff
+    /// ("1990 → 1994") is what the review row shows and applies.
+    func testOnDiskCurrentYearDifferingFromProposedDefaultsIncludeYearOn() {
+        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: 1990)
+        let model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Artist",
+            currentTitle: "Title",
+            currentAlbum: "Album",
+            currentYear: nil
+        )
+
+        XCTAssertTrue(model.includeYear, "on-disk year differs from proposed — should default on")
+        XCTAssertEqual(model.currentYear, 1990)
+        XCTAssertEqual(model.payload().year, 1994)
+    }
+
+    /// When the on-disk read didn't produce a year (`currentFileYear` nil,
+    /// e.g. the tag has no year frame), the caller-supplied `tracks.year`
+    /// is still an honest fallback for the diff.
+    func testFallsBackToTracksYearWhenOnDiskYearMissing() {
+        let candidate = makeCandidate(proposedYear: 1994, currentFileYear: nil)
+        let model = AutoTagRowModel(
+            candidate: candidate,
+            currentArtist: "Artist",
+            currentTitle: "Title",
+            currentAlbum: "Album",
+            currentYear: 1994
+        )
+
+        XCTAssertFalse(model.includeYear, "tracks.year fallback matches proposed — nothing to change")
+        XCTAssertEqual(model.currentYear, 1994)
     }
 }

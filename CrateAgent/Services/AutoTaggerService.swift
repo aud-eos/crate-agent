@@ -195,12 +195,12 @@ final class AutoTaggerService: ObservableObject {
             fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
-            releaseMBID: chosenRelease.id,
             isrc: recording.isrcs.first,
             proposedArtist: artistCredit?.name ?? "",
             proposedTitle: recording.title,
             proposedAlbum: chosenRelease.title,
-            proposedYear: recording.releaseGroup?.firstReleaseDate.flatMap(Self.year(fromMusicBrainzDate:))
+            proposedYear: recording.releaseGroup?.firstReleaseDate.flatMap(Self.year(fromMusicBrainzDate:)),
+            currentFileYear: tags.year.map(Int.init)
         )
 
         return Self.classify(candidate)

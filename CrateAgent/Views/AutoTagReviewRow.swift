@@ -14,6 +14,13 @@ struct AutoTagRowModel {
     let currentArtist: String
     let currentTitle: String
     let currentAlbum: String
+    /// The "current" year shown in the review diff and used to default
+    /// `includeYear`. Prefers `candidate.currentFileYear` — the file's
+    /// on-disk tag, read at scan time — over the caller-supplied
+    /// `tracks.year` fallback, since `tracks.year` is nil on a
+    /// greenfield first-pass match (no `tracks` row exists yet), which
+    /// used to make the diff show "— → 1994" even when the file already
+    /// had a correct year tag.
     let currentYear: Int?
 
     /// The tier `TitleMatcher.decide` resolved for this row's title pair,
@@ -37,7 +44,8 @@ struct AutoTagRowModel {
         self.currentArtist = currentArtist
         self.currentTitle = currentTitle
         self.currentAlbum = currentAlbum
-        self.currentYear = currentYear
+        let resolvedCurrentYear = candidate.currentFileYear ?? currentYear
+        self.currentYear = resolvedCurrentYear
 
         let decision = TitleMatcher.decide(current: currentTitle, proposed: candidate.proposedTitle)
         titleTier = decision.tier
@@ -46,8 +54,8 @@ struct AutoTagRowModel {
         includeArtist = candidate.proposedArtist != currentArtist
         includeAlbum = candidate.proposedAlbum != currentAlbum
         // A nil proposedYear means MusicBrainz had nothing to propose —
-        // never defaults to "included" even though nil != currentYear.
-        includeYear = candidate.proposedYear != nil && candidate.proposedYear != currentYear
+        // never defaults to "included" even though nil != resolvedCurrentYear.
+        includeYear = candidate.proposedYear != nil && candidate.proposedYear != resolvedCurrentYear
     }
 
     /// The title string `titleChoice` currently resolves to — shown live
@@ -74,8 +82,7 @@ struct AutoTagRowModel {
     /// title is always resolved from `titleChoice` (there is no separate
     /// title toggle — `.keep` already means "no change"), and the
     /// remaining display fields are only included when their toggle is
-    /// on. The release id comes from `candidate.chosenRelease`, not
-    /// `candidate.releaseMBID` (fixed at resolution time), so a
+    /// on. The release id comes from `candidate.chosenRelease`, so a
     /// "pick a different release" selection is reflected here.
     func payload() -> ApplyMusicBrainzMatchPayload {
         ApplyMusicBrainzMatchPayload(
