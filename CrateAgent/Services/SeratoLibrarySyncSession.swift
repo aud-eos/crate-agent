@@ -34,7 +34,8 @@ final class SeratoLibrarySyncSession: ObservableObject {
     private var requested = false
     private var filesystemFailure: String?
     private var filesystemRetryActive = false
-    private var successfulPass: UInt64 = 0
+    private var requestGeneration: UInt64 = 0
+    private var successfulGeneration: UInt64?
 
     init(reader: SeratoMembershipSnapshotReader, reconciler: SeratoMembershipReconciler,
          scanner: LibraryScanner, operationEngine: OperationEngine, watchdog: SeratoWatchdog,
@@ -53,6 +54,8 @@ final class SeratoLibrarySyncSession: ObservableObject {
     }
 
     func requestSync() {
+        requestGeneration += 1
+        successfulGeneration = nil
         if let filesystemFailure, !filesystemRetryActive {
             state = .failed(filesystemFailure)
             return
@@ -70,11 +73,13 @@ final class SeratoLibrarySyncSession: ObservableObject {
     }
 
     func synchronize() async throws {
-        let previousPass = successfulPass
         requestSync()
+        let requiredGeneration = requestGeneration
         await waitUntilIdle()
         try Task.checkCancellation()
-        guard successfulPass > previousPass else {
+        guard let successfulGeneration, successfulGeneration >= requiredGeneration,
+              successfulGeneration == requestGeneration
+        else {
             if case let .failed(message) = state {
                 throw LibrarySyncFailure(message: message)
             }
@@ -86,6 +91,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
     }
 
     func suspend() {
+        successfulGeneration = nil
         requested = false
         readiness.invalidate()
         task?.cancel()
@@ -93,6 +99,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
     }
 
     func reportFailure(_ message: String) {
+        successfulGeneration = nil
         requested = false
         readiness.invalidate()
         task?.cancel()
@@ -152,6 +159,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         do {
             while requested {
                 requested = false
+                let generation = requestGeneration
                 try Task.checkCancellation()
                 watchdog.refresh()
                 guard !watchdog.isSeratoRunning else { state = .waitingForSerato; return }
@@ -161,8 +169,11 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 try await refreshMetadata(snapshot)
                 try await reader.validate(snapshot)
                 try Task.checkCancellation()
+                if requested {
+                    continue
+                }
                 if filesystemRetryActive {
-                    successfulPass += 1
+                    successfulGeneration = generation
                     if let filesystemFailure {
                         state = .failed(filesystemFailure)
                     }
@@ -180,8 +191,13 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 }
                 try readiness.markReady(authorization)
                 fingerprintProgress = nil
-                await startProcessing()
                 let processingAuthorization = try readiness.capture()
+                await startProcessing()
+                if requested {
+                    await stopProcessing()
+                    continue
+                }
+                try processingAuthorization.check()
                 await worker?.start { [weak self] progress in
                     Task { @MainActor in
                         guard let self, (try? processingAuthorization.check()) != nil else { return }
@@ -192,11 +208,18 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     }
                 }
                 try Task.checkCancellation()
+                if requested {
+                    await stopProcessing()
+                    await worker?.stop()
+                    continue
+                }
+                try processingAuthorization.check()
                 initialSyncComplete = true
-                successfulPass += 1
+                successfulGeneration = generation
                 state = .ready(summary)
             }
         } catch {
+            successfulGeneration = nil
             readiness.invalidate()
             await stopProcessing()
             await worker?.stop()

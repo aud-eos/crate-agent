@@ -73,7 +73,10 @@ drains and schedules work, avoiding both a cyclic wait and a premature ready sta
 
 The session installs a closed readiness gate before service startup. It invalidates
 the gate's generation before stopping work or reading a new snapshot. Ordinary
-mutation transactions and fingerprint completions verify the captured generation;
+mutation transactions and fingerprint persistence verify the captured generation
+before and after their transaction work; invalidation during an update rolls back
+the transaction. Decoder failure persistence uses the same guard, and supersession
+remains a stopped result rather than a new row failure. Together these checks mean
 a close/reopen cannot authorize old work. Explicit import intent and verified local
 filesystem observations remain possible, while external writes queue. Only the
 session's scoped drain authorization can write before normal readiness opens.
@@ -87,6 +90,13 @@ worker database errors stop processing and publish a monitored failure. Readines
 supersession is cancellation, not a decoder or database failure. A successful retry
 starts a new worker generation. Initial completion becomes true only after the
 whole sequence succeeds.
+
+Synchronization acknowledgements belong to the latest requested generation, not
+an earlier successful pass in a coalesced task. Scheduling must finish with the
+same authorization and no newer request before publishing initial completion or
+ready. A later failed pass cannot acknowledge a required filesystem reconciliation
+or advance its checkpoint. Validation-only filesystem retry records its successful
+generation independently of the normal ready state.
 
 Completed Auto-Tag reviews survive successful synchronization when original file
 revision, identity, and freshness checks still pass. New explicit alternative

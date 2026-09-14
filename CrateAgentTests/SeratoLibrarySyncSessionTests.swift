@@ -6,6 +6,67 @@ import XCTest
 
 @MainActor
 final class SeratoLibrarySyncSessionTests: XCTestCase {
+    func testSupersededFinalSchedulingCannotAcknowledgeFailedFilesystemSync() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let worker = FingerprintWorker(database: fixture.database, readiness: gate)
+        let entered = expectation(description: "Worker actor held during final scheduling")
+        let release = DispatchSemaphore(value: 0)
+        var session: SeratoLibrarySyncSession!
+        defer { session = nil }
+        session = SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler,
+                                           scanner: LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator),
+                                           operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: gate,
+                                           startProcessing: {
+                                               Task { await worker.holdScheduling(entered: entered, release: release) }
+                                               await self.fulfillment(of: [entered], timeout: 5)
+                                               Task { @MainActor in
+                                                   do { try Data([1, 2]).write(to: fixture.locator.databaseV2Url) }
+                                                   catch { XCTFail("Could not corrupt fixture: \(error)") }
+                                                   session.requestSync()
+                                                   release.signal()
+                                               }
+                                           }, worker: worker)
+        let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        let handler = FilesystemSyncBatchHandler(coordinator: coordinator, session: session)
+        let checkpoints = SessionCheckpoints()
+        let processor = FilesystemEventProcessor(handler: { try await handler.handle($0) }, checkpoint: { await checkpoints.append($0) })
+        do {
+            try await processor.enqueue(.init(observations: [.init(path: fixture.directory.path, isDirectory: true, requiresReconciliation: true)], highestEventID: 91))
+            XCTFail("Failed coalesced source was acknowledged")
+        } catch {}
+        await session.waitUntilIdle()
+        guard case .failed = session.state else { return XCTFail("Expected final source failure") }
+        XCTAssertFalse(session.initialSyncComplete)
+        let retained = await coordinator.requiresReconciliation
+        XCTAssertTrue(retained)
+        let saved = await checkpoints.values
+        XCTAssertEqual(saved, [])
+        do { try await processor.enqueue(.init(observations: [], highestEventID: 92)); XCTFail("Failed head was discarded") } catch {}
+        await worker.stop()
+    }
+
+    func testWorkerInvalidationDuringFingerprintUpdateRollsBackTransaction() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("during-write.mp3")
+        try gate.markReady(gate.prepareDrain())
+        try await fixture.database.writer.write { database in
+            database.trace { event in
+                if event.description.contains("UPDATE files"), event.description.contains("chromaprint_fingerprint") {
+                    gate.invalidate()
+                }
+            }
+        }
+        let worker = FingerprintWorker(database: fixture.database, fingerprintFunction: { _ in [1, 2, 3] }, readiness: gate)
+        do { _ = try await worker.processAllPendingOnce(); XCTFail("Invalidated update committed") } catch is LibrarySyncReadinessError {}
+        let current = try await fixture.row(file)
+        XCTAssertEqual(current.fingerprintStatus, .pending)
+        XCTAssertNil(current.chromaprintFingerprint)
+    }
+
     func testExitRetiresBeforeQueuedAddAndRenameDrain() async throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)
@@ -330,6 +391,13 @@ actor SessionCheckpoints {
     private(set) var values: [UInt64] = []
     func append(_ value: UInt64) {
         values.append(value)
+    }
+}
+
+extension FingerprintWorker {
+    func holdScheduling(entered: XCTestExpectation, release: DispatchSemaphore) {
+        entered.fulfill()
+        release.wait()
     }
 }
 

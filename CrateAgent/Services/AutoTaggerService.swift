@@ -565,6 +565,9 @@ final class AutoTaggerService: ObservableObject {
             do {
                 try await persistFingerprintFailure(for: file, authorization: authorization)
             } catch {
+                if error is LibrarySyncReadinessError || error is CancellationError {
+                    throw error
+                }
                 throw AutoTaggerRowFailure(
                     "failed to compute fingerprint for file \(fileID): \(decodeError); could not persist failure: \(error)"
                 )
@@ -578,21 +581,22 @@ final class AutoTaggerService: ObservableObject {
 
     private func persistFingerprintFailure(for original: FileRecord, authorization: LibrarySyncReadiness.Authorization?) async throws {
         try await database.writer.write { db in
-            try authorization?.check()
-            guard let fileID = original.id,
-                  let current = try FileRecord.fetchOne(db, key: fileID),
-                  current.path == original.path,
-                  current.fileSize == original.fileSize,
-                  current.mtime == original.mtime,
-                  current.fingerprintStatus == original.fingerprintStatus,
-                  current.chromaprintFingerprint == original.chromaprintFingerprint,
-                  current.fingerprintedSize == original.fingerprintedSize,
-                  current.fingerprintedMtime == original.fingerprintedMtime
-            else { return }
-            // Compare and write in one transaction: a failure of stale .done
-            // bytes is real, but cannot erase a concurrent successful decode.
-            try FingerprintPersistence.write(fileID: fileID, fingerprint: nil, status: .failed,
-                                             expectedMembershipToken: FileMembershipToken(fileId: fileID, revision: original.membershipRevision), in: db)
+            try FingerprintPersistence.withAuthorization(authorization) {
+                guard let fileID = original.id,
+                      let current = try FileRecord.fetchOne(db, key: fileID),
+                      current.path == original.path,
+                      current.fileSize == original.fileSize,
+                      current.mtime == original.mtime,
+                      current.fingerprintStatus == original.fingerprintStatus,
+                      current.chromaprintFingerprint == original.chromaprintFingerprint,
+                      current.fingerprintedSize == original.fingerprintedSize,
+                      current.fingerprintedMtime == original.fingerprintedMtime
+                else { return }
+                // Compare and write in one transaction: a failure of stale .done
+                // bytes is real, but cannot erase a concurrent successful decode.
+                try FingerprintPersistence.write(fileID: fileID, fingerprint: nil, status: .failed,
+                                                 expectedMembershipToken: FileMembershipToken(fileId: fileID, revision: original.membershipRevision), in: db)
+            }
         }
     }
 
@@ -724,12 +728,13 @@ final class AutoTaggerService: ObservableObject {
         authorization: LibrarySyncReadiness.Authorization?
     ) async throws {
         try await database.writer.write { db in
-            try authorization?.check()
-            try FileProcessingEligibility.requireCurrent(expectedMembershipToken, in: db)
-            try FingerprintPersistence.write(
-                fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis,
-                requirePendingStatus: requirePendingStatus, expectedMembershipToken: expectedMembershipToken, in: db
-            )
+            try FingerprintPersistence.withAuthorization(authorization) {
+                try FileProcessingEligibility.requireCurrent(expectedMembershipToken, in: db)
+                try FingerprintPersistence.write(
+                    fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis,
+                    requirePendingStatus: requirePendingStatus, expectedMembershipToken: expectedMembershipToken, in: db
+                )
+            }
         }
     }
 }

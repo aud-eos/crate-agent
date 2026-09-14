@@ -263,40 +263,40 @@ public actor FingerprintWorker {
         guard totalFiles > 0 else { return }
 
         let counts = try await database.writer.write { database in
-            try Task.checkCancellation()
-            try authorization?.check()
-            var completed = 0
-            var failed = 0
-            for entry in plan.toCopyFromExistingTwin {
-                if try FingerprintPersistence.write(
-                    fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done,
-                    requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[entry.fileId]!, in: database
-                ) {
-                    completed += 1
-                }
-            }
-            for (assignment, result) in representativeResults {
-                let fingerprint: Data?
-                let status: FingerprintStatus
-                switch result.outcome {
-                case let .success(bytes): fingerprint = bytes; status = .done
-                case .failure: fingerprint = nil; status = .failed
-                case .notDecoded: continue
-                }
-                for fileID in [result.fileId] + assignment.siblingIds {
+            try FingerprintPersistence.withAuthorization(authorization) {
+                var completed = 0
+                var failed = 0
+                for entry in plan.toCopyFromExistingTwin {
                     if try FingerprintPersistence.write(
-                        fileID: fileID, fingerprint: fingerprint, status: status,
-                        requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[fileID]!, in: database
+                        fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done,
+                        requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[entry.fileId]!, in: database
                     ) {
-                        if status == .done {
-                            completed += 1
-                        } else {
-                            failed += 1
+                        completed += 1
+                    }
+                }
+                for (assignment, result) in representativeResults {
+                    let fingerprint: Data?
+                    let status: FingerprintStatus
+                    switch result.outcome {
+                    case let .success(bytes): fingerprint = bytes; status = .done
+                    case .failure: fingerprint = nil; status = .failed
+                    case .notDecoded: continue
+                    }
+                    for fileID in [result.fileId] + assignment.siblingIds {
+                        if try FingerprintPersistence.write(
+                            fileID: fileID, fingerprint: fingerprint, status: status,
+                            requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[fileID]!, in: database
+                        ) {
+                            if status == .done {
+                                completed += 1
+                            } else {
+                                failed += 1
+                            }
                         }
                     }
                 }
+                return (completed, failed)
             }
-            return (completed, failed)
         }
         let doneCount = counts.0
         let failedCount = counts.1

@@ -6,6 +6,19 @@ import GRDB
 /// and sibling-propagation writes) and `AutoTaggerService`'s on-demand
 /// ensure-fingerprint path. One `UPDATE` definition, not four.
 enum FingerprintPersistence {
+    /// Run inside the writer transaction so supersession rolls back every batch row.
+    static func withAuthorization<Result>(
+        _ authorization: LibrarySyncReadiness.Authorization?,
+        perform: () throws -> Result
+    ) throws -> Result {
+        try Task.checkCancellation()
+        try authorization?.check()
+        let result = try perform()
+        try Task.checkCancellation()
+        try authorization?.check()
+        return result
+    }
+
     /// - Parameter freshnessBasis: the file's on-disk size + mtime AT THE TIME
     ///   this fingerprint was computed, persisted into
     ///   `fingerprinted_size`/`fingerprinted_mtime` so a later scan can tell a
