@@ -220,3 +220,8 @@ Task 8 must complete pending/legacy/unavailable status projections in BrowserRow
 status badges in Library and Auto-Tag selection. Task 6 provides read-only Auto-Tag
 review reasons and original-token approval/application guards; it does not claim the
 final diagnostics UI or startup readiness integration is complete.
+
+The single-file Rename dialog uses the same physical rename primitive with its
+captured file revision and source path. It performs no pre-engine filesystem move
+or post-move FSEvents deduplication read. A committed rename with incomplete cleanup
+or external sync remains visible as an error; History retries external writes.
