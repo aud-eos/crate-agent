@@ -19,6 +19,54 @@ import XCTest
 ///   4. An N-row apply coalesces the `database V2` metadata updates into
 ///      exactly ONE read/rewrite pass (C2b), not N.
 final class OperationEnginePartialFailureTests: XCTestCase {
+    func testResyncRejectsMalformedReplayablePayloadsBeforeWriting() async throws {
+        for eventType in [EventType.fileRenamed, .musicBrainzMatchApplied, .musicBrainzMatchReverted,
+                          .metadataCommittedToSerato, .fileTagsWritten] {
+            for malformedPayload in ["{", "{}"] {
+                let tagWriter = ThrowingTagWriter()
+                let (engine, database, directory, fileIDs) = try await MainActor.run {
+                    try makeEngineWithLibrary(tagWriter: tagWriter)
+                }
+                defer { try? FileManager.default.removeItem(at: directory.deletingLastPathComponent()) }
+                let databasePath = directory.appendingPathComponent("database V2")
+                let originalBytes = try Data(contentsOf: databasePath)
+                let eventID = try await database.writer.write { db in
+                    var event = EventRecord(batchId: "broken", timestamp: 1, fileId: fileIDs[0],
+                                            eventType: eventType, payloadJson: malformedPayload, inversePayloadJson: "{}")
+                    try event.insert(db)
+                    return event.eventId!
+                }
+                await XCTAssertThrowsErrorAsync(try await engine.resyncSeratoForBatch("broken")) { error in
+                    XCTAssertTrue(error.localizedDescription.contains("broken"))
+                    XCTAssertTrue(error.localizedDescription.contains(String(eventID)))
+                    XCTAssertTrue(error.localizedDescription.contains(eventType.rawValue))
+                }
+                XCTAssertEqual(try Data(contentsOf: databasePath), originalBytes)
+                XCTAssertTrue(tagWriter.writtenPaths.isEmpty)
+            }
+        }
+    }
+
+    func testResyncRejectsMalformedOwnershipHistoryBeforeWriting() async throws {
+        let tagWriter = ThrowingTagWriter()
+        let (engine, database, directory, fileIDs) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        defer { try? FileManager.default.removeItem(at: directory.deletingLastPathComponent()) }
+        _ = try await engine.applyBatch(matchMutations(fileIds: [fileIDs[0]]), batchId: "valid")
+        let originalPaths = tagWriter.writtenPaths
+        try await database.writer.write { db in
+            var event = EventRecord(batchId: "broken-owner", timestamp: 2, fileId: fileIDs[0],
+                                    eventType: .metadataSet, payloadJson: "{", inversePayloadJson: "{}")
+            try event.insert(db)
+        }
+        await XCTAssertThrowsErrorAsync(try await engine.resyncSeratoForBatch("valid")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("broken-owner"))
+            XCTAssertTrue(error.localizedDescription.contains(EventType.metadataSet.rawValue))
+        }
+        XCTAssertEqual(tagWriter.writtenPaths, originalPaths)
+    }
+
     /// Records successful file-tag writes and can be told to throw on a
     /// chosen call number, simulating a read-only file / permissions
     /// error partway through the external-write phase.

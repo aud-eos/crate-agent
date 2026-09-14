@@ -172,9 +172,13 @@ case applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload)
 - Restore previous `files.track_id`, previous `files` metadata, and previous file
   ID3 tags from the captured snapshots (only the fields this mutation changed).
 - If the `tracks` row pre-existed, restore its previous identifier values. If
-  SP-2 **created** the row, the inverse nulls the identifiers it set and leaves
+  SP-2 **created** the row, the inverse nulls its identifiers and all initialized
+  display fields, including kept on-disk values used to seed the new row, and leaves
   the now-orphaned row in place (keyed by fingerprint, harmless, reused on
   re-match; deleting risks FK churn).
+  Reusing a completely empty, unreferenced fingerprint row seeds kept fields
+  from the new apply's captured tags, so redo restores them too. Occupied or
+  nonempty existing rows retain their kept canonical values.
 
 Undo therefore returns the file to its exact prior tag/Serato/DB state, for both
 the new-track-row and pre-existing-track-row cases.
@@ -184,6 +188,20 @@ the new-track-row and pre-existing-track-row cases.
 The review UI confirms N tracks → one `operationEngine.applyBatch([...],
 batchId:)` call, exactly like `LibraryHygiene.applyMergedMetadata`. A batch of
 confirms is a single Undo unit and a single Serato-running check.
+
+The selection search associates its published rows, match count, and errors with
+the query that produced them. Editing the query hides the previous results
+immediately, including from Select All Results, throughout debounce and the DB read.
+Existing checkbox selections persist across searches.
+Changing the normalized query invalidates the completed outcome, so revisiting
+an earlier query or returning through New Scan waits for fresh results.
+
+Re-sync decodes all replayable payloads and relevant field-ownership history before
+issuing external writes. An undecodable event fails recovery with its event ID,
+batch ID, event type, and decoding diagnostic; it is never reported as an empty
+successful replay.
+Undo and redo use the same throwing decoder for their forward-payload safety
+checks; a malformed payload cannot silently bypass protection of later edits.
 
 ## Lookup pipeline
 
@@ -223,6 +241,8 @@ is routed through the existing `FingerprintWorker` before lookup.
   the same tracks costs zero network. Backed by `URLCache` + a small keyed
   on-disk store.
 - Exponential backoff on `429`/`503`. The pass is cancellable mid-flight.
+  Both backoff and proactive rate-limit waits propagate cancellation, so cancelling
+  a scan while it waits for a request slot prevents that request from being sent.
 
 ### Default release selection
 

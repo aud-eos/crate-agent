@@ -11,7 +11,7 @@ public protocol RateLimiterClock: Sendable {
 
     /// Suspends the caller until this clock's `now` reaches `deadline`.
     /// Returns immediately if `now` has already reached it.
-    func sleep(until deadline: TimeInterval) async
+    func sleep(until deadline: TimeInterval) async throws
 }
 
 /// Production clock backed by `ContinuousClock`, which is monotonic and
@@ -26,10 +26,10 @@ public struct SystemClock: RateLimiterClock {
         (ContinuousClock.now - origin).timeInterval
     }
 
-    public func sleep(until deadline: TimeInterval) async {
+    public func sleep(until deadline: TimeInterval) async throws {
         let secondsRemaining = deadline - now
         guard secondsRemaining > 0 else { return }
-        try? await Task.sleep(for: .seconds(secondsRemaining))
+        try await Task.sleep(for: .seconds(secondsRemaining))
     }
 }
 
@@ -65,7 +65,8 @@ public actor RateLimiter {
 
     /// Suspends until it is this caller's turn, spaced `minInterval`
     /// seconds after the previous caller's reserved slot.
-    public func acquire() async {
+    public func acquire() async throws {
+        try Task.checkCancellation()
         // minInterval <= 0 means "unconstrained" — used by `.noop` so
         // client tests aren't coupled to real elapsed time at all.
         guard minInterval > 0 else { return }
@@ -81,7 +82,8 @@ public actor RateLimiter {
         nextAvailableTime = reservedTime + minInterval
 
         if clock.now < reservedTime {
-            await clock.sleep(until: reservedTime)
+            try await clock.sleep(until: reservedTime)
+            try Task.checkCancellation()
         }
     }
 }

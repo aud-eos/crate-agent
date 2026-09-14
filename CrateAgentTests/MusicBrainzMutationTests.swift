@@ -10,6 +10,124 @@ import XCTest
 /// library writes on the watchdog (invariant #3), and keys the canonical
 /// `tracks` row by Chromaprint fingerprint hash (invariant #4).
 final class MusicBrainzMutationTests: XCTestCase {
+    func testRedoRejectsMalformedRevertPayloadBeforeClobberingLaterEdit() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileID) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(.applyMusicBrainzMatch(fullPayload(
+            fileID: fileID, fingerprintHash: sha256(sampleFingerprintBytes)
+        )), batchId: "redo-source")
+        let undoBatch = try await engine.undoBatch("redo-source")
+        try await engine.apply(.setMetadata(SetMetadataPayload(
+            fileId: fileID, metadata: SeratoMetadata(artist: "User Edit")
+        )), batchId: "later-edit")
+        try await database.writer.write { db in
+            try db.execute(sql: "UPDATE events SET payload_json = ? WHERE batch_id = ?", arguments: ["{", undoBatch])
+        }
+        await XCTAssertThrowsErrorAsync(try await engine.undoBatch(undoBatch)) { error in
+            XCTAssertTrue(error.localizedDescription.contains(undoBatch))
+        }
+        try await database.writer.read { db in
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: fileID)?.artist, "User Edit")
+        }
+    }
+
+    func testRedoRestoresKeptFieldsAfterCreatedRowWasCleared() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileID) = try await MainActor.run {
+            try makeEngineWithFile(artist: "Disk Artist", title: "Disk Title", album: "Disk Album", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        try await engine.apply(.applyMusicBrainzMatch(fullPayload(
+            fileID: fileID, fingerprintHash: fingerprint,
+            artist: nil, title: nil, album: nil, year: nil,
+            currentFileYear: 1990, currentFileArtist: "Disk Artist",
+            currentFileTitle: "Disk Title", currentFileAlbum: "Disk Album"
+        )), batchId: "kept-redo")
+        let undoBatch = try await engine.undoBatch("kept-redo")
+        let redoBatch = try await engine.undoBatch(undoBatch)
+        try await database.writer.read { db in
+            let track = try XCTUnwrap(TrackRecord.filter(Column("fingerprint_hash") == fingerprint).fetchOne(db))
+            XCTAssertEqual(track.artist, "Disk Artist")
+            XCTAssertEqual(track.title, "Disk Title")
+            XCTAssertEqual(track.album, "Disk Album")
+            XCTAssertEqual(track.year, 1990)
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: fileID)?.trackId, track.id)
+        }
+        _ = try await engine.undoBatch(redoBatch)
+        try await database.writer.read { db in
+            let track = try XCTUnwrap(TrackRecord.filter(Column("fingerprint_hash") == fingerprint).fetchOne(db))
+            XCTAssertNil(track.artist)
+            XCTAssertNil(track.title)
+            XCTAssertNil(track.album)
+            XCTAssertNil(track.year)
+        }
+        XCTAssertTrue(recorder.calls.isEmpty)
+    }
+
+    func testUndoRejectsMalformedForwardPayloadBeforeClobberingLaterEdit() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileID) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(.applyMusicBrainzMatch(fullPayload(
+            fileID: fileID, fingerprintHash: sha256(sampleFingerprintBytes)
+        )), batchId: "corrupt-forward")
+        try await engine.apply(.setMetadata(SetMetadataPayload(
+            fileId: fileID, metadata: SeratoMetadata(artist: "User Edit")
+        )), batchId: "later-edit")
+        try await database.writer.write { db in
+            try db.execute(sql: "UPDATE events SET payload_json = ? WHERE batch_id = ?", arguments: ["{", "corrupt-forward"])
+        }
+        await XCTAssertThrowsErrorAsync(try await engine.undoBatch("corrupt-forward")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("corrupt-forward"))
+        }
+        try await database.writer.read { db in
+            XCTAssertEqual(try FileRecord.fetchOne(db, key: fileID)?.artist, "User Edit")
+        }
+    }
+
+    func testUndoClearsKeptFieldsSeededOnCreatedRow() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileID) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+        try await engine.apply(.applyMusicBrainzMatch(fullPayload(
+            fileID: fileID, fingerprintHash: fingerprint,
+            artist: nil, title: nil, album: nil, year: nil,
+            currentFileYear: 1990, currentFileArtist: "Disk Artist",
+            currentFileTitle: "Disk Title", currentFileAlbum: "Disk Album"
+        )), batchId: "seed-kept")
+        _ = try await engine.undoBatch("seed-kept")
+        try await database.writer.read { db in
+            let track = try XCTUnwrap(TrackRecord.filter(Column("fingerprint_hash") == fingerprint).fetchOne(db))
+            XCTAssertNil(track.artist)
+            XCTAssertNil(track.title)
+            XCTAssertNil(track.album)
+            XCTAssertNil(track.year)
+            XCTAssertNil(track.musicbrainzRecordingId)
+            let file = try XCTUnwrap(FileRecord.fetchOne(db, key: fileID))
+            XCTAssertNil(file.trackId)
+            XCTAssertEqual(file.artist, "old")
+        }
+        try await engine.apply(.applyMusicBrainzMatch(fullPayload(
+            fileID: fileID, fingerprintHash: fingerprint,
+            artist: nil, title: nil, album: nil, year: nil,
+            currentFileYear: 2001, currentFileArtist: "Replacement Artist",
+            currentFileTitle: "Replacement Title", currentFileAlbum: "Replacement Album"
+        )), batchId: "identity-only-after-undo")
+        try await database.writer.read { db in
+            let track = try XCTUnwrap(TrackRecord.filter(Column("fingerprint_hash") == fingerprint).fetchOne(db))
+            XCTAssertEqual(track.artist, "Replacement Artist")
+            XCTAssertEqual(track.title, "Replacement Title")
+            XCTAssertEqual(track.album, "Replacement Album")
+            XCTAssertEqual(track.year, 2001)
+        }
+        XCTAssertTrue(recorder.calls.isEmpty)
+    }
+
     /// Captures `fileTagWriter` invocations so tests can assert exactly
     /// what would be written to (or restored on) disk, including the
     /// year field that only reaches the file-tag path.

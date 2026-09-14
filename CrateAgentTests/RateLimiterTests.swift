@@ -24,7 +24,7 @@ final class TestClock: RateLimiterClock, @unchecked Sendable {
         lock.withLock { currentTime }
     }
 
-    func sleep(until deadline: TimeInterval) async {
+    func sleep(until deadline: TimeInterval) async throws {
         // NSLock's lock()/unlock() are flagged when called directly from an
         // async context (Swift 6 concurrency mode) — `withLock` is the
         // suggested async-safe scoped-locking replacement, and also reads
@@ -70,15 +70,15 @@ final class TestClock: RateLimiterClock, @unchecked Sendable {
 }
 
 final class RateLimiterTests: XCTestCase {
-    func testEnforcesMinimumSpacing() async {
+    func testEnforcesMinimumSpacing() async throws {
         let clock = TestClock()
         let limiter = RateLimiter(minInterval: 1.0, clock: clock)
 
-        await limiter.acquire() // immediate — nothing to wait behind.
+        try await limiter.acquire() // immediate — nothing to wait behind.
 
         let secondAcquireCompleted = ManagedAtomicBool()
         async let second: Void = {
-            await limiter.acquire()
+            try await limiter.acquire()
             secondAcquireCompleted.set(true)
         }()
 
@@ -87,19 +87,19 @@ final class RateLimiterTests: XCTestCase {
         XCTAssertFalse(secondAcquireCompleted.get(), "should still be waiting before minInterval elapses")
 
         clock.advance(by: 0.2)
-        await second
+        try await second
 
         XCTAssertTrue(secondAcquireCompleted.get())
         XCTAssertGreaterThanOrEqual(clock.now, 1.0)
     }
 
-    func testUnrelatedCallsWithoutContentionProceedImmediately() async {
+    func testUnrelatedCallsWithoutContentionProceedImmediately() async throws {
         let clock = TestClock()
         let limiter = RateLimiter(minInterval: 1.0, clock: clock)
 
-        await limiter.acquire()
+        try await limiter.acquire()
         clock.advance(by: 1.0)
-        await limiter.acquire() // spacing already satisfied — no wait needed.
+        try await limiter.acquire() // spacing already satisfied — no wait needed.
 
         XCTAssertEqual(clock.now, 1.0)
     }
@@ -114,19 +114,19 @@ final class RateLimiterTests: XCTestCase {
     /// must reserve its own deadline before it suspends, so three
     /// concurrent callers behind one busy slot come out staggered by
     /// `minInterval`, not clumped.
-    func testStaggersThreeConcurrentCallersByMinInterval() async {
+    func testStaggersThreeConcurrentCallersByMinInterval() async throws {
         let clock = TestClock()
         let limiter = RateLimiter(minInterval: 1.0, clock: clock)
 
-        await limiter.acquire() // A: immediate, reserves the next slot at t=1.0.
+        try await limiter.acquire() // A: immediate, reserves the next slot at t=1.0.
 
         let completionTimes = RecordedTimes()
         async let second: Void = {
-            await limiter.acquire()
+            try await limiter.acquire()
             completionTimes.record(clock.now)
         }()
         async let third: Void = {
-            await limiter.acquire()
+            try await limiter.acquire()
             completionTimes.record(clock.now)
         }()
 
@@ -144,8 +144,8 @@ final class RateLimiterTests: XCTestCase {
         clock.advance(by: 1.0) // t=2.0 — the other caller wakes.
         await completionTimes.waitUntilCount(atLeast: 2)
 
-        _ = await second
-        _ = await third
+        _ = try await second
+        _ = try await third
 
         XCTAssertEqual(
             completionTimes.all().sorted(),
@@ -154,12 +154,12 @@ final class RateLimiterTests: XCTestCase {
         )
     }
 
-    func testNoopLimiterNeverDelays() async {
+    func testNoopLimiterNeverDelays() async throws {
         // `.noop` uses a real SystemClock but minInterval 0, so this must
         // return without the test needing to wait on real time at all.
-        await RateLimiter.noop.acquire()
-        await RateLimiter.noop.acquire()
-        await RateLimiter.noop.acquire()
+        try await RateLimiter.noop.acquire()
+        try await RateLimiter.noop.acquire()
+        try await RateLimiter.noop.acquire()
     }
 }
 

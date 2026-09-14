@@ -349,7 +349,7 @@ public actor OperationEngine {
         var replayedEventCount = 0
         let decoder = JSONDecoder()
         for event in events {
-            let reconstructed = Self.resyncWrites(
+            let reconstructed = try Self.resyncWrites(
                 for: event, pathByFileId: pathByFileId, decoder: decoder
             )
             guard let fileId = event.fileId, let eventId = event.eventId else {
@@ -500,27 +500,25 @@ public actor OperationEngine {
             // co-imported fields the user never touched — and with it their
             // re-sync restore path (independent-review concern on #4001251164).
             if event.eventType == .metadataSet {
-                if let data = event.payloadJson.data(using: .utf8),
-                   let payload = try? decoder.decode(SetMetadataPayload.self, from: data) {
-                    let newFields = Self.metadataFieldMap(payload.metadata)
-                    let previousFields = Self.metadataFieldMap(payload.previousMetadata)
-                    // Union of both key sets so a CLEAR (a field going from a
-                    // value to absent) also claims ownership — otherwise a user
-                    // clearing a field in Serato would leave the older match the
-                    // latest V2 writer and re-sync would restore the value they
-                    // cleared (finding #4001407067). `metadataFieldMap` drops
-                    // nils, so a cleared field is absent from `newFields`;
-                    // comparing the optional values over the union catches the
-                    // value→nil transition too.
-                    for key in Set(newFields.keys).union(previousFields.keys)
-                    where newFields[key] != previousFields[key] {
-                        v2[fileId, default: [:]][key] = eventId
-                    }
+                let payload = try Self.decodeEventPayload(SetMetadataPayload.self, event: event, decoder: decoder)
+                let newFields = Self.metadataFieldMap(payload.metadata)
+                let previousFields = Self.metadataFieldMap(payload.previousMetadata)
+                // Union of both key sets so a CLEAR (a field going from a
+                // value to absent) also claims ownership — otherwise a user
+                // clearing a field in Serato would leave the older match the
+                // latest V2 writer and re-sync would restore the value they
+                // cleared (finding #4001407067). `metadataFieldMap` drops
+                // nils, so a cleared field is absent from `newFields`;
+                // comparing the optional values over the union catches the
+                // value→nil transition too.
+                for key in Set(newFields.keys).union(previousFields.keys)
+                where newFields[key] != previousFields[key] {
+                    v2[fileId, default: [:]][key] = eventId
                 }
                 continue
             }
             // ASC order → the last event to write a field wins for that field.
-            for write in Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder) {
+            for write in try Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder) {
                 switch write {
                 case .metadataUpdate(let update):
                     for key in Self.metadataFieldMap(update.metadata).keys { v2[fileId, default: [:]][key] = eventId }
@@ -553,6 +551,19 @@ public actor OperationEngine {
         }
     }
 
+    private static func decodeEventPayload<Payload: Decodable>(
+        _ type: Payload.Type, event: EventRecord, decoder: JSONDecoder
+    ) throws -> Payload {
+        do {
+            return try decoder.decode(type, from: Data(event.payloadJson.utf8))
+        } catch {
+            throw OperationEngineError.eventPayloadDecodingFailed(
+                eventId: event.eventId, batchId: event.batchId,
+                eventType: event.eventType, underlying: String(describing: error)
+            )
+        }
+    }
+
     /// Reconstruct one event's Serato writes from its forward payload.
     /// The single "event → pending Serato writes" mapping every replay
     /// flows through — `resyncSeratoForBatch` then routes the result
@@ -561,22 +572,17 @@ public actor OperationEngine {
     /// event types that project onto Serato/audio-tag writes: `fileRenamed`,
     /// `musicBrainzMatchApplied`, `metadataCommittedToSerato`, `fileTagsWritten`,
     /// and `musicBrainzMatchReverted` (which re-emits an undo's restore writes).
-    /// Empty for event types with no replayable Serato projection (or when the
-    /// source data needed to rebuild the write is missing). Kept in sync with
+    /// Malformed payloads throw before any writes run. Empty for event types
+    /// with no replayable Serato projection. Kept in sync with
     /// `EventType.hasReplayableSeratoProjection`.
     private static func resyncWrites(
         for event: EventRecord,
         pathByFileId: [Int64: String],
         decoder: JSONDecoder
-    ) -> [SeratoPendingWrite] {
-        guard let forwardJsonData = event.payloadJson.data(using: .utf8) else {
-            return []
-        }
+    ) throws -> [SeratoPendingWrite] {
         switch event.eventType {
         case .fileRenamed:
-            guard let payload = try? decoder.decode(
-                RenameFilePayload.self, from: forwardJsonData
-            ) else { return [] }
+            let payload = try decodeEventPayload(RenameFilePayload.self, event: event, decoder: decoder)
             // Missing `previousPath` (older events before this field was
             // always populated) leaves no source path to rewrite from.
             guard !payload.previousPath.isEmpty else { return [] }
@@ -594,9 +600,7 @@ public actor OperationEngine {
                 newAbsolutePath: currentPath
             ))]
         case .musicBrainzMatchApplied:
-            guard let payload = try? decoder.decode(
-                ApplyMusicBrainzMatchPayload.self, from: forwardJsonData
-            ) else { return [] }
+            let payload = try decodeEventPayload(ApplyMusicBrainzMatchPayload.self, event: event, decoder: decoder)
             guard let fileId = event.fileId,
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzSeratoWrites(
@@ -609,9 +613,7 @@ public actor OperationEngine {
         case .metadataCommittedToSerato:
             // Hygiene / importer path: re-emit the database-V2 metadata
             // update the forward `commitMetadataToSerato` produced.
-            guard let payload = try? decoder.decode(
-                CommitMetadataToSeratoPayload.self, from: forwardJsonData
-            ) else { return [] }
+            let payload = try decodeEventPayload(CommitMetadataToSeratoPayload.self, event: event, decoder: decoder)
             guard let fileId = event.fileId,
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return [.metadataUpdate(SeratoPendingMetadataUpdate(
@@ -623,9 +625,7 @@ public actor OperationEngine {
             // audio-tag frames Serato itself doesn't store; the forward
             // mutation carried none here (its pending write left year nil),
             // so the replay mirrors that.
-            guard let payload = try? decoder.decode(
-                WriteFileTagsPayload.self, from: forwardJsonData
-            ) else { return [] }
+            let payload = try decodeEventPayload(WriteFileTagsPayload.self, event: event, decoder: decoder)
             guard let fileId = event.fileId,
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return [.fileTagWrite(SeratoPendingFileTagWrite(
@@ -636,9 +636,7 @@ public actor OperationEngine {
             // that failed mid-`undoBatch` has a recovery path (#3999974011).
             // The event's forward payload IS the RevertMusicBrainzMatchPayload;
             // its `.applied` carries the captured pre-match tags to restore.
-            guard let payload = try? decoder.decode(
-                RevertMusicBrainzMatchPayload.self, from: forwardJsonData
-            ) else { return [] }
+            let payload = try decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder)
             guard let fileId = event.fileId,
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
@@ -776,9 +774,8 @@ public actor OperationEngine {
                 // Value comparison against the current row: a field the match
                 // applied that no longer holds the applied value has been
                 // changed since, so undoing would clobber that change.
-                if let data = event.payloadJson.data(using: .utf8),
-                   let applied = try? decoder.decode(ApplyMusicBrainzMatchPayload.self, from: data),
-                   let file = currentFiles[fileId] {
+                let applied = try Self.decodeEventPayload(ApplyMusicBrainzMatchPayload.self, event: event, decoder: decoder)
+                if let file = currentFiles[fileId] {
                     let clobbersLaterEdit =
                         (applied.artist != nil && file.artist != applied.artist)
                         || (applied.title != nil && file.title != applied.title)
@@ -798,9 +795,8 @@ public actor OperationEngine {
                 // later edit changed it after the revert, redoing would write
                 // the match value back over that edit — the same clobber the
                 // apply branch guards, in the opposite direction.
-                if let data = event.payloadJson.data(using: .utf8),
-                   let revert = try? decoder.decode(RevertMusicBrainzMatchPayload.self, from: data),
-                   let restored = revert.applied.previousMetadata,
+                let revert = try Self.decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder)
+                if let restored = revert.applied.previousMetadata,
                    let file = currentFiles[fileId] {
                     let applied = revert.applied
                     let clobbersLaterEdit =
@@ -1990,6 +1986,15 @@ public actor OperationEngine {
         return writes
     }
 
+    private static func applyMusicBrainzDisplayFields(
+        _ payload: ApplyMusicBrainzMatchPayload, to track: inout TrackRecord, seedKeptFields: Bool
+    ) {
+        if let artist = payload.artist ?? (seedKeptFields ? payload.currentFileArtist : nil) { track.artist = artist }
+        if let title = payload.title ?? (seedKeptFields ? payload.currentFileTitle : nil) { track.title = title }
+        if let album = payload.album ?? (seedKeptFields ? payload.currentFileAlbum : nil) { track.album = album }
+        if let year = payload.year ?? (seedKeptFields ? payload.currentFileYear : nil) { track.year = year }
+    }
+
     private static func applyMusicBrainzMatch(
         _ payload: ApplyMusicBrainzMatchPayload,
         batchId: String,
@@ -2066,19 +2071,20 @@ public actor OperationEngine {
                 year: existingTrack.year
             )
             createdTrackRow = false
+            guard let existingId = existingTrack.id else {
+                throw OperationEngineError.insertDidNotReturnRowId
+            }
+            // Undo retains an empty fingerprint row for FK stability. Reusing
+            // that unreferenced row must seed kept fields just like creation.
+            let isEmptyOrphan = try existingTrack == TrackRecord(id: existingId, fingerprintHash: payload.fingerprintHash)
+                && FileRecord.filter(Column("track_id") == existingId).fetchCount(db) == 0
             existingTrack.acoustidId = payload.acoustID
             existingTrack.musicbrainzRecordingId = payload.recordingMBID
             existingTrack.musicbrainzReleaseId = payload.releaseMBID
             existingTrack.musicbrainzArtistId = payload.artistMBID
             existingTrack.isrc = payload.isrc
-            if let artist = payload.artist { existingTrack.artist = artist }
-            if let title = payload.title { existingTrack.title = title }
-            if let album = payload.album { existingTrack.album = album }
-            if let year = payload.year { existingTrack.year = year }
+            applyMusicBrainzDisplayFields(payload, to: &existingTrack, seedKeptFields: isEmptyOrphan)
             try existingTrack.update(db)
-            guard let existingId = existingTrack.id else {
-                throw OperationEngineError.insertDidNotReturnRowId
-            }
             trackID = existingId
         } else {
             previousTrackIdentifiers = nil
@@ -2089,19 +2095,16 @@ public actor OperationEngine {
             // would create a recording with identifiers but a NULL
             // title/artist/album/year even though the kept value is known in the
             // payload's currentFile* snapshot (finding #4001501073). For an
-            // EXISTING row (the branch above) nil still means leave-unchanged.
+            // occupied or nonempty existing row, nil still means leave-unchanged.
             var newTrack = TrackRecord(
                 fingerprintHash: payload.fingerprintHash,
                 acoustidId: payload.acoustID,
                 musicbrainzRecordingId: payload.recordingMBID,
                 musicbrainzReleaseId: payload.releaseMBID,
                 musicbrainzArtistId: payload.artistMBID,
-                isrc: payload.isrc,
-                artist: payload.artist ?? payload.currentFileArtist,
-                title: payload.title ?? payload.currentFileTitle,
-                album: payload.album ?? payload.currentFileAlbum,
-                year: payload.year ?? payload.currentFileYear
+                isrc: payload.isrc
             )
+            applyMusicBrainzDisplayFields(payload, to: &newTrack, seedKeptFields: true)
             try newTrack.insert(db)
             guard let newId = newTrack.id else {
                 throw OperationEngineError.insertDidNotReturnRowId
@@ -2271,10 +2274,10 @@ public actor OperationEngine {
                     track.musicbrainzReleaseId = nil
                     track.musicbrainzArtistId = nil
                     track.isrc = nil
-                    if applied.artist != nil { track.artist = nil }
-                    if applied.title != nil { track.title = nil }
-                    if applied.album != nil { track.album = nil }
-                    if applied.year != nil { track.year = nil }
+                    track.artist = nil
+                    track.title = nil
+                    track.album = nil
+                    track.year = nil
                     try track.update(db)
                 }
             } else if let previous = applied.previousTrackIdentifiers {
@@ -2991,6 +2994,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case fileNotFound(fileId: Int64)
     case insertDidNotReturnRowId
     case payloadEncodingFailed
+    case eventPayloadDecodingFailed(eventId: Int64?, batchId: String, eventType: EventType, underlying: String)
     case seratoEnumerationFailed(directory: String, underlying: String)
     case seratoRewriteFailed(path: String, underlying: String)
     case fileTagWriteFailed(path: String, underlying: String)
@@ -3027,6 +3031,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             return "Mutation referenced file id \(fileId), which is not in the database."
         case .insertDidNotReturnRowId:
             return "Database insert did not produce a row id — schema or driver invariant broken."
+        case let .eventPayloadDecodingFailed(eventId, batchId, eventType, underlying):
+            return "Cannot decode event \(eventId.map(String.init) ?? "unknown") (\(eventType.rawValue)) in batch \(batchId): \(underlying)"
         case .payloadEncodingFailed:
             return "Could not encode mutation payload as UTF-8 JSON."
         case .seratoEnumerationFailed(let directory, let underlying):

@@ -37,11 +37,12 @@ struct AutoTaggerView: View {
     @State private var libraryFileCount: Int = 0
 
     /// The selection-stage search box and its debounced, capped results.
-    @State private var searchQuery: String = ""
-    @State private var searchResults: [BrowserRow] = []
-    @State private var searchTotalMatchCount: Int = 0
-    @State private var isSearching: Bool = false
-    @State private var searchError: String?
+    @State private var searchState = AutoTagSearchState()
+
+    private var searchResults: [BrowserRow] { searchState.results.matches }
+    private var searchTotalMatchCount: Int { searchState.results.totalMatchCount }
+    private var searchError: String? { searchState.error }
+    private var isSearching: Bool { searchState.isSearching }
 
     /// The user's checkbox picks across every search the user has run
     /// this session. Starts empty on every launch of this view — never
@@ -110,12 +111,9 @@ struct AutoTaggerView: View {
         // query. Without this, every character typed would fire a
         // fresh bounded DB read — cheap individually, but wasteful at
         // typing speed. Mirrors LibraryBrowserView's search debounce.
-        .task(id: searchQuery) {
-            let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        .task(id: searchState.query) {
+            let trimmedQuery = searchState.query.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedQuery.isEmpty else {
-                searchResults = []
-                searchTotalMatchCount = 0
-                searchError = nil
                 return
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
@@ -178,7 +176,7 @@ struct AutoTaggerView: View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
-            TextField("Search by artist or title…", text: $searchQuery)
+            TextField("Search by artist or title…", text: $searchState.query)
                 .textFieldStyle(.plain)
         }
         .padding(.horizontal, 16)
@@ -187,7 +185,7 @@ struct AutoTaggerView: View {
 
     @ViewBuilder
     private var selectionResultsSection: some View {
-        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedQuery = searchState.query.trimmingCharacters(in: .whitespacesAndNewlines)
         if let searchError {
             placeholder(icon: "exclamationmark.triangle", color: .orange, headline: "Search failed", detail: searchError)
         } else if trimmedQuery.isEmpty {
@@ -492,21 +490,17 @@ struct AutoTaggerView: View {
     /// `AutoTagFileSearch.resultCap` — this never loads the whole
     /// library, on the main thread or otherwise.
     ///
-    /// `.task(id: searchQuery)` cancels the previous task when the query
+    /// `.task(id: searchState.query)` cancels the previous task when the query
     /// changes, but cancellation is cooperative: a slower, older query's
     /// `database.writer.read` can still complete after a newer query's
     /// read already published its results. Guarding only on
     /// `Task.isCancelled` right after the `await` is not enough — by the
     /// time an old task resumes post-await it may already have raced past
     /// its own cancellation check. So the guard also compares the query
-    /// this call ran for against the current `searchQuery`: if a newer
+    /// this call ran for against the current `searchState.query`: if a newer
     /// query has since taken over, this call's result is stale and must
     /// be dropped rather than published, however it got here.
     private func performSearch(query: String) async {
-        isSearching = true
-        defer { isSearching = false }
-        searchError = nil
-
         let outcome: Result<AutoTagFileSearch.Results, Error>
         do {
             let results = try await services.database.writer.read { db in
@@ -519,17 +513,11 @@ struct AutoTaggerView: View {
 
         guard Self.shouldPublishSearchResult(
             queryTaskRanFor: query,
-            currentQuery: searchQuery,
+            currentQuery: searchState.query,
             isCancelled: Task.isCancelled
         ) else { return }
 
-        switch outcome {
-        case let .success(results):
-            searchResults = results.matches
-            searchTotalMatchCount = results.totalMatchCount
-        case let .failure(error):
-            searchError = "\(error.localizedDescription)"
-        }
+        searchState.publish(outcome, for: query)
     }
 
     /// Pure "should this completed search's results still be published"
@@ -640,7 +628,7 @@ struct AutoTaggerView: View {
         confirmedFileIDs.removeAll()
         appliedFileIDs.removeAll()
         rowModels.removeAll()
-        searchQuery = ""
+        searchState.query = ""
         actionError = nil
         lastResult = nil
         pendingResyncBatchId = nil

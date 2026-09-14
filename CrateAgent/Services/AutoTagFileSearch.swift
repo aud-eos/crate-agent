@@ -1,5 +1,47 @@
 import GRDB
 
+struct AutoTagSearchState {
+    var query = "" {
+        didSet {
+            guard query.trimmingCharacters(in: .whitespacesAndNewlines)
+                != oldValue.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            completedQuery = nil
+            storedResults = .empty
+            storedError = nil
+        }
+    }
+    private var completedQuery: String?
+    private var storedResults = AutoTagFileSearch.Results.empty
+    private var storedError: String?
+
+    private var hasCurrentOutcome: Bool {
+        completedQuery == query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var results: AutoTagFileSearch.Results {
+        hasCurrentOutcome ? storedResults : .empty
+    }
+
+    var error: String? { hasCurrentOutcome ? storedError : nil }
+
+    var isSearching: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasCurrentOutcome
+    }
+
+    mutating func publish(_ outcome: Result<AutoTagFileSearch.Results, Error>, for completedQuery: String) {
+        guard completedQuery == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        self.completedQuery = completedQuery
+        switch outcome {
+        case .success(let results):
+            storedResults = results
+            storedError = nil
+        case .failure(let error):
+            storedResults = .empty
+            storedError = error.localizedDescription
+        }
+    }
+}
+
 /// Bounded file search behind the Auto-Tag panel's selection stage.
 ///
 /// Matches artist/title/path (not album — `LibraryBrowserView`'s

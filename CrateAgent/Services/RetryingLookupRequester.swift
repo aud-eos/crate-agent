@@ -52,7 +52,7 @@ public struct RetryingLookupRequester: Sendable {
             // service concurrently with its replacement (finding #4001501076).
             try Task.checkCancellation()
             attempt += 1
-            await limiter.acquire()
+            try await limiter.acquire()
 
             let (data, response) = try await load(request)
             guard let httpResponse = response as? HTTPURLResponse else {

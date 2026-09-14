@@ -2,6 +2,22 @@
 import XCTest
 
 final class AcoustIDClientTests: XCTestCase {
+    func testCancellationDuringRateLimitWaitDoesNotSendRequest() async throws {
+        let waiting = expectation(description: "entered production clock wait")
+        let limiter = RateLimiter(minInterval: 60, clock: ObservedSystemClock(waiting: waiting))
+        try await limiter.acquire()
+        let loader = StubLoader(status: 200, body: Data())
+        let requester = RetryingLookupRequester(loader: loader, limiter: limiter)
+        let request = URLRequest(url: URL(string: "https://example.invalid/lookup")!)
+        let task = Task { try await requester.perform(request) }
+        await fulfillment(of: [waiting], timeout: 2)
+        task.cancel()
+        await XCTAssertThrowsErrorAsync(try await task.value) { error in
+            XCTAssertTrue(error is CancellationError, "got \(error)")
+        }
+        XCTAssertEqual(loader.callCount, 0)
+    }
+
     private func fixture(_ name: String) -> Data {
         let bundle = Bundle(for: Self.self)
         guard let url = bundle.url(forResource: name, withExtension: nil) else {
@@ -410,6 +426,18 @@ final class AcoustIDClientTests: XCTestCase {
             bodyString.contains("format=json"),
             "expected the form-encoded body to pin format=json, got: \(bodyString)"
         )
+    }
+}
+
+private struct ObservedSystemClock: RateLimiterClock {
+    let waiting: XCTestExpectation
+    private let system = SystemClock()
+
+    var now: TimeInterval { system.now }
+
+    func sleep(until deadline: TimeInterval) async throws {
+        waiting.fulfill()
+        try await system.sleep(until: deadline)
     }
 }
 
