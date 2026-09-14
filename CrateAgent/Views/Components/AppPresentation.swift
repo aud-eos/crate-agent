@@ -28,7 +28,10 @@ struct LibrarySyncStatusView: View {
         case .waitingForSerato: "Waiting for Serato to close before checking its saved library."
         case .reconciling: "Checking saved Serato membership and synchronizing changes…"
         case let .failed(message): message
-        case let .ready(summary): "Library synced · \(summary.retired) removed from Serato · \(summary.reactivated) activated · \(summary.unavailable) unavailable"
+        case let .ready(summary):
+            "Library synced · \(summary.retired) removed from Serato · \(summary.reactivated) activated · \(summary.unavailable) unavailable"
+                + (summary.supersededWrites > 0 ? " · \(summary.supersededWrites) queued changes superseded" : "")
+                + (summary.duplicateCleanupMessage.map { " · " + $0 } ?? "")
         }
     }
 

@@ -19,4 +19,5 @@ public struct SetFileLibraryStatePayload: Codable, Sendable {
     public let fileId: Int64
     public let expectedRevision: Int64
     public let state: FileLibraryState
+    public var observedReadditionAfterOwnedRemoval: Bool? = nil
 }

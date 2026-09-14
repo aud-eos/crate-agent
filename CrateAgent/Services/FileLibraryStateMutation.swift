@@ -28,11 +28,12 @@ enum FileLibraryStateMutation {
             throw FileLibraryStateMutationError.staleRevision(fileId: payload.fileId, expected: payload.expectedRevision, actual: file.membershipRevision)
         }
         let previousState = file.libraryState
-        guard startsImportIntent || previousState != payload.state else { return nil }
+        let readded = payload.observedReadditionAfterOwnedRemoval == true
+        guard startsImportIntent || readded || previousState != payload.state else { return nil }
 
-        if startsImportIntent || file.libraryMembership != payload.state.membership {
+        if startsImportIntent || readded || file.libraryMembership != payload.state.membership {
             file.membershipRevision += 1
-            if payload.state.membership == .retired {
+            if readded || payload.state.membership == .retired {
                 // Legacy History stays invalid after retirement or content replacement.
                 file.lastProjectionInvalidationRevision = file.membershipRevision
             }

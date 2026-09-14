@@ -52,9 +52,9 @@ final class SeratoRemovalFixture {
         try SeratoTestEncoding.library(paths: paths).write(to: locator.databaseV2Url)
     }
 
-    func add(_ name: String, membership: LibraryMembership = .active) async throws -> FileRecord {
+    func add(_ name: String, membership: LibraryMembership = .active, bytes: Data = Data([1, 2, 3, 4])) async throws -> FileRecord {
         let path = directory.appendingPathComponent(name).path
-        try Data([1, 2, 3, 4]).write(to: URL(fileURLWithPath: path))
+        try bytes.write(to: URL(fileURLWithPath: path))
         let metadata = FileMetadataCollector.collect(at: path, includeLightweightHash: true)!
         let owner = try await reader.read().libraryID
         return try await database.writer.write { connection in

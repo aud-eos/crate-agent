@@ -10,6 +10,11 @@ import XCTest
 /// library writes on the watchdog (invariant #3), and keys the canonical
 /// `tracks` row by Chromaprint fingerprint hash (invariant #4).
 final class MusicBrainzMutationTests: XCTestCase {
+    private let audioFixture = OwnedProcessingAudioFixture()
+
+    override func tearDownWithError() throws {
+        try audioFixture.remove()
+    }
     @MainActor private var runningState: ProcessingTestSeratoState?
     func testRedoRejectsMalformedRevertPayloadBeforeClobberingLaterEdit() async throws {
         let recorder = FileTagWriterRecorder()
@@ -194,7 +199,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         let fileId = try database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: path,
+                path: self.audioFixture.path(path),
                 volumeUuid: "v1",
                 inode: inode,
                 fileSize: 1,
@@ -205,6 +210,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }

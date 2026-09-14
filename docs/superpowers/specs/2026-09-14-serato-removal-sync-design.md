@@ -257,6 +257,8 @@ the original inode and volume as authority. Cross-volume copies use an exclusive
 created destination descriptor and native `COPYFILE_ALL` to preserve file metadata,
 ACLs, extended attributes, and resource forks. The destination path must still name
 that descriptor's inode and match the unchanged source before rollback authority is
-recorded. Compensation and post-commit cleanup compare all collected metadata,
-including modification time. Unknown or changed destinations remain in place with
+recorded. Compensation and post-commit cleanup retain and compare precise change
+identity (including subsecond mtime/ctime) and a bounded-memory streaming digest of
+all audio bytes; whole-second metadata and sampled hashes alone cannot authorize
+deletion. Unknown or changed destinations remain in place with
 an actionable error; observing a replacement never grants permission to remove it.

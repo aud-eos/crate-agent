@@ -243,7 +243,7 @@ public final class AppServices: ObservableObject {
             do {
                 try await filesystemProcessor.retry()
                 syncSession.finishFilesystemRetry(succeeded: true)
-                try await syncSession.synchronize()
+                try await syncSession.synchronize(retryingFailedCleanup: true)
             } catch {
                 syncSession.finishFilesystemRetry(succeeded: false)
                 syncSession.reportFailure("Sync retry failed: \(error.localizedDescription)")

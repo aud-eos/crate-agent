@@ -53,6 +53,16 @@ final class SeratoWatchdogTests: XCTestCase {
 }
 
 final class OperationEngineTests: XCTestCase {
+    private let audioFixture = OwnedProcessingAudioFixture()
+    override func tearDownWithError() throws {
+        try self.audioFixture.remove()
+    }
+
+    private func prepareAudioFixtures(in database: LibraryDatabase, membership: LibraryMembership = .active) async throws {
+        try await markProcessingFixturesAvailable(in: database, membership: membership)
+        try await self.audioFixture.prepare(in: database)
+    }
+
     @MainActor private var runningState: ProcessingTestSeratoState?
 
     @MainActor
@@ -85,7 +95,7 @@ final class OperationEngineTests: XCTestCase {
     func testIndexNewFileInsertsFileRowAndLogsEvent() async throws {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
         let mutation = TrackMutation.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/Test.mp3",
+            path: self.audioFixture.path("/Music/A/Test.mp3"),
             volumeUuid: "v1",
             inode: 42,
             fileSize: 1024,
@@ -98,7 +108,7 @@ final class OperationEngineTests: XCTestCase {
         try await database.writer.read { db in
             let files = try FileRecord.fetchAll(db)
             XCTAssertEqual(files.count, 1)
-            XCTAssertEqual(files.first?.path, "/Music/A/Test.mp3")
+            XCTAssertEqual(files.first?.path, self.audioFixture.path("/Music/A/Test.mp3"))
             XCTAssertEqual(files.first?.fingerprintStatus, .pending)
 
             let events = try EventRecord.fetchAll(db)
@@ -114,27 +124,27 @@ final class OperationEngineTests: XCTestCase {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
 
         let indexEventId = try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/old.mp3",
+            path: self.audioFixture.path("/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
         XCTAssertGreaterThan(try XCTUnwrap(indexEventId), 0)
 
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/old.mp3")])
         }!
 
         let renameEventId = try await engine.apply(.renameFile(RenameFilePayload(
             fileId: fileId,
-            newPath: "/Music/A/new.mp3"
+            newPath: self.audioFixture.path("/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Music/A/old.mp3"), physicalMove: true
         )))
         XCTAssertGreaterThan(try XCTUnwrap(renameEventId), try XCTUnwrap(indexEventId))
 
         try await database.writer.read { db in
             // Path was updated.
             let file = try FileRecord.fetchOne(db, key: fileId)!
-            XCTAssertEqual(file.path, "/Music/A/new.mp3")
+            XCTAssertEqual(file.path, self.audioFixture.path("/Music/A/new.mp3"))
 
             // Rename event was logged with the original path captured.
             let renameEvent = try EventRecord
@@ -152,10 +162,10 @@ final class OperationEngineTests: XCTestCase {
                 RenameFilePayload.self,
                 from: renameEvent.inversePayloadJson.data(using: .utf8)!
             )
-            XCTAssertEqual(forward.previousPath, "/Music/A/old.mp3")
-            XCTAssertEqual(forward.newPath, "/Music/A/new.mp3")
-            XCTAssertEqual(inverse.previousPath, "/Music/A/new.mp3")
-            XCTAssertEqual(inverse.newPath, "/Music/A/old.mp3")
+            XCTAssertEqual(forward.previousPath, self.audioFixture.path("/Music/A/old.mp3"))
+            XCTAssertEqual(forward.newPath, self.audioFixture.path("/Music/A/new.mp3"))
+            XCTAssertEqual(inverse.previousPath, self.audioFixture.path("/Music/A/new.mp3"))
+            XCTAssertEqual(inverse.newPath, self.audioFixture.path("/Music/A/old.mp3"))
         }
     }
 
@@ -163,7 +173,7 @@ final class OperationEngineTests: XCTestCase {
         let (engine, _, _) = try await MainActor.run { try makeEngine() }
         do {
             _ = try await engine.apply(.renameFile(RenameFilePayload(
-                fileId: 9_999, newPath: "/Music/A/nothing.mp3"
+                fileId: 9999, newPath: self.audioFixture.path("/Music/A/nothing.mp3")
             )))
             XCTFail("expected fileNotFound to throw")
         } catch let error as OperationEngineError {
@@ -175,10 +185,10 @@ final class OperationEngineTests: XCTestCase {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
         let batchId = "import-batch-1"
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/a.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
+            path: self.audioFixture.path("/Music/A/a.mp3"), volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )), batchId: batchId)
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/b.mp3", volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
+            path: self.audioFixture.path("/Music/A/b.mp3"), volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
         )), batchId: batchId)
 
         try await database.writer.read { db in
@@ -193,7 +203,7 @@ final class OperationEngineTests: XCTestCase {
 
     func testRenameFileRewritesSeratoCrateWhenSeratoClosed() async throws {
         let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
-            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+            withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -202,21 +212,21 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/old.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
         try await engine.apply(.renameFile(RenameFilePayload(
-            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
         )))
 
         let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
-        XCTAssertEqual(updatedPaths, ["Users/testuser/Music/A/new.mp3"])
+        XCTAssertEqual(updatedPaths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"))])
 
         let queueDepth = await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 0, "no queueing should occur when Serato is closed")
@@ -224,7 +234,7 @@ final class OperationEngineTests: XCTestCase {
 
     func testRenameFileQueuesRewriteWhenSeratoRunning() async throws {
         let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
-            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+            withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -233,22 +243,22 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/old.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
         try await engine.apply(.renameFile(RenameFilePayload(
-            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
         )))
 
         // Crate file must still hold the original path while Serato is open.
         let crateContents = try readCratePaths(cratePath: crateFileUrl.path)
-        XCTAssertEqual(crateContents, ["Users/testuser/Music/A/old.mp3"])
+        XCTAssertEqual(crateContents, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))])
 
         let queueDepth = await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 1, "the rewrite must be queued, not applied")
@@ -278,7 +288,7 @@ final class OperationEngineTests: XCTestCase {
 
         let regularCrate = subcratesDirectory.appendingPathComponent("Regular.crate")
         try OperationEngineTests.synthesizeCrateBytesForTest(
-            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+            withTrackPaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         ).write(to: regularCrate)
 
         // Smart crates share the otrk/ptrk record format used by
@@ -288,7 +298,7 @@ final class OperationEngineTests: XCTestCase {
         // synthesizer is sufficient for the rewrite test.
         let smartCrate = smartCratesDirectory.appendingPathComponent("NEVER PLAYED.scrate")
         try OperationEngineTests.synthesizeCrateBytesForTest(
-            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+            withTrackPaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         ).write(to: smartCrate)
 
         let (engine, database, _) = try await MainActor.run {
@@ -296,25 +306,25 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/old.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
         try await engine.apply(.renameFile(RenameFilePayload(
-            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
         )))
 
         let regularPaths = try readCratePaths(cratePath: regularCrate.path)
-        XCTAssertEqual(regularPaths, ["Users/testuser/Music/A/new.mp3"],
+        XCTAssertEqual(regularPaths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"))],
                        "regular .crate must be rewritten")
 
         let smartPaths = try readCratePaths(cratePath: smartCrate.path)
-        XCTAssertEqual(smartPaths, ["Users/testuser/Music/A/new.mp3"],
+        XCTAssertEqual(smartPaths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"))],
                        "smart .scrate must also be rewritten — otherwise Serato restores the old path on next launch")
     }
 
@@ -331,9 +341,9 @@ final class OperationEngineTests: XCTestCase {
         // describes WHAT it needs.
         let (seratoDirectory, goodCrate, databaseV2Optional) =
             try Self.makeTemporarySeratoLibrary(
-                withCratePaths: ["Users/testuser/Music/A/old.mp3"],
+                withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))],
                 corruptedCrateNames: ["Bad"],
-                databaseV2Paths: ["Users/testuser/Music/A/old.mp3"]
+                databaseV2Paths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
             )
         let databaseV2 = try XCTUnwrap(databaseV2Optional)
         defer {
@@ -345,30 +355,30 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/old.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
         // The rename must NOT throw despite the corrupted crate.
         try await engine.apply(.renameFile(RenameFilePayload(
-            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
         )))
 
         // Database V2 MUST reflect the new path — this is the
         // bug fix's primary contract.
         let v2Paths = try readDatabasePaths(databasePath: databaseV2.path)
-        XCTAssertEqual(v2Paths, ["Users/testuser/Music/A/new.mp3"],
+        XCTAssertEqual(v2Paths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"))],
                        "database V2 must be rewritten even when a sibling .crate file is corrupted")
 
         // The good crate also got rewritten — per-crate tolerance
         // means the loop continued past the bad one.
         let goodPaths = try readCratePaths(cratePath: goodCrate.path)
-        XCTAssertEqual(goodPaths, ["Users/testuser/Music/A/new.mp3"])
+        XCTAssertEqual(goodPaths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"))])
     }
 
     /// Regression mirror for `applySeratoCrateSweepRemoval` — the
@@ -385,7 +395,7 @@ final class OperationEngineTests: XCTestCase {
         // the directory + bytes.
         let (seratoDirectory, goodCrate, _) =
             try Self.makeTemporarySeratoLibrary(
-                withCratePaths: ["Users/testuser/Music/A/dupe.mp3"],
+                withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/dupe.mp3"))],
                 corruptedCrateNames: ["Bad"]
             )
         defer {
@@ -397,19 +407,21 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/dupe.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/dupe.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/dupe.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/dupe.mp3")])
         }!
 
-        // The sweep removal must NOT throw despite the corrupt crate.
-        try await engine.apply(.removeFileFromCrates(
-            RemoveFileFromCratesPayload(fileId: fileId)
-        ))
+        do {
+            try await engine.apply(.removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fileId)))
+            XCTFail("An incomplete sweep must report its failed crate")
+        } catch let error as OperationEngineError {
+            guard case .externalSyncIncomplete = error else { return XCTFail("\(error)") }
+        }
 
         // Valid crate had its otrk removed; bad crate is untouched
         // on disk (the parse failed before any write attempt).
@@ -439,7 +451,7 @@ final class OperationEngineTests: XCTestCase {
         // logged the DB-side mutation but the Serato write was
         // lost.
         try OperationEngineTests.synthesizeDatabaseV2BytesForTest(
-            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+            withTrackPaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         ).write(to: databaseV2)
 
         let (engine, database, _) = try await MainActor.run {
@@ -449,21 +461,21 @@ final class OperationEngineTests: XCTestCase {
         let recoveryBatchId = "test-recovery-batch"
         try await engine.apply(
             .indexNewFile(IndexNewFilePayload(
-                path: "/Users/testuser/Music/A/old.mp3",
+                path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
                 volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
             )),
             batchId: recoveryBatchId
         )
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
         // First rename succeeds normally — V2 already has new path.
         try await engine.apply(
             .renameFile(RenameFilePayload(
-                fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+                fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
             )),
             batchId: recoveryBatchId
         )
@@ -472,7 +484,7 @@ final class OperationEngineTests: XCTestCase {
         // pre-rename state. This is what the user's library
         // looked like after the bug fired.
         try OperationEngineTests.synthesizeDatabaseV2BytesForTest(
-            withTrackPaths: ["Users/testuser/Music/A/old.mp3"]
+            withTrackPaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         ).write(to: databaseV2)
 
         // Recovery: replay the Serato side of the batch.
@@ -481,7 +493,7 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(outcome.queuedCount, 0, "Serato was closed; nothing should have queued")
 
         let v2PathsAfter = try readDatabasePaths(databasePath: databaseV2.path)
-        XCTAssertEqual(v2PathsAfter, ["Users/testuser/Music/A/new.mp3"],
+        XCTAssertEqual(v2PathsAfter, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"))],
                        "resync must rewrite database V2 from the event log")
     }
 
@@ -491,7 +503,7 @@ final class OperationEngineTests: XCTestCase {
     /// sees "Re-sync complete" while nothing actually lands.
     func testResyncReportsQueuedCountWhenSeratoIsRunning() async throws {
         let (seratoDirectoryUrl, _, _) = try Self.makeTemporarySeratoLibrary(
-            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+            withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -501,16 +513,16 @@ final class OperationEngineTests: XCTestCase {
 
         let batchId = "test-queued-resync"
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/old.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )), batchId: batchId)
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
         try await engine.apply(.renameFile(RenameFilePayload(
-            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
         )), batchId: batchId)
 
         let outcome = try await engine.resyncSeratoForBatch(batchId)
@@ -524,7 +536,7 @@ final class OperationEngineTests: XCTestCase {
 
     func testQueueDepthPublisherEmitsOnEnqueueAndDrain() async throws {
         let (seratoDirectoryUrl, _, _) = try Self.makeTemporarySeratoLibrary(
-            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+            withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -542,17 +554,17 @@ final class OperationEngineTests: XCTestCase {
         defer { cancellable.cancel() }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/old.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
         try await engine.apply(.renameFile(RenameFilePayload(
-            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
         )))
         await runningState?.stop()
         try await engine.drainPendingSeratoUpdates()
@@ -576,7 +588,7 @@ final class OperationEngineTests: XCTestCase {
         // commitMetadataToSerato mutation and verify the file on
         // disk has the new metadata.
         let (seratoDirectoryUrl, databaseV2Url) = try Self.makeTemporarySeratoDatabase(
-            withTrack: "Users/testuser/Music/A/track.mp3"
+            withTrack: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/track.mp3"))
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -585,13 +597,13 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/track.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/track.mp3")])
         }!
 
         let newMetadata = SeratoMetadata(
@@ -613,7 +625,7 @@ final class OperationEngineTests: XCTestCase {
 
     func testCommitMetadataToSeratoQueuesWhenSeratoRunning() async throws {
         let (seratoDirectoryUrl, databaseV2Url) = try Self.makeTemporarySeratoDatabase(
-            withTrack: "Users/testuser/Music/A/track.mp3"
+            withTrack: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/track.mp3"))
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -622,13 +634,13 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/track.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/track.mp3")])
         }!
 
         let newMetadata = SeratoMetadata(artist: "Queued Artist", bpm: "130.000")
@@ -659,7 +671,7 @@ final class OperationEngineTests: XCTestCase {
 
     func testAddTrackToSeratoAppendsOtrkWhenSeratoClosed() async throws {
         let (seratoDirectoryUrl, databaseV2Url) = try Self.makeTemporarySeratoDatabase(
-            withTrack: "Users/testuser/Music/Existing.mp3"
+            withTrack: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/Existing.mp3"))
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -668,17 +680,17 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/newly-dropped.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/newly-dropped.mp3"),
             volumeUuid: "v1", inode: 99, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "Drop Artist", title: "Drop Title")
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/newly-dropped.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/newly-dropped.mp3")])
         }!
 
-        try await markProcessingFixturesAvailable(in: database, membership: .pendingImport)
+        try await prepareAudioFixtures(in: database, membership: .pendingImport)
         try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
             fileId: fileId,
             metadata: SeratoMetadata(artist: "Drop Artist", title: "Drop Title")
@@ -686,7 +698,7 @@ final class OperationEngineTests: XCTestCase {
 
         let records = try readDatabaseRecords(databasePath: databaseV2Url.path)
         XCTAssertEqual(records.count, 2, "should have both the original and the newly-added track")
-        let droppedRecord = records.first { $0.path == "Users/testuser/Music/A/newly-dropped.mp3" }
+        let droppedRecord = records.first { $0.path == SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/newly-dropped.mp3")) }
         XCTAssertNotNil(droppedRecord)
         XCTAssertEqual(droppedRecord?.artist, "Drop Artist")
         XCTAssertEqual(droppedRecord?.title, "Drop Title")
@@ -706,16 +718,16 @@ final class OperationEngineTests: XCTestCase {
             try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: false)
         }
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/first.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/first.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "First")
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/first.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/first.mp3")])
         }!
-        try await markProcessingFixturesAvailable(in: database, membership: .pendingImport)
+        try await prepareAudioFixtures(in: database, membership: .pendingImport)
         try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
             fileId: fileId,
             metadata: SeratoMetadata(artist: "First")
@@ -728,13 +740,13 @@ final class OperationEngineTests: XCTestCase {
         )
         let records = try readDatabaseRecords(databasePath: databaseV2Url.path)
         XCTAssertEqual(records.count, 1)
-        XCTAssertEqual(records[0].path, "Users/testuser/Music/A/first.mp3")
+        XCTAssertEqual(records[0].path, SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/first.mp3")))
         XCTAssertEqual(records[0].artist, "First")
     }
 
     func testDrainAppliesQueuedRewrites() async throws {
         let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
-            withCratePaths: ["Users/testuser/Music/A/old.mp3"]
+            withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
         )
         defer { try? FileManager.default.removeItem(at: seratoDirectoryUrl.deletingLastPathComponent()) }
 
@@ -743,24 +755,24 @@ final class OperationEngineTests: XCTestCase {
         }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Users/testuser/Music/A/old.mp3",
+            path: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Users/testuser/Music/A/old.mp3"])
+                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
         try await engine.apply(.renameFile(RenameFilePayload(
-            fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
+            fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
         )))
 
         await runningState?.stop()
         try await engine.drainPendingSeratoUpdates()
 
         let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
-        XCTAssertEqual(updatedPaths, ["Users/testuser/Music/A/new.mp3"])
+        XCTAssertEqual(updatedPaths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"))])
 
         let queueDepthAfterDrain = await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepthAfterDrain, 0)
@@ -950,14 +962,14 @@ extension OperationEngineTests {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/track.mp3",
+            path: self.audioFixture.path("/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 10, mtime: 1,
             metadata: SeratoMetadata(artist: "X", title: "Y")
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/track.mp3")])
         }!
 
         try await engine.apply(.removeFile(RemoveFilePayload(fileId: fileId)))
@@ -982,9 +994,9 @@ extension OperationEngineTests {
             IndexNewFilePayload.self,
             from: removalEvent.inversePayloadJson.data(using: .utf8)!
         )
-        XCTAssertEqual(inverse.path, "/Music/A/track.mp3")
-        XCTAssertEqual(inverse.volumeUuid, "v1")
-        XCTAssertEqual(inverse.inode, 1)
+        XCTAssertEqual(inverse.path, self.audioFixture.path("/Music/A/track.mp3"))
+        XCTAssertEqual(inverse.volumeUuid, try FileMetadataCollector.collectVerified(at: inverse.path).volumeUuid)
+        XCTAssertEqual(inverse.inode, try FileMetadataCollector.collectVerified(at: inverse.path).inode)
         XCTAssertEqual(inverse.metadata.artist, "X")
         XCTAssertEqual(inverse.metadata.title, "Y")
     }
@@ -993,18 +1005,18 @@ extension OperationEngineTests {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/original.mp3",
+            path: self.audioFixture.path("/Music/A/original.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/original.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/original.mp3")])
         }!
 
         let renameBatchId = "test-rename-batch"
         try await engine.apply(
-            .renameFile(RenameFilePayload(fileId: fileId, newPath: "/Music/A/renamed.mp3")),
+            .renameFile(RenameFilePayload(fileId: fileId, newPath: self.audioFixture.path("/Music/A/renamed.mp3"), previousPath: self.audioFixture.path("/Music/A/original.mp3"), physicalMove: true)),
             batchId: renameBatchId
         )
 
@@ -1012,7 +1024,7 @@ extension OperationEngineTests {
             try String.fetchOne(db, sql: "SELECT path FROM files WHERE id = ?",
                                 arguments: [fileId])
         }!
-        XCTAssertEqual(pathAfterRename, "/Music/A/renamed.mp3")
+        XCTAssertEqual(pathAfterRename, self.audioFixture.path("/Music/A/renamed.mp3"))
 
         let undoBatchId = try await engine.undoBatch(renameBatchId)
         XCTAssertTrue(undoBatchId.hasPrefix("undo:\(renameBatchId):"),
@@ -1022,7 +1034,7 @@ extension OperationEngineTests {
             try String.fetchOne(db, sql: "SELECT path FROM files WHERE id = ?",
                                 arguments: [fileId])
         }!
-        XCTAssertEqual(pathAfterUndo, "/Music/A/original.mp3")
+        XCTAssertEqual(pathAfterUndo, self.audioFixture.path("/Music/A/original.mp3"))
 
         // Undo itself was journaled, under the new batch id.
         let undoEventCount = try await database.writer.read { db in
@@ -1037,14 +1049,14 @@ extension OperationEngineTests {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/track.mp3",
+            path: self.audioFixture.path("/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "Original", title: "Track")
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/track.mp3")])
         }!
 
         let editBatchId = "metadata-edit-batch"
@@ -1078,7 +1090,7 @@ extension OperationEngineTests {
         let importBatchId = "test-import-batch"
         try await engine.apply(
             .indexNewFile(IndexNewFilePayload(
-                path: "/Music/A/imported.mp3",
+                path: self.audioFixture.path("/Music/A/imported.mp3"),
                 volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
             )),
             batchId: importBatchId
@@ -1102,20 +1114,20 @@ extension OperationEngineTests {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/start.mp3",
+            path: self.audioFixture.path("/Music/A/start.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "A0")
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/start.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/start.mp3")])
         }!
 
         let compositeBatchId = "composite"
         // rename first…
         try await engine.apply(
-            .renameFile(RenameFilePayload(fileId: fileId, newPath: "/Music/A/middle.mp3")),
+            .renameFile(RenameFilePayload(fileId: fileId, newPath: self.audioFixture.path("/Music/A/middle.mp3"))),
             batchId: compositeBatchId
         )
         // …then edit metadata.
@@ -1133,7 +1145,7 @@ extension OperationEngineTests {
         let restored = try await database.writer.read { db in
             try FileRecord.fetchOne(db, key: fileId)!
         }
-        XCTAssertEqual(restored.path, "/Music/A/start.mp3")
+        XCTAssertEqual(restored.path, self.audioFixture.path("/Music/A/start.mp3"))
         XCTAssertEqual(restored.artist, "A0")
     }
 
@@ -1152,20 +1164,20 @@ extension OperationEngineTests {
 
         // Bootstrap a file so the addTrackToSerato payload resolves.
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/dropped.mp3",
+            path: self.audioFixture.path("/Music/A/dropped.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/dropped.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/dropped.mp3")])
         }!
 
         // Simulate the drag-drop batch's addTrackToSerato leg. The
         // Serato-side write fails (test locator points at /dev/null),
         // but the DB event lands first — that's what undoBatch will
         // encounter and reject.
-        try await markProcessingFixturesAvailable(in: database, membership: .pendingImport)
+        try await prepareAudioFixtures(in: database, membership: .pendingImport)
         let dragDropBatchId = "drag-drop-batch"
         do {
             _ = try await engine.apply(
@@ -1199,13 +1211,13 @@ extension OperationEngineTests {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
 
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/gone.mp3",
+            path: self.audioFixture.path("/Music/A/gone.mp3"),
             volumeUuid: "v1", inode: 42, fileSize: 10, mtime: 1_700_000_000,
             metadata: SeratoMetadata(artist: "Ghost", title: "Track")
         )))
         let originalFileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/gone.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/gone.mp3")])
         }!
 
         let removalBatchId = "removal-batch"
@@ -1221,7 +1233,7 @@ extension OperationEngineTests {
         _ = try await engine.undoBatch(removalBatchId)
 
         let restored = try await database.writer.read { db in
-            try FileRecord.filter(Column("path") == "/Music/A/gone.mp3").fetchOne(db)
+            try FileRecord.filter(Column("path") == self.audioFixture.path("/Music/A/gone.mp3")).fetchOne(db)
         }
         XCTAssertNotNil(restored, "row must reappear at the original path")
         XCTAssertEqual(restored?.inode, 42)
@@ -4465,283 +4477,95 @@ final class DuplicateKeeperPickerTests: XCTestCase {
     }
 }
 
+@MainActor
 final class DuplicateResolverTests: XCTestCase {
-
-    /// Records trasher invocations so the test can assert which
-    /// files would have been moved to Trash.
-    private final class TrasherRecorder: @unchecked Sendable {
-        private let lock = NSLock()
-        private var _paths: [String] = []
-        var paths: [String] {
-            lock.lock(); defer { lock.unlock() }
-            return _paths
+    private func setup(_ names: [String], failingName: String? = nil) async throws -> (SeratoRemovalFixture, OperationEngine, [FileRecord]) {
+        let fixture = try SeratoRemovalFixture()
+        var files: [FileRecord] = []
+        for name in names {
+            try files.append(await fixture.add(name))
         }
-        func record(_ path: String) {
-            lock.lock(); defer { lock.unlock() }
-            _paths.append(path)
-        }
-    }
-
-    @MainActor
-    private func makeEngine(
-        recorder: TrasherRecorder = TrasherRecorder()
-    ) throws -> (OperationEngine, LibraryDatabase, TrasherRecorder) {
-        let database = try LibraryDatabase.openInMemory()
-        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
-        let engine = OperationEngine(
-            database: database,
-            seratoWatchdog: watchdog,
-            seratoLocator: locator,
-            fileTagWriter: { _, _ in },
-            fileTrasher: { path in recorder.record(path) }
-        )
-        return (engine, database, recorder)
-    }
-
-    private func indexFile(
-        path: String,
-        inode: Int64,
-        engine: OperationEngine
-    ) async throws -> Int64 {
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: path,
-            volumeUuid: "v1",
-            inode: inode,
-            fileSize: 1, mtime: 1
-        )))
-        let eventId = try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: path + ".duplicate-bootstrap-noop",  // workaround
-            volumeUuid: "v1",
-            inode: inode + 1000,
-            fileSize: 1, mtime: 1
-        )))
-        return try XCTUnwrap(eventId)
+        try fixture.save(paths: files.map { SeratoLibraryLocator.seratoRelativePath(fromAbsolute: $0.path) })
+        let root = fixture.directory
+        let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator, fileTrasher: { path in
+            if (path as NSString).lastPathComponent == failingName {
+                throw NSError(domain: "TestTrasher", code: 13, userInfo: [NSLocalizedDescriptionKey: "synthetic trash failure"])
+            }
+            try FileManager.default.moveItem(atPath: path, toPath: root.appendingPathComponent("trashed-" + (path as NSString).lastPathComponent).path)
+        })
+        return (fixture, engine, files)
     }
 
     func testResolveTrashesNonKeepersAndKeepsTheChosenFile() async throws {
-        let (engine, database, recorder) = try await MainActor.run { try makeEngine() }
-        let keeperPath = "/Music/A/keeper.mp3"
-        let dupePath = "/Music/A/dupe.mp3"
-
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: keeperPath, volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
-        )))
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: dupePath, volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
-        )))
-        let keeperId = try await database.writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: [keeperPath])
-        }!
-        let dupeId = try await database.writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: [dupePath])
-        }!
-
-        // Pull the (now-inserted) FileRecords to build a real group.
-        try await markProcessingFixturesAvailable(in: database)
-        let files = try await database.writer.read { db in
-            try FileRecord.fetchAll(db)
-        }
-        let group = DuplicateFinder.DuplicateGroup(
-            groupKey: "k", mode: .byteLevel, files: files
-        )
-
-        let resolver = DuplicateResolver(operationEngine: engine)
-        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
-
+        let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe.mp3"])
+        defer { fixture.cleanup() }
+        let keeperID = try XCTUnwrap(files[0].id)
+        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: keeperID)
         XCTAssertEqual(outcome.trashedCount, 1)
-        XCTAssertEqual(recorder.paths, [dupePath],
-                       "the keeper must NOT be trashed; only non-keepers")
-        let surviving = try await database.writer.read { db in
-            try FileRecord.fetchAll(db)
-        }
-        XCTAssertEqual(surviving.count, 1)
-        XCTAssertEqual(surviving.first?.id, keeperId,
-                       "the keeper's file row must remain in the DB")
-        XCTAssertNotEqual(surviving.first?.id, dupeId)
+        XCTAssertEqual(outcome.pendingCount, 0)
+        XCTAssertEqual(outcome.failureCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: files[0].path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: files[1].path))
+        let surviving = try await fixture.database.writer.read { try FileRecord.fetchAll($0) }
+        XCTAssertEqual(surviving.map(\.id), [keeperID])
     }
 
     func testResolveJournalsFourEventsPerNonKeeperUnderOneBatch() async throws {
-        let (engine, database, _) = try await MainActor.run { try makeEngine() }
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/k.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
-        )))
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/d1.mp3", volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
-        )))
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/d2.mp3", volumeUuid: "v1", inode: 3, fileSize: 1, mtime: 1
-        )))
-        let keeperId = try await database.writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/k.mp3"])
-        }!
-        try await markProcessingFixturesAvailable(in: database)
-        let files = try await database.writer.read { db in
-            try FileRecord.fetchAll(db)
-        }
-        let group = DuplicateFinder.DuplicateGroup(
-            groupKey: "k", mode: .byteLevel, files: files
-        )
-
-        let resolver = DuplicateResolver(operationEngine: engine)
-        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
-
-        // 2 non-keepers × 4 mutations = 8 events; all under one batch.
-        let batchEvents = try await database.writer.read { db in
-            try EventRecord
-                .filter(Column("batch_id") == outcome.batchId)
-                .order(Column("event_id").asc)
-                .fetchAll(db)
-        }
-        XCTAssertEqual(batchEvents.count, 8)
-        XCTAssertEqual(batchEvents.map(\.eventType), [
-            .trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved,
-            .trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved,
-        ])
+        let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe1.mp3", "dupe2.mp3"])
+        defer { fixture.cleanup() }
+        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: XCTUnwrap(files[0].id))
+        let events = try await fixture.database.writer.read { try EventRecord.filter(Column("batch_id") == outcome.batchId).order(Column("event_id")).fetchAll($0) }
+        XCTAssertEqual(events.count, 8)
+        XCTAssertEqual(events.map(\.eventType), [.trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved])
+        XCTAssertTrue(events.allSatisfy { !$0.inversePayloadJson.isEmpty })
     }
 
     func testResolveRejectsKeeperNotInGroup() async throws {
-        let (engine, database, _) = try await MainActor.run { try makeEngine() }
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/a.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
-        )))
-        try await markProcessingFixturesAvailable(in: database)
-        let files = try await database.writer.read { db in
-            try FileRecord.fetchAll(db)
-        }
-        let group = DuplicateFinder.DuplicateGroup(
-            groupKey: "k", mode: .byteLevel, files: files
-        )
-        let resolver = DuplicateResolver(operationEngine: engine)
+        let (fixture, engine, files) = try await setup(["member.mp3"])
+        defer { fixture.cleanup() }
         do {
-            _ = try await resolver.resolve(group: group, keeperId: 9999)
-            XCTFail("expected keeperNotInGroup")
-        } catch let error as DuplicateResolver.ResolverError {
-            XCTAssertEqual(error, .keeperNotInGroup)
-        }
+            _ = try await DuplicateResolver(operationEngine: engine).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: 9999)
+            XCTFail("Expected keeperNotInGroup")
+        } catch let error as DuplicateResolver.ResolverError { XCTAssertEqual(error, .keeperNotInGroup) }
     }
 
     func testResolveBatchIsNotUndoable() async throws {
-        let (engine, database, _) = try await MainActor.run { try makeEngine() }
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/k.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
-        )))
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/d.mp3", volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
-        )))
-        let keeperId = try await database.writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/k.mp3"])
-        }!
-        try await markProcessingFixturesAvailable(in: database)
-        let files = try await database.writer.read { db in
-            try FileRecord.fetchAll(db)
-        }
-        let group = DuplicateFinder.DuplicateGroup(
-            groupKey: "k", mode: .byteLevel, files: files
-        )
-        let resolver = DuplicateResolver(operationEngine: engine)
-        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
-
+        let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe.mp3"])
+        defer { fixture.cleanup() }
+        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: XCTUnwrap(files[0].id))
         do {
             _ = try await engine.undoBatch(outcome.batchId)
-            XCTFail("resolution batch must not be undoable through the engine")
+            XCTFail("Cleanup is not undoable through the engine")
         } catch let error as OperationEngineError {
-            // The first event in newest-first order is fileRemoved
-            // (the last one journaled). undoBatch processes in
-            // reverse so it sees fileRemoved → its inverse is
-            // indexNewFile which IS supported. The trash, however,
-            // throws undoNotSupported. Either rejection is correct
-            // — what matters is that the batch is rejected.
-            switch error {
-            case .undoNotSupported:
-                break
-            default:
-                XCTFail("expected undoNotSupported, got \(error)")
-            }
+            guard case .undoNotSupported = error else { return XCTFail("Expected undoNotSupported, got \(error)") }
         }
     }
 
-    /// Regression for the per-file-isolation gap the post-session
-    /// code review caught: pre-fix, one file's failure in the
-    /// 4-mutation sequence aborted the entire resolve loop, leaving
-    /// later non-keepers untouched. Now the loop catches per file,
-    /// records the failure in `Outcome.errors`, and continues.
     func testResolveContinuesAfterPerFileFailureAndReportsCounts() async throws {
-        // Build a 1-keeper + 2-non-keeper group; arrange for the
-        // SECOND non-keeper's trash step to throw. The FIRST
-        // non-keeper should complete; the second should be
-        // recorded as a failure; the loop must not abort.
-        let keeperPath = "/Music/A/keeper.mp3"
-        let dupePathOk = "/Music/A/dupe-ok.mp3"
-        let dupePathFail = "/Music/A/dupe-fail.mp3"
-
-        let database = try await MainActor.run { try LibraryDatabase.openInMemory() }
-        let watchdog = await MainActor.run {
-            SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        }
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
-        let engine = OperationEngine(
-            database: database,
-            seratoWatchdog: watchdog,
-            seratoLocator: locator,
-            fileTagWriter: { _, _ in },
-            fileTrasher: { path in
-                if path == dupePathFail {
-                    throw NSError(
-                        domain: "TestTrasher", code: 13,
-                        userInfo: [NSLocalizedDescriptionKey: "synthetic trash failure"]
-                    )
-                }
-            }
-        )
-
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: keeperPath, volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
-        )))
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: dupePathOk, volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1
-        )))
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: dupePathFail, volumeUuid: "v1", inode: 3, fileSize: 1, mtime: 1
-        )))
-        let keeperId = try await database.writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: [keeperPath])
-        }!
-
-        try await markProcessingFixturesAvailable(in: database)
-        let files = try await database.writer.read { db in
-            try FileRecord.fetchAll(db).sorted(by: { lhs, rhs in
-                // Force a deterministic order so the failing file
-                // is the second one processed.
-                let lhsKey = lhs.path == dupePathFail ? 1 : 0
-                let rhsKey = rhs.path == dupePathFail ? 1 : 0
-                return lhsKey < rhsKey
-            })
-        }
-        let group = DuplicateFinder.DuplicateGroup(
-            groupKey: "isolation-test", mode: .byteLevel, files: files
-        )
-
-        let resolver = DuplicateResolver(operationEngine: engine)
-        let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
-
-        XCTAssertEqual(outcome.trashedCount, 1,
-                       "the non-failing duplicate must complete")
-        XCTAssertEqual(outcome.failureCount, 1,
-                       "the failing duplicate must be reported as skipped")
-        XCTAssertEqual(outcome.errors.count, 1,
-                       "one per-file error string must be recorded")
-        XCTAssertTrue(outcome.errors.first?.contains("synthetic trash failure") ?? false,
-                      "error string must include the underlying message; got \(outcome.errors)")
+        let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe-ok.mp3", "dupe-fail.mp3"], failingName: "dupe-fail.mp3")
+        defer { fixture.cleanup() }
+        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: XCTUnwrap(files[0].id))
+        XCTAssertEqual(outcome.trashedCount, 1)
+        XCTAssertEqual(outcome.failureCount, 1)
+        XCTAssertEqual(outcome.errors.count, 1)
+        XCTAssertTrue(outcome.errors[0].contains("synthetic trash failure"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: files[2].path))
+        let retained = try await fixture.database.writer.read { try FileRecord.fetchOne($0, key: files[2].id) }
+        XCTAssertNotNil(retained)
     }
 }
 
 final class WriteFileTagsMutationTests: XCTestCase {
+    private let audioFixture = OwnedProcessingAudioFixture()
+    override func tearDownWithError() throws {
+        try self.audioFixture.remove()
+    }
+
+    private func prepareAudioFixtures(in database: LibraryDatabase, membership: LibraryMembership = .active) async throws {
+        try await markProcessingFixturesAvailable(in: database, membership: membership)
+        try await self.audioFixture.prepare(in: database)
+    }
+
 
     /// Captures calls from the injected fileTagWriter so the test
     /// can assert what would have been written to disk.
@@ -4786,13 +4610,13 @@ final class WriteFileTagsMutationTests: XCTestCase {
     func testWriteFileTagsInvokesWriterWithResolvedPath() async throws {
         let (engine, database, recorder) = try await MainActor.run { try makeEngine() }
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/track.mp3",
+            path: self.audioFixture.path("/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/track.mp3")])
         }!
 
         try await engine.apply(.writeFileTags(WriteFileTagsPayload(
@@ -4802,7 +4626,7 @@ final class WriteFileTagsMutationTests: XCTestCase {
         )))
 
         XCTAssertEqual(recorder.calls.count, 1)
-        XCTAssertEqual(recorder.calls.first?.path, "/Music/A/track.mp3")
+        XCTAssertEqual(recorder.calls.first?.path, self.audioFixture.path("/Music/A/track.mp3"))
         XCTAssertEqual(recorder.calls.first?.update.artist, "New Artist")
         XCTAssertEqual(recorder.calls.first?.update.title, "New Title")
     }
@@ -4812,13 +4636,13 @@ final class WriteFileTagsMutationTests: XCTestCase {
             try makeEngine(seratoIsRunning: true)
         }
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/track.mp3",
+            path: self.audioFixture.path("/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/track.mp3")])
         }!
 
         try await engine.apply(.writeFileTags(WriteFileTagsPayload(
@@ -4837,13 +4661,13 @@ final class WriteFileTagsMutationTests: XCTestCase {
     func testWriteFileTagsUndoableViaBatch() async throws {
         let (engine, database, recorder) = try await MainActor.run { try makeEngine() }
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/track.mp3",
+            path: self.audioFixture.path("/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/track.mp3")])
         }!
 
         let batchId = "test-tag-write"
@@ -4868,13 +4692,13 @@ final class WriteFileTagsMutationTests: XCTestCase {
     func testUndoRejectsWriteFileTagsLackingPreviousMetadata() async throws {
         let (engine, database, _) = try await MainActor.run { try makeEngine() }
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/track.mp3",
+            path: self.audioFixture.path("/Music/A/track.mp3"),
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        try await markProcessingFixturesAvailable(in: database)
+        try await prepareAudioFixtures(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                              arguments: ["/Music/A/track.mp3"])
+                               arguments: [self.audioFixture.path("/Music/A/track.mp3")])
         }!
 
         let batchId = "no-previous-state"

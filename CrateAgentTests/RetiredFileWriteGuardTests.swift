@@ -30,7 +30,7 @@ final class RetiredFileWriteGuardTests: XCTestCase {
         let counter = ReadCounter()
         try await writer.write { database in
             database.trace { event in
-                guard event.description.contains("SELECT"), event.description.contains("FROM \"files\""), counter.reaches(3) else { return }
+                guard event.expandedDescription.contains("SELECT"), event.expandedDescription.contains("file_identity_observed"), counter.reaches(1) else { return }
                 writer.asyncWrite { database in
                     _ = try FileLibraryStateMutation.apply(SetFileLibraryStatePayload(fileId: fileID, expectedRevision: 0,
                                                                                       state: FileLibraryState(membership: .retired, availability: .available, libraryID: "test", retiredAt: 1)),
@@ -214,7 +214,8 @@ final class RetiredFileWriteGuardTests: XCTestCase {
             try OperationEngineTests.synthesizeCrateBytesForTest(withTrackPaths: [seratoPath]).write(to: crate)
             let database = try LibraryDatabase.openInMemory()
             let fileID = try await database.writer.write { database in
-                var file = FileRecord(path: audio.path, volumeUuid: "test", inode: 1, fileSize: 14, mtime: 1)
+                let identity = try FileMetadataCollector.collectVerified(at: audio.path)
+                var file = FileRecord(path: audio.path, volumeUuid: identity.volumeUuid, inode: identity.inode, fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash)
                 file.libraryMembership = membership
                 file.fileAvailability = .available
                 try file.insert(database)
@@ -521,7 +522,8 @@ final class RetiredFileWriteGuardTests: XCTestCase {
             let originalAudio = try Data(contentsOf: audio)
             let database = try LibraryDatabase.openInMemory()
             let fileID = try await database.writer.write { db in
-                var file = FileRecord(path: audio.path, volumeUuid: "test", inode: 1, fileSize: 14, mtime: 1)
+                let identity = try FileMetadataCollector.collectVerified(at: audio.path)
+                var file = FileRecord(path: audio.path, volumeUuid: identity.volumeUuid, inode: identity.inode, fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash)
                 file.libraryMembership = .active
                 file.fileAvailability = .available
                 try file.insert(db)

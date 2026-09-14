@@ -36,6 +36,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
     private var filesystemRetryActive = false
     private var requestGeneration: UInt64 = 0
     private var successfulGeneration: UInt64?
+    private var retryingFailedCleanup = false
 
     init(reader: SeratoMembershipSnapshotReader, reconciler: SeratoMembershipReconciler,
          scanner: LibraryScanner, operationEngine: OperationEngine, watchdog: SeratoWatchdog,
@@ -72,7 +73,8 @@ final class SeratoLibrarySyncSession: ObservableObject {
         }
     }
 
-    func synchronize() async throws {
+    func synchronize(retryingFailedCleanup: Bool = false) async throws {
+        self.retryingFailedCleanup = self.retryingFailedCleanup || retryingFailedCleanup
         requestSync()
         let requiredGeneration = requestGeneration
         await waitUntilIdle()
@@ -148,6 +150,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
 
     private func run() async {
         defer {
+            retryingFailedCleanup = false
             task = nil
             scanProgress = nil
             if requested {
@@ -165,7 +168,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 guard !watchdog.isSeratoRunning else { state = .waitingForSerato; return }
                 state = .reconciling
                 let snapshot = try await reader.read()
-                let summary = try await reconciler.reconcile(snapshot)
+                var summary = try await reconciler.reconcile(snapshot)
                 try await refreshMetadata(snapshot)
                 try await reader.validate(snapshot)
                 try Task.checkCancellation()
@@ -181,8 +184,16 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 }
                 let revision = watchdog.stateRevision
                 let authorization = readiness.prepareDrain()
-                _ = try await LibrarySyncReadiness.$drainAuthorization.withValue(authorization) {
-                    try await operationEngine.drainPendingSeratoUpdates()
+                let drain = try await LibrarySyncReadiness.$drainAuthorization.withValue(authorization) {
+                    try await operationEngine.drainPendingSeratoUpdates(retryingFailedCleanup: retryingFailedCleanup)
+                }
+                retryingFailedCleanup = false
+                summary.supersededWrites = drain.supersededCount
+                summary.duplicateCleanupMessage = await operationEngine.duplicateCleanupMessage
+                if drain.appliedCount > 0 {
+                    let refreshedSnapshot = try await reader.read()
+                    try await refreshMetadata(refreshedSnapshot)
+                    try await reader.validate(refreshedSnapshot)
                 }
                 try Task.checkCancellation()
                 guard watchdog.isClosed(atRevision: revision) else { throw SeratoMembershipSnapshotError.seratoRunning }

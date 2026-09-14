@@ -1269,11 +1269,12 @@ private struct DuplicatesPanel: View {
         do {
             let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
             if outcome.failureCount == 0 {
-                lastResolution = "Moved \(outcome.trashedCount) duplicate\(outcome.trashedCount == 1 ? "" : "s") to Trash"
+                lastResolution = "Moved \(outcome.trashedCount) duplicate\(outcome.trashedCount == 1 ? "" : "s") to Trash; \(outcome.pendingCount) pending until Serato closes"
             } else {
-                actionError = "Moved \(outcome.trashedCount); \(outcome.failureCount) skipped (see activity log)"
+                actionError = "Moved \(outcome.trashedCount); \(outcome.pendingCount) pending; \(outcome.failureCount) stopped (see activity log)"
             }
             await rescan()
+            await reportCleanupFailure()
         } catch {
             actionError = "Resolve failed: \(error.localizedDescription)"
         }
@@ -1311,6 +1312,7 @@ private struct DuplicatesPanel: View {
         let resolver = DuplicateResolver(operationEngine: services.operationEngine, activityLog: services.activityLog)
 
         var trashedSoFar = 0
+        var pendingSoFar = 0
         var skippedSoFar = 0
         var groupsResolved = 0
         for entry in resolvable {
@@ -1321,6 +1323,7 @@ private struct DuplicatesPanel: View {
                     batchId: sharedBatchId
                 )
                 trashedSoFar += outcome.trashedCount
+                pendingSoFar += outcome.pendingCount
                 skippedSoFar += outcome.failureCount
                 groupsResolved += 1
                 // Throttle: every progress mutation fires a full
@@ -1344,12 +1347,19 @@ private struct DuplicatesPanel: View {
 
         if actionError == nil {
             if skippedSoFar == 0 {
-                lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s") across \(groupsResolved) group\(groupsResolved == 1 ? "" : "s") to Trash"
+                lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s") across \(groupsResolved) group\(groupsResolved == 1 ? "" : "s") to Trash; \(pendingSoFar) pending until Serato closes"
             } else {
-                lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s"); \(skippedSoFar) skipped (see activity log)"
+                lastResolution = "Moved \(trashedSoFar) file\(trashedSoFar == 1 ? "" : "s"); \(pendingSoFar) pending; \(skippedSoFar) stopped (see activity log)"
             }
         }
         await rescan()
+        await reportCleanupFailure()
+    }
+
+    private func reportCleanupFailure() async {
+        if let message = await services.operationEngine.failedDuplicateCleanupMessage {
+            services.syncSession.reportFailure(message)
+        }
     }
 }
 

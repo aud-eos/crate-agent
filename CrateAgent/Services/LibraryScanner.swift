@@ -263,9 +263,9 @@ public actor LibraryScanner {
                 guard !FileIdentityObservationMutation.isReplacement(existing, identity: identity) else {
                     throw SeratoReconciliationError.ambiguousIdentity(path)
                 }
-                let events = try await operationEngine.applyObservedBatch([.observeFileIdentity(.init(fileId: fileID, expectedRevision: existing.membershipRevision,
+                let events = try await operationEngine.observeSnapshotMetadata(.init(fileId: fileID, expectedRevision: existing.membershipRevision,
                                                                                                       previousIdentity: existing.identity, identity: identity, metadata: metadata,
-                                                                                                      bitrateKbps: readBitrateKbps(forPathAt: path), expectedState: existing.libraryState))], authorization: authorization)
+                                                                                     bitrateKbps: readBitrateKbps(forPathAt: path), expectedState: existing.libraryState), authorization: authorization)
                 if !events.isEmpty {
                     updated += 1
                 }
@@ -282,6 +282,12 @@ public actor LibraryScanner {
                     .setFileLibraryState(.init(fileId: fileID, expectedRevision: file.membershipRevision,
                                                state: FileLibraryState(membership: .active, availability: .available, libraryID: snapshot.libraryID, retiredAt: nil))),
                 ], authorization: authorization)
+                guard let active = try await database.writer.read({ connection in
+                    try FileRecord.fetchOne(connection, key: fileID)
+                }) else { throw SeratoReconciliationError.ambiguousIdentity(path) }
+                _ = try await operationEngine.observeSnapshotMetadata(.init(fileId: fileID, expectedRevision: active.membershipRevision,
+                                                                            previousIdentity: active.identity, identity: identity, metadata: metadata,
+                                                                            expectedState: active.libraryState), authorization: authorization)
                 indexed += 1
             }
             if (indexed + updated) % 50 == 0 {

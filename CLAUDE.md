@@ -56,6 +56,12 @@ Why this exists: paths change (rename, move, re-encode); fingerprints don't (wit
 
 How to apply: new features that need to refer to "the same recording" should use `track_id`, not `path` or `file_id`. The `files ←→ tracks` relationship is many-to-one (multiple files can encode the same recording — FLAC and MP3 of the same song); use the right side of that relationship.
 
+Physical I/O must verify that its actual target still matches the original authorized file; a current row or reused path alone is insufficient. `SeratoWriteEligibility` shares this check across queued effects, while destructive move compensation requires `OwnedAudioIdentity`'s complete digest and precise change identity. See [physical effects and cleanup](docs/serato-membership-reconciliation.md#physical-effects-and-duplicate-cleanup).
+
+Successful owned tag-only writes journal a verified physical identity and fingerprint-basis refresh without changing recording association, membership revision, or Serato-mirrored metadata. New writers must use the shared engine path, or the next strict scan will mistake their own edit for replacement. See the [observation consumer contract](docs/serato-membership-reconciliation.md#consumer-contract).
+
+Keep queued local intent separate from the last authorized external metadata baseline, per file revision and write target. Unchanged saved values preserve queued intent; changed or cleared Serato fields supersede only affected V2 ownership, independently of audio tags—even when SQLite already displays the external value. See the [baseline and History contract](docs/serato-membership-reconciliation.md#consumer-contract).
+
 ### 5. The folder layout is artist-first-letter, hardcoded
 
 `<MusicFolder>/<Letter>/<filename>.ext` — single-letter buckets by the normalized first letter of the artist. **No configurable folder template in SP-1.** The normalizer (strip articles, normalize numerics, strip symbols) lives in `ArtistLetterNormalizer.swift` and is the single source of truth for the letter assignment.

@@ -5,6 +5,50 @@ import XCTest
 final class PhysicalFileMoveTransactionTests: XCTestCase {
     private static let disposableVolume = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume")
 
+    func testSameSecondMiddleEditCannotBeDeletedByRollback() async throws {
+        try await assertSameSecondMiddleEditRetained(editSource: false)
+    }
+
+    func testSameSecondMiddleEditCannotBeDeletedBySourceCleanup() async throws {
+        try await assertSameSecondMiddleEditRetained(editSource: true)
+    }
+
+    private func assertSameSecondMiddleEditRetained(editSource: Bool) async throws {
+        guard FileManager.default.fileExists(atPath: Self.disposableVolume.appendingPathComponent(".task6-test-volume").path) else {
+            throw XCTSkip("Requires the explicitly created disposable Task 6 disk image")
+        }
+        let fixture = try await MoveFixture(destinationRoot: Self.disposableVolume, bytes: Data(repeating: 3, count: 4 * 1024 * 1024))
+        defer { fixture.remove() }
+        let changedURL = editSource ? fixture.source : fixture.destination
+        do {
+            try await PhysicalFileMoveTransaction.write(to: fixture.database.writer, batchId: "same-second-edit") { database, moves in
+                let file = try XCTUnwrap(FileRecord.fetchOne(database, key: fixture.fileID))
+                _ = try moves.move(.init(fileId: fixture.fileID, newPath: fixture.destination.path, previousPath: fixture.source.path, physicalMove: true), file: file)
+                let before = try SeratoSourceIdentity.read(changedURL)
+                let handle = try FileHandle(forWritingTo: changedURL)
+                try handle.seek(toOffset: 2 * 1024 * 1024)
+                try handle.write(contentsOf: Data([9]))
+                try handle.close()
+                var times = [timespec(tv_sec: before.modifiedSeconds, tv_nsec: 0), timespec(tv_sec: before.modifiedSeconds, tv_nsec: before.modifiedNanoseconds == 123_456_789 ? 234_567_890 : 123_456_789)]
+                XCTAssertEqual(utimensat(AT_FDCWD, changedURL.path, &times, 0), 0)
+                let after = try SeratoSourceIdentity.read(changedURL)
+                XCTAssertEqual(after.modifiedSeconds, before.modifiedSeconds)
+                XCTAssertNotEqual(after.modifiedNanoseconds, before.modifiedNanoseconds)
+                if !editSource {
+                    try database.execute(sql: "INSERT INTO deliberately_missing_table VALUES (1)")
+                }
+            }
+            XCTFail("Changed audio must stop destructive cleanup")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains(editSource ? "retained source" : "Retained audio paths"), "\(error)")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.source.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.destination.path))
+        if FileManager.default.fileExists(atPath: changedURL.path) {
+            XCTAssertEqual(try Data(contentsOf: changedURL)[2 * 1024 * 1024], 9)
+        }
+    }
+
     func testCrossVolumeReplacedDestinationBeforeVerificationIsRetained() async throws {
         try await assertCrossVolumeReplacementRetained(replacementMatchesSource: false)
     }

@@ -26,9 +26,17 @@ public struct ObserveFileIdentityPayload: Codable, Sendable {
     public var metadata: SeratoMetadata? = nil
     public var bitrateKbps: Int? = nil
     public var expectedState: FileLibraryState? = nil
+    public var ownedTagWriteEventID: Int64? = nil
+    public var observedMetadata: SeratoMetadata? = nil
+    public var previousObservedMetadata: SeratoMetadata? = nil
+    public var uncertainV2Fields: [String]? = nil
 }
 
 extension FileRecord {
+    var seratoMetadata: SeratoMetadata {
+        SeratoMetadata(artist: artist, title: title, album: album, genre: genre, bpm: bpm,
+                       musicalKey: musicalKey, comment: comment, length: length, label: label)
+    }
     static func loadIdentityProjections(database: LibraryDatabase) async throws -> [FileRecord] {
         let columns = "id, path, volume_uuid, inode, file_size, mtime, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision"
         var result: [FileRecord] = []
@@ -51,6 +59,23 @@ extension FileRecord {
 }
 
 enum FileIdentityObservationMutation {
+    static func recordOwnedTagWrite(previous: FileRecord, identity: FileMetadata, eventID: Int64, in database: GRDB.Database) throws {
+        guard let fileID = previous.id else { throw OperationEngineError.insertDidNotReturnRowId }
+        var current = previous
+        if current.fingerprintedSize == previous.fileSize, current.fingerprintedMtime == previous.mtime {
+            current.fingerprintedSize = identity.fileSize
+            current.fingerprintedMtime = identity.mtime
+        }
+        applyIdentity(identity, to: &current)
+        guard current != previous else { return }
+        try current.update(database)
+        let payload = ObserveFileIdentityPayload(fileId: fileID, expectedRevision: previous.membershipRevision,
+                                                 previousIdentity: previous.identity, identity: identity, ownedTagWriteEventID: eventID)
+        _ = try OperationEngine.insertEvent(batchId: "audio-written:\(eventID)", timestamp: Int64(Date().timeIntervalSince1970 * 1000),
+                                            fileId: fileID, trackId: previous.trackId, eventType: .fileIdentityObserved,
+                                            forwardPayload: payload, inversePayload: previous, in: database)
+    }
+
     static func apply(_ payload: ObserveFileIdentityPayload, batchId: String, timestamp: Int64, in database: GRDB.Database) throws -> Int64? {
         guard var file = try FileRecord.fetchOne(database, key: payload.fileId) else {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
@@ -86,28 +111,41 @@ enum FileIdentityObservationMutation {
             file.bitrateKbps = nil
             applyMetadata(SeratoMetadata(), to: &file)
         }
-        file.path = identity.path
-        file.volumeUuid = identity.volumeUuid
-        file.inode = identity.inode
-        file.fileSize = identity.fileSize
-        file.mtime = identity.mtime
-        file.lightweightHash = identity.lightweightHash
+        applyIdentity(identity, to: &file)
         if let metadata = payload.metadata {
             applyMetadata(metadata, to: &file)
         }
         if let bitrate = payload.bitrateKbps {
             file.bitrateKbps = bitrate
         }
-        guard file != previous else { return nil }
-        try file.update(database)
+        var journaled = payload
+        if let observed = payload.observedMetadata, payload.previousObservedMetadata == nil {
+            let uncertain = Set(payload.uncertainV2Fields ?? []).union(OperationEngine.changedMetadataFields(observed, previous: previous.seratoMetadata))
+            journaled.uncertainV2Fields = uncertain.isEmpty ? nil : uncertain.sorted()
+        }
+        let changedExternalMetadata = payload.previousObservedMetadata != nil
+            && payload.observedMetadata != payload.previousObservedMetadata
+        guard file != previous || changedExternalMetadata || journaled.uncertainV2Fields?.isEmpty == false else { return nil }
+        if file != previous {
+            try file.update(database)
+        }
         return try OperationEngine.insertEvent(batchId: batchId, timestamp: timestamp, fileId: file.id, trackId: previous.trackId,
-                                               eventType: .fileIdentityObserved, forwardPayload: payload, inversePayload: previous, in: database)
+                                               eventType: .fileIdentityObserved, forwardPayload: journaled, inversePayload: previous, in: database)
     }
 
     static func isReplacement(_ file: FileRecord, identity: FileMetadata) -> Bool {
         file.volumeUuid != identity.volumeUuid || file.inode != identity.inode
             || file.fileSize != identity.fileSize || file.mtime != identity.mtime
             || (file.lightweightHash != nil && file.lightweightHash != identity.lightweightHash)
+    }
+
+    private static func applyIdentity(_ identity: FileMetadata, to file: inout FileRecord) {
+        file.path = identity.path
+        file.volumeUuid = identity.volumeUuid
+        file.inode = identity.inode
+        file.fileSize = identity.fileSize
+        file.mtime = identity.mtime
+        file.lightweightHash = identity.lightweightHash
     }
 
     static func matchesContent(_ file: FileRecord, identity: FileMetadata) -> Bool {

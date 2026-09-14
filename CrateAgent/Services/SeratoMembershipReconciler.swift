@@ -6,6 +6,8 @@ struct ReconciliationSummary: Sendable, Equatable {
     var reactivated: Int = 0
     var unavailable: Int = 0
     var skippedUnsupported: Int = 0
+    var supersededWrites: Int = 0
+    var duplicateCleanupMessage: String? = nil
 }
 
 enum SeratoReconciliationError: LocalizedError {
@@ -77,6 +79,8 @@ actor SeratoMembershipReconciler {
                 observed = .trashed
             }
             let saved = savedPaths.contains(SeratoPath.normalized(path))
+            let ownedRemoval = try await operationEngine.pendingCleanupOwnsRemoval(of: file)
+            let readdedAfterOwnedRemoval = ownedRemoval && saved
             var mutations: [TrackMutation] = []
             var revision = file.membershipRevision
             if let movedIdentity {
@@ -98,7 +102,7 @@ actor SeratoMembershipReconciler {
             if observed != .offline {
                 if saved {
                     membership = .active
-                } else if membership != .pendingImport,
+                } else if membership != .pendingImport, !ownedRemoval,
                           try !(await hasApplicableRename(file, observedAvailability: observed, savedPaths: savedPaths))
                 {
                     membership = .retired
@@ -107,11 +111,14 @@ actor SeratoMembershipReconciler {
             let state = FileLibraryState(membership: membership, availability: observed,
                                          libraryID: observed == .offline ? file.seratoLibraryId : snapshot.libraryID,
                                          retiredAt: membership == .retired ? (file.retiredAt ?? Int64(Date().timeIntervalSince1970 * 1000)) : nil)
-            mutations.append(.setFileLibraryState(.init(fileId: fileID, expectedRevision: revision, state: state)))
+            mutations.append(.setFileLibraryState(.init(fileId: fileID, expectedRevision: revision, state: state, observedReadditionAfterOwnedRemoval: readdedAfterOwnedRemoval ? true : nil)))
             try await beforeCommit()
             let authorization = try await reader.authorization(for: snapshot)
             let expected = FileObservationExpectation(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)
             _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
+            if readdedAfterOwnedRemoval {
+                await operationEngine.supersedeReappearedCleanup(fileID: fileID)
+            }
             if membership == .retired, file.libraryMembership != .retired {
                 summary.retired += 1
             }

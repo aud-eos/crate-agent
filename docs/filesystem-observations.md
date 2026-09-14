@@ -37,6 +37,9 @@ This matters when a rename committed its database row but an external rewrite fa
 
 Dropped events and directory renames set a coalesced reconciliation request; they
 do not launch recursive scans or infer membership changes. The reconciliation
-consumer is wired separately. The current application failure boundary stops the
-process with the failed event ID and error, preserving the prior checkpoint. The
-session integration stage replaces that boundary with monitored error and retry UI.
+consumer uses the shared synchronization session. A failure stops processing and
+publishes the failed event and error through the main-window/menu-bar sync status.
+The failed head remains queued, later batches cannot pass it, and the prior kernel
+checkpoint remains unchanged. Retry Sync replays that head with strict validation;
+only successful replay and checkpointing clear the failure latch. A fresh normal
+session then drains outbound writes and reopens processing readiness.

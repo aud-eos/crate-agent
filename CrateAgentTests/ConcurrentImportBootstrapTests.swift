@@ -15,8 +15,10 @@ final class ConcurrentImportBootstrapTests: XCTestCase {
             try Data(audio.lastPathComponent.utf8).write(to: audio)
         }
         let fileIDs = try await database.writer.write { connection in
-            try audioURLs.enumerated().map { index, audio in
-                var file = FileRecord(path: audio.path, volumeUuid: "test", inode: Int64(index + 1), fileSize: 10, mtime: 1)
+            try audioURLs.map { audio in
+                let identity = try FileMetadataCollector.collectVerified(at: audio.path)
+                var file = FileRecord(path: audio.path, volumeUuid: identity.volumeUuid, inode: identity.inode,
+                                      fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash)
                 file.libraryMembership = .pendingImport
                 file.fileAvailability = .available
                 file.membershipRevision = 1

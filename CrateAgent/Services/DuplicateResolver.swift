@@ -2,11 +2,11 @@ import Foundation
 
 /// Carries out the destructive side of duplicate resolution. Given
 /// a group of duplicate files and the user's chosen keeper, the
-/// resolver fires a four-mutation batch per non-keeper:
+/// engine retains an original-authority sequence per non-keeper:
 ///
 ///   1. `removeTrackFromSerato` — drop the otrk from `database V2`
 ///      so Serato stops showing it
-///   2. `removeFileFromCrates` — sweep every `.crate` and remove
+///   2. `removeFileFromCrates` — sweep every `.crate` / `.scrate` and remove
 ///      the path so individual crates lose their broken reference
 ///   3. `trashFile` — move the file to macOS Trash (reversible
 ///      via Finder's "Put Back" until Trash is emptied)
@@ -16,6 +16,9 @@ import Foundation
 /// view. The events are journaled but undoNotSupported — recovery
 /// is via Finder Trash plus manual Serato re-add. The History
 /// entry is an audit log, not an undo handle, for this workflow.
+/// Pending/failed external stages retain their owner row. Completion and
+/// final row deletion follow actual successful Trash I/O; Retry Sync resumes
+/// a retained failed stage only after fresh saved-library authorization.
 ///
 /// Serato-closed precondition is enforced by `SeratoWatchdog`
 /// inside the engine (every Serato side effect queues if Serato is
@@ -30,6 +33,7 @@ public actor DuplicateResolver {
         /// Number of files that fully completed the 4-mutation
         /// sequence (Serato cleanup → trash → DB removal).
         public let trashedCount: Int
+        public let pendingCount: Int
         /// Number of files where one or more of the per-file
         /// mutations threw. Earlier mutations on these files may
         /// have already applied — see `errors` for context.
@@ -40,11 +44,13 @@ public actor DuplicateResolver {
         public init(
             batchId: String,
             trashedCount: Int,
+            pendingCount: Int = 0,
             failureCount: Int = 0,
             errors: [String] = []
         ) {
             self.batchId = batchId
             self.trashedCount = trashedCount
+            self.pendingCount = pendingCount
             self.failureCount = failureCount
             self.errors = errors
         }
@@ -88,12 +94,11 @@ public actor DuplicateResolver {
         keeperId: Int64,
         batchId: String? = nil
     ) async throws -> Outcome {
-        let keeperIsInGroup = group.files.contains { file in file.id == keeperId }
-        guard keeperIsInGroup else { throw ResolverError.keeperNotInGroup }
+        guard let keeper = group.files.first(where: { file in file.id == keeperId }) else { throw ResolverError.keeperNotInGroup }
 
-        let toTrash: [Int64] = group.files.compactMap { file -> Int64? in
+        let toTrash: [FileRecord] = group.files.compactMap { file -> FileRecord? in
             guard let identifier = file.id, identifier != keeperId else { return nil }
-            return identifier
+            return file
         }
         guard !toTrash.isEmpty else { throw ResolverError.noFilesToTrash }
 
@@ -102,12 +107,20 @@ public actor DuplicateResolver {
         await note("Resolving duplicate group: trashing \(toTrash.count) non-keeper\(toTrash.count == 1 ? "" : "s")…")
 
         var trashedCount = 0
+        var pendingCount = 0
         var failureCount = 0
         var errors: [String] = []
-        for fileId in toTrash {
+        for file in toTrash {
+            let fileId = file.id!
             do {
-                try await resolveOne(fileId: fileId, batchId: effectiveBatchId)
-                trashedCount += 1
+                let result = try await operationEngine.resolveDuplicate(target: file, keeper: keeper, batchID: effectiveBatchId)
+                switch result {
+                case .completed: trashedCount += 1
+                case .pending: pendingCount += 1
+                case let .superseded(message), let .failed(message):
+                    failureCount += 1
+                    errors.append("file id \(fileId): \(message)")
+                }
             } catch {
                 // Per-file fault tolerance: one failure must not
                 // abort the rest of the batch. The earlier
@@ -124,36 +137,14 @@ public actor DuplicateResolver {
             }
         }
 
-        await note("Resolved group — \(trashedCount) file\(trashedCount == 1 ? "" : "s") trashed, \(failureCount) skipped")
+        await note("Resolved group — \(trashedCount) trashed, \(pendingCount) pending, \(failureCount) skipped")
         return Outcome(
             batchId: effectiveBatchId,
             trashedCount: trashedCount,
+            pendingCount: pendingCount,
             failureCount: failureCount,
             errors: errors
         )
     }
 
-    private func resolveOne(fileId: Int64, batchId: String) async throws {
-        await note("Trashing file id \(fileId) (Serato cleanup → trash → DB)")
-        // Order matters for FK behavior: the Serato cleanups and
-        // the trash all read the FileRecord by id to resolve the
-        // path. `removeFile` deletes the row last, so it can't
-        // pull the path out from under earlier steps.
-        try await operationEngine.apply(
-            .removeTrackFromSerato(RemoveTrackFromSeratoPayload(fileId: fileId)),
-            batchId: batchId
-        )
-        try await operationEngine.apply(
-            .removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fileId)),
-            batchId: batchId
-        )
-        try await operationEngine.apply(
-            .trashFile(TrashFilePayload(fileId: fileId)),
-            batchId: batchId
-        )
-        try await operationEngine.apply(
-            .removeFile(RemoveFilePayload(fileId: fileId)),
-            batchId: batchId
-        )
-    }
 }

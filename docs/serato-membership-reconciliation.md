@@ -27,7 +27,8 @@ membership observations are informational History entries with no Undo or Re-syn
 permission to write obsolete content.
 
 `lastProjectionInvalidationRevision` permanently fences unversioned historical
-projections after either retirement or replacement. Initial legacy activation
+projections after retirement, replacement, or an observed re-add following a
+registered cleanup's confirmed V2 removal. Initial legacy activation
 alone does not set this fence. Modern projections always require an exact
 membership revision. The field and migration are new on this unshipped branch;
 the generalized name replaces the earlier retirement-only name.
@@ -41,6 +42,28 @@ read a fresh strict snapshot. The snapshot overload uses only the supplied
 records and journals guarded metadata/derived identity observations. Its legacy
 `scan(progress:)` overload is a separate compatibility entry point and does not
 provide this authorization contract.
+
+The engine retains the last successfully authorized external metadata observation
+per file/revision for the lifetime of its in-process queue, including unchanged
+observations. Each queued V2 edit captures that baseline separately from SQLite's
+local intended values. Saved `A` followed by queued `B` and unchanged saved `A`
+allows `B`; a later saved `C` or clear supersedes only affected older V2 fields.
+Unknown baselines report uncertainty/conflict rather than inventing newer external
+ownership. The observation journals affected `uncertainV2Fields` separately from
+proven raw external changes. History fences older V2 projections across those
+fields and visibly counts their supersession; retry does not grant them fresh
+authority. Independent fields and audio-tag writes retain their own authority.
+Successful own V2 writes advance the external baseline; a real drain is followed
+by a fresh strict read and metadata scan before readiness can reopen.
+
+Identity observations carry raw previous/current external metadata as well as the
+local projection. History uses their actual changed fields, including clears, as
+new V2 ownership. An external change is journaled even when SQLite already shows
+that value; unchanged co-imported fields do not acquire ownership. These events
+never claim audio-tag ownership. An owned successful tag write instead journals
+its verified physical identity and fingerprint basis, preserving revision,
+recording links, and Serato-mirrored metadata. Genuine replacements still invalidate
+the prior association.
 
 `reader.authorization(for:)` captures source identity, the reader's latest
 generation, and the watchdog's closed lifecycle revision. The engine's
@@ -109,3 +132,39 @@ directory ownership identifier. Add confirmation remains the engine's existing
 `import-confirmed:<eventID>` transaction. Failed adds retain pending membership.
 This work does not implement the general durable queue (#110) or change shared
 recording ownership rules (#113).
+
+## Physical effects and duplicate cleanup
+
+Queued effects retain their original file identity and membership revision. The
+shared final writer boundary resolves a verified move to the current audio target,
+checks the actual target and original content intent, and rechecks after journal
+lookups under writer serialization. Ordered reference renames retain their explicit
+path transition; an unrelated occupant of an old path cannot authorize rewriting
+or removing that occupant's V2/crate references. Expected supersession removes only
+the obsolete queued work; unexpected I/O failure stays visible and retryable.
+
+Duplicate cleanup retains the original keeper and target authority for every step.
+V2 removal, both crate forms, and Trash must actually complete before it reports
+completion. The row remains while external work is pending or failed; its final
+audited deletion runs in the successful Trash writer transaction. A failed crate
+does not prevent attempts on other crates, but any failed crate blocks Trash.
+An immediate external failure retains the already-journaled guarded write in the
+existing queue and publishes the existing Sync failure/Retry Sync surface. Normal
+sync leaves it failed; explicit Retry Sync resumes after fresh strict authorization,
+without re-journaling the mutation or renewing the original plan.
+
+Only a registered sequence with a confirmed own V2 removal may retain an absent
+member during reconciliation. An unstarted queued removal has no exemption.
+Retirement, replacement, a changed keeper, or a saved re-add cancels old cleanup.
+A re-add after confirmed own removal journals an active-to-active revision and
+permanent History fence without inventing retirement or altering recording/audio.
+Pending, completed, failed, and superseded counts remain visible in sync status.
+This bookkeeping is in-process and does not implement durable queue recovery.
+
+Physical move rollback and retained-source cleanup use `OwnedAudioIdentity`:
+precise device/inode/size/mtime/ctime plus a streaming SHA-256 digest of every byte.
+Native copying remains bound to the opened source and exclusively created
+destination. Changed or unowned files are retained with an error, including middle
+edits within the same timestamp second. Digest reads use bounded memory on the
+writer's execution context and only touch files participating in a move; browse
+and full-library snapshots do not hash every audio byte.

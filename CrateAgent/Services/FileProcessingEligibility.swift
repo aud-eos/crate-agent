@@ -49,6 +49,13 @@ extension TrackMutation {
         case let .revertMusicBrainzMatch(payload): return payload.applied.fileID
         }
     }
+
+    var tokenFileID: Int64? {
+        if case let .removeFile(payload) = self {
+            return payload.fileId
+        }
+        return processingFileID
+    }
 }
 
 public enum FileProcessingEligibilityError: LocalizedError {

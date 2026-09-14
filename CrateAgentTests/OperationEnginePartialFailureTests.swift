@@ -141,7 +141,10 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         }
     }
 
-    private let seratoPaths = ["Music/A/one.mp3", "Music/A/two.mp3", "Music/A/three.mp3"]
+    private let audioRoot = FileManager.default.temporaryDirectory.appendingPathComponent("owned-engine-audio-\(UUID().uuidString)")
+    private var seratoPaths: [String] {
+        ["one.mp3", "two.mp3", "three.mp3"].map { SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioRoot.appendingPathComponent($0).path) }
+    }
 
     private func sha256(_ data: Data) -> Data {
         Data(SHA256.hash(data: data))
@@ -155,8 +158,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         metadataSpy: MetadataBatchWriterSpy? = nil,
         seratoIsRunning: Bool = false
     ) throws -> (OperationEngine, LibraryDatabase, URL, [Int64]) {
-        let rootDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("crate-agent-c2-\(UUID().uuidString)", isDirectory: true)
+        let rootDirectory = audioRoot
         let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
         try FileManager.default.createDirectory(
             at: seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true),
@@ -191,9 +193,13 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         // slash back to the fixture's Serato-relative form.
         let fileIds = try database.writer.write { db -> [Int64] in
             try seratoPaths.enumerated().map { index, seratoPath in
+                let path = "/\(seratoPath)"
+                try Data([UInt8(index)]).write(to: URL(fileURLWithPath: path))
+                try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: path)
+                let identity = try FileMetadataCollector.collectVerified(at: path)
                 var file = FileRecord(
-                    path: "/\(seratoPath)", volumeUuid: "v1", inode: Int64(index + 1),
-                    fileSize: 1, mtime: 1, artist: "old", title: "old", album: "old"
+                    path: path, volumeUuid: identity.volumeUuid, inode: identity.inode,
+                    fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash, artist: "old", title: "old", album: "old"
                 )
                 file.libraryMembership = .active
                 file.fileAvailability = .available
@@ -281,7 +287,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
 
         // Every file's tag write eventually landed, and V2 metadata is set.
         let distinctWritten = Set(tagWriter.writtenPaths)
-        XCTAssertEqual(distinctWritten, Set(fileIds.map { "/Music/A/\(nameForFileIndex(fileIds, $0))" }),
+        XCTAssertEqual(distinctWritten, Set(fileIds.map { audioRoot.appendingPathComponent(nameForFileIndex(fileIds, $0)).path }),
                        "all three file-tag writes landed after resync")
 
         let records = try readDatabaseRecords(
@@ -340,7 +346,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         let committedEvents = try await eventCount(in: database, batchId: batchId)
         XCTAssertEqual(committedEvents, 2)
         // The failed file-tag write genuinely did not land during apply.
-        XCTAssertFalse(tagWriter.writtenPaths.contains("/Music/A/two.mp3"),
+        XCTAssertFalse(tagWriter.writtenPaths.contains("/\(seratoPaths[1])"),
                        "the file-tag write threw, so it did not land during apply")
 
         // Recovery must replay BOTH Hygiene event types — not return (0,0).
@@ -355,12 +361,12 @@ final class OperationEnginePartialFailureTests: XCTestCase {
 
         // The previously-missing file-tag write landed on resync, and the
         // committed metadata is present in database V2.
-        XCTAssertTrue(tagWriter.writtenPaths.contains("/Music/A/two.mp3"),
+        XCTAssertTrue(tagWriter.writtenPaths.contains("/\(seratoPaths[1])"),
                       "the failed file-tag write is replayed by resync")
         let records = try readDatabaseRecords(
             databasePath: seratoDirectory.appendingPathComponent("database V2").path
         )
-        let firstRecord = records.first { $0.path == "Music/A/one.mp3" }
+        let firstRecord = records.first { $0.path == seratoPaths[0] }
         XCTAssertEqual(firstRecord?.artist, "Hygiene0",
                        "committed metadata present in database V2 after the batch + resync")
     }
@@ -428,7 +434,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         if legacyJournal { try await stripMetadataAuthority(in: database) }
         _ = try await engine.resyncSeratoForBatch(undoBatchID)
         let records = try readDatabaseRecords(databasePath: databaseURL.path)
-        let record = try XCTUnwrap(records.first { $0.path == "Music/A/one.mp3" })
+        let record = try XCTUnwrap(records.first { $0.path == seratoPaths[0] })
         XCTAssertEqual(record.artist, "old")
         XCTAssertEqual(record.title, "old")
     }
@@ -523,9 +529,9 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         let records = try readDatabaseRecords(
             databasePath: seratoDirectory.appendingPathComponent("database V2").path
         )
-        let record = records.first { $0.path == "Music/A/one.mp3" }
+        let record = records.first { $0.path == seratoPaths[0] }
         XCTAssertEqual(record?.artist, "H0", "V2 metadata present after resync (not dropped as superseded)")
-        XCTAssertTrue(tagWriter.writtenPaths.contains("/Music/A/one.mp3"), "the file-tag write replayed too")
+        XCTAssertTrue(tagWriter.writtenPaths.contains("/\(seratoPaths[0])"), "the file-tag write replayed too")
     }
 
     // MARK: - #104 reground: resync ranks by ACTUAL writes, not event type
@@ -572,7 +578,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         let records = try readDatabaseRecords(
             databasePath: seratoDirectory.appendingPathComponent("database V2").path
         )
-        let record = records.first { $0.path == "Music/A/one.mp3" }
+        let record = records.first { $0.path == seratoPaths[0] }
         XCTAssertEqual(
             record?.artist, "Nas",
             "the earlier full match's V2 metadata is current (the later year-only match didn't touch V2) and must survive resync"
@@ -610,7 +616,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         let records = try readDatabaseRecords(
             databasePath: seratoDirectory.appendingPathComponent("database V2").path
         )
-        let record = records.first { $0.path == "Music/A/one.mp3" }
+        let record = records.first { $0.path == seratoPaths[0] }
         XCTAssertEqual(
             record?.artist, "old",
             "undo must restore database V2 from the DB snapshot (\"old\"), not the on-disk tag (\"Disk Artist\")"
@@ -652,7 +658,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         let records = try readDatabaseRecords(
             databasePath: seratoDirectory.appendingPathComponent("database V2").path
         )
-        let record = records.first { $0.path == "Music/A/one.mp3" }
+        let record = records.first { $0.path == seratoPaths[0] }
         XCTAssertEqual(record?.title, "A Title", "A's title survives B's artist-only write")
     }
 
@@ -689,7 +695,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         _ = try batchUpdateDatabaseRecords(
             databasePath: databaseV2Path,
             updates: [SeratoTrackMetadataUpdate(
-                trackPath: "Music/A/one.mp3",
+                trackPath: seratoPaths[0],
                 update: SeratoMetadataUpdate(
                     artist: "User Edit", title: nil, album: nil, genre: nil, bpm: nil,
                     key: nil, comment: nil, length: nil, label: nil
@@ -706,7 +712,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         _ = try await engine.resyncSeratoForBatch("batchA")
 
         let records = try readDatabaseRecords(databasePath: databaseV2Path)
-        let record = records.first { $0.path == "Music/A/one.mp3" }
+        let record = records.first { $0.path == seratoPaths[0] }
         XCTAssertEqual(
             record?.artist, "User Edit",
             "the user's newer in-Serato edit (imported as .metadataSet) must survive — resync must not clobber it with the stale match artist"
@@ -755,7 +761,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         _ = try batchUpdateDatabaseRecords(
             databasePath: databaseV2Path,
             updates: [SeratoTrackMetadataUpdate(
-                trackPath: "Music/A/one.mp3",
+                trackPath: seratoPaths[0],
                 update: SeratoMetadataUpdate(
                     artist: "User Edit", title: "CLOBBERED", album: nil, genre: nil, bpm: nil,
                     key: nil, comment: nil, length: nil, label: nil
@@ -768,7 +774,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         _ = try await engine.resyncSeratoForBatch("batchA")
 
         let records = try readDatabaseRecords(databasePath: databaseV2Path)
-        let record = records.first { $0.path == "Music/A/one.mp3" }
+        let record = records.first { $0.path == seratoPaths[0] }
         XCTAssertEqual(
             record?.title, "NY State",
             "the match still owns the co-imported title the user never edited, so resync restores it after a clobber"
@@ -819,7 +825,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         _ = try batchUpdateDatabaseRecords(
             databasePath: databaseV2Path,
             updates: [SeratoTrackMetadataUpdate(
-                trackPath: "Music/A/one.mp3",
+                trackPath: seratoPaths[0],
                 update: SeratoMetadataUpdate(
                     artist: "", title: nil, album: nil, genre: nil, bpm: nil,
                     key: nil, comment: nil, length: nil, label: nil
@@ -832,7 +838,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         _ = try await engine.resyncSeratoForBatch("batchA")
 
         let records = try readDatabaseRecords(databasePath: databaseV2Path)
-        let record = records.first { $0.path == "Music/A/one.mp3" }
+        let record = records.first { $0.path == seratoPaths[0] }
         XCTAssertTrue(
             record?.artist == "" || record?.artist == nil,
             "the user's clear must survive as cleared — resync must not restore the match's artist (was \(String(describing: record?.artist)))"
