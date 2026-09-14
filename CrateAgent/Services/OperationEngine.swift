@@ -199,6 +199,44 @@ public actor OperationEngine {
         return executionResults.compactMap(\.eventId)
     }
 
+    func applyObservedBatch(_ mutations: [TrackMutation], authorization: SeratoSnapshotAuthorization, batchId: String = UUID().uuidString) async throws -> [Int64] {
+        try await database.writer.write { connection in
+            try authorization.check()
+            let results = try mutations.map { mutation in
+                try Self.validateObservedIdentity(mutation, in: connection)
+                let result = try Self.executeAndLog(mutation: mutation, batchId: batchId, in: connection)
+                guard result.seratoWrites.isEmpty else { throw SeratoMembershipSnapshotError.unsupportedSource }
+                return result
+            }
+            try authorization.check()
+            return results.compactMap(\.eventId)
+        }
+    }
+
+    private static func validateObservedIdentity(_ mutation: TrackMutation, in database: GRDB.Database) throws {
+        switch mutation {
+        case let .indexNewFile(payload):
+            let expected = FileMetadata(path: payload.path, volumeUuid: payload.volumeUuid, inode: payload.inode, fileSize: payload.fileSize, mtime: payload.mtime, lightweightHash: payload.lightweightHash)
+            guard try FileMetadataCollector.collectVerified(at: payload.path) == expected else { throw SeratoMembershipSnapshotError.sourceChanged }
+        case let .setFileLibraryState(payload) where payload.state.availability == .available:
+            guard let file = try FileRecord.fetchOne(database, key: payload.fileId),
+                  try !FileIdentityObservationMutation.isReplacement(file, identity: FileMetadataCollector.collectVerified(at: file.path))
+            else {
+                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            }
+        case let .observeFileLocation(payload):
+            let identity = try FileMetadataCollector.collectVerified(at: payload.path)
+            guard let file = try FileRecord.fetchOne(database, key: payload.fileId),
+                  identity.inode == payload.inode, identity.volumeUuid == payload.volumeUuid,
+                  identity.fileSize == file.fileSize,
+                  file.lightweightHash.map({ hash in hash == identity.lightweightHash }) ?? (file.mtime == identity.mtime)
+            else {
+                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            }
+        default: break
+        }
+    }
+
     /// Route a committed batch's Serato-side writes: queue them if
     /// Serato is running (they drain on Serato exit — invariant #3),
     /// otherwise apply them now (coalesced — see
@@ -601,7 +639,7 @@ public actor OperationEngine {
             return true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileImportRequested:
+             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
             return false
         }
     }
@@ -696,7 +734,7 @@ public actor OperationEngine {
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
             return []
         }
     }
@@ -912,7 +950,7 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
-        case .fileLibraryStateChanged, .fileLocationObserved, .fileImportRequested:
+        case .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
             // Observation inverses preserve audit evidence, not permission to
             // reverse an external Serato decision or re-add its membership.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
@@ -1088,7 +1126,7 @@ public actor OperationEngine {
             guard let guardedWrite = guardedWrites.first else {
                 throw OperationEngineError.insertDidNotReturnRowId
             }
-            let libraryID = seratoLocator.seratoDirectory.standardizedFileURL.path
+            let libraryID = try seratoLocator.supportedLibraryIdentity()
             try await database.writer.write { database in
                 guard let file = try FileRecord.fetchOne(database, key: guardedWrite.token.fileId),
                       SeratoWriteEligibility.permits(guardedWrite, file: file)
@@ -1699,6 +1737,9 @@ public actor OperationEngine {
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .observeFileLocation(payload):
             let eventId = try FileLocationObservationMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .observeFileIdentity(payload):
+            let eventId = try FileIdentityObservationMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .setFileLibraryState(payload):
             let eventId = try FileLibraryStateMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
@@ -2756,6 +2797,7 @@ public enum TrackMutation: Sendable {
     case removeFile(RemoveFilePayload)
     case setFileLibraryState(SetFileLibraryStatePayload)
     case observeFileLocation(ObserveFileLocationPayload)
+    case observeFileIdentity(ObserveFileIdentityPayload)
     case beginFileImport(BeginFileImportPayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)

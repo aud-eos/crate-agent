@@ -43,7 +43,13 @@ remain pending until their explicit add succeeds or a saved snapshot confirms
 membership. Absence must not cancel a newly requested import simply because it
 has not reached V2 yet.
 
-Membership transitions and deliberate new import requests advance the revision.
+Membership transitions, deliberate new import requests, and confirmed replacement
+of a file's physical/content identity advance the revision. Replacement invalidates
+prior queued work and cached file associations while preserving the file row and
+shared recording history. Same-file location/availability observations do not
+advance the revision.
+Retirement and replacement also set a permanent projection-invalidation revision,
+so unversioned historical work cannot regain permission through a new identity.
 An explicit retry uses a dedicated begin-import mutation, verifies the same file's
 identity, and advances the revision even for pending-import to pending-import.
 It cancels older queued adds without manufacturing an intermediate membership

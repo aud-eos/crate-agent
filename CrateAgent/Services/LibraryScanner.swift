@@ -12,9 +12,8 @@ import os.log
 ///     the stored snapshot → `setMetadata`
 ///   • otherwise → no-op
 ///
-/// Tracks Serato has removed are NOT yet pruned from the local table
-/// (the `removeFile` mutation hasn't landed). They'd just sit there
-/// orphaned until that ships.
+/// The validated snapshot entry point works with SeratoMembershipReconciler,
+/// which independently journals saved membership and retirement.
 ///
 /// Used by AppServices on launch and by SeratoSyncCoordinator when
 /// Serato quits — same operation in both contexts.
@@ -218,6 +217,81 @@ public actor LibraryScanner {
     }
 
     // MARK: - Helpers
+
+    /// Consumes exactly the saved generation reconciled by the caller. Run before
+    /// queue drain; draining changes V2 and requires a newly read snapshot.
+    @discardableResult
+    func scan(snapshot: SeratoMembershipSnapshot, reader: SeratoMembershipSnapshotReader, progress: ProgressHandler? = nil) async throws -> ScanResult {
+        try await reader.validate(snapshot)
+        let files = try await FileRecord.loadIdentityProjections(database: database)
+        var byPath: [String: FileRecord] = [:]
+        for file in files {
+            let path = SeratoPath.normalized(file.path)
+            guard byPath.updateValue(file, forKey: path) == nil else { throw SeratoReconciliationError.ambiguousIdentity(path) }
+        }
+        var records: [String: SeratoTrackRecord] = [:]
+        for record in snapshot.records {
+            let path = SeratoPath.normalized(record.path)
+            guard records.updateValue(record, forKey: path) == nil else { throw SeratoReconciliationError.ambiguousIdentity(path) }
+        }
+        var indexed = 0
+        var updated = 0
+        var skipped = 0
+        let resolver = FileAvailabilityResolver()
+        for path in records.keys.sorted() {
+            try Task.checkCancellation()
+            guard let record = records[path] else { preconditionFailure("Snapshot path index lost a record") }
+            let existing = byPath[path]
+            if let existing, existing.libraryMembership != .active || existing.fileAvailability != .available {
+                skipped += 1
+                continue
+            }
+            guard let basic = FileMetadataCollector.collect(at: path) else {
+                // Missing audio remains diagnosable through reconciliation's availability.
+                skipped += 1
+                continue
+            }
+            guard try resolver.inspect(path: path, volumeID: existing?.volumeUuid ?? basic.volumeUuid) == .available else {
+                skipped += 1
+                continue
+            }
+            let identity = try FileMetadataCollector.collectVerified(at: path)
+            let metadata = makeSeratoMetadata(fromRecord: record)
+            let authorization = try await reader.authorization(for: snapshot)
+            if let existing, let fileID = existing.id {
+                // Identity refresh belongs to reconciliation, which supersedes stale work.
+                guard !FileIdentityObservationMutation.isReplacement(existing, identity: identity) else {
+                    throw SeratoReconciliationError.ambiguousIdentity(path)
+                }
+                let events = try await operationEngine.applyObservedBatch([.observeFileIdentity(.init(fileId: fileID, expectedRevision: existing.membershipRevision,
+                                                                                                      previousIdentity: existing.identity, identity: identity, metadata: metadata,
+                                                                                                      bitrateKbps: readBitrateKbps(forPathAt: path), expectedState: existing.libraryState))], authorization: authorization)
+                if !events.isEmpty {
+                    updated += 1
+                }
+            } else {
+                _ = try await operationEngine.applyObservedBatch([.indexNewFile(.init(path: identity.path, volumeUuid: identity.volumeUuid, inode: identity.inode,
+                                                                                      fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash,
+                                                                                      bitrateKbps: readBitrateKbps(forPathAt: path), metadata: metadata))], authorization: authorization)
+                guard let file = try await database.writer.read({ connection in
+                    try FileRecord.filter(Column("path") == path).fetchOne(connection)
+                }), let fileID = file.id else { throw SeratoReconciliationError.ambiguousIdentity(path) }
+                try await reader.validate(snapshot)
+                _ = try await operationEngine.applyObservedBatch([
+                    .observeFileIdentity(.init(fileId: fileID, expectedRevision: file.membershipRevision, previousIdentity: file.identity, identity: identity, expectedState: file.libraryState)),
+                    .setFileLibraryState(.init(fileId: fileID, expectedRevision: file.membershipRevision,
+                                               state: FileLibraryState(membership: .active, availability: .available, libraryID: snapshot.libraryID, retiredAt: nil))),
+                ], authorization: authorization)
+                indexed += 1
+            }
+            if (indexed + updated) % 50 == 0 {
+                progress?(ScanProgress(seratoReferenceCount: records.count, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped, lastChangedPath: path))
+            }
+        }
+        try await reader.validate(snapshot)
+        progress?(ScanProgress(seratoReferenceCount: records.count, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped, lastChangedPath: nil))
+        return ScanResult(seratoReferenceCount: records.count, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped)
+    }
 
     /// Read Serato's database V2 and return the records keyed by
     /// absolute path. Off the actor's isolation domain because the

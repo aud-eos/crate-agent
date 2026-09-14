@@ -26,10 +26,14 @@ public final class SeratoWatchdog: ObservableObject {
 
     @Published public private(set) var isSeratoRunning: Bool = false
     public private(set) var stateRevision: UInt64 = 0
-    private nonisolated let externalWriteState = OSAllocatedUnfairLock(initialState: false)
+    private nonisolated let externalWriteState = OSAllocatedUnfairLock(initialState: (running: false, revision: UInt64(0)))
+
+    nonisolated func isClosed(atRevision revision: UInt64) -> Bool {
+        externalWriteState.withLock { state in !state.running && state.revision == revision }
+    }
 
     nonisolated var isRunningForExternalWrite: Bool {
-        externalWriteState.withLock { $0 }
+        externalWriteState.withLock { state in state.running }
     }
 
     private let runningBundleIdentifiersProvider: () -> [String]
@@ -105,6 +109,8 @@ public final class SeratoWatchdog: ObservableObject {
         else { return }
         // A queued launch and termination can both arrive after the process has exited.
         stateRevision += 1
+        let revision = stateRevision
+        externalWriteState.withLock { state in state.revision = revision }
         refresh()
     }
 
@@ -118,7 +124,8 @@ public final class SeratoWatchdog: ObservableObject {
         }
         if running != isSeratoRunning {
             stateRevision += 1
-            externalWriteState.withLock { $0 = running }
+            let revision = stateRevision
+            externalWriteState.withLock { state in state = (running, revision) }
             isSeratoRunning = running
         }
     }

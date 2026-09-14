@@ -33,8 +33,8 @@ enum FileLibraryStateMutation {
         if startsImportIntent || file.libraryMembership != payload.state.membership {
             file.membershipRevision += 1
             if payload.state.membership == .retired {
-                // Unversioned History intent stays invalid after reactivation or inverse application.
-                file.lastRetirementRevision = file.membershipRevision
+                // Legacy History stays invalid after retirement or content replacement.
+                file.lastProjectionInvalidationRevision = file.membershipRevision
             }
         }
         file.libraryMembership = payload.state.membership

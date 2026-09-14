@@ -920,10 +920,7 @@ final class OperationEngineTests: XCTestCase {
     }
 
     private static func appendTlvRecord(tag: String, payload: Data, to data: inout Data) {
-        precondition(tag.utf8.count == 4, "Serato tags are 4 ASCII bytes")
-        data.append(contentsOf: tag.utf8)
-        data.append(contentsOf: uint32BigEndianBytes(of: UInt32(payload.count)))
-        data.append(payload)
+        data.append(SeratoTestEncoding.record(tag, payload))
     }
 
     private static func utf16BeBytes(of string: String) -> Data {

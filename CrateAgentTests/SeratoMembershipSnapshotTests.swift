@@ -76,9 +76,7 @@ final class SeratoMembershipSnapshotTests: XCTestCase {
     }
 
     private var emptyLibrary: Data {
-        let payload = "2.0/Serato Scratch LIVE Database".data(using: .utf16BigEndian)!
-        var length = UInt32(payload.count).bigEndian
-        return Data("vrsn".utf8) + withUnsafeBytes(of: &length) { Data($0) } + payload
+        SeratoTestEncoding.library(paths: [])
     }
 
     func testValidMembershipComesFromEncodedTrack() async throws {

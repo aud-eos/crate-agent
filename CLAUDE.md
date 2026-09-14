@@ -18,6 +18,11 @@ Why this exists: without the chokepoint, every feature reinvents (a) the Serato-
 
 How to apply: when adding a new feature that modifies tracks, add a `TrackMutation` case and implement its apply / inverse logic. Do not write a parallel path that goes around `OperationEngine`.
 
+Async validation is not authorization for a later commit: another actor can retire
+the file, replace its identity, or supersede a saved snapshot during suspension.
+Recheck the relevant revision, identity, and snapshot/lifecycle generation inside
+the serialized transaction or external-write boundary (removal-sync Tasks 3 and 5).
+
 ### 2. Every mutation logs an event with an inverse payload
 
 The `events` table is append-only and serves two queries:

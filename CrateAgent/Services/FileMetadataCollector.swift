@@ -39,6 +39,16 @@ public struct FileMetadata: Codable, Sendable, Equatable {
 }
 
 public enum FileMetadataCollector {
+    static func collectVerified(at path: String) throws -> FileMetadata {
+        let url = URL(fileURLWithPath: path)
+        let before = try SeratoSourceIdentity.read(url)
+        guard let metadata = collect(at: path, includeLightweightHash: true), metadata.lightweightHash != nil,
+              try before == SeratoSourceIdentity.read(url)
+        else {
+            throw SeratoMembershipSnapshotError.sourceChanged
+        }
+        return metadata
+    }
 
     /// Read metadata for the file at `path`. Returns nil when the
     /// file doesn't exist, isn't stat-able (permissions, broken
@@ -59,8 +69,8 @@ public enum FileMetadataCollector {
         guard stat(path, &statBuffer) == 0 else { return nil }
 
         let url = URL(fileURLWithPath: path)
-        let volumeUuidString = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?
-            .volumeUUIDString ?? "unknown-volume"
+        guard let volumeUuidString = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?
+            .volumeUUIDString else { return nil }
 
         let hash = includeLightweightHash
             ? LightweightHashCalculator.compute(forFileAt: path)

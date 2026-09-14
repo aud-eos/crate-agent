@@ -68,10 +68,10 @@ public actor ImportCoordinator {
     private func importSingleFile(at fileUrl: URL) async -> Bool {
         let absolutePath = fileUrl.path
 
-        guard let fileMetadata = FileMetadataCollector.collect(
-            at: absolutePath,
-            includeLightweightHash: true
-        ) else {
+        let fileMetadata: FileMetadata
+        do {
+            fileMetadata = try FileMetadataCollector.collectVerified(at: SeratoPath.normalized(absolutePath))
+        } catch {
             Self.logger.warning(
                 "could not stat \(absolutePath, privacy: .public); skipping import"
             )
@@ -88,7 +88,10 @@ public actor ImportCoordinator {
         let fileId: Int64
         do {
             let existing = try await database.writer.read { database in
-                try FileRecord.filter(Column("path") == fileMetadata.path).fetchOne(database)
+                let candidates = try FileRecord.filter(Column("path") == fileMetadata.path || (Column("inode") == fileMetadata.inode && Column("volume_uuid") == fileMetadata.volumeUuid)).fetchAll(database)
+                    .filter { file in SeratoPath.normalized(file.path) == SeratoPath.normalized(fileMetadata.path) }
+                guard candidates.count <= 1 else { throw SeratoReconciliationError.ambiguousIdentity(fileMetadata.path) }
+                return candidates.first
             }
             if let existing {
                 guard existing.libraryMembership != .active,

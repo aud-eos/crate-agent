@@ -11,7 +11,7 @@ public enum FileProcessingEligibility {
 extension TrackMutation {
     var processingFileID: Int64? {
         switch self {
-        case .indexNewFile, .observeFileLocation, .setFileLibraryState, .beginFileImport, .removeFile: return nil
+        case .indexNewFile, .observeFileLocation, .observeFileIdentity, .setFileLibraryState, .beginFileImport, .removeFile: return nil
         case let .setMetadata(payload): return payload.isSeratoAuthoritative == true ? nil : payload.fileId
         case let .renameFile(payload): return payload.fileId
         case let .commitMetadataToSerato(payload): return payload.fileId

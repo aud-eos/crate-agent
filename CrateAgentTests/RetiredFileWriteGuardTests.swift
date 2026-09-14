@@ -330,7 +330,7 @@ final class RetiredFileWriteGuardTests: XCTestCase {
         XCTAssertEqual(after.supersededCount, 1)
         XCTAssertEqual(try Data(contentsOf: v2URL), bytes)
         let file = try await fixture.database.writer.read { database in try XCTUnwrap(FileRecord.fetchOne(database, key: fixture.fileID)) }
-        XCTAssertEqual(file.lastRetirementRevision, 2)
+        XCTAssertEqual(file.lastProjectionInvalidationRevision, 2)
     }
 
     @MainActor
@@ -437,7 +437,7 @@ final class RetiredFileWriteGuardTests: XCTestCase {
         let active = try await fixture.database.writer.read { database in try XCTUnwrap(FileRecord.fetchOne(database, key: fileID)) }
         XCTAssertEqual(active.libraryMembership, .active)
         XCTAssertEqual(active.membershipRevision, 5)
-        XCTAssertEqual(active.lastRetirementRevision, 3)
+        XCTAssertEqual(active.lastProjectionInvalidationRevision, 3)
         try await fixture.engine.apply(.setFileLibraryState(SetFileLibraryStatePayload(fileId: fileID, expectedRevision: 5,
                                                                                        state: FileLibraryState(membership: .retired, availability: .available, libraryID: "test", retiredAt: 1))))
         try Data("replacement audio with a different size".utf8).write(to: audio)

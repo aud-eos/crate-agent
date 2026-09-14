@@ -41,7 +41,7 @@ enum SeratoWriteEligibility {
             guard revision == file.membershipRevision else { return nil }
             return FileMembershipToken(fileId: fileId, revision: revision)
         }
-        guard file.lastRetirementRevision == nil else { return nil }
+        guard file.lastProjectionInvalidationRevision == nil else { return nil }
         return FileMembershipToken(fileId: fileId, revision: file.membershipRevision)
     }
 }
