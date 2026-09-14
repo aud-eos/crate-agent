@@ -1,6 +1,37 @@
 import CoreServices
 import Foundation
 
+struct FilesystemWatchConfiguration: Sendable {
+    let watchedPaths: [String]
+    let checkpointKey: String
+    private let legacyMusicPath: String
+
+    init(musicFolder: URL, trashDirectory: (URL) throws -> URL = { folder in
+        try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: folder, create: true)
+    }) throws {
+        legacyMusicPath = musicFolder.path
+        let trash = try trashDirectory(musicFolder)
+        watchedPaths = Set([musicFolder.path, trash.path].map(SeratoPath.normalized)).sorted()
+        checkpointKey = try "watch-roots:" + String(decoding: JSONEncoder().encode(watchedPaths), as: UTF8.self)
+    }
+
+    func resumeEventID(readCheckpoint: (String) -> UInt64?) -> UInt64 {
+        readCheckpoint(checkpointKey) ?? readCheckpoint(legacyMusicPath) ?? FSEventsWatcher.sinceNow
+    }
+}
+
+enum FilesystemWatcherError: LocalizedError {
+    case creationFailed([String])
+    case startFailed([String])
+
+    var errorDescription: String? {
+        switch self {
+        case let .creationFailed(paths): return "Could not create filesystem observation for \(paths.joined(separator: ", "))."
+        case let .startFailed(paths): return "Could not start filesystem observation for \(paths.joined(separator: ", "))."
+        }
+    }
+}
+
 /// Watches one or more filesystem paths and emits typed observations
 /// for every change. Wraps the C-level FSEvents API.
 ///
@@ -62,8 +93,9 @@ public final class FSEventsWatcher {
         FSEventStreamRelease(stream)
     }
 
-    public func start() {
+    public func start() throws {
         guard stream == nil else { return }
+        guard !watchedPaths.isEmpty else { throw FilesystemWatcherError.creationFailed(watchedPaths) }
 
         let context = UnsafeMutablePointer<FSEventStreamContext>.allocate(capacity: 1)
         defer { context.deallocate() }
@@ -90,11 +122,15 @@ public final class FSEventsWatcher {
             coalescingLatency,
             flags
         ) else {
-            return
+            throw FilesystemWatcherError.creationFailed(watchedPaths)
         }
 
         FSEventStreamSetDispatchQueue(createdStream, dispatchQueue)
-        FSEventStreamStart(createdStream)
+        guard FSEventStreamStart(createdStream) else {
+            FSEventStreamInvalidate(createdStream)
+            FSEventStreamRelease(createdStream)
+            throw FilesystemWatcherError.startFailed(watchedPaths)
+        }
         stream = createdStream
     }
 

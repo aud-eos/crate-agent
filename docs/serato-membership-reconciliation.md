@@ -16,6 +16,19 @@ currently applicable rename when its membership revision still matches, its
 destination is the verified indexed file, and its original location is missing.
 Prior-membership rename events do not grant permission after reactivation.
 
+Explicit import accepts an unknown historical content hash only when normalized
+path, volume, inode, size, and modification time still match. The transaction
+verifies the current file again and journals the hash backfill before import
+intent. A known unequal hash or any other identity mismatch rejects the import.
+This compatibility rule does not relax exact prior-identity observation guards.
+
+The historical `unknown-volume` sentinel has a separate repair path: a readable
+indexed location must pass the same retained attribute checks before its verified
+real volume is adopted through a journaled observation. Adoption preserves the
+recording and fingerprint and allows ordinary membership activation. Missing
+sentinel locations remain unresolved/offline; arbitrary unknown volume IDs are
+never adopted, and mismatched identities produce a visible ambiguity error.
+
 A saved new path can retain a known file ID only through unique physical or
 content identity and a missing old location. Case-only spellings on a filesystem
 that reports case-insensitive names are accepted only when both paths still
@@ -116,6 +129,17 @@ paused; a successful retry opens it once. AppServices owns and cancels the start
 wait task; cancellation is checked again after the session becomes idle, before
 any buffered replay. The processor owns pending delivery,
 so startup does not wait for a filesystem handler that can itself request sync.
+
+Production setup resolves the watched music folder's applicable native Trash
+directory once, creating that directory if necessary, and watches the normalized,
+deduplicated music and Trash paths in one stream. This captures native Trash
+destinations without enumerating Trash or scanning it per missing row. A verified
+Trash destination marks the indexed original path as trashed; it never becomes a
+V2 rename target. Root derivation and stream creation/start failures fail startup
+visibly. The checkpoint key includes the complete watched-path set. Until the
+first checkpoint for that set, the old music-root cursor is a conservative replay
+fallback; checkpoints advance only after the combined batch succeeds. Watch roots
+are fixed for the AppServices lifecycle and reconstructed on the next startup.
 
 A destination-first copy/move observation retains a verified candidate against
 the original indexed file's revision, state, and identity. A live source remains

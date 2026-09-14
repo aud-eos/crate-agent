@@ -26,7 +26,11 @@ final class FileAvailabilityResolverTests: XCTestCase {
     }
 
     func testNativeTrashFixture() async throws {
-        let source = FileManager.default.temporaryDirectory.appendingPathComponent("crate-agent-trash-test-\(UUID().uuidString).mp3")
+        let ownedVolume = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume")
+        guard FileManager.default.fileExists(atPath: ownedVolume.appendingPathComponent(".task6-test-volume").path) else {
+            throw XCTSkip("Requires task-owned APFS volume")
+        }
+        let source = ownedVolume.appendingPathComponent("crate-agent-trash-test-\(UUID().uuidString).mp3")
         try Data([5, 6]).write(to: source)
         defer {
             if FileManager.default.fileExists(atPath: source.path) {
@@ -46,6 +50,10 @@ final class FileAvailabilityResolverTests: XCTestCase {
             OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }), seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
         }
         let coordinator = FilesystemSyncCoordinator(operationEngine: engine, database: database)
+        let trash = try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: source, create: true)
+        guard SeratoPath.normalized(trash.path).hasPrefix(SeratoPath.normalized(ownedVolume.path) + "/") else {
+            return XCTFail("Native Trash must belong to the task-owned volume")
+        }
         var resultingURL: NSURL?
         try FileManager.default.trashItem(at: source, resultingItemURL: &resultingURL)
         let trashed = try XCTUnwrap(resultingURL as URL?)

@@ -83,9 +83,9 @@ actor SeratoMembershipReconciler {
                 summary.skippedUnsupported += 1
                 continue
             }
-            let movedIdentity = moves[fileID]
-            let path = movedIdentity?.path ?? file.path
-            var observed = try availability.inspect(path: path, volumeID: movedIdentity?.volumeUuid ?? file.volumeUuid)
+            let observedIdentity = try moves[fileID] ?? repairedLegacyVolume(file)
+            let path = observedIdentity?.path ?? file.path
+            var observed = try availability.inspect(path: path, volumeID: observedIdentity?.volumeUuid ?? file.volumeUuid)
             if observed == .offline {
                 summary.skippedUnsupported += 1
             }
@@ -97,8 +97,8 @@ actor SeratoMembershipReconciler {
             let readdedAfterOwnedRemoval = ownedRemoval && saved
             var mutations: [TrackMutation] = []
             var revision = file.membershipRevision
-            if let movedIdentity {
-                mutations.append(.observeFileIdentity(.init(fileId: fileID, expectedRevision: revision, previousIdentity: file.identity, identity: movedIdentity)))
+            if let observedIdentity {
+                mutations.append(.observeFileIdentity(.init(fileId: fileID, expectedRevision: revision, previousIdentity: file.identity, identity: observedIdentity)))
             } else if observed == .available {
                 let identity = try FileMetadataCollector.collectVerified(at: path)
                 if identity != file.identity {
@@ -144,6 +144,17 @@ actor SeratoMembershipReconciler {
             }
         }
         return summary
+    }
+
+    private func repairedLegacyVolume(_ file: FileRecord) throws -> FileMetadata? {
+        guard file.volumeUuid == LegacyFileIdentity.unknownVolume,
+              let basic = FileMetadataCollector.collect(at: file.path),
+              try availability.inspect(path: file.path, volumeID: basic.volumeUuid) == .available else { return nil }
+        let identity = try FileMetadataCollector.collectVerified(at: file.path)
+        guard LegacyFileIdentity.canAdoptVolume(file, identity: identity) else {
+            throw SeratoReconciliationError.ambiguousIdentity(file.path)
+        }
+        return identity
     }
 
     private func resolveSavedMoves(paths: Set<String>, files: [FileRecord], byPath: [String: FileRecord]) throws -> [Int64: FileMetadata] {

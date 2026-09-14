@@ -163,14 +163,10 @@ public final class AppServices: ObservableObject {
             seratoWatchdog: seratoWatchdog
         )
 
-        // Resume from the last seen event ID if we have one for this
-        // exact watched path — events that happened while crate-agent
-        // was closed get replayed. First launch (no stored ID) starts
-        // from "now."
-        let watchedFolderPath = watchedMusicFolder.path
-        let resumeFromEventId = UserPreferences.lastFSEventId(
-            forWatchedPath: watchedFolderPath
-        ) ?? FSEventsWatcher.sinceNow
+        let watchConfiguration = try FilesystemWatchConfiguration(musicFolder: watchedMusicFolder)
+        let resumeFromEventId = watchConfiguration.resumeEventID {
+            UserPreferences.lastFSEventId(forWatchedPath: $0)
+        }
 
         let eventStream = AsyncStream<FilesystemEventBatch>.makeStream()
         filesystemContinuation = eventStream.continuation
@@ -179,16 +175,18 @@ public final class AppServices: ObservableObject {
             initiallyPaused: true,
             handler: { batch in try await batchHandler.handle(batch) },
             checkpoint: { eventId in
-                UserPreferences.setLastFSEventId(eventId, forWatchedPath: watchedFolderPath)
+                UserPreferences.setLastFSEventId(eventId, forWatchedPath: watchConfiguration.checkpointKey)
             }
         )
         filesystemProcessor = processor
-        filesystemStartupTask = processor.resumeAfterInitialSync(session)
-        fsEventsWatcher = FSEventsWatcher(
-            watchedPaths: [watchedFolderPath],
+        let watcher = FSEventsWatcher(
+            watchedPaths: watchConfiguration.watchedPaths,
             sinceWhen: resumeFromEventId,
             handler: { batch in eventStream.continuation.yield(batch) }
         )
+        try watcher.start()
+        fsEventsWatcher = watcher
+        filesystemStartupTask = processor.resumeAfterInitialSync(session)
         filesystemEventsTask = Task { [weak self] in
             for await batch in eventStream.stream {
                 if Task.isCancelled {
@@ -205,7 +203,6 @@ public final class AppServices: ObservableObject {
 
         // All stored properties are now assigned; start lifecycle.
         seratoWatchdog.startObservingWorkspace()
-        fsEventsWatcher.start()
 
         // Bridge OperationEngine's queue-depth publisher into the
         // @Published var so SwiftUI views observe it like any other

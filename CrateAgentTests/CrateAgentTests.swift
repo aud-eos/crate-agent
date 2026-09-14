@@ -1650,7 +1650,7 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
             path: "/imaginary/old-location.mp3",
             volumeUuid: (try? audioFile.resourceValues(forKeys: [.volumeUUIDStringKey]))?
-                .volumeUUIDString ?? "unknown-volume",
+                .volumeUUIDString ?? LegacyFileIdentity.unknownVolume,
             inode: realInode,
             fileSize: 11,
             mtime: 1
@@ -1763,7 +1763,7 @@ final class FSEventsWatcherTests: XCTestCase {
                 checkpointExpectation.fulfill()
             }
         )
-        watcher.start()
+        try watcher.start()
         defer { watcher.stop() }
 
         Thread.sleep(forTimeInterval: 0.2)
@@ -1819,7 +1819,7 @@ final class FSEventsWatcherTests: XCTestCase {
                 createObservedExpectation.fulfill()
             }
         }
-        watcher.start()
+        try watcher.start()
         defer { watcher.stop() }
 
         // Give FSEvents a moment to register the watch before
@@ -2203,7 +2203,7 @@ extension FilesystemSyncCoordinatorTests {
         }
         let realInode = Int64(statBuffer.st_ino)
         let realVolumeUuid = (try? audioFile.resourceValues(forKeys: [.volumeUUIDStringKey]))?
-            .volumeUUIDString ?? "unknown-volume"
+            .volumeUUIDString ?? LegacyFileIdentity.unknownVolume
 
         // Pre-populate with a row that has the file's true hash and
         // size but a DIFFERENT (inode, volume_uuid) — i.e., the row

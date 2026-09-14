@@ -15,9 +15,13 @@ public struct BeginFileImportPayload: Codable, Sendable {
 
 enum FileImportIdentity {
     static func matches(_ file: FileRecord, identity: FileMetadata) -> Bool {
-        file.path == identity.path && file.volumeUuid == identity.volumeUuid
-            && file.inode == identity.inode && file.fileSize == identity.fileSize
-            && file.mtime == identity.mtime && file.lightweightHash == identity.lightweightHash
+        file.volumeUuid == identity.volumeUuid && matchesAttributes(file, identity: identity)
+    }
+
+    static func matchesAttributes(_ file: FileRecord, identity: FileMetadata) -> Bool {
+        SeratoPath.normalized(file.path) == SeratoPath.normalized(identity.path)
+            && file.inode == identity.inode && file.fileSize == identity.fileSize && file.mtime == identity.mtime
+            && (file.lightweightHash == nil || file.lightweightHash == identity.lightweightHash)
     }
 }
 
@@ -26,8 +30,15 @@ extension FileLibraryStateMutation {
         guard let file = try FileRecord.fetchOne(database, key: payload.fileId) else {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
-        guard file.libraryMembership != .active, FileImportIdentity.matches(file, identity: payload.identity) else {
+        guard file.libraryMembership != .active, FileImportIdentity.matches(file, identity: payload.identity),
+              try FileMetadataCollector.collectVerified(at: payload.identity.path) == payload.identity
+        else {
             throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+        }
+        if file.lightweightHash == nil {
+            _ = try FileIdentityObservationMutation.apply(.init(fileId: payload.fileId, expectedRevision: payload.expectedRevision,
+                                                                previousIdentity: file.identity, identity: payload.identity),
+                                                          batchId: batchId, timestamp: timestamp, in: database)
         }
         let state = SetFileLibraryStatePayload(fileId: payload.fileId, expectedRevision: payload.expectedRevision,
                                                state: FileLibraryState(membership: .pendingImport, availability: .available, libraryID: file.seratoLibraryId, retiredAt: nil))

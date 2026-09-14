@@ -1,6 +1,15 @@
 import Darwin
 import Foundation
 
+enum LegacyFileIdentity {
+    static let unknownVolume = "unknown-volume"
+
+    static func canAdoptVolume(_ file: FileRecord, identity: FileMetadata) -> Bool {
+        file.volumeUuid == unknownVolume && identity.volumeUuid != unknownVolume
+            && FileImportIdentity.matchesAttributes(file, identity: identity)
+    }
+}
+
 /// File-level identity metadata extracted from a path on disk: the
 /// fields needed to populate `FileRecord` plus the inode used by the
 /// FilesystemSyncCoordinator's rename-detection lookups.

@@ -88,7 +88,7 @@ enum FileIdentityObservationMutation {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
         guard file.membershipRevision == payload.expectedRevision,
-              FileImportIdentity.matches(file, identity: payload.previousIdentity),
+              file.identity == payload.previousIdentity,
               payload.expectedState == nil || payload.expectedState == file.libraryState
         else {
             throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
@@ -97,6 +97,9 @@ enum FileIdentityObservationMutation {
         let identity = payload.identity
         guard try FileMetadataCollector.collectVerified(at: identity.path) == identity else {
             throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+        }
+        if file.volumeUuid == LegacyFileIdentity.unknownVolume, !LegacyFileIdentity.canAdoptVolume(file, identity: identity) {
+            throw SeratoReconciliationError.ambiguousIdentity(identity.path)
         }
         let moved = SeratoPath.normalized(file.path) != SeratoPath.normalized(identity.path)
         if moved {
@@ -142,7 +145,10 @@ enum FileIdentityObservationMutation {
     }
 
     static func isReplacement(_ file: FileRecord, identity: FileMetadata) -> Bool {
-        file.volumeUuid != identity.volumeUuid || file.inode != identity.inode
+        if LegacyFileIdentity.canAdoptVolume(file, identity: identity) {
+            return false
+        }
+        return file.volumeUuid != identity.volumeUuid || file.inode != identity.inode
             || file.fileSize != identity.fileSize || file.mtime != identity.mtime
             || (file.lightweightHash != nil && file.lightweightHash != identity.lightweightHash)
     }
