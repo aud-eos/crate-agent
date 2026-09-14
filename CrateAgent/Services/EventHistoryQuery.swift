@@ -128,6 +128,7 @@ public enum EventHistoryQuery {
         let unsupportedRaw: Set<String> = [
             EventType.trackAddedToSerato.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
+            EventType.fileImportRequested.rawValue,
             EventType.fileTrashed.rawValue,
             EventType.trackRemovedFromSerato.rawValue,
             EventType.fileRemovedFromCrates.rawValue,
@@ -165,6 +166,8 @@ public enum EventHistoryQuery {
         switch eventType {
         case .fileLibraryStateChanged:
             return "Observed library state for \(count) file\(pluralS)"
+        case .fileImportRequested:
+            return "Requested import for \(count) file\(pluralS)"
         case .trackImported:
             return "Imported \(count) track\(pluralS)"
         case .fileRenamed:

@@ -10,7 +10,7 @@ import Foundation
 /// path, what metadata do we record?" Adding a new field here (e.g.,
 /// lightweight content hash for cross-volume move detection) lights
 /// up both call sites at once.
-public struct FileMetadata: Sendable, Equatable {
+public struct FileMetadata: Codable, Sendable, Equatable {
     public let path: String
     public let volumeUuid: String
     public let inode: Int64

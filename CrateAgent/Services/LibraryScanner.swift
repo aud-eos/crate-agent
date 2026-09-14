@@ -110,7 +110,8 @@ public actor LibraryScanner {
                 do {
                     try await operationEngine.apply(.setMetadata(SetMetadataPayload(
                         fileId: fileId,
-                        metadata: seratoMetadata
+                        metadata: seratoMetadata,
+                        isSeratoAuthoritative: true
                     )))
                     filesMetadataUpdated += 1
                     lastChangedPath = absolutePath

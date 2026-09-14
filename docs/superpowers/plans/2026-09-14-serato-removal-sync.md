@@ -140,7 +140,10 @@ Persist fields on files as library_membership, file_availability,
 serato_library_id, retired_at, and membership_revision. Migration defaults existing
 rows to legacyUnverified/unknown/revision 0; does not inspect disk or retire rows.
 Add `.setFileLibraryState` mutation and `.fileLibraryStateChanged` event. Revision
-increases only on membership transitions, not on a repeated availability check.
+increases on membership transitions and explicit new import intent, not on a
+repeated availability check. Task 3's dedicated `.beginFileImport` mutation advances
+it even for pending→pending retries, validates file identity, and journals the
+audit-only `.fileImportRequested` event with a full prior-state inverse.
 Never decrement/reuse a revision when replaying an inverse.
 
 - [ ] Add migration tests that seed pre-migration file/track/event rows and verify

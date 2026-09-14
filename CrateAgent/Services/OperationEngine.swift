@@ -66,7 +66,10 @@ public actor OperationEngine {
     /// Pending writes to Serato library files. Either a path
     /// rewrite or a metadata update. Drained when Serato exits via
     /// `drainPendingSeratoUpdates`.
-    private var pendingSeratoWrites: [SeratoPendingWrite] = []
+    private var pendingSeratoWrites: [GuardedSeratoWrite] = []
+    private var isDraining = false
+
+    private enum ExternalWriteInterruption: Error { case deferred }
 
     /// Backing subject for `queueDepthPublisher`. CurrentValueSubject
     /// emits the latest value on subscribe, so UI bindings render
@@ -132,7 +135,7 @@ public actor OperationEngine {
     /// Returns nil when an observation confirms an unchanged state.
     @discardableResult
     public func apply(_ mutation: TrackMutation, batchId: String) async throws -> Int64? {
-        let executionResult: ExecutionResult = try await database.writer.write { db in
+        let executionResult: GuardedExecutionResult = try await database.writer.write { db in
             try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
         }
 
@@ -141,27 +144,52 @@ public actor OperationEngine {
         return executionResult.eventId
     }
 
+    @discardableResult
+    public func apply(_ mutation: TrackMutation, expectedMembershipToken: FileMembershipToken, batchId: String = UUID().uuidString) async throws -> Int64? {
+        let result = try await database.writer.write { database in
+            try Self.requireCurrentToken(expectedMembershipToken, mutation: mutation, in: database)
+            return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: database)
+        }
+        try await routeSeratoWrites(result.seratoWrites, batchId: batchId)
+        return result.eventId
+    }
+
+    private static func requireCurrentToken(_ token: FileMembershipToken, mutation: TrackMutation, in database: GRDB.Database) throws {
+        guard mutation.processingFileID == token.fileId,
+              let file = try FileRecord.fetchOne(database, key: token.fileId),
+              file.membershipRevision == token.revision
+        else {
+            throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
+        }
+    }
+
     /// Apply many mutations under a single batch identifier, atomically.
     /// Returned event IDs omit unchanged observations and preserve input order.
     ///
     /// One SQLite write transaction covers every mutation's DB-side
-    /// work — if any throws, none persist. The `seratoWatchdog`
-    /// running-state check happens once, before the transaction, and
-    /// is reused for routing every Serato write the batch produced
-    /// (queue if Serato is up, apply now if not). This is the path
+    /// work — if any throws, none persist. External writes carry the
+    /// transaction's membership revision and recheck lifecycle and
+    /// Serato state before each write group. This is the path
     /// any caller that produces N>1 related mutations should take —
     /// for N renames the cost goes from N writer transactions and N
     /// actor hops to one of each.
     @discardableResult
     public func applyBatch(
         _ mutations: [TrackMutation],
-        batchId: String
+        batchId: String,
+        expectedMembershipTokens: [Int64: FileMembershipToken]? = nil
     ) async throws -> [Int64] {
         guard !mutations.isEmpty else { return [] }
 
-        let executionResults: [ExecutionResult] = try await database.writer.write { db in
+        let executionResults: [GuardedExecutionResult] = try await database.writer.write { db in
             try mutations.map { mutation in
-                try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
+                if let expectedMembershipTokens, let fileID = mutation.processingFileID {
+                    guard let token = expectedMembershipTokens[fileID] else {
+                        throw FileProcessingEligibilityError.superseded(fileId: fileID)
+                    }
+                    try Self.requireCurrentToken(token, mutation: mutation, in: db)
+                }
+                return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
             }
         }
 
@@ -189,7 +217,7 @@ public actor OperationEngine {
     /// (Serato-running) path never throws for external writes; only the
     /// Serato-not-running, write-throws path does.
     private func routeSeratoWrites(
-        _ writes: [SeratoPendingWrite],
+        _ writes: [GuardedSeratoWrite],
         batchId: String
     ) async throws {
         guard !writes.isEmpty else { return }
@@ -200,7 +228,10 @@ public actor OperationEngine {
             return
         }
         do {
-            try await applyConsecutiveSeratoWrites(writes)
+            let outcome = try await applyGuardedSeratoWrites(writes)
+            if outcome.supersededCount > 0 {
+                await note(outcome.summaryMessage)
+            }
         } catch {
             throw OperationEngineError.externalSyncIncomplete(
                 batchId: batchId,
@@ -279,26 +310,23 @@ public actor OperationEngine {
 
         await note("Re-syncing Serato library for batch — \(events.count) event\(events.count == 1 ? "" : "s") to inspect")
 
-        let (writes, replayedEventCount) = try await reconstructResyncWrites(from: events)
+        let (writes, replayedEventCount, supersededCount) = try await reconstructResyncWrites(from: events)
         guard !writes.isEmpty else {
-            let outcome = ResyncOutcome(appliedCount: 0, queuedCount: 0)
+            let outcome = ResyncOutcome(appliedCount: 0, queuedCount: 0, supersededCount: supersededCount)
             await note(outcome.summaryMessage)
             return outcome
         }
 
-        // Route once, exactly like a fresh apply: check the Serato-
-        // running guard a single time so the metadata updates can
-        // coalesce into one V2 rewrite rather than being split by an
-        // interleaved per-event guard check.
         let isSeratoRunning = await seratoWatchdog.isSeratoRunning
         let outcome: ResyncOutcome
         if isSeratoRunning {
             pendingSeratoWrites.append(contentsOf: writes)
             queueDepthSubject.send(pendingSeratoWrites.count)
-            outcome = ResyncOutcome(appliedCount: 0, queuedCount: replayedEventCount)
+            outcome = ResyncOutcome(appliedCount: 0, queuedCount: replayedEventCount, supersededCount: supersededCount)
         } else {
-            try await applyConsecutiveSeratoWrites(writes)
-            outcome = ResyncOutcome(appliedCount: replayedEventCount, queuedCount: 0)
+            let routed = try await applyGuardedSeratoWrites(writes)
+            outcome = ResyncOutcome(appliedCount: routed.appliedCount, queuedCount: routed.queuedCount,
+                                    supersededCount: supersededCount + routed.supersededCount)
         }
         await note(outcome.summaryMessage)
         return outcome
@@ -311,24 +339,24 @@ public actor OperationEngine {
     /// `ResyncOutcome`.
     private func reconstructResyncWrites(
         from events: [EventRecord]
-    ) async throws -> (writes: [SeratoPendingWrite], replayedEventCount: Int) {
+    ) async throws -> (writes: [GuardedSeratoWrite], replayedEventCount: Int, supersededCount: Int) {
         // Every replay except a rename needs the file's CURRENT absolute
         // path (the DB is the source of truth — the file may have been
         // renamed since; a rename carries both paths in its own payload).
         // Batch-read every referenced file row once rather than per event.
-        let pathDependentFileIds = events.compactMap { event -> Int64? in
-            Self.eventNeedsCurrentFilePath(event.eventType) ? event.fileId : nil
+        let pathDependentFileIds = events.compactMap(\.fileId)
+        let filesByID = try await database.writer.read { db in
+            try Self.fetchFiles(fileIDs: pathDependentFileIds, in: db).reduce(into: [Int64: FileRecord]()) { files, file in
+                if let fileID = file.id {
+                    files[fileID] = file
+                }
+            }
         }
         let pathByFileId: [Int64: String]
         if pathDependentFileIds.isEmpty {
             pathByFileId = [:]
         } else {
-            pathByFileId = try await database.writer.read { db in
-                try Self.fetchFiles(fileIDs: pathDependentFileIds, in: db)
-                    .reduce(into: [Int64: String]()) { accumulator, file in
-                        if let id = file.id { accumulator[id] = file.path }
-                    }
-            }
+            pathByFileId = filesByID.mapValues(\.path)
         }
 
         // Re-sync must project each file's CURRENT external state, not blindly
@@ -345,17 +373,21 @@ public actor OperationEngine {
         let (latestV2FieldWriter, latestTagFieldWriter) =
             try await latestFieldWriterEventIds(pathByFileId: pathByFileId)
 
-        var writes: [SeratoPendingWrite] = []
+        var writes: [GuardedSeratoWrite] = []
         var replayedEventCount = 0
+        var supersededCount = 0
         let decoder = JSONDecoder()
         for event in events {
             let reconstructed = try Self.resyncWrites(
                 for: event, pathByFileId: pathByFileId, decoder: decoder
             )
-            guard let fileId = event.fileId, let eventId = event.eventId else {
-                // No id to rank against — replay as-is (shouldn't happen for
-                // projecting events, which always carry a file id).
-                if !reconstructed.isEmpty { writes.append(contentsOf: reconstructed); replayedEventCount += 1 }
+            guard event.eventType.hasReplayableSeratoProjection else { continue }
+            guard let fileId = event.fileId, let eventId = event.eventId,
+                  let file = filesByID[fileId],
+                  let token = try SeratoWriteEligibility.replayToken(event: event, file: file),
+                  reconstructed.allSatisfy({ SeratoWriteEligibility.permits($0, file: file) })
+            else {
+                supersededCount += 1
                 continue
             }
             let kept = reconstructed.compactMap {
@@ -366,11 +398,11 @@ public actor OperationEngine {
                 )
             }
             if !kept.isEmpty {
-                writes.append(contentsOf: kept)
+                writes.append(contentsOf: kept.map { GuardedSeratoWrite(token: token, write: $0, eventId: eventId) })
                 replayedEventCount += 1
             }
         }
-        return (writes, replayedEventCount)
+        return (writes, replayedEventCount, supersededCount)
     }
 
     /// Event types whose journaled payload can reconstruct a Serato/audio-tag
@@ -569,7 +601,7 @@ public actor OperationEngine {
             return true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .fileLibraryStateChanged:
+             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileImportRequested:
             return false
         }
     }
@@ -664,7 +696,7 @@ public actor OperationEngine {
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileImportRequested:
             return []
         }
     }
@@ -709,7 +741,20 @@ public actor OperationEngine {
         // reverts or none of it does. With N transactions (the
         // pre-batch shape) we'd risk leaving the DB half-undone if
         // one inverse hit a fileNotFound mid-loop.
-        _ = try await applyBatch(inverseMutations, batchId: undoBatchId)
+        let results = try await database.writer.write { database in
+            for (event, mutation) in zip(events, inverseMutations) {
+                guard let fileID = mutation.processingFileID else { continue }
+                guard let file = try FileRecord.fetchOne(database, key: fileID),
+                      try SeratoWriteEligibility.replayToken(event: event, file: file) != nil
+                else {
+                    throw FileProcessingEligibilityError.superseded(fileId: fileID)
+                }
+            }
+            return try inverseMutations.map { mutation in
+                try Self.executeAndLog(mutation: mutation, batchId: undoBatchId, in: database)
+            }
+        }
+        try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
         return undoBatchId
     }
 
@@ -866,7 +911,7 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
-        case .fileLibraryStateChanged:
+        case .fileLibraryStateChanged, .fileImportRequested:
             // Observation inverses preserve audit evidence, not permission to
             // reverse an external Serato decision or re-add its membership.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
@@ -908,28 +953,135 @@ public actor OperationEngine {
     /// just exited (the SeratoSyncCoordinator drives this). Drains
     /// the queue oldest-first and stops at the first failure, leaving
     /// the remaining entries queued for retry.
-    public func drainPendingSeratoUpdates() async throws {
+    @discardableResult
+    public func drainPendingSeratoUpdates() async throws -> ResyncOutcome {
+        guard !isDraining else {
+            return ResyncOutcome(appliedCount: 0, queuedCount: Set(pendingSeratoWrites.map(\.eventId)).count)
+        }
+        isDraining = true
+        defer { isDraining = false }
+        var applied = Set<Int64>()
+        var superseded = Set<Int64>()
         while let next = pendingSeratoWrites.first {
-            try await applySeratoWrite(next)
+            guard !(await seratoWatchdog.isSeratoRunning) else { break }
+            if try await isEligible(next) {
+                do {
+                    try await requireExternalWriteEligibility([next])
+                    try await applySeratoWrite(next.write, guardedWrites: [next])
+                } catch ExternalWriteInterruption.deferred {
+                    break
+                }
+                applied.insert(next.eventId)
+            } else {
+                superseded.insert(next.eventId)
+            }
             pendingSeratoWrites.removeFirst()
             queueDepthSubject.send(pendingSeratoWrites.count)
         }
+        let outcome = ResyncOutcome(appliedCount: applied.count,
+                                    queuedCount: Set(pendingSeratoWrites.map(\.eventId)).count, supersededCount: superseded.count)
+        await note(outcome.summaryMessage)
+        return outcome
     }
 
-    private func applySeratoWrite(_ write: SeratoPendingWrite) async throws {
+    private func isEligible(_ write: GuardedSeratoWrite) async throws -> Bool {
+        try await eligibleWrites([write]).count == 1
+    }
+
+    private func eligibleWrites(_ writes: [GuardedSeratoWrite]) async throws -> [GuardedSeratoWrite] {
+        try await database.writer.read { database in
+            let files = try Self.fetchFiles(fileIDs: writes.map { $0.token.fileId }, in: database)
+                .reduce(into: [Int64: FileRecord]()) { files, file in
+                    if let fileID = file.id {
+                        files[fileID] = file
+                    }
+                }
+            return writes.filter { SeratoWriteEligibility.permits($0, file: files[$0.token.fileId]) }
+        }
+    }
+
+    private func requireExternalWriteEligibility(_ writes: [GuardedSeratoWrite]) async throws {
+        let eligible = try await eligibleWrites(writes)
+        guard eligible.count == writes.count, !(await seratoWatchdog.isSeratoRunning) else {
+            throw ExternalWriteInterruption.deferred
+        }
+    }
+
+    private func applyGuardedSeratoWrites(_ writes: [GuardedSeratoWrite]) async throws -> ResyncOutcome {
+        var metadata: [GuardedSeratoWrite] = []
+        var remaining: [GuardedSeratoWrite] = []
+        for write in writes {
+            if case .metadataUpdate = write.write {
+                metadata.append(write)
+            } else {
+                remaining.append(write)
+            }
+        }
+        var groups: [[GuardedSeratoWrite]] = metadata.isEmpty ? [] : [metadata]
+        for write in remaining {
+            if case .rename = write.write, let last = groups.last?.last, case .rename = last.write {
+                groups[groups.count - 1].append(write)
+            } else {
+                groups.append([write])
+            }
+        }
+        var applied = Set<Int64>()
+        var superseded = Set<Int64>()
+        for (index, group) in groups.enumerated() {
+            guard !(await seratoWatchdog.isSeratoRunning) else {
+                let remainder = groups[index...].flatMap { $0 }
+                pendingSeratoWrites.append(contentsOf: remainder)
+                queueDepthSubject.send(pendingSeratoWrites.count)
+                return ResyncOutcome(appliedCount: applied.count,
+                                     queuedCount: Set(remainder.map(\.eventId)).count, supersededCount: superseded.count)
+            }
+            let eligible = try await eligibleWrites(group)
+            superseded.formUnion(Set(group.map(\.eventId)).subtracting(eligible.map(\.eventId)))
+            do {
+                try await requireExternalWriteEligibility(eligible)
+                try await applyConsecutiveSeratoWrites(eligible.map(\.write), guardedWrites: eligible)
+            } catch ExternalWriteInterruption.deferred {
+                let remainder = eligible + groups.dropFirst(index + 1).flatMap { $0 }
+                pendingSeratoWrites.append(contentsOf: remainder)
+                queueDepthSubject.send(pendingSeratoWrites.count)
+                return ResyncOutcome(appliedCount: applied.count,
+                                     queuedCount: Set(remainder.map(\.eventId)).count, supersededCount: superseded.count)
+            }
+            applied.formUnion(eligible.map(\.eventId))
+        }
+        return ResyncOutcome(appliedCount: applied.count, queuedCount: 0, supersededCount: superseded.count)
+    }
+
+    private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
         switch write {
         case .rename(let rename):
-            try await applySeratoRename(rename)
+            try await applySeratoRename(rename, guardedWrites: guardedWrites)
         case .metadataUpdate(let update):
             try await applySeratoMetadataUpdate(update)
         case .addTrack(let add):
             try await applySeratoAddTrack(add)
+            guard let guardedWrite = guardedWrites.first else {
+                throw OperationEngineError.insertDidNotReturnRowId
+            }
+            let libraryID = seratoLocator.seratoDirectory.standardizedFileURL.path
+            try await database.writer.write { database in
+                guard let file = try FileRecord.fetchOne(database, key: guardedWrite.token.fileId),
+                      SeratoWriteEligibility.permits(guardedWrite, file: file)
+                else {
+                    throw FileProcessingEligibilityError.superseded(fileId: guardedWrite.token.fileId)
+                }
+                _ = try FileLibraryStateMutation.apply(
+                    SetFileLibraryStatePayload(fileId: guardedWrite.token.fileId, expectedRevision: guardedWrite.token.revision,
+                                               state: FileLibraryState(membership: .active, availability: file.fileAvailability, libraryID: libraryID, retiredAt: nil)),
+                    batchId: "import-confirmed:\(guardedWrite.eventId)", timestamp: Int64(Date().timeIntervalSince1970 * 1000), in: database
+                )
+            }
         case .fileTagWrite(let write):
             try await applyFileTagWrite(write)
         case .removeFromDatabase(let removal):
             try await applySeratoDatabaseRemoval(removal)
         case .removeFromCrates(let removal):
-            try await applySeratoCrateSweepRemoval(removal)
+            try await applySeratoCrateSweepRemoval(removal, guardedWrites: guardedWrites)
         case .trashFile(let trash):
             try await applyTrashFileOperation(trash)
         }
@@ -969,7 +1121,7 @@ public actor OperationEngine {
         }
     }
 
-    private func applySeratoCrateSweepRemoval(_ removal: SeratoPendingRemoval) async throws {
+    private func applySeratoCrateSweepRemoval(_ removal: SeratoPendingRemoval, guardedWrites: [GuardedSeratoWrite]) async throws {
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
@@ -989,6 +1141,7 @@ public actor OperationEngine {
         // crate. Symmetric with `applySeratoRename`.
         var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
+            try await requireExternalWriteEligibility(guardedWrites)
             do {
                 _ = try removePathFromCrate(
                     cratePath: crateFile.path,
@@ -1164,7 +1317,7 @@ public actor OperationEngine {
         ]
     }
 
-    private func applySeratoRename(_ rename: SeratoPendingRename) async throws {
+    private func applySeratoRename(_ rename: SeratoPendingRename, guardedWrites: [GuardedSeratoWrite]) async throws {
         let oldSeratoPath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: rename.oldAbsolutePath
         )
@@ -1222,6 +1375,7 @@ public actor OperationEngine {
 
         var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
+            try await requireExternalWriteEligibility(guardedWrites)
             do {
                 _ = try rewriteCratePath(
                     cratePath: crateFile.path,
@@ -1263,10 +1417,10 @@ public actor OperationEngine {
     /// preserve the more granular "⚠️ no entry for X" diagnostic
     /// (the batch FFI returns a single aggregate count and can't
     /// distinguish "0 renames applied" from "all renames missed").
-    private func applySeratoRenameBatch(_ renames: [SeratoPendingRename]) async throws {
+    private func applySeratoRenameBatch(_ renames: [SeratoPendingRename], guardedWrites: [GuardedSeratoWrite]) async throws {
         guard renames.count > 1 else {
             if let single = renames.first {
-                try await applySeratoRename(single)
+                try await applySeratoRename(single, guardedWrites: guardedWrites)
             }
             return
         }
@@ -1312,6 +1466,7 @@ public actor OperationEngine {
 
         var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
+            try await requireExternalWriteEligibility(guardedWrites)
             do {
                 _ = try batchRewriteCratePaths(
                     cratePath: crateFile.path,
@@ -1349,7 +1504,7 @@ public actor OperationEngine {
     /// Without this, a 200-row Auto-Tag apply would trigger 200 serial
     /// full-library `database V2` rewrites.
     private func applyConsecutiveSeratoWrites(
-        _ writes: [SeratoPendingWrite]
+        _ writes: [SeratoPendingWrite], guardedWrites: [GuardedSeratoWrite]
     ) async throws {
         var metadataUpdates: [SeratoPendingMetadataUpdate] = []
         var remaining: [SeratoPendingWrite] = []
@@ -1373,9 +1528,9 @@ public actor OperationEngine {
                     renames.append(rename)
                     index += 1
                 }
-                try await applySeratoRenameBatch(renames)
+                try await applySeratoRenameBatch(renames, guardedWrites: guardedWrites)
             } else {
-                try await applySeratoWrite(remaining[index])
+                try await applySeratoWrite(remaining[index], guardedWrites: guardedWrites)
                 index += 1
             }
         }
@@ -1444,6 +1599,45 @@ public actor OperationEngine {
     private static func executeAndLog(
         mutation: TrackMutation,
         batchId: String,
+        in database: GRDB.Database
+    ) throws -> GuardedExecutionResult {
+        if let fileID = mutation.processingFileID {
+            guard let file = try FileRecord.fetchOne(database, key: fileID) else {
+                throw OperationEngineError.fileNotFound(fileId: fileID)
+            }
+            if case .addTrackToSerato = mutation {
+                guard file.libraryMembership == .pendingImport, file.fileAvailability == .available else {
+                    throw FileProcessingEligibilityError.superseded(fileId: fileID)
+                }
+            } else {
+                try FileProcessingEligibility.requireProcessable(file)
+            }
+        }
+        let result = try executeMutation(mutation: mutation, batchId: batchId, in: database)
+        guard !result.seratoWrites.isEmpty else {
+            return GuardedExecutionResult(eventId: result.eventId, seratoWrites: [])
+        }
+        guard let eventID = result.eventId,
+              let event = try EventRecord.fetchOne(database, key: eventID),
+              let fileID = event.fileId,
+              let file = try FileRecord.fetchOne(database, key: fileID)
+        else {
+            throw OperationEngineError.insertDidNotReturnRowId
+        }
+        let token = FileMembershipToken(fileId: fileID, revision: file.membershipRevision)
+        return GuardedExecutionResult(eventId: result.eventId, seratoWrites: result.seratoWrites.map {
+            GuardedSeratoWrite(token: token, write: $0, eventId: eventID)
+        })
+    }
+
+    private struct GuardedExecutionResult: Sendable {
+        let eventId: Int64?
+        let seratoWrites: [GuardedSeratoWrite]
+    }
+
+    private static func executeMutation(
+        mutation: TrackMutation,
+        batchId: String,
         in db: GRDB.Database
     ) throws -> ExecutionResult {
         let timestampMillis = Int64(Date().timeIntervalSince1970 * 1000)
@@ -1468,6 +1662,9 @@ public actor OperationEngine {
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .setFileLibraryState(payload):
             let eventId = try FileLibraryStateMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .beginFileImport(payload):
+            let eventId = try FileLibraryStateMutation.beginImport(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case .setMetadata(let payload):
             let eventId = try applySetMetadata(
@@ -2441,7 +2638,14 @@ public actor OperationEngine {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
 
-        let forwardJsonData = try encoder.encode(forwardPayload)
+        var forwardJsonData = try encoder.encode(forwardPayload)
+        if let fileId, let file = try FileRecord.fetchOne(db, key: fileId) {
+            guard var object = try JSONSerialization.jsonObject(with: forwardJsonData) as? [String: Any] else {
+                throw OperationEngineError.payloadEncodingFailed
+            }
+            object["membershipRevision"] = file.membershipRevision
+            forwardJsonData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        }
         let inverseJsonData = try encoder.encode(inversePayload)
 
         guard let forwardJsonString = String(data: forwardJsonData, encoding: .utf8),
@@ -2477,15 +2681,20 @@ public actor OperationEngine {
 public struct ResyncOutcome: Sendable, Equatable {
     public let appliedCount: Int
     public let queuedCount: Int
+    public let supersededCount: Int
 
-    public init(appliedCount: Int, queuedCount: Int) {
+    public init(appliedCount: Int, queuedCount: Int, supersededCount: Int = 0) {
         self.appliedCount = appliedCount
         self.queuedCount = queuedCount
+        self.supersededCount = supersededCount
     }
 
     public var totalCount: Int { appliedCount + queuedCount }
 
     public var summaryMessage: String {
+        if supersededCount > 0 {
+            return "Re-sync wrote \(appliedCount), queued \(queuedCount), superseded \(supersededCount) changes after library membership changed."
+        }
         if totalCount == 0 {
             return "Re-sync inspected the batch — no Serato changes to replay."
         }
@@ -2506,6 +2715,7 @@ public enum TrackMutation: Sendable {
     case renameFile(RenameFilePayload)
     case removeFile(RemoveFilePayload)
     case setFileLibraryState(SetFileLibraryStatePayload)
+    case beginFileImport(BeginFileImportPayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)
     case addTrackToSerato(AddTrackToSeratoPayload)
@@ -2855,7 +3065,7 @@ public struct SetMetadataPayload: Codable, Sendable, Equatable {
         fileId: Int64,
         metadata: SeratoMetadata,
         previousMetadata: SeratoMetadata = .empty,
-        isSeratoAuthoritative: Bool? = true
+        isSeratoAuthoritative: Bool? = false
     ) {
         self.fileId = fileId
         self.metadata = metadata

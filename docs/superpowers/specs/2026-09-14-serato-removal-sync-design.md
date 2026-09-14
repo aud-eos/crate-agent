@@ -43,6 +43,13 @@ remain pending until their explicit add succeeds or a saved snapshot confirms
 membership. Absence must not cancel a newly requested import simply because it
 has not reached V2 yet.
 
+Membership transitions and deliberate new import requests advance the revision.
+An explicit retry uses a dedicated begin-import mutation, verifies the same file's
+identity, and advances the revision even for pending-import to pending-import.
+It cancels older queued adds without manufacturing an intermediate membership
+state. Ordinary unchanged observations remain no-ops. A successful add confirms
+active membership; failed adds remain pending and can be explicitly retried.
+
 Store availability independently: unknown, available, missing, trashed, offline,
 or inaccessible. Missing means the recorded file could not be found on an online
 volume; it is not a claim of deletion. Trashed requires positive Trash evidence.

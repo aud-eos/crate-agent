@@ -14,6 +14,13 @@ public enum FileLibraryStateMutationError: LocalizedError, Equatable {
 
 enum FileLibraryStateMutation {
     static func apply(_ payload: SetFileLibraryStatePayload, batchId: String, timestamp: Int64, in database: GRDB.Database) throws -> Int64? {
+        try updateAndLog(payload, batchId: batchId, timestamp: timestamp, startsImportIntent: false,
+                         eventType: .fileLibraryStateChanged, forwardPayload: payload, in: database)
+    }
+
+    static func updateAndLog<Payload: Encodable>(_ payload: SetFileLibraryStatePayload, batchId: String, timestamp: Int64,
+                                                 startsImportIntent: Bool, eventType: EventType, forwardPayload: Payload, in database: GRDB.Database) throws -> Int64?
+    {
         guard var file = try FileRecord.fetchOne(database, key: payload.fileId) else {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
@@ -21,10 +28,14 @@ enum FileLibraryStateMutation {
             throw FileLibraryStateMutationError.staleRevision(fileId: payload.fileId, expected: payload.expectedRevision, actual: file.membershipRevision)
         }
         let previousState = file.libraryState
-        guard previousState != payload.state else { return nil }
+        guard startsImportIntent || previousState != payload.state else { return nil }
 
-        if file.libraryMembership != payload.state.membership {
+        if startsImportIntent || file.libraryMembership != payload.state.membership {
             file.membershipRevision += 1
+            if payload.state.membership == .retired {
+                // Unversioned History intent stays invalid after reactivation or inverse application.
+                file.lastRetirementRevision = file.membershipRevision
+            }
         }
         file.libraryMembership = payload.state.membership
         file.fileAvailability = payload.state.availability
@@ -33,6 +44,6 @@ enum FileLibraryStateMutation {
         try file.update(database)
 
         let inverse = SetFileLibraryStatePayload(fileId: payload.fileId, expectedRevision: file.membershipRevision, state: previousState)
-        return try OperationEngine.insertEvent(batchId: batchId, timestamp: timestamp, fileId: file.id, trackId: file.trackId, eventType: .fileLibraryStateChanged, forwardPayload: payload, inversePayload: inverse, in: database)
+        return try OperationEngine.insertEvent(batchId: batchId, timestamp: timestamp, fileId: file.id, trackId: file.trackId, eventType: eventType, forwardPayload: forwardPayload, inversePayload: inverse, in: database)
     }
 }

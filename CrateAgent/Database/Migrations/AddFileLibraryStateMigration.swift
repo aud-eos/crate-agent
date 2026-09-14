@@ -9,6 +9,7 @@ enum AddFileLibraryStateMigration {
                 table.add(column: "serato_library_id", .text)
                 table.add(column: "retired_at", .integer)
                 table.add(column: "membership_revision", .integer).notNull().defaults(to: 0)
+                table.add(column: "last_retirement_revision", .integer)
             }
         }
     }

@@ -25,6 +25,7 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var seratoLibraryId: String?
     public var retiredAt: Int64?
     public var membershipRevision: Int64 = 0
+    public var lastRetirementRevision: Int64?
 
     public var libraryState: FileLibraryState {
         FileLibraryState(membership: libraryMembership, availability: fileAvailability, libraryID: seratoLibraryId, retiredAt: retiredAt)

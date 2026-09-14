@@ -53,6 +53,7 @@ final class SeratoWatchdogTests: XCTestCase {
 }
 
 final class OperationEngineTests: XCTestCase {
+    @MainActor private var runningState: ProcessingTestSeratoState?
 
     @MainActor
     private func makeEngine(
@@ -60,11 +61,14 @@ final class OperationEngineTests: XCTestCase {
         seratoIsRunning: Bool = false
     ) throws -> (OperationEngine, LibraryDatabase, SeratoLibraryLocator) {
         let database = try LibraryDatabase.openInMemory()
+        let state = ProcessingTestSeratoState(isRunning: seratoIsRunning)
+        runningState = state
         let watchdog = SeratoWatchdog(
             runningBundleIdentifiersProvider: {
-                seratoIsRunning ? ["com.serato.djpro"] : []
+                state.isRunning ? ["com.serato.djpro"] : []
             }
         )
+        state.watchdog = watchdog
         let locator = SeratoLibraryLocator(
             seratoDirectory: seratoDirectory ?? URL(fileURLWithPath: "/dev/null")
         )
@@ -115,6 +119,7 @@ final class OperationEngineTests: XCTestCase {
         )))
         XCTAssertGreaterThan(try XCTUnwrap(indexEventId), 0)
 
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/old.mp3"])
@@ -200,6 +205,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -230,6 +236,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -292,6 +299,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -340,6 +348,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -391,6 +400,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/dupe.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/dupe.mp3"])
@@ -444,6 +454,7 @@ final class OperationEngineTests: XCTestCase {
             )),
             batchId: recoveryBatchId
         )
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -493,6 +504,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )), batchId: batchId)
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -533,6 +545,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -541,6 +554,7 @@ final class OperationEngineTests: XCTestCase {
         try await engine.apply(.renameFile(RenameFilePayload(
             fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
         )))
+        await runningState?.stop()
         try await engine.drainPendingSeratoUpdates()
 
         emissionsLock.lock()
@@ -574,6 +588,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/track.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/track.mp3"])
@@ -610,6 +625,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/track.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/track.mp3"])
@@ -630,6 +646,7 @@ final class OperationEngineTests: XCTestCase {
 
         // Now drain — verifies the same drain path handles both
         // rename and metadata writes.
+        await runningState?.stop()
         try await engine.drainPendingSeratoUpdates()
 
         let postDrainRecords = try readDatabaseRecords(databasePath: databaseV2Url.path)
@@ -655,11 +672,13 @@ final class OperationEngineTests: XCTestCase {
             volumeUuid: "v1", inode: 99, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "Drop Artist", title: "Drop Title")
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/newly-dropped.mp3"])
         }!
 
+        try await markProcessingFixturesAvailable(in: database, membership: .pendingImport)
         try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
             fileId: fileId,
             metadata: SeratoMetadata(artist: "Drop Artist", title: "Drop Title")
@@ -691,10 +710,12 @@ final class OperationEngineTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "First")
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/first.mp3"])
         }!
+        try await markProcessingFixturesAvailable(in: database, membership: .pendingImport)
         try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
             fileId: fileId,
             metadata: SeratoMetadata(artist: "First")
@@ -725,6 +746,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Users/testuser/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Users/testuser/Music/A/old.mp3"])
@@ -734,6 +756,7 @@ final class OperationEngineTests: XCTestCase {
             fileId: fileId, newPath: "/Users/testuser/Music/A/new.mp3"
         )))
 
+        await runningState?.stop()
         try await engine.drainPendingSeratoUpdates()
 
         let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
@@ -934,6 +957,7 @@ extension OperationEngineTests {
             volumeUuid: "v1", inode: 1, fileSize: 10, mtime: 1,
             metadata: SeratoMetadata(artist: "X", title: "Y")
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/track.mp3"])
@@ -975,6 +999,7 @@ extension OperationEngineTests {
             path: "/Music/A/original.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/original.mp3"])
@@ -1019,6 +1044,7 @@ extension OperationEngineTests {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "Original", title: "Track")
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/track.mp3"])
@@ -1083,6 +1109,7 @@ extension OperationEngineTests {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "A0")
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/start.mp3"])
@@ -1131,6 +1158,7 @@ extension OperationEngineTests {
             path: "/Music/A/dropped.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/dropped.mp3"])
@@ -1140,6 +1168,7 @@ extension OperationEngineTests {
         // Serato-side write fails (test locator points at /dev/null),
         // but the DB event lands first — that's what undoBatch will
         // encounter and reject.
+        try await markProcessingFixturesAvailable(in: database, membership: .pendingImport)
         let dragDropBatchId = "drag-drop-batch"
         do {
             _ = try await engine.apply(
@@ -2369,6 +2398,7 @@ final class EventHistoryQueryTests: XCTestCase {
             )),
             batchId: batchId
         )
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/track.mp3"])
@@ -4738,6 +4768,7 @@ final class WriteFileTagsMutationTests: XCTestCase {
             path: "/Music/A/track.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/track.mp3"])
@@ -4763,6 +4794,7 @@ final class WriteFileTagsMutationTests: XCTestCase {
             path: "/Music/A/track.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/track.mp3"])
@@ -4787,6 +4819,7 @@ final class WriteFileTagsMutationTests: XCTestCase {
             path: "/Music/A/track.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/track.mp3"])
@@ -4817,6 +4850,7 @@ final class WriteFileTagsMutationTests: XCTestCase {
             path: "/Music/A/track.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/track.mp3"])

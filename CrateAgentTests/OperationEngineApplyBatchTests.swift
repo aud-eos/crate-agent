@@ -138,6 +138,7 @@ final class OperationEngineApplyBatchTests: XCTestCase {
         try await engine.apply(indexNewFile("/Music/A/a.mp3", inode: 1))
         try await engine.apply(indexNewFile("/Music/A/b.mp3", inode: 2))
 
+        try await markProcessingFixturesAvailable(in: database)
         let (idA, idB) = try await database.writer.read { connection in
             let rowA = try Int64.fetchOne(
                 connection, sql: "SELECT id FROM files WHERE path = ?",

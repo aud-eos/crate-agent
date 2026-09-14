@@ -85,6 +85,7 @@ final class OperationEngineBatchRenameTests: XCTestCase {
         }
 
         // Look up the inserted file IDs.
+        try await markProcessingFixturesAvailable(in: database)
         let fileIds = try await database.writer.read { connection in
             try Int64.fetchAll(
                 connection,

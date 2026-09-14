@@ -28,6 +28,8 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         let fileIDs = try await database.writer.write { db in
             try (0..<1100).map { index in
                 var file = FileRecord(path: "/large/\(index).mp3", volumeUuid: "large", inode: Int64(index), fileSize: 1, mtime: 1)
+                file.libraryMembership = .active
+                file.fileAvailability = .available
                 try file.insert(db)
                 return try XCTUnwrap(file.id)
             }
@@ -193,6 +195,8 @@ final class OperationEnginePartialFailureTests: XCTestCase {
                     path: "/\(seratoPath)", volumeUuid: "v1", inode: Int64(index + 1),
                     fileSize: 1, mtime: 1, artist: "old", title: "old", album: "old"
                 )
+                file.libraryMembership = .active
+                file.fileAvailability = .available
                 try file.insert(db)
                 return file.id!
             }
@@ -693,7 +697,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
             )]
         )
         try await engine.apply(
-            .setMetadata(SetMetadataPayload(fileId: file, metadata: SeratoMetadata(artist: "User Edit"))),
+            .setMetadata(SetMetadataPayload(fileId: file, metadata: SeratoMetadata(artist: "User Edit"), isSeratoAuthoritative: true)),
             batchId: "seratoImport"
         )
 
@@ -742,7 +746,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         try await engine.apply(
             .setMetadata(SetMetadataPayload(
                 fileId: file,
-                metadata: SeratoMetadata(artist: "User Edit", title: "NY State")
+                metadata: SeratoMetadata(artist: "User Edit", title: "NY State"), isSeratoAuthoritative: true
             )),
             batchId: "seratoImport"
         )
@@ -806,7 +810,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         try await engine.apply(
             .setMetadata(SetMetadataPayload(
                 fileId: file,
-                metadata: SeratoMetadata(artist: nil, title: "old", album: "old")
+                metadata: SeratoMetadata(artist: nil, title: "old", album: "old"), isSeratoAuthoritative: true
             )),
             batchId: "seratoImport"
         )
