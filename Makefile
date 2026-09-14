@@ -12,8 +12,8 @@ SHELL := /bin/bash
 CARGO ?= $(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 RUSTUP ?= $(shell command -v rustup 2>/dev/null || echo $(HOME)/.cargo/bin/rustup)
 
-DERIVED_DATA_PATH := $(HOME)/Library/Developer/Xcode/DerivedData
-APP_GLOB := $(DERIVED_DATA_PATH)/CrateAgent-*/Build/Products/Debug/CrateAgent.app
+DERIVED_DATA_PATH := $(CURDIR)/build-output/DerivedData
+APP_PATH := $(DERIVED_DATA_PATH)/Build/Products/Debug/CrateAgent.app
 
 .PHONY: help install-deps doctor build build-rust xcodeproj \
         test test-rust test-swift run clean format lint
@@ -93,7 +93,7 @@ doctor:
 
 build: build-rust xcodeproj
 	@echo "==> Building CrateAgent.app (Debug)..."
-	xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent -configuration Debug build
+	xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent -configuration Debug -derivedDataPath "$(DERIVED_DATA_PATH)" build
 
 build-rust:
 	@echo "==> Building Rust core (universal arm64 + x86_64 static lib + Swift bindings)..."
@@ -140,14 +140,13 @@ lint:
 # ---------------------------------------------------------------------------
 
 run:
-	@APP_PATH=$$(ls -d $(APP_GLOB) 2>/dev/null | head -1); \
-	if [ -z "$$APP_PATH" ]; then \
-	    echo "No built app found at $(APP_GLOB)"; \
+	@if [ ! -d "$(APP_PATH)" ]; then \
+	    echo "No built app found at $(APP_PATH)"; \
 	    echo "Run 'make build' first."; \
 	    exit 1; \
-	fi; \
-	echo "Opening $$APP_PATH"; \
-	open "$$APP_PATH"
+	fi
+	@echo "Opening $(APP_PATH)"
+	open "$(APP_PATH)"
 
 clean:
 	@echo "==> Removing build artifacts..."
@@ -156,5 +155,4 @@ clean:
 	rm -rf CrateAgent/Generated
 	rm -rf CrateAgent.xcodeproj
 	@echo "    Done."
-	@echo "    Note: Xcode's DerivedData (built .app) is NOT removed."
-	@echo "    To purge that too: rm -rf $(DERIVED_DATA_PATH)/CrateAgent-*"
+	@echo "    Builds made directly in Xcode are not removed."
