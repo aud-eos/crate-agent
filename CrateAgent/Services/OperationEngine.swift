@@ -1229,39 +1229,31 @@ public actor OperationEngine {
             fromAbsolute: add.absolutePath
         )
 
-        // If Serato has never run on this machine there's no database
-        // V2 yet. We still want to register the import — write a fresh
-        // one with just our otrk. Subsequent Serato launches will
-        // augment it with the full analysis schema.
-        if !FileManager.default.fileExists(atPath: databaseV2Path) {
-            try FileManager.default.createDirectory(
-                at: seratoLocator.seratoDirectory,
-                withIntermediateDirectories: true
-            )
-            let bootstrapBytes = freshDatabaseV2Bytes(
-                withTrackPath: seratoRelativePath,
-                metadata: add.metadata
-            )
-            try await performExternalWrite(guardedWrites) { try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path)) }
-            return
-        }
-
+        let seratoDirectory = seratoLocator.seratoDirectory
+        let bootstrapBytes = freshDatabaseV2Bytes(withTrackPath: seratoRelativePath, metadata: add.metadata)
         do {
-            _ = try await performExternalWrite(guardedWrites) { try addTrackToDatabase(
-                databasePath: databaseV2Path,
-                trackPath: seratoRelativePath,
-                metadata: SeratoMetadataUpdate(
-                    artist: add.metadata.artist,
-                    title: add.metadata.title,
-                    album: add.metadata.album,
-                    genre: add.metadata.genre,
-                    bpm: add.metadata.bpm,
-                    key: add.metadata.musicalKey,
-                    comment: add.metadata.comment,
-                    length: add.metadata.length,
-                    label: add.metadata.label
+            try await performExternalWrite(guardedWrites) {
+                if !FileManager.default.fileExists(atPath: databaseV2Path) {
+                    try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
+                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+                    return
+                }
+                _ = try addTrackToDatabase(
+                    databasePath: databaseV2Path,
+                    trackPath: seratoRelativePath,
+                    metadata: SeratoMetadataUpdate(
+                        artist: add.metadata.artist,
+                        title: add.metadata.title,
+                        album: add.metadata.album,
+                        genre: add.metadata.genre,
+                        bpm: add.metadata.bpm,
+                        key: add.metadata.musicalKey,
+                        comment: add.metadata.comment,
+                        length: add.metadata.length,
+                        label: add.metadata.label
+                    )
                 )
-            ) }
+            }
         } catch ExternalWriteInterruption.deferred {
             throw ExternalWriteInterruption.deferred
         } catch {
