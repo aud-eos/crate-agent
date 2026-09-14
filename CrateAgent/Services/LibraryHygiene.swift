@@ -38,6 +38,10 @@ extension HygieneFileRow: HygieneFileSource {}
 /// free per Rules 1 and 2.
 public enum LibraryHygiene {
 
+    public static func normalizedMissingFieldValue(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// One field on one file needs a value rewrite. The display
     /// captures both old and new so the UI can render diff badges
     /// without re-running the analyzer.
@@ -715,7 +719,7 @@ public actor LibraryHygieneRunner {
         files: [F],
         batchId: String? = nil
     ) async throws -> String {
-        let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedValue = LibraryHygiene.normalizedMissingFieldValue(value)
         guard !trimmedValue.isEmpty, !fileIds.isEmpty else {
             return batchId ?? ""
         }

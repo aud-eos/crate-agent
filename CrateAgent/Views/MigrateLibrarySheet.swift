@@ -17,6 +17,7 @@ import SwiftUI
 /// like Resolve All — the per-file `renameFile` mutations write to
 /// Serato library files and shouldn't compete with Serato.
 struct MigrateLibrarySheet: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
 
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
@@ -24,6 +25,7 @@ struct MigrateLibrarySheet: View {
 
     @State private var newRoot: URL = (try? UserPreferences.defaultLibraryRoot())
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Music/_DJ_Library_")
+    @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var plans: [LibraryMigrator.Plan] = []
     @State private var isScanning: Bool = false
     @State private var isApplying: Bool = false
@@ -44,7 +46,8 @@ struct MigrateLibrarySheet: View {
             Divider()
             footer
         }
-        .frame(width: 620, height: 480)
+        .frame(width: 760, height: 600)
+        .appPresentation()
         .task { await rescan() }
         .alert(
             "Move \(plans.count) file\(plans.count == 1 ? "" : "s") to the new library?",
@@ -64,16 +67,11 @@ struct MigrateLibrarySheet: View {
         }
     }
 
-    @ViewBuilder
     private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Move Library")
-                .font(.title2.weight(.semibold))
-            VStack(alignment: .leading, spacing: 6) {
-                pathRow(label: "Currently at", path: services.watchedMusicFolder.path)
-                pathRow(label: "New location", path: newRoot.path, isDestination: true)
-            }
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: density.spacing) {
+            PageHeading("Move library", subtitle: "Review the new location before moving your tracked files.")
+            MetadataComparison(current: services.watchedMusicFolder.path, proposed: newRoot.path, field: "Library folder")
+            HStack(spacing: density.spacing) {
                 FolderPickerButton(
                     title: "Change Destination…",
                     message: "Pick a different folder for the new library root."
@@ -81,7 +79,7 @@ struct MigrateLibrarySheet: View {
                     newRoot = pickedUrl
                     Task { await rescan() }
                 }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
 
                 Button("Use _DJ_Library_") {
                     if let recommended = try? UserPreferences.defaultLibraryRoot() {
@@ -89,35 +87,19 @@ struct MigrateLibrarySheet: View {
                         Task { await rescan() }
                     }
                 }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
                 .disabled(
                     (try? UserPreferences.defaultLibraryRoot())?.path == newRoot.path
                 )
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
-    }
-
-    @ViewBuilder
-    private func pathRow(label: String, path: String, isDestination: Bool = false) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text(label)
-                .font(.caption.smallCaps())
-                .foregroundStyle(.secondary)
-                .frame(width: 90, alignment: .leading)
-            Text(path)
-                .font(.caption.monospaced())
-                .foregroundStyle(isDestination ? .primary : .secondary)
-                .lineLimit(2)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-        }
+        .padding(.horizontal, density.pagePadding)
+        .padding(.vertical, density.spacing)
     }
 
     @ViewBuilder
     private var content: some View {
-        if isScanning && plans.isEmpty {
+        if isScanning, plans.isEmpty {
             ProgressView("Planning move…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if plans.isEmpty {
@@ -127,16 +109,15 @@ struct MigrateLibrarySheet: View {
         }
     }
 
-    @ViewBuilder
     private var emptyState: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: density.spacing) {
             Image(systemName: "checkmark.seal")
                 .font(.largeTitle)
                 .foregroundStyle(.green)
             Text(emptyHeadline)
                 .font(.headline)
             Text(emptyDetail)
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
@@ -158,61 +139,43 @@ struct MigrateLibrarySheet: View {
         return "No tracked files were found under the current root. If you've already moved them manually, use \"Change Without Moving…\" in Settings instead."
     }
 
-    @ViewBuilder
     private var planList: some View {
         List(plans) { plan in
-            VStack(alignment: .leading, spacing: 2) {
-                Text(plan.sourcePath)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.down.right")
-                        .foregroundStyle(.tertiary)
-                        .font(.caption2)
-                    Text(plan.destinationPath)
-                        .font(.caption.monospaced())
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+            VStack(alignment: .leading, spacing: density.spacing) {
+                let identity = trackIdentities[plan.sourcePath]
+                TrackHeading(artist: identity?.artist, title: identity?.title, filename: (plan.sourcePath as NSString).lastPathComponent)
+                MetadataComparison(current: plan.sourcePath, proposed: plan.destinationPath, field: "Location")
             }
-            .padding(.vertical, 2)
+            .padding(.vertical, density.rowPadding)
         }
         .listStyle(.inset)
     }
 
-    @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 12) {
+        ActionBar {
             if let actionError {
-                Label(actionError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(2)
+                ActionErrorMessage(message: actionError)
             } else if let lastResult {
                 Label(lastResult, systemImage: "checkmark.circle")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.green)
             } else if !plans.isEmpty {
                 Text("\(plans.count) file\(plans.count == 1 ? "" : "s") will move")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+        } actions: {
             Button("Cancel") { dismiss() }
                 .disabled(isApplying)
-            Button("Move Library") {
+            Button("Move \(plans.count) files") {
                 pendingConfirm = true
             }
             .keyboardShortcut(.defaultAction)
             .disabled(plans.isEmpty || isApplying || seratoWatchdog.isSeratoRunning)
             .help(seratoWatchdog.isSeratoRunning
-                  ? "Quit Serato before moving — the Serato library writes shouldn't run while Serato is open."
-                  : "Move every tracked file to the new root and update Serato + DB in one batch.")
+                ? "Quit Serato before moving — the Serato library writes shouldn't run while Serato is open."
+                : "Move every tracked file to the new root and update Serato + DB in one batch.")
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
     }
 
     // MARK: - Actions
@@ -225,6 +188,7 @@ struct MigrateLibrarySheet: View {
             let files = try await services.database.writer.read { db in
                 try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
+            trackIdentities = TrackDisplayIdentity.index(files)
             plans = LibraryMigrator.findMoves(
                 in: files,
                 oldRoot: services.watchedMusicFolder,

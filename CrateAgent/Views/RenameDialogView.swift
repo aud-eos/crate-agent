@@ -15,6 +15,7 @@ import SwiftUI
 /// behavior (folder = bucket letter, filename = templated) is pinned
 /// without instantiating SwiftUI.
 struct RenameDialogView: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     let file: FileRecord
     @EnvironmentObject private var services: AppServices
     @Environment(\.dismiss) private var dismiss
@@ -48,26 +49,27 @@ struct RenameDialogView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Rename Track")
-                .font(.title2)
-                .fontWeight(.semibold)
+        VStack(alignment: .leading, spacing: density.spacing) {
+            PageHeading("Rename track", subtitle: "Preview the filename and folder before moving this file.")
 
             sourceSection
             templateSection
             previewSection
 
             Toggle("Save as default template", isOn: $saveAsDefault)
-                .font(.caption)
+                .font(.callout)
 
             if let actionError {
                 Label(actionError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.orange)
             }
 
-            HStack {
-                Spacer()
+            ActionBar {
+                if isRenaming {
+                    ProgressView("Renaming…")
+                }
+            } actions: {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("Rename") {
@@ -77,36 +79,25 @@ struct RenameDialogView: View {
                 .disabled(!canRename || isRenaming)
             }
         }
-        .padding(20)
-        .frame(width: 560)
+        .padding(density.pagePadding)
+        .frame(width: 680)
+        .appPresentation()
     }
 
-    @ViewBuilder
     private var sourceSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("From")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(file.path)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-        }
+        TrackHeading(artist: file.artist, title: file.title, filename: sourceUrl.lastPathComponent)
     }
 
-    @ViewBuilder
     private var templateSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
             HStack {
                 Text("Filename template")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Text("$artist · $title · $album · $bpm · $key · $genre · $ext")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
             TextField(
                 UserPreferences.defaultFilenameTemplate,
@@ -117,18 +108,12 @@ struct RenameDialogView: View {
         }
     }
 
-    @ViewBuilder
     private var previewSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Will become")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(destinationUrl.path)
-                .font(.caption.monospaced())
-                .foregroundStyle(canRename ? .primary : .tertiary)
-                .lineLimit(2)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            MetadataComparison(current: file.path, proposed: destinationUrl.path, field: "Location")
+            if !canRename {
+                StatusBadge(title: "No valid rename to apply", systemImage: "info.circle")
+            }
         }
     }
 
@@ -219,9 +204,8 @@ struct RenameDialogView: View {
 /// `HygieneFileRow` projection (used by the bulk Organize view —
 /// the BLOB columns aren't needed for path computation).
 public enum RenameDestinationPlanner {
-
-    public static func destination<F: HygieneFileSource>(
-        forFile file: F,
+    public static func destination(
+        forFile file: some HygieneFileSource,
         musicFolder: URL,
         template: String
     ) -> URL {

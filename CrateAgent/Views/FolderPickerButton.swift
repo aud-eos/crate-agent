@@ -6,6 +6,7 @@ import SwiftUI
 /// fileExporter-flavored and quirky around directory selection on
 /// macOS; `NSOpenPanel.runModal` is the established native pattern.
 struct FolderPickerButton: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     let title: String
     let message: String
     let onPick: (URL) -> Void
@@ -23,5 +24,6 @@ struct FolderPickerButton: View {
                 onPick(pickedUrl)
             }
         }
+        .controlSize(density.controlSize)
     }
 }

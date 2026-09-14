@@ -12,19 +12,20 @@ import SwiftUI
 /// this view is the always-visible top-of-panel hint that explains
 /// why the button is disabled.
 struct SeratoRunningBanner: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     let message: String
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: density.spacing) {
             Image(systemName: "exclamationmark.shield.fill")
                 .foregroundStyle(.orange)
             Text(message)
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .padding(.horizontal, density.pagePadding)
+        .padding(.vertical, density.rowPadding)
         .background(Color.orange.opacity(0.1))
     }
 }
