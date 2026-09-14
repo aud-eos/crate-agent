@@ -1,9 +1,70 @@
+import AppKit
 @testable import CrateAgent
 import Foundation
 import XCTest
 
 @MainActor
 final class SeratoMembershipSnapshotTests: XCTestCase {
+    private static let notificationBundleIdentifierKey = "testBundleIdentifier"
+
+    private func observingWatchdog(_ center: NotificationCenter) -> SeratoWatchdog {
+        let watchdog = SeratoWatchdog(
+            workspaceNotificationCenter: center,
+            notificationBundleIdentifierProvider: { notification in
+                notification.userInfo?[Self.notificationBundleIdentifierKey] as? String
+            },
+            runningBundleIdentifiersProvider: { [] }
+        )
+        watchdog.startObservingWorkspace()
+        return watchdog
+    }
+
+    func testDelayedSeratoLifecycleNotificationsInvalidateSnapshot() async throws {
+        let center = NotificationCenter()
+        let watchdog = observingWatchdog(center)
+        let locator = try fixture(emptyLibrary)
+        let reader = SeratoMembershipSnapshotReader(locator: locator, watchdog: watchdog, afterParsing: {
+            await MainActor.run {
+                center.post(name: NSWorkspace.didLaunchApplicationNotification, object: nil, userInfo: [Self.notificationBundleIdentifierKey: "com.serato.dj"])
+                center.post(name: NSWorkspace.didTerminateApplicationNotification, object: nil, userInfo: [Self.notificationBundleIdentifierKey: "com.serato.dj"])
+            }
+        })
+        await expectFailure(.seratoRunning, reader: reader)
+        XCTAssertFalse(watchdog.isSeratoRunning)
+        XCTAssertEqual(watchdog.stateRevision, 2)
+    }
+
+    func testUnrelatedLifecycleNotificationsDoNotInvalidateSnapshot() async throws {
+        let center = NotificationCenter()
+        let watchdog = observingWatchdog(center)
+        let locator = try fixture(emptyLibrary)
+        let reader = SeratoMembershipSnapshotReader(locator: locator, watchdog: watchdog, afterParsing: {
+            await MainActor.run {
+                center.post(name: NSWorkspace.didLaunchApplicationNotification, object: nil, userInfo: [Self.notificationBundleIdentifierKey: "com.example.other"])
+                center.post(name: NSWorkspace.didTerminateApplicationNotification, object: nil, userInfo: [Self.notificationBundleIdentifierKey: "com.example.other"])
+            }
+        })
+        _ = try await reader.read()
+        XCTAssertEqual(watchdog.stateRevision, 0)
+    }
+
+    func testDatabaseFileSymlinkIsUnsupported() async throws {
+        let target = try fixture(emptyLibrary)
+        let locator = try fixture()
+        try FileManager.default.createSymbolicLink(at: locator.databaseV2Url, withDestinationURL: target.databaseV2Url)
+        await expectFailure(.unsupportedSource, reader: SeratoMembershipSnapshotReader(locator: locator, watchdog: SeratoWatchdog { [] }))
+    }
+
+    func testDatabaseReplacedWithSymlinkDuringReadIsUnsupported() async throws {
+        let target = try fixture(emptyLibrary)
+        let locator = try fixture(emptyLibrary)
+        let reader = SeratoMembershipSnapshotReader(locator: locator, watchdog: SeratoWatchdog { [] }, afterParsing: {
+            try FileManager.default.removeItem(at: locator.databaseV2Url)
+            try FileManager.default.createSymbolicLink(at: locator.databaseV2Url, withDestinationURL: target.databaseV2Url)
+        })
+        await expectFailure(.unsupportedSource, reader: reader)
+    }
+
     private func fixture(_ payload: Data? = nil) throws -> SeratoLibraryLocator {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

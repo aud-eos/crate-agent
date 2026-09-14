@@ -27,6 +27,8 @@ public final class SeratoWatchdog: ObservableObject {
     public private(set) var stateRevision: UInt64 = 0
 
     private let runningBundleIdentifiersProvider: () -> [String]
+    private let workspaceNotificationCenter: NotificationCenter
+    private let notificationBundleIdentifierProvider: (Notification) -> String?
     private var observers: [NSObjectProtocol] = []
 
     /// Pass `nil` (or rely on the default) for production behavior —
@@ -38,9 +40,25 @@ public final class SeratoWatchdog: ObservableObject {
     /// because the latter was a MainActor-isolated static property,
     /// which Swift 6 strict-concurrency rejects when referenced from
     /// a default-argument expression.
-    public init(
+    public convenience init(
         runningBundleIdentifiersProvider customProvider: (() -> [String])? = nil
     ) {
+        self.init(
+            workspaceNotificationCenter: NSWorkspace.shared.notificationCenter,
+            notificationBundleIdentifierProvider: { notification in
+                (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+            },
+            runningBundleIdentifiersProvider: customProvider
+        )
+    }
+
+    init(
+        workspaceNotificationCenter: NotificationCenter,
+        notificationBundleIdentifierProvider: @escaping (Notification) -> String?,
+        runningBundleIdentifiersProvider customProvider: (() -> [String])? = nil
+    ) {
+        self.workspaceNotificationCenter = workspaceNotificationCenter
+        self.notificationBundleIdentifierProvider = notificationBundleIdentifierProvider
         runningBundleIdentifiersProvider = customProvider ?? {
             NSWorkspace.shared.runningApplications.compactMap { app in
                 app.bundleIdentifier
@@ -53,7 +71,7 @@ public final class SeratoWatchdog: ObservableObject {
         // Synchronous cleanup is safe here — removeObserver doesn't
         // hop actors and observers is a value-typed array.
         for observer in observers {
-            NotificationCenter.default.removeObserver(observer)
+            workspaceNotificationCenter.removeObserver(observer)
         }
     }
 
@@ -62,22 +80,26 @@ public final class SeratoWatchdog: ObservableObject {
     /// register duplicate observers.
     public func startObservingWorkspace() {
         guard observers.isEmpty else { return }
-        let workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
-        let launchObserver = workspaceNotificationCenter.addObserver(
-            forName: NSWorkspace.didLaunchApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+        observers = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification].map { notificationName in
+            workspaceNotificationCenter.addObserver(
+                forName: notificationName,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                MainActor.assumeIsolated {
+                    self?.handleWorkspaceNotification(notification)
+                }
+            }
         }
-        let terminateObserver = workspaceNotificationCenter.addObserver(
-            forName: NSWorkspace.didTerminateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-        observers = [launchObserver, terminateObserver]
+    }
+
+    private func handleWorkspaceNotification(_ notification: Notification) {
+        guard let bundleIdentifier = notificationBundleIdentifierProvider(notification),
+              bundleIdentifier.hasPrefix(Self.seratoBundleIdentifierPrefix)
+        else { return }
+        // A queued launch and termination can both arrive after the process has exited.
+        stateRevision += 1
+        refresh()
     }
 
     /// Recompute `isSeratoRunning` from the current running app list.

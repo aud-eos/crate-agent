@@ -15,7 +15,7 @@ struct SeratoSourceIdentity: Equatable, Sendable {
 
     static func read(_ url: URL) throws -> Self {
         var metadata = stat()
-        guard stat(url.path, &metadata) == 0 else {
+        guard lstat(url.path, &metadata) == 0 else {
             throw SeratoMembershipSnapshotError.sourceUnavailable
         }
         guard metadata.st_mode & S_IFMT == S_IFREG else {
