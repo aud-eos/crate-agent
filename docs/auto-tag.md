@@ -16,6 +16,13 @@ filename. Selections stay selected when you change pages or searches. Selecting
 a page selects only its displayed tracks. **Scan selected (N)** starts the audio
 lookup for those tracks; opening the browser does not start a scan.
 
+Each file shows its Serato membership and availability. **Import pending** and
+**Membership unverified** entries remain inspectable, but only verified active,
+available files can be selected for processing. Missing files, offline volumes,
+access failures, and unknown availability have distinct labels. A page selection
+includes only processable files. Removed entries are available in Library's
+**Removed from Serato** filter, with their last normal path and **Show History**.
+
 ## Review in List or Focus
 
 **List** lets you compare several tracks. **Focus** shows one track at a time,
@@ -68,6 +75,24 @@ operation engine. It checks whether files changed since review. Serato library
 and tag writes queue while Serato is running. If an external write fails after
 the library transaction committed, the UI retains the recovery information;
 reapplying the same batch is not a substitute for recovery.
+
+Removing a track from Serato retires its indexed entry, preserving its recording
+link and History. Serato can remove membership alone or also move audio to Trash.
+crate-agent retirement itself never moves, deletes, or restores audio.
+Restoring a file from Trash does not import it into Serato. Re-adding verified
+audio in Serato can reactivate the retained entry; an old Auto-Tag result does not
+gain permission to write after retirement or content replacement. Start a new
+scan for that file. Unavailable review errors include the filename.
+
+Before the first scan and after Serato closes, synchronization checks a complete
+saved library. A missing, unreadable, or corrupt Serato database leaves processing
+blocked and shows **Retry Sync**; it never means the library is empty. Missing
+audio that Serato still references remains a member. The **Missing** Library
+filter includes all active unavailable entries, with offline and permission
+problems labeled accurately. External volumes must be online for retirement
+decisions; independent external Serato libraries and portable path translation
+are outside the supported scope. See the
+[saved-library reconciliation contract](serato-membership-reconciliation.md).
 
 ## Comfortable or Compact
 

@@ -101,8 +101,7 @@ enum AutoTagFileSearch {
         let matches = try BrowserRow.fetchAll(
             db,
             sql: """
-            SELECT id, path, artist, title, album, bpm, musical_key
-            FROM files
+            \(BrowserRow.browserFetchSQL)
             \(whereClause)
             ORDER BY artist, title
             LIMIT ?

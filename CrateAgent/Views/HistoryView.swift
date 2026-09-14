@@ -169,3 +169,75 @@ struct HistoryView: View {
         await reload()
     }
 }
+
+struct FileHistoryView: View {
+    let database: LibraryDatabase
+    let file: BrowserRow
+    @Environment(\.dismiss) private var dismiss
+    @State private var entries: [FileHistoryEntry] = []
+    @State private var error: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            FileHistoryContent(file: file, entries: entries, error: error)
+            Button("Done") { dismiss() }.padding()
+        }
+        .frame(minWidth: 600, minHeight: 400)
+        .task {
+            do {
+                let fileID = file.id
+                entries = try await database.writer.read { database in
+                    try EventHistoryQuery.loadFileHistory(fileID: fileID, in: database).map(FileHistoryEntry.init)
+                }
+                error = nil
+            } catch { self.error = "Could not load file history: \(error.localizedDescription)" }
+        }
+    }
+}
+
+struct FileHistoryEntry: Identifiable {
+    let id: Int64
+    let description: String
+    let timestamp: Date
+
+    init(event: EventRecord) throws {
+        guard let eventID = event.eventId else { throw FileHistoryError.missingEventID }
+        id = eventID
+        description = try EventHistoryQuery.fileEventDescription(event)
+        timestamp = Date(timeIntervalSince1970: TimeInterval(event.timestamp) / 1000)
+    }
+
+    private enum FileHistoryError: Error { case missingEventID }
+}
+
+struct FileHistoryContent: View {
+    let file: BrowserRow
+    let entries: [FileHistoryEntry]
+    var error: String?
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
+                PageHeading("File history", subtitle: file.filenameOnly)
+                Text(file.path).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                LibraryFileStatusView(file: file)
+                Text("Most recent 200 events for this file. Recorded observations do not restore audio or import it into Serato.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }.padding(density.pagePadding)
+            Divider()
+            if let error {
+                ActionErrorMessage(message: error).padding(density.pagePadding)
+            } else if entries.isEmpty {
+                AppEmptyState(title: "No recorded changes", detail: "Future events for this file will appear here.", systemImage: "clock")
+            } else {
+                List(entries) { entry in
+                    VStack(alignment: .leading, spacing: density.detailSpacing) {
+                        Text(entry.description).font(.headline)
+                        Text(entry.timestamp, format: .dateTime.month().day().hour().minute()).font(.callout).foregroundStyle(.secondary)
+                    }.padding(.vertical, density.rowPadding)
+                }.listStyle(.inset)
+            }
+        }.appPresentation()
+    }
+}

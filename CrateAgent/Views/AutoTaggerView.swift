@@ -70,7 +70,7 @@ struct AutoTaggerView: View {
                 }
             } actions: {
                 Button(session.selectionMode == .browse ? "Select this page" : "Select these results") {
-                    session.selectVisibleFileIDs(visibleFiles.map(\.id))
+                    session.selectVisibleFileIDs(visibleFiles.filter(\.canProcess).map(\.id))
                 }.disabled(visibleFiles.isEmpty || selectionIsLoading || session.isScanning)
                 Button("Clear selection", action: session.clearSelection).disabled(session.selectedFileIDs.isEmpty || session.isScanning)
                 Button("Scan selected (\(session.selectedFileIDs.count))") { Task { await session.startScan() } }
@@ -114,6 +114,7 @@ struct AutoTaggerView: View {
             VStack(spacing: 0) {
                 List(visibleFiles, id: \.id) { file in
                     AutoTagSelectionRow(fileID: file.id, path: file.path, artist: file.artist, title: file.title,
+                                        libraryMembership: file.libraryMembership, fileAvailability: file.fileAvailability,
                                         isSelected: session.selectedFileIDs.contains(file.id),
                                         onToggle: { session.toggleSelection(file.id) })
                         .equatable().disabled(session.isScanning)

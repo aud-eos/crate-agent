@@ -58,7 +58,7 @@ enum AutoTagFileBrowse {
         let matches = try BrowserRow.fetchAll(
             db,
             sql: """
-            SELECT files.id, files.path, files.artist, files.title, files.album, files.bpm, files.musical_key
+            SELECT \(BrowserRow.browserColumnsSQL)
             \(source)
             ORDER BY files.artist, files.title, files.id
             LIMIT :limit OFFSET :offset

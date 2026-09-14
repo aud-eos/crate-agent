@@ -4540,6 +4540,7 @@ final class DuplicateResolverTests: XCTestCase {
         }!
 
         // Pull the (now-inserted) FileRecords to build a real group.
+        try await markProcessingFixturesAvailable(in: database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -4577,6 +4578,7 @@ final class DuplicateResolverTests: XCTestCase {
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/k.mp3"])
         }!
+        try await markProcessingFixturesAvailable(in: database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -4606,6 +4608,7 @@ final class DuplicateResolverTests: XCTestCase {
         try await engine.apply(.indexNewFile(IndexNewFilePayload(
             path: "/Music/A/a.mp3", volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
+        try await markProcessingFixturesAvailable(in: database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -4633,6 +4636,7 @@ final class DuplicateResolverTests: XCTestCase {
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
                               arguments: ["/Music/A/k.mp3"])
         }!
+        try await markProcessingFixturesAvailable(in: database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -4709,6 +4713,7 @@ final class DuplicateResolverTests: XCTestCase {
                               arguments: [keeperPath])
         }!
 
+        try await markProcessingFixturesAvailable(in: database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db).sorted(by: { lhs, rhs in
                 // Force a deterministic order so the failing file

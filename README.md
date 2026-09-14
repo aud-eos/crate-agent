@@ -21,6 +21,17 @@ with **Retry Sync**. A missing or unreadable Serato database stops synchronizati
 it never means that every track was removed. See the
 [reconciliation contract](docs/serato-membership-reconciliation.md).
 
+In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
+current membership and availability. Right-click a file for **Show History**;
+retired entries keep their last normal path and cannot be processed. Missing
+includes offline volumes, access failures, and unknown availability, each labeled
+separately. Serato offers library-only removal and removal with a move to Trash;
+crate-agent retirement itself never moves, deletes, or restores audio.
+Re-adding verified audio in Serato can reactivate its retained entry; restoring
+audio alone does not re-import it. Reconciliation currently supports the configured
+local Serato library, not independent libraries on external volumes. Offline
+volumes cannot provide evidence for retirement.
+
 ## Why this exists
 
 Serato stores absolute file paths in its binary library files. When you rename a file in Finder, Serato silently loses access to it. Serato has no public API, plugin system, or library-management hooks. Third-party tools that bridge the gap (Lexicon, Rekordbuddy) are excellent but commercial; this project exists to be a small, focused, native alternative that the author can shape to fit their own DJ workflow.

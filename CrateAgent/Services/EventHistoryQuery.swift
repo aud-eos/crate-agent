@@ -40,6 +40,22 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
 
 public enum EventHistoryQuery {
 
+    static func loadFileHistory(fileID: Int64, in database: GRDB.Database, limit: Int = 200, offset: Int = 0) throws -> [EventRecord] {
+        precondition(limit > 0 && offset >= 0)
+        return try EventRecord.filter(Column("file_id") == fileID)
+            .order(Column("timestamp").desc, Column("event_id").desc)
+            .limit(limit, offset: offset)
+            .fetchAll(database)
+    }
+
+    static func fileEventDescription(_ event: EventRecord) throws -> String {
+        if event.eventType == .fileLibraryStateChanged {
+            let payload = try JSONDecoder().decode(SetFileLibraryStatePayload.self, from: Data(event.payloadJson.utf8))
+            return "\(payload.state.membership.displayTitle) · \(payload.state.availability.displayTitle)"
+        }
+        return phrase(for: event.eventType, count: 1)
+    }
+
     /// Read the most-recent `limit` batches from the `events` table,
     /// newest-first by earliest event timestamp.
     ///

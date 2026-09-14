@@ -5,7 +5,7 @@ import XCTest
 
 @MainActor
 final class AutoTagLibraryStateTests: XCTestCase {
-    func testCountTracksRepeatedLibraryChangesAfterInitiallyEmptyRead() async throws {
+    func testProcessableCountTracksChangesWhileUnavailableAndUnverifiedRowsStayBrowsable() async throws {
         let database = try LibraryDatabase.openInMemory()
         let state = AutoTagLibraryState()
         let loaded = expectation(description: "initial empty read")
@@ -31,11 +31,28 @@ final class AutoTagLibraryStateTests: XCTestCase {
         XCTAssertEqual(state.fileCount, 0)
         try await database.writer.write { db in
             var first = FileRecord(path: "/first.mp3", volumeUuid: "test", inode: 1, fileSize: 1, mtime: 1)
+            first.libraryMembership = .active
+            first.fileAvailability = .available
             try first.insert(db)
+            let states: [(LibraryMembership, FileAvailability)] = [
+                (.pendingImport, .available), (.legacyUnverified, .available),
+                (.retired, .available), (.active, .offline),
+            ]
+            for (index, state) in states.enumerated() {
+                var file = FileRecord(path: "/excluded-\(index).mp3", volumeUuid: "test", inode: Int64(index + 10), fileSize: 1, mtime: 1)
+                file.libraryMembership = state.0
+                file.fileAvailability = state.1
+                try file.insert(db)
+            }
         }
         await fulfillment(of: [inserted], timeout: 2)
+        XCTAssertEqual(state.fileCount, 1)
+        let visibleCount = try await database.writer.read { try LibraryStatusBrowse.fetch($0).totalCount }
+        XCTAssertEqual(visibleCount, 4)
         try await database.writer.write { db in
             var second = FileRecord(path: "/second.mp3", volumeUuid: "test", inode: 2, fileSize: 1, mtime: 1)
+            second.libraryMembership = .active
+            second.fileAvailability = .available
             try second.insert(db)
         }
         await fulfillment(of: [insertedAgain], timeout: 2)
