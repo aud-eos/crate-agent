@@ -2,36 +2,36 @@ import GRDB
 import SwiftUI
 
 struct MenuBarStatusView: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
     @State private var indexedFileCount: Int = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("crate-agent")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: density.spacing) {
+            PageHeading("crate-agent", subtitle: "Library status")
 
-            HStack(spacing: 6) {
+            HStack(spacing: density.spacing) {
                 Circle()
                     .fill(seratoWatchdog.isSeratoRunning ? Color.orange : Color.green)
                     .frame(width: 8, height: 8)
                 Text(seratoWatchdog.isSeratoRunning
                     ? "Serato is running — writes deferred"
                     : "Idle — ready to sync")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
             }
 
             Text("\(indexedFileCount) files indexed")
-                .font(.caption.monospacedDigit())
+                .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
 
             if services.pendingSeratoQueueDepth > 0 {
-                HStack(spacing: 6) {
+                HStack(spacing: density.spacing) {
                     Image(systemName: "clock.arrow.circlepath")
                         .foregroundStyle(.orange)
                     Text("\(services.pendingSeratoQueueDepth) change\(services.pendingSeratoQueueDepth == 1 ? "" : "s") pending sync")
-                        .font(.caption.monospacedDigit())
+                        .font(.callout.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
             }
@@ -47,8 +47,9 @@ struct MenuBarStatusView: View {
                 NSApp.terminate(nil)
             }
         }
-        .padding(12)
-        .frame(width: 280)
+        .padding(density.pagePadding)
+        .frame(width: 340)
+        .appPresentation()
         .task {
             await observeIndexedFileCount()
         }

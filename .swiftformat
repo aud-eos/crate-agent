@@ -1,0 +1,2 @@
+# The XCTest helper evaluates an async autoclosure; its inner await must remain.
+--async-capturing XCTAssertThrowsErrorAsync

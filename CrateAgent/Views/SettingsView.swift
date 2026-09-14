@@ -20,33 +20,43 @@ struct SettingsView: View {
             AboutSettingsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
-        .frame(width: 540, height: 360)
+        .frame(width: 660, height: 500)
+        .appPresentation()
     }
 }
 
 // MARK: - General
 
 struct GeneralSettingsView: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @State private var showRestartAlert: Bool = false
     @State private var showMigrationSheet: Bool = false
 
     var body: some View {
         Form {
+            PageHeading("General", subtitle: "Choose your library folder and how much space the interface uses.")
+            Section("Appearance") {
+                DensityPicker()
+                    .pickerStyle(.segmented)
+                Text("Comfortable provides more room to read. Compact uses less space throughout the app.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             Section {
                 LabeledContent("Library folder") {
-                    VStack(alignment: .trailing, spacing: 4) {
+                    VStack(alignment: .trailing, spacing: density.detailSpacing) {
                         Text(services.watchedMusicFolder.path)
-                            .font(.caption.monospaced())
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                             .truncationMode(.middle)
                             .textSelection(.enabled)
-                        HStack(spacing: 6) {
+                        HStack(spacing: density.spacing) {
                             Button("Move Library…") {
                                 showMigrationSheet = true
                             }
-                            .controlSize(.small)
+                            .controlSize(density.controlSize)
                             .help("Move every tracked file under this folder into a new location. The DB and Serato library follow in one undoable batch.")
 
                             FolderPickerButton(
@@ -56,13 +66,13 @@ struct GeneralSettingsView: View {
                                 UserPreferences.watchedMusicFolder = pickedUrl
                                 showRestartAlert = true
                             }
-                            .controlSize(.small)
+                            .controlSize(density.controlSize)
                         }
                     }
                 }
             } footer: {
                 Text("crate-agent watches this folder for renames and indexes the files Serato references inside it. The recommended location is `~/Music/_DJ_Library_/` — a dedicated managed folder that sorts alongside Serato's own `_Serato_/`.")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
             }
         }
@@ -88,6 +98,7 @@ struct FilenameTemplateSettingsView: View {
 
     var body: some View {
         Form {
+            PageHeading("Filename template", subtitle: "Preview how your tags become a filename. Artist letter folders stay the same.")
             Section {
                 TextField(
                     UserPreferences.defaultFilenameTemplate,
@@ -99,14 +110,14 @@ struct FilenameTemplateSettingsView: View {
                 Text("Template")
             } footer: {
                 Text("Beets-style $field syntax. Supported fields: $artist · $title · $album · $genre · $bpm · $key · $comment · $length · $label · $ext.")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
             }
 
             Section("Preview") {
                 LabeledContent("Sample") {
                     Text(SettingsTemplatePreviewer.preview(template: template))
-                        .font(.caption.monospaced())
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                         .truncationMode(.middle)
@@ -129,7 +140,7 @@ struct FilenameTemplateSettingsView: View {
                 }
                 if let saveConfirmation {
                     Text(saveConfirmation)
-                        .font(.caption)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -145,6 +156,7 @@ struct FilenameTemplateSettingsView: View {
 /// appears in any `Text` or log statement outside the `SecureField`
 /// binding itself.
 struct AutoTagSettingsView: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @State private var apiKey: String = ""
     @State private var loadError: String?
     @State private var saveConfirmation: String?
@@ -152,6 +164,7 @@ struct AutoTagSettingsView: View {
 
     var body: some View {
         Form {
+            PageHeading("Auto-Tag", subtitle: "Connect AcoustID to look up recordings from their audio fingerprints.")
             Section {
                 SecureField("AcoustID API key", text: $apiKey)
                     .textFieldStyle(.roundedBorder)
@@ -165,11 +178,11 @@ struct AutoTagSettingsView: View {
                 HStack {
                     if let loadError {
                         Label(loadError, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
+                            .font(.callout)
                             .foregroundStyle(.orange)
                     } else if let saveConfirmation {
                         Text(saveConfirmation)
-                            .font(.caption)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -187,15 +200,15 @@ struct AutoTagSettingsView: View {
     @ViewBuilder
     private var footerContent: some View {
         if apiKey.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
                 Text("Auto-Tag needs a free AcoustID API key to look up matches.")
                 Link("Get a key at acoustid.org", destination: URL(string: "https://acoustid.org")!)
             }
-            .font(.caption)
+            .font(.callout)
             .foregroundStyle(.secondary)
         } else {
             Text("Stored securely in the macOS Keychain.")
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
         }
     }
@@ -229,13 +242,13 @@ struct AboutSettingsView: View {
 
     var body: some View {
         Form {
+            PageHeading("About crate-agent", subtitle: "Your companion for managing a Serato library.")
             Section {
                 LabeledContent("Application") {
                     Text(Bundle.main.shortVersion)
                 }
                 LabeledContent("Rust core") {
                     Text(coreVersionString)
-                        .monospaced()
                 }
             } header: {
                 Text("Version")
@@ -244,7 +257,6 @@ struct AboutSettingsView: View {
             Section("Library") {
                 LabeledContent("Watched folder") {
                     Text(services.watchedMusicFolder.lastPathComponent)
-                        .monospaced()
                 }
                 if let progress = services.fingerprintProgress {
                     LabeledContent("Fingerprinting") {
@@ -274,7 +286,6 @@ private extension Bundle {
 /// as a separate type so the rendering can be tested without
 /// instantiating the view.
 public enum SettingsTemplatePreviewer {
-
     /// Demo metadata used to populate the preview row.
     public static let sampleMetadata = SeratoMetadata(
         artist: "Aphex Twin",

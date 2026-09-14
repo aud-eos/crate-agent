@@ -12,6 +12,7 @@ import SwiftUI
 /// pattern `LibraryHygieneView`'s Duplicates panel uses for its
 /// keeper cache.
 struct AutoTagSelectionRow: View, Equatable {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     let fileID: Int64
     let path: String
     let artist: String?
@@ -28,33 +29,22 @@ struct AutoTagSelectionRow: View, Equatable {
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            Toggle(isOn: Binding(get: { isSelected }, set: { _ in onToggle() })) { EmptyView() }
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-            VStack(alignment: .leading, spacing: 2) {
-                Text(displayTitle)
-                    .font(.caption)
-                    .lineLimit(1)
-                Text((path as NSString).lastPathComponent)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
+        Toggle(isOn: Binding(get: { isSelected }, set: { _ in onToggle() })) {
+            TrackHeading(artist: artist, title: title, filename: (path as NSString).lastPathComponent)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(path)
         }
-        .padding(.vertical, 2)
-        .contentShape(Rectangle())
-        .onTapGesture { onToggle() }
+        .toggleStyle(.checkbox)
+        .accessibilityLabel("Select \(displayTitle)")
+        .padding(.vertical, density.rowPadding)
     }
 
     private var displayTitle: String {
         switch (artist, title) {
-        case let (artist?, title?): return "\(artist) — \(title)"
-        case let (artist?, nil): return artist
-        case let (nil, title?): return title
-        case (nil, nil): return (path as NSString).lastPathComponent
+        case let (artist?, title?): "\(artist) — \(title)"
+        case let (artist?, nil): artist
+        case let (nil, title?): title
+        case (nil, nil): (path as NSString).lastPathComponent
         }
     }
 }

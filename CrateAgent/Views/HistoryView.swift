@@ -10,6 +10,7 @@ import SwiftUI
 /// overhead to be worth the wiring — the Refresh button covers the
 /// "I just made a change, show me" case.
 struct HistoryView: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
@@ -21,52 +22,37 @@ struct HistoryView: View {
     @State private var resyncInFlightBatchId: String?
 
     var body: some View {
-        content
-            .navigationTitle("History")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        Task { await reload() }
-                    } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(isLoading)
+        VStack(spacing: 0) {
+            PageHeading("History", subtitle: "Review recorded changes, undo a batch, or retry its external writes.")
+                .padding(density.pagePadding)
+            Divider()
+            content
+        }
+        .appPresentation()
+        .navigationTitle("History")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await reload() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
                 }
+                .disabled(isLoading)
             }
-            .frame(minWidth: 520, minHeight: 360)
-            .task { await reload() }
+        }
+        .frame(minWidth: 520, minHeight: 360)
+        .task { await reload() }
     }
 
     @ViewBuilder
     private var content: some View {
-        if isLoading && batches.isEmpty {
+        if isLoading, batches.isEmpty {
             ProgressView("Loading history…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let loadError {
-            VStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.largeTitle)
-                    .foregroundStyle(.orange)
-                Text("Couldn't load history")
-                    .font(.headline)
-                Text(loadError)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            AppEmptyState(title: "Couldn't load history", detail: loadError, systemImage: "exclamationmark.triangle", tint: .orange)
         } else if batches.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "clock")
-                    .font(.largeTitle)
-                    .foregroundStyle(.tertiary)
-                Text("No activity yet")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-                Text("Renames, metadata edits, and imports will appear here.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            AppEmptyState(title: "No activity yet", detail: "Renames, metadata edits, and imports will appear here.", systemImage: "clock")
         } else {
             List(batches) { batch in
                 row(for: batch)
@@ -80,31 +66,25 @@ struct HistoryView: View {
         }
     }
 
-    @ViewBuilder
     private func row(for batch: BatchSummary) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    if batch.isUndoBatch {
-                        Image(systemName: "arrow.uturn.backward.circle")
-                            .foregroundStyle(.tertiary)
-                            .help("This batch was itself produced by undoing another batch.")
-                    }
-                    Text(batch.description)
-                        .font(.body)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                }
-                Text(batch.timestamp, style: .relative)
-                    .font(.caption.monospacedDigit())
+        ActionBar {
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
+                Text(batch.description)
+                    .font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(batch.timestamp, format: .dateTime.month().day().hour().minute())
+                    .font(.callout)
                     .foregroundStyle(.secondary)
-                    + Text(" ago")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                if undoInFlightBatchId == batch.batchId {
+                    ProgressView("Undoing batch…")
+                } else if resyncInFlightBatchId == batch.batchId {
+                    ProgressView("Re-syncing batch…")
+                } else {
+                    StatusBadge(title: batch.isUndoBatch ? "Undo batch" : "Recorded changes",
+                                systemImage: batch.isUndoBatch ? "arrow.uturn.backward.circle" : "clock")
+                }
             }
-
-            Spacer(minLength: 8)
-
+        } actions: {
             if batch.canResync {
                 Button {
                     Task { await resync(batch: batch) }
@@ -112,11 +92,11 @@ struct HistoryView: View {
                     Label("Re-sync Serato", systemImage: "arrow.triangle.2.circlepath")
                         .labelStyle(.titleAndIcon)
                 }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
                 .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil || seratoWatchdog.isSeratoRunning)
                 .help(seratoWatchdog.isSeratoRunning
-                      ? "Quit Serato before re-syncing — writes would queue in memory and disappear on app restart."
-                      : "Re-run this batch's Serato library and audio-tag writes. Newer edits made in external tag editors can be overwritten.")
+                    ? "Quit Serato before re-syncing — writes would queue in memory and disappear on app restart."
+                    : "Re-run this batch's Serato library and audio-tag writes. Newer edits made in external tag editors can be overwritten.")
             }
 
             Button("Undo") {
@@ -124,27 +104,23 @@ struct HistoryView: View {
             }
             .disabled(!batch.canUndo || undoInFlightBatchId != nil || resyncInFlightBatchId != nil)
             .help(batch.canUndo
-                  ? "Reverse every change in this batch."
-                  : "This batch contains operations that can't be undone yet (Serato-side imports/commits).")
+                ? "Reverse every change in this batch."
+                : "This batch contains operations that can't be undone yet (Serato-side imports/commits).")
         }
-        .padding(.vertical, 4)
-        .opacity((undoInFlightBatchId == batch.batchId || resyncInFlightBatchId == batch.batchId) ? 0.55 : 1)
+        .padding(.vertical, density.rowPadding)
     }
 
-    @ViewBuilder
     private func actionErrorBanner(_ message: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
+        ActionBar {
+            Label(message, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-            Text(message)
-                .font(.caption)
-                .lineLimit(2)
-            Spacer()
+                .fixedSize(horizontal: false, vertical: true)
+        } actions: {
             Button("Dismiss") { actionError = nil }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, density.pagePadding)
+        .padding(.vertical, density.rowPadding)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         .padding(12)
     }
@@ -184,7 +160,7 @@ struct HistoryView: View {
             // it on the inline banner too — the activity strip
             // message scrolls past quickly, but History's banner
             // stays visible until the user dismisses or undoes.
-            if outcome.queuedCount > 0 && outcome.appliedCount == 0 {
+            if outcome.queuedCount > 0, outcome.appliedCount == 0 {
                 actionError = outcome.summaryMessage
             }
         } catch {

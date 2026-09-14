@@ -8,6 +8,7 @@ import SwiftUI
 /// the user having confirmed (or changed) the folder so the user
 /// can't blow past the choice with a stray return key.
 struct OnboardingView: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     let onComplete: (URL) -> Void
 
     @State private var chosenFolder: URL = OnboardingView.defaultMusicFolder
@@ -19,15 +20,15 @@ struct OnboardingView: View {
     static var defaultMusicFolder: URL {
         (try? UserPreferences.defaultLibraryRoot())
             ?? URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Music", isDirectory: true)
-                .appendingPathComponent(
-                    UserPreferences.defaultLibraryFolderName,
-                    isDirectory: true
-                )
+            .appendingPathComponent("Music", isDirectory: true)
+            .appendingPathComponent(
+                UserPreferences.defaultLibraryFolderName,
+                isDirectory: true
+            )
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
+        VStack(alignment: .leading, spacing: density.spacing) {
             header
             Divider()
             folderSection
@@ -36,38 +37,25 @@ struct OnboardingView: View {
             Spacer(minLength: 0)
             footer
         }
-        .padding(32)
-        .frame(width: 640, height: 560)
+        .padding(density.pagePadding)
+        .frame(width: 680, height: 660)
+        .appPresentation()
     }
 
-    @ViewBuilder
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Image(systemName: "music.note.list")
-                    .font(.system(size: 28))
-                    .foregroundStyle(.tint)
-                Text("Welcome to crate-agent")
-                    .font(.title)
-                    .fontWeight(.semibold)
-            }
-            Text("crate-agent watches a folder of music files and keeps Serato's library in sync with the changes you make outside of Serato.")
-                .font(.body)
-                .foregroundStyle(.secondary)
-        }
+        PageHeading("Welcome to crate-agent", subtitle: "Choose a music folder to watch. crate-agent keeps Serato's library in sync when you rename or move files in Finder.")
     }
 
-    @ViewBuilder
     private var folderSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: density.spacing) {
             sectionHeading("Watched folder", systemImage: "folder")
             Text(chosenFolder.path)
-                .font(.body.monospaced())
+                .font(.body)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
-                .padding(.vertical, 6)
+                .padding(.vertical, density.rowPadding)
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
@@ -84,31 +72,33 @@ struct OnboardingView: View {
                     chosenFolder = OnboardingView.defaultMusicFolder
                     hasConfirmed = true
                 }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
             }
         }
     }
 
-    @ViewBuilder
     private var scopeSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: density.spacing) {
             sectionHeading("What happens next", systemImage: "info.circle")
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: density.spacing) {
                 bullet("crate-agent reads your Serato library and indexes the files Serato references inside the watched folder. Your files are not moved.")
                 bullet("Renames in Finder are mirrored into Serato so the library doesn't lose track of moved or renamed files.")
                 bullet("Drop a file or folder onto the library window to register new tracks with Serato.")
                 bullet("Audio files are fingerprinted in the background for future track-identity features.")
             }
-            .font(.callout)
+            .font(.body)
             .foregroundStyle(.secondary)
         }
     }
 
-    @ViewBuilder
     private var footer: some View {
-        HStack {
-            Spacer()
-            Button("Start") {
+        ActionBar {
+            if !hasConfirmed {
+                Text("Confirm your watched folder to continue.")
+                    .foregroundStyle(.secondary)
+            }
+        } actions: {
+            Button("Start watching") {
                 // Make sure the chosen directory exists before the
                 // app tries to watch it — the opinionated default
                 // `~/Music/_DJ_Library_/` is intentionally not
@@ -124,14 +114,13 @@ struct OnboardingView: View {
             .controlSize(.large)
             .disabled(!hasConfirmed)
             .help(hasConfirmed
-                  ? "Bootstrap the library and start watching."
-                  : "Confirm the watched folder above (Change… or Use Default) to enable Start.")
+                ? "Bootstrap the library and start watching."
+                : "Confirm the watched folder above (Change… or Use Default) to enable Start.")
         }
     }
 
-    @ViewBuilder
     private func sectionHeading(_ title: String, systemImage: String) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: density.spacing) {
             Image(systemName: systemImage)
                 .foregroundStyle(.tint)
             Text(title)
@@ -139,11 +128,10 @@ struct OnboardingView: View {
         }
     }
 
-    @ViewBuilder
     private func bullet(_ text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: density.spacing) {
             Text("•")
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
             Text(text)
         }
     }

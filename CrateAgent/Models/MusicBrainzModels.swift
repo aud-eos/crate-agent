@@ -80,6 +80,28 @@ public struct AcoustIDResult: Codable, Equatable {
 
 // MARK: - MusicBrainz
 
+public struct MBRecordingDetails: Codable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let creditedArtistName: String
+    let disambiguation: String?
+    let durationMilliseconds: Int?
+
+    init(id: String, title: String, creditedArtistName: String, disambiguation: String?, durationMilliseconds: Int?) {
+        self.id = id
+        self.title = title
+        self.creditedArtistName = creditedArtistName
+        self.disambiguation = disambiguation
+        self.durationMilliseconds = durationMilliseconds
+    }
+
+    init(recording: MBRecording, requestedID: String) {
+        self.init(id: recording.id ?? requestedID, title: recording.title,
+                  creditedArtistName: recording.creditedArtistName, disambiguation: recording.disambiguation,
+                  durationMilliseconds: recording.durationMilliseconds)
+    }
+}
+
 /// `GET /ws/2/recording/<mbid>?inc=releases+release-groups+artist-credits+isrcs`.
 ///
 /// Decoding is lenient: a sparse response (no releases, no ISRCs, no
@@ -101,6 +123,8 @@ public struct MBRecording: Codable, Equatable {
     /// found". See `MBReleaseGroup.sortableFirstReleaseDate`.
     let releaseGroup: MBReleaseGroup?
     let isrcs: [String]
+    let disambiguation: String?
+    let durationMilliseconds: Int?
 
     public init(
         title: String,
@@ -108,7 +132,9 @@ public struct MBRecording: Codable, Equatable {
         releases: [MBRelease],
         releaseGroup: MBReleaseGroup?,
         isrcs: [String],
-        id: String? = nil
+        id: String? = nil,
+        disambiguation: String? = nil,
+        durationMilliseconds: Int? = nil
     ) {
         self.id = id
         self.title = title
@@ -116,10 +142,13 @@ public struct MBRecording: Codable, Equatable {
         self.releases = releases
         self.releaseGroup = releaseGroup
         self.isrcs = isrcs
+        self.disambiguation = disambiguation
+        self.durationMilliseconds = durationMilliseconds
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title
+        case id, title, disambiguation
+        case durationMilliseconds = "length"
         case artistCredit = "artist-credit"
         case releases
         case isrcs
@@ -133,11 +162,14 @@ public struct MBRecording: Codable, Equatable {
         releases = try container.decodeIfPresent([MBRelease].self, forKey: .releases) ?? []
         releaseGroup = Self.earliestReleaseGroup(in: releases)
         isrcs = try container.decodeIfPresent([String].self, forKey: .isrcs) ?? []
+        disambiguation = try container.decodeIfPresent(String.self, forKey: .disambiguation)
+        durationMilliseconds = try container.decodeIfPresent(Int.self, forKey: .durationMilliseconds)
     }
 
     func replacingReleases(with releases: [MBRelease]) -> MBRecording {
         MBRecording(title: title, artistCredit: artistCredit, releases: releases,
-                    releaseGroup: Self.earliestReleaseGroup(in: releases), isrcs: isrcs, id: id)
+                    releaseGroup: Self.earliestReleaseGroup(in: releases), isrcs: isrcs, id: id,
+                    disambiguation: disambiguation, durationMilliseconds: durationMilliseconds)
     }
 
     private static func earliestReleaseGroup(in releases: [MBRelease]) -> MBReleaseGroup? {

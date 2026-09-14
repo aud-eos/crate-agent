@@ -30,6 +30,7 @@ struct LibraryHygieneView: View {
                 .tabItem { Label("Duplicates", systemImage: "square.on.square") }
         }
         .navigationTitle("Library Cleanup")
+        .appPresentation()
         .frame(minWidth: 680, minHeight: 480)
     }
 }
@@ -37,9 +38,11 @@ struct LibraryHygieneView: View {
 // MARK: - Whitespace panel
 
 private struct WhitespacePanel: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
+    @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var files: [HygieneFileRow] = []
     @State private var issues: [LibraryHygiene.WhitespaceIssue] = []
     @State private var isScanning: Bool = false
@@ -49,10 +52,18 @@ private struct WhitespacePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PageHeading("Whitespace", subtitle: "Review visible whitespace changes before applying fixes to library fields.")
+                .padding(density.pagePadding)
             if seratoWatchdog.isSeratoRunning {
                 SeratoRunningBanner(message: "Serato is running — quit it before fixing whitespace.")
                 Divider()
             }
+            Text(WhitespacePreview.legend)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, density.pagePadding)
+                .padding(.bottom, density.spacing)
             issueListSection
             Divider()
             footer
@@ -62,7 +73,7 @@ private struct WhitespacePanel: View {
 
     @ViewBuilder
     private var issueListSection: some View {
-        if isScanning && issues.isEmpty {
+        if isScanning, issues.isEmpty {
             ProgressView("Scanning library…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if issues.isEmpty {
@@ -74,52 +85,48 @@ private struct WhitespacePanel: View {
             )
         } else {
             List(issues) { issue in
-                diffRow(
+                HygieneDiffRow(
                     fieldName: issue.field.displayName,
                     path: issue.path,
                     oldValue: issue.oldValue,
-                    newValue: issue.newValue
+                    newValue: issue.newValue,
+                    identity: trackIdentities[issue.path],
+                    showsWhitespace: true
                 )
             }
             .listStyle(.inset)
         }
     }
 
-    @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 12) {
+        ActionBar {
             if let actionError {
-                Label(actionError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(2)
+                ActionErrorMessage(message: actionError)
             } else if let lastResult {
                 Label(lastResult, systemImage: "checkmark.circle")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.green)
             } else {
-                Text("\(issues.count) issue\(issues.count == 1 ? "" : "s") found")
-                    .font(.caption.monospacedDigit())
+                Text("\(issues.count) field fixes across \(Set(issues.map(\.fileId)).count) tracks")
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+        } actions: {
             Button {
                 Task { await rescan() }
             } label: {
                 Label("Rescan", systemImage: "arrow.clockwise")
             }
             .disabled(isScanning || isFixing)
-            Button("Fix All Whitespace") {
+            Button("Apply \(issues.count) whitespace fixes") {
                 Task { await fixAll() }
             }
             .keyboardShortcut(.defaultAction)
             .disabled(issues.isEmpty || isFixing || seratoWatchdog.isSeratoRunning)
             .help(seratoWatchdog.isSeratoRunning
-                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                  : "Trim whitespace from every flagged field in one undoable batch.")
+                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                : "Trim whitespace from every flagged field in one undoable batch.")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
     }
 
     private func rescan() async {
@@ -130,6 +137,7 @@ private struct WhitespacePanel: View {
             files = try await services.database.writer.read { db in
                 try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
+            trackIdentities = TrackDisplayIdentity.index(files)
             issues = LibraryHygiene.findWhitespaceIssues(in: files)
         } catch {
             actionError = "Couldn't scan library: \(error.localizedDescription)"
@@ -156,6 +164,7 @@ private struct WhitespacePanel: View {
 // MARK: - Find & Replace panel
 
 private struct FindReplacePanel: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
@@ -163,6 +172,7 @@ private struct FindReplacePanel: View {
     @State private var replaceText: String = ""
     @State private var caseSensitive: Bool = false
     @State private var selectedFields: Set<SeratoMetadataField> = [.artist, .title, .album]
+    @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var files: [HygieneFileRow] = []
     @State private var matches: [LibraryHygiene.FindAndReplaceMatch] = []
     @State private var selectedMatchIds: Set<String> = []
@@ -181,6 +191,8 @@ private struct FindReplacePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PageHeading("Find and replace", subtitle: "Preview each field replacement and select only the changes you want.")
+                .padding(density.pagePadding)
             if seratoWatchdog.isSeratoRunning {
                 SeratoRunningBanner(message: "Serato is running — quit it before applying find/replace.")
                 Divider()
@@ -210,14 +222,13 @@ private struct FindReplacePanel: View {
         }
     }
 
-    @ViewBuilder
     private var queryForm: some View {
         Form {
             Section {
                 TextField("Find", text: $findText)
-                    .font(.body.monospaced())
+                    .font(.body)
                 TextField("Replace with", text: $replaceText)
-                    .font(.body.monospaced())
+                    .font(.body)
                 Toggle("Match case", isOn: $caseSensitive)
             }
             Section("Fields") {
@@ -230,20 +241,24 @@ private struct FindReplacePanel: View {
     @ViewBuilder
     private var fieldsRow: some View {
         let columns = [
-            GridItem(.adaptive(minimum: 110, maximum: 160), alignment: .leading)
+            GridItem(.adaptive(minimum: 110, maximum: 160), alignment: .leading),
         ]
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 4) {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: density.detailSpacing) {
             ForEach(SeratoMetadataField.allCases, id: \.rawValue) { field in
                 Toggle(field.displayName, isOn: Binding(
                     get: { selectedFields.contains(field) },
                     set: { include in
-                        if include { selectedFields.insert(field) } else { selectedFields.remove(field) }
+                        if include {
+                            selectedFields.insert(field)
+                        } else {
+                            selectedFields.remove(field)
+                        }
                     }
                 ))
                 .toggleStyle(.checkbox)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, density.rowPadding)
     }
 
     @ViewBuilder
@@ -264,64 +279,63 @@ private struct FindReplacePanel: View {
             )
         } else {
             List(matches) { match in
-                HStack(alignment: .top, spacing: 10) {
+                HStack(alignment: .top, spacing: density.spacing) {
                     Toggle(isOn: Binding(
                         get: { selectedMatchIds.contains(match.id) },
                         set: { include in
-                            if include { selectedMatchIds.insert(match.id) }
-                            else { selectedMatchIds.remove(match.id) }
+                            if include {
+                                selectedMatchIds.insert(match.id)
+                            } else {
+                                selectedMatchIds.remove(match.id)
+                            }
                         }
                     )) { EmptyView() }
-                    .toggleStyle(.checkbox)
-                    .labelsHidden()
+                        .toggleStyle(.checkbox)
+                        .labelsHidden()
+                        .accessibilityLabel("Select \(match.field.displayName) replacement for \((match.path as NSString).lastPathComponent)")
 
-                    diffRow(
+                    HygieneDiffRow(
                         fieldName: match.field.displayName,
                         path: match.path,
                         oldValue: match.oldValue,
-                        newValue: match.newValue
+                        newValue: match.newValue,
+                        identity: trackIdentities[match.path]
                     )
                 }
-                .padding(.vertical, 4)
+                .padding(.vertical, density.rowPadding)
             }
             .listStyle(.inset)
         }
     }
 
-    @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 12) {
+        ActionBar {
             if let actionError {
-                Label(actionError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(2)
+                ActionErrorMessage(message: actionError)
             } else if let lastResult {
                 Label(lastResult, systemImage: "checkmark.circle")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.green)
             } else if !matches.isEmpty {
                 Text("\(selectedMatchIds.count) of \(matches.count) selected")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+        } actions: {
             Button("Select All") {
                 selectedMatchIds = Set(matches.map(\.id))
             }
-            .controlSize(.small)
+            .controlSize(density.controlSize)
             .disabled(matches.isEmpty)
-            Button("Apply Selected") {
+            Button("Apply \(selectedMatchIds.count) replacements") {
                 Task { await applySelected() }
             }
             .keyboardShortcut(.defaultAction)
             .disabled(selectedMatchIds.isEmpty || isApplying || seratoWatchdog.isSeratoRunning)
             .help(seratoWatchdog.isSeratoRunning
-                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                  : "Apply the selected replacements in one undoable batch.")
+                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                : "Apply the selected replacements in one undoable batch.")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
     }
 
     private func loadFiles() async {
@@ -329,6 +343,7 @@ private struct FindReplacePanel: View {
             files = try await services.database.writer.read { db in
                 try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
+            trackIdentities = TrackDisplayIdentity.index(files)
             recomputeMatches()
         } catch {
             actionError = "Couldn't load library: \(error.localizedDescription)"
@@ -373,6 +388,7 @@ private struct FindReplacePanel: View {
 // MARK: - Case consistency panel
 
 private struct CaseConsistencyPanel: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
@@ -390,6 +406,8 @@ private struct CaseConsistencyPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PageHeading("Consistent capitalization", subtitle: "Choose the spelling to keep for each group, or skip that group.")
+                .padding(density.pagePadding)
             if seratoWatchdog.isSeratoRunning {
                 SeratoRunningBanner(message: "Serato is running — quit it before normalizing case.")
                 Divider()
@@ -403,7 +421,7 @@ private struct CaseConsistencyPanel: View {
 
     @ViewBuilder
     private var groupListSection: some View {
-        if isScanning && groups.isEmpty {
+        if isScanning, groups.isEmpty {
             ProgressView("Scanning library…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if groups.isEmpty {
@@ -421,91 +439,88 @@ private struct CaseConsistencyPanel: View {
         }
     }
 
-    @ViewBuilder
     private func groupRow(_ group: LibraryHygiene.CaseInconsistencyGroup) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: density.spacing) {
+            HStack(spacing: density.spacing) {
                 Text(group.field.displayName)
-                    .font(.caption.smallCaps())
+                    .font(.callout)
                     .foregroundStyle(.tint)
                 Text("\(group.totalFiles) file\(group.totalFiles == 1 ? "" : "s")")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             ForEach(group.variants, id: \.value) { variant in
                 let isChosen = resolvedCanonical(for: group) == variant.value
-                HStack(spacing: 8) {
-                    Image(systemName: isChosen ? "largecircle.fill.circle" : "circle")
-                        .foregroundStyle(isChosen ? Color.accentColor : Color.secondary)
-                        .onTapGesture {
-                            resolutions[group.id] = .some(variant.value)
-                        }
-                    Text("«\(variant.value)»")
-                        .font(.caption.monospaced())
+                HStack(spacing: density.spacing) {
+                    Button {
+                        resolutions[group.id] = .some(variant.value)
+                    } label: {
+                        Image(systemName: isChosen ? "largecircle.fill.circle" : "circle")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(isChosen ? Color.accentColor : Color.secondary)
+                    .accessibilityLabel("Use \(variant.value) for \(group.field.displayName)")
+                    .accessibilityValue(isChosen ? "Selected" : "Not selected")
+                    Text(variant.value)
+                        .font(.callout)
                         .foregroundStyle(isChosen ? Color.primary : Color.secondary)
                     Spacer()
                     Text("\(variant.count) file\(variant.count == 1 ? "" : "s")")
-                        .font(.caption2.monospacedDigit())
+                        .font(.callout.monospacedDigit())
                         .foregroundStyle(Color.secondary)
                 }
             }
-            HStack(spacing: 8) {
+            HStack(spacing: density.spacing) {
                 Button("Skip this group") {
                     resolutions[group.id] = .some("")
                 }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
                 .disabled(resolvedCanonical(for: group) == nil)
                 Button("Reset") {
                     resolutions[group.id] = nil
                 }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
                 .disabled(resolutions[group.id] == nil)
                 Spacer()
                 if resolvedCanonical(for: group) == nil {
                     Text("Skipped")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, density.rowPadding)
     }
 
-    @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 12) {
+        ActionBar {
             if let actionError {
-                Label(actionError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(2)
+                ActionErrorMessage(message: actionError)
             } else if let lastResult {
                 Label(lastResult, systemImage: "checkmark.circle")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.green)
             } else {
                 Text("\(activeGroupCount) of \(groups.count) group\(groups.count == 1 ? "" : "s") will apply")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+        } actions: {
             Button {
                 Task { await rescan() }
             } label: {
                 Label("Rescan", systemImage: "arrow.clockwise")
             }
             .disabled(isScanning || isApplying)
-            Button("Apply Selections") {
+            Button("Apply \(activeGroupCount) case groups") {
                 Task { await applySelections() }
             }
             .keyboardShortcut(.defaultAction)
             .disabled(activeGroupCount == 0 || isApplying || seratoWatchdog.isSeratoRunning)
             .help(seratoWatchdog.isSeratoRunning
-                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                  : "Apply the selected canonicals in one undoable batch.")
+                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                : "Apply the selected canonicals in one undoable batch.")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
     }
 
     /// The canonical the user has chosen (or the analyzer suggested)
@@ -521,7 +536,7 @@ private struct CaseConsistencyPanel: View {
             if let value = entry, !value.isEmpty {
                 return value
             }
-            return nil  // skip
+            return nil // skip
         }
         return group.suggestedCanonical
     }
@@ -575,9 +590,11 @@ private struct CaseConsistencyPanel: View {
 // MARK: - Missing fields panel
 
 private struct MissingFieldsPanel: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
+    @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var files: [HygieneFileRow] = []
     @State private var summaries: [LibraryHygiene.MissingFieldSummary] = []
     @State private var selectedField: SeratoMetadataField = .artist
@@ -591,6 +608,8 @@ private struct MissingFieldsPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PageHeading("Missing library fields", subtitle: "Choose a missing field and review the value to fill on selected tracks.")
+                .padding(density.pagePadding)
             if seratoWatchdog.isSeratoRunning {
                 SeratoRunningBanner(message: "Serato is running — quit it before filling missing fields.")
                 Divider()
@@ -618,21 +637,21 @@ private struct MissingFieldsPanel: View {
             .frame(maxHeight: 140)
         } else {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
+                HStack(spacing: density.spacing) {
                     ForEach(summaries) { summary in
                         Button {
                             selectedField = summary.field
                             recomputeEntries()
                         } label: {
-                            VStack(alignment: .leading, spacing: 2) {
+                            VStack(alignment: .leading, spacing: density.detailSpacing) {
                                 Text(summary.field.displayName)
-                                    .font(.caption.smallCaps())
+                                    .font(.callout)
                                 Text("\(summary.count) missing")
-                                    .font(.caption.monospacedDigit())
+                                    .font(.callout.monospacedDigit())
                                     .foregroundStyle(.secondary)
                             }
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
+                            .padding(.vertical, density.rowPadding)
                             .background(
                                 RoundedRectangle(cornerRadius: 8)
                                     .strokeBorder(
@@ -646,14 +665,13 @@ private struct MissingFieldsPanel: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+                .padding(.horizontal, density.pagePadding)
+                .padding(.vertical, density.rowPadding)
             }
             .background(Color.secondary.opacity(0.05))
         }
     }
 
-    @ViewBuilder
     private var fillForm: some View {
         Form {
             Section {
@@ -664,12 +682,12 @@ private struct MissingFieldsPanel: View {
                 }
                 .onChange(of: selectedField) { _, _ in recomputeEntries() }
                 TextField("Value to fill in", text: $fillValue)
-                    .font(.body.monospaced())
+                    .font(.body)
             } header: {
                 Text("Bulk Fill")
             } footer: {
                 Text("Sets the chosen field on every selected file to the supplied value. Rows already populated since the last scan are skipped at apply time.")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
             }
         }
@@ -678,7 +696,7 @@ private struct MissingFieldsPanel: View {
 
     @ViewBuilder
     private var entryListSection: some View {
-        if isScanning && entries.isEmpty {
+        if isScanning, entries.isEmpty {
             ProgressView("Scanning…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if entries.isEmpty {
@@ -690,49 +708,46 @@ private struct MissingFieldsPanel: View {
             )
         } else {
             List(entries) { entry in
-                HStack(spacing: 10) {
+                HStack(spacing: density.spacing) {
                     Toggle(isOn: Binding(
                         get: { selectedEntryIds.contains(entry.id) },
                         set: { include in
-                            if include { selectedEntryIds.insert(entry.id) }
-                            else { selectedEntryIds.remove(entry.id) }
+                            if include {
+                                selectedEntryIds.insert(entry.id)
+                            } else {
+                                selectedEntryIds.remove(entry.id)
+                            }
                         }
                     )) { EmptyView() }
-                    .toggleStyle(.checkbox)
-                    .labelsHidden()
-                    Text((entry.path as NSString).lastPathComponent)
-                        .font(.caption.monospaced())
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Text(entry.field.displayName)
-                        .font(.caption2.smallCaps())
-                        .foregroundStyle(.tertiary)
+                        .toggleStyle(.checkbox)
+                        .labelsHidden()
+                        .accessibilityLabel("Select missing \(entry.field.displayName) for \((entry.path as NSString).lastPathComponent)")
+                    VStack(alignment: .leading, spacing: density.spacing) {
+                        let identity = trackIdentities[entry.path]
+                        TrackHeading(artist: identity?.artist, title: identity?.title, filename: (entry.path as NSString).lastPathComponent)
+                        MissingFieldFillComparison(field: entry.field, value: fillValue)
+                    }
                 }
-                .padding(.vertical, 2)
+                .padding(.vertical, density.rowPadding)
             }
             .listStyle(.inset)
         }
     }
 
-    @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 12) {
+        ActionBar {
             if let actionError {
-                Label(actionError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(2)
+                ActionErrorMessage(message: actionError)
             } else if let lastResult {
                 Label(lastResult, systemImage: "checkmark.circle")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.green)
             } else if !entries.isEmpty {
                 Text("\(selectedEntryIds.count) of \(entries.count) selected")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+        } actions: {
             Button {
                 Task { await rescan() }
             } label: {
@@ -742,24 +757,22 @@ private struct MissingFieldsPanel: View {
             Button("Select All") {
                 selectedEntryIds = Set(entries.map(\.id))
             }
-            .controlSize(.small)
+            .controlSize(density.controlSize)
             .disabled(entries.isEmpty)
-            Button("Apply Fill") {
+            Button("Fill \(selectedEntryIds.count) fields") {
                 Task { await applyFill() }
             }
             .keyboardShortcut(.defaultAction)
             .disabled(canApply == false || isApplying || seratoWatchdog.isSeratoRunning)
             .help(seratoWatchdog.isSeratoRunning
-                  ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                  : "Fill the chosen field on every selected track.")
+                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
+                : "Fill the chosen field on every selected track.")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
     }
 
     private var canApply: Bool {
         !selectedEntryIds.isEmpty
-            && !fillValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !LibraryHygiene.normalizedMissingFieldValue(fillValue).isEmpty
     }
 
     private func rescan() async {
@@ -770,12 +783,14 @@ private struct MissingFieldsPanel: View {
             files = try await services.database.writer.read { db in
                 try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
             }
+            trackIdentities = TrackDisplayIdentity.index(files)
             summaries = LibraryHygiene.missingFieldSummaries(in: files)
             // If the previously-selected field has no gaps anymore,
             // jump to whichever field does. Avoids the user staring
             // at "Nothing missing" indefinitely.
             if !summaries.contains(where: { $0.field == selectedField }),
-               let first = summaries.first?.field {
+               let first = summaries.first?.field
+            {
                 selectedField = first
             }
             recomputeEntries()
@@ -814,6 +829,7 @@ private struct MissingFieldsPanel: View {
 // MARK: - Duplicates panel
 
 private struct DuplicatesPanel: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
@@ -853,7 +869,9 @@ private struct DuplicatesPanel: View {
 
         static let idle = BatchProgress(trashed: 0, total: 0)
 
-        var isActive: Bool { total > 0 }
+        var isActive: Bool {
+            total > 0
+        }
     }
 
     private static let byteCountFormatter: ByteCountFormatter = {
@@ -864,19 +882,21 @@ private struct DuplicatesPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            PageHeading("Duplicate tracks", subtitle: "Choose one keeper per group. Review the other copies before moving them to Trash.")
+                .padding(density.pagePadding)
             if seratoWatchdog.isSeratoRunning {
                 SeratoRunningBanner(message: "Serato is running — quit it before resolving duplicates.")
                 Divider()
             }
             modeBar
             Divider()
-            if !groups.isEmpty {
-                batchActionBar
-                Divider()
-            }
             groupListSection
             Divider()
             footer
+            if !groups.isEmpty {
+                Divider()
+                batchActionBar
+            }
         }
         .task { await rescan() }
         // Cache invalidation: when the group set changes (after a
@@ -891,7 +911,11 @@ private struct DuplicatesPanel: View {
             "Resolve duplicates?",
             isPresented: Binding(
                 get: { pendingResolveGroup != nil },
-                set: { isPresented in if !isPresented { pendingResolveGroup = nil } }
+                set: {
+                    isPresented in if !isPresented {
+                        pendingResolveGroup = nil
+                    }
+                }
             ),
             presenting: pendingResolveGroup
         ) { group in
@@ -920,42 +944,38 @@ private struct DuplicatesPanel: View {
     /// unambiguous "Resolve All" before any sticky per-group
     /// section header. Hidden when there are no groups (the
     /// list section renders its own empty state).
-    @ViewBuilder
     private var batchActionBar: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
+        ActionBar {
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
                 Text("\(groups.count) duplicate group\(groups.count == 1 ? "" : "s")")
                     .font(.subheadline.weight(.medium))
                 if batchProgress.isActive {
                     Text("Resolving… \(batchProgress.trashed) of \(batchProgress.total) files trashed")
-                        .font(.caption.monospacedDigit())
+                        .font(.callout.monospacedDigit())
                         .foregroundStyle(.secondary)
                 } else {
                     Text("\(totalNonKeeperCount) file\(totalNonKeeperCount == 1 ? "" : "s") will move to Trash")
-                        .font(.caption.monospacedDigit())
+                        .font(.callout.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
             }
-            Spacer()
+        } actions: {
             Button(role: .destructive) {
                 pendingResolveAll = true
             } label: {
-                Label("Resolve All", systemImage: "trash")
+                Label("Move \(totalNonKeeperCount) duplicate files to Trash", systemImage: "trash")
                     .labelStyle(.titleAndIcon)
             }
             .disabled(isResolving || seratoWatchdog.isSeratoRunning || totalNonKeeperCount == 0)
             .help(seratoWatchdog.isSeratoRunning
-                  ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
-                  : "Trash every non-keeper across all groups in one undoable-as-an-audit-log batch.")
+                ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
+                : "Trash every non-keeper across all groups in one undoable-as-an-audit-log batch.")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
         .background(Color.secondary.opacity(0.06))
     }
 
-    @ViewBuilder
     private var modeBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: density.spacing) {
             Picker("Mode", selection: $mode) {
                 ForEach(DuplicateFinder.Mode.allCases, id: \.rawValue) { entry in
                     Text(entry.displayName).tag(entry)
@@ -969,18 +989,18 @@ private struct DuplicatesPanel: View {
             Spacer()
             if mode == .perceptual {
                 Text("\(fingerprintCoverage.done) of \(fingerprintCoverage.total) fingerprinted")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .help("Perceptual matching needs Chromaprint fingerprints. Files still being fingerprinted in the background can't be matched yet — results improve as the fingerprint worker progresses.")
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.horizontal, density.pagePadding)
+        .padding(.vertical, density.spacing)
     }
 
     @ViewBuilder
     private var groupListSection: some View {
-        if isScanning && groups.isEmpty {
+        if isScanning, groups.isEmpty {
             ProgressView("Scanning library…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if groups.isEmpty {
@@ -998,45 +1018,44 @@ private struct DuplicatesPanel: View {
             // Per-group cards avoid the stickiness entirely and
             // make the per-group scope visually obvious.
             ScrollView {
-                LazyVStack(spacing: 12) {
+                LazyVStack(spacing: density.spacing) {
                     ForEach(groups) { group in
                         groupCard(group)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
+                .padding(.horizontal, density.pagePadding)
+                .padding(.vertical, density.spacing)
             }
         }
     }
 
-    @ViewBuilder
     private func groupCard(_ group: DuplicateFinder.DuplicateGroup) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: density.spacing) {
+            HStack(spacing: density.spacing) {
                 Text("\(group.size) copies · \(modeHeader(for: group))")
-                    .font(.caption.smallCaps())
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
                     pendingResolveGroup = group
                 } label: {
-                    Label("Resolve Group", systemImage: "trash")
+                    Label("Trash \(group.size - 1) copies", systemImage: "trash")
                         .labelStyle(.titleAndIcon)
                 }
-                .controlSize(.small)
+                .controlSize(density.controlSize)
                 .disabled(isResolving || seratoWatchdog.isSeratoRunning)
                 .help(seratoWatchdog.isSeratoRunning
-                      ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
-                      : "Move non-keepers in this group to Trash and remove their Serato references in one batch.")
+                    ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
+                    : "Move non-keepers in this group to Trash and remove their Serato references in one batch.")
             }
-            VStack(spacing: 4) {
+            VStack(spacing: density.detailSpacing) {
                 ForEach(group.files, id: \.id) { file in
                     duplicateRow(file: file, group: group)
                 }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, density.pagePadding)
+        .padding(.vertical, density.spacing)
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.secondary.opacity(0.06))
@@ -1050,9 +1069,9 @@ private struct DuplicatesPanel: View {
     private var modeEmptyDetail: String {
         switch mode {
         case .byteLevel:
-            return "No two files share the same content hash. (Byte-level duplicates would be the same file copied to two locations.)"
+            "No two files share the same content hash. (Byte-level duplicates would be the same file copied to two locations.)"
         case .perceptual:
-            return "No two fingerprinted files match each other. (Perceptual duplicates would be the same recording at different bitrates or in different formats.)"
+            "No two fingerprinted files match each other. (Perceptual duplicates would be the same recording at different bitrates or in different formats.)"
         }
     }
 
@@ -1074,39 +1093,35 @@ private struct DuplicatesPanel: View {
     ) -> some View {
         let keeperId = effectiveKeeperId(for: group)
         let isKeeper = file.id == keeperId
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: isKeeper ? "largecircle.fill.circle" : "circle")
-                .foregroundStyle(isKeeper ? Color.accentColor : Color.secondary)
-                .onTapGesture {
-                    if let identifier = file.id {
-                        keeperOverrides[group.id] = identifier
-                    }
+        HStack(alignment: .top, spacing: density.spacing) {
+            Button {
+                if let identifier = file.id {
+                    keeperOverrides[group.id] = identifier
                 }
-                .help("Set as the keeper for this group.")
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(file.path)
-                        .font(.caption.monospaced())
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                        .foregroundStyle(isKeeper ? Color.primary : Color.secondary)
-                    if isKeeper {
-                        Text("keeper")
-                            .font(.caption2.smallCaps())
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(
-                                Capsule().fill(Color.accentColor.opacity(0.15))
-                            )
-                            .foregroundStyle(Color.accentColor)
-                    }
+            } label: {
+                Image(systemName: isKeeper ? "largecircle.fill.circle" : "circle")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(isKeeper ? Color.accentColor : Color.secondary)
+            .accessibilityLabel("Keep \((file.path as NSString).lastPathComponent)")
+            .accessibilityValue(isKeeper ? "Selected keeper" : "Not selected")
+            .help("Set as the keeper for this group.")
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
+                TrackHeading(artist: file.artist, title: file.title, filename: (file.path as NSString).lastPathComponent)
+                Text(file.path)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(density == .comfortable ? 2 : 1)
+                    .truncationMode(.middle)
+                    .help(file.path)
+                if isKeeper {
+                    StatusBadge(title: "Keeper", systemImage: "checkmark.circle", tint: .accentColor)
                 }
-                HStack(spacing: 12) {
+                HStack(spacing: density.spacing) {
                     Text(Self.byteCountFormatter.string(fromByteCount: file.fileSize))
                         .foregroundStyle(.secondary)
                     Text((file.path as NSString).pathExtension.uppercased())
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                     if let bitrate = file.bitrateKbps {
                         Text("\(bitrate) kbps")
                             .foregroundStyle(.secondary)
@@ -1115,7 +1130,7 @@ private struct DuplicatesPanel: View {
                         statusBadge(file.fingerprintStatus)
                     }
                 }
-                .font(.caption2.monospacedDigit())
+                .font(.callout.monospacedDigit())
             }
             Spacer()
             Button {
@@ -1129,7 +1144,7 @@ private struct DuplicatesPanel: View {
             .buttonStyle(.borderless)
             .help("Show this file in Finder so you can review or delete it manually.")
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, density.rowPadding)
     }
 
     @ViewBuilder
@@ -1146,24 +1161,20 @@ private struct DuplicatesPanel: View {
         }
     }
 
-    @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 12) {
+        ActionBar {
             if let actionError {
-                Label(actionError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(2)
+                ActionErrorMessage(message: actionError)
             } else if let lastResolution {
                 Label(lastResolution, systemImage: "checkmark.circle")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.green)
             } else {
                 Text("\(groups.count) duplicate group\(groups.count == 1 ? "" : "s") · \(totalDuplicateFiles) file\(totalDuplicateFiles == 1 ? "" : "s")")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+        } actions: {
             Button {
                 Task { await rescan() }
             } label: {
@@ -1171,8 +1182,6 @@ private struct DuplicatesPanel: View {
             }
             .disabled(isScanning || isResolving)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
     }
 
     private var totalDuplicateFiles: Int {
@@ -1346,65 +1355,51 @@ private struct DuplicatesPanel: View {
 
 // MARK: - Shared
 
-@ViewBuilder
-private func diffRow(
-    fieldName: String,
-    path: String,
-    oldValue: String,
-    newValue: String
-) -> some View {
-    VStack(alignment: .leading, spacing: 4) {
-        HStack(spacing: 8) {
-            Text(fieldName)
-                .font(.caption.smallCaps())
-                .foregroundStyle(.tint)
-            Text((path as NSString).lastPathComponent)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        HStack(alignment: .top, spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("From")
-                    .font(.caption2.smallCaps())
-                    .foregroundStyle(.tertiary)
-                Text("«\(oldValue)»")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-            Image(systemName: "arrow.right")
-                .foregroundStyle(.tertiary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("To")
-                    .font(.caption2.smallCaps())
-                    .foregroundStyle(.tertiary)
-                Text("«\(newValue)»")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.primary)
-            }
-        }
+struct MissingFieldFillComparison: View {
+    let field: SeratoMetadataField
+    let value: String
+
+    var comparison: MetadataComparison {
+        MetadataComparison(current: nil, proposed: LibraryHygiene.normalizedMissingFieldValue(value), field: field.displayName)
+    }
+
+    var body: some View {
+        comparison
     }
 }
 
-@ViewBuilder
+private struct HygieneDiffRow: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    let fieldName: String
+    let path: String
+    let oldValue: String
+    let newValue: String
+    var identity: TrackDisplayIdentity?
+    var showsWhitespace = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: density.spacing) {
+            TrackHeading(artist: identity?.artist, title: identity?.title, filename: (path as NSString).lastPathComponent)
+            if showsWhitespace {
+                let preview = WhitespacePreview(current: oldValue, proposed: newValue)
+                MetadataComparison(current: preview.visibleCurrent, proposed: preview.visibleProposed, field: fieldName, emptyLabel: "Empty")
+                Text(preview.summary)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                MetadataComparison(current: oldValue, proposed: newValue, field: fieldName, emptyLabel: "Empty")
+            }
+        }
+        .padding(.vertical, density.rowPadding)
+        .help(path)
+    }
+}
+
 private func placeholderView(
     icon: String,
     color: Color,
     headline: String,
     detail: String
 ) -> some View {
-    VStack(spacing: 8) {
-        Image(systemName: icon)
-            .font(.largeTitle)
-            .foregroundStyle(color)
-        Text(headline)
-            .font(.headline)
-        Text(detail)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 40)
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    AppEmptyState(title: headline, detail: detail, systemImage: icon, tint: color)
 }
