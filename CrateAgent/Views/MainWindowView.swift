@@ -43,6 +43,7 @@ struct MainWindowView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            LibrarySyncStatusView(state: services.syncState, retry: services.retrySync)
             NavigationSplitView {
                 List(Section.allCases, selection: $selection) { section in
                     Label(section.displayName, systemImage: section.iconName)

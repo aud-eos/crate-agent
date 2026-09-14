@@ -318,10 +318,13 @@ but cannot automatically process before initial reconciliation finishes.
 Create `CrateAgent/Services/SeratoLibrarySyncSession.swift` and
 `CrateAgentTests/SeratoLibrarySyncSessionTests.swift`.
 
-**Interfaces:** `SeratoLibrarySyncSession` serializes read → reconcile → drain →
-metadata refresh, publishes `waitingForSerato`, `reconciling`, `ready(summary)`,
+**Interfaces:** `SeratoLibrarySyncSession` serializes strict read → reconcile →
+`scanner.scan(snapshot:reader:)` → authorized drain → worker scheduling, publishes
+`waitingForSerato`, `reconciling`, `ready(summary)`,
 or `failed(message)`, and accepts `requestSync()` from startup, Serato exit, and
 coalesced filesystem-reconciliation requests. No unbounded task-per-event fanout.
+A drain can change V2; a later scan requires a fresh strict snapshot. Never reuse
+the pre-drain source authorization or relax validation to accommodate the drain.
 
 - [ ] Add real temporary-library tests with a queued add/rename plus an external
   Serato removal, then simulate Serato exit. Assert retirement commits before

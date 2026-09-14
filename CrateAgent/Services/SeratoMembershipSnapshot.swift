@@ -43,12 +43,22 @@ struct SeratoSnapshotAuthorization: Sendable {
     let check: @Sendable () throws -> Void
 }
 
-enum SeratoMembershipSnapshotError: Error, Equatable {
+enum SeratoMembershipSnapshotError: LocalizedError, Equatable {
     case sourceUnavailable
     case malformedSource
     case sourceChanged
     case seratoRunning
     case unsupportedSource
+
+    var errorDescription: String? {
+        switch self {
+        case .sourceUnavailable: "Cannot read Serato's saved database V2. Check that the library is available, then retry sync."
+        case .malformedSource: "Serato's saved database V2 is incomplete or corrupt. Save the library in Serato, close Serato, then retry sync."
+        case .sourceChanged: "Serato's saved library changed during synchronization. Close Serato and retry sync."
+        case .seratoRunning: "Waiting for Serato to close before synchronizing its saved library."
+        case .unsupportedSource: "This Serato library source cannot be validated. Check the configured library location before retrying sync."
+        }
+    }
 }
 
 @MainActor

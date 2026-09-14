@@ -11,16 +11,7 @@ struct MenuBarStatusView: View {
         VStack(alignment: .leading, spacing: density.spacing) {
             PageHeading("crate-agent", subtitle: "Library status")
 
-            HStack(spacing: density.spacing) {
-                Circle()
-                    .fill(seratoWatchdog.isSeratoRunning ? Color.orange : Color.green)
-                    .frame(width: 8, height: 8)
-                Text(seratoWatchdog.isSeratoRunning
-                    ? "Serato is running — writes deferred"
-                    : "Idle — ready to sync")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
+            LibrarySyncStatusView(state: services.syncState, retry: services.retrySync)
 
             Text("\(indexedFileCount) files indexed")
                 .font(.callout.monospacedDigit())

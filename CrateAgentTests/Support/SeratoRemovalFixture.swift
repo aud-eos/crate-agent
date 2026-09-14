@@ -28,7 +28,7 @@ final class SeratoRemovalFixture {
     let lifecycle = Lifecycle()
     final class Lifecycle { var running = false }
 
-    init() throws {
+    init(readiness: LibrarySyncReadiness? = nil) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         locator = SeratoLibraryLocator(seratoDirectory: directory)
@@ -38,7 +38,7 @@ final class SeratoRemovalFixture {
         let lifecycle = lifecycle
         watchdog = SeratoWatchdog { lifecycle.running ? ["com.serato.dj"] : [] }
         reader = SeratoMembershipSnapshotReader(locator: locator, watchdog: watchdog)
-        engine = OperationEngine(database: database, seratoWatchdog: watchdog, seratoLocator: locator)
+        engine = OperationEngine(database: database, seratoWatchdog: watchdog, seratoLocator: locator, readiness: readiness)
         reconciler = SeratoMembershipReconciler(database: database, operationEngine: engine, reader: reader)
         try save(paths: [])
     }

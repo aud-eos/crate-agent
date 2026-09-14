@@ -12,6 +12,15 @@ other screens while the app remains open. See the [Auto-Tag guide](docs/auto-tag
 Use the shared Comfortable/Compact density setting to adjust spacing throughout
 the app.
 
+At startup and after Serato closes, crate-agent checks the complete saved library
+before processing tracks or sending queued changes. Removing a track from Serato
+retires its crate-agent entry while preserving the audio, recording identity, and
+History. Missing audio that Serato still references remains a member but cannot
+be processed. The main window and menu bar show waiting, sync results, or an error
+with **Retry Sync**. A missing or unreadable Serato database stops synchronization;
+it never means that every track was removed. See the
+[reconciliation contract](docs/serato-membership-reconciliation.md).
+
 ## Why this exists
 
 Serato stores absolute file paths in its binary library files. When you rename a file in Finder, Serato silently loses access to it. Serato has no public API, plugin system, or library-management hooks. Third-party tools that bridge the gap (Lexicon, Rekordbuddy) are excellent but commercial; this project exists to be a small, focused, native alternative that the author can shape to fit their own DJ workflow.

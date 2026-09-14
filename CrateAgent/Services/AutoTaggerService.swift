@@ -62,6 +62,8 @@ final class AutoTaggerService: ObservableObject {
     /// `.failed`, which leaves the rest of the pass running.
     @Published private(set) var fatalError: String?
 
+    private let readiness: LibrarySyncReadiness?
+    private var syncAuthorization: LibrarySyncReadiness.Authorization?
     private let database: LibraryDatabase
     private let acoustIDClient: AcoustIDLookupClient
     private let musicBrainzClient: MusicBrainzLookupClient
@@ -90,8 +92,10 @@ final class AutoTaggerService: ObservableObject {
             FileMetadataCollector.collect(at: path).map {
                 FileFreshnessSnapshot(fileSize: $0.fileSize, mtime: $0.mtime)
             }
-        }
+        },
+        readiness: LibrarySyncReadiness? = nil
     ) {
+        self.readiness = readiness
         self.database = database
         self.acoustIDClient = acoustIDClient
         self.musicBrainzClient = musicBrainzClient
@@ -113,6 +117,7 @@ final class AutoTaggerService: ObservableObject {
     /// Offsets address the original ranked IDs, so learning that two entries
     /// are aliases cannot skip the next page. Failures stay attached to their ID.
     func loadAlternativeDetails(fileID: Int64, offset: Int, limit: Int = 10) async throws -> [RecordingAlternativeDetailResult] {
+        let authorization = try readiness?.capture()
         guard offset >= 0, limit > 0, limit <= 10 else {
             throw AutoTaggerRowFailure("Recording detail pages require a nonnegative offset and a limit from 1 to 10")
         }
@@ -122,31 +127,32 @@ final class AutoTaggerService: ObservableObject {
         let generation = runGeneration
         var results: [RecordingAlternativeDetailResult] = []
         for alternative in alternatives.entries.dropFirst(offset).prefix(limit) {
-            try ensureCurrent(generation: generation)
+            try ensureCurrent(generation: generation, authorization: authorization)
             do {
                 let details: MBRecordingDetails = if let loaded = recordingDetails[fileID]?[alternative.recordingID] {
                     loaded
                 } else {
                     try await musicBrainzClient.recordingDetails(mbid: alternative.recordingID)
                 }
-                try ensureCurrent(generation: generation)
+                try ensureCurrent(generation: generation, authorization: authorization)
                 recordingDetails[fileID, default: [:]][alternative.recordingID] = details
                 results.append(RecordingAlternativeDetailResult(alternative: alternative, state: .loaded(details)))
             } catch {
-                try ensureCurrent(generation: generation)
+                try ensureCurrent(generation: generation, authorization: authorization)
                 if error is CancellationError {
                     throw error
                 }
                 results.append(RecordingAlternativeDetailResult(alternative: alternative, state: .failed(Self.metadataFailureDescription(error))))
             }
         }
-        try ensureCurrent(generation: generation)
+        try ensureCurrent(generation: generation, authorization: authorization)
         return results
     }
 
     /// Returns a complete replacement; editable review state belongs to the
     /// session, which checks selection identity before committing it.
     func resolveAlternative(fileID: Int64, recordingID: String) async throws -> MatchCandidate {
+        let authorization = try readiness?.capture()
         guard let baseline = lookupBaselines[fileID],
               let alternative = recordingAlternatives[fileID]?.alternative(
                   for: recordingID, details: recordingDetails[fileID] ?? [:]
@@ -155,10 +161,11 @@ final class AutoTaggerService: ObservableObject {
             throw AutoTaggerRowFailure("Recording \(recordingID) was not returned by this file's scan")
         }
         let generation = runGeneration
-        try ensureCurrent(generation: generation)
+        try ensureCurrent(generation: generation, authorization: authorization)
         let recording = try await loadRecording(mbid: alternative.recordingID)
-        try ensureCurrent(generation: generation)
-        try await requireCurrent(baseline.membershipToken)
+        try ensureCurrent(generation: generation, authorization: authorization)
+        try await requireCurrent(baseline.membershipToken, authorization: authorization)
+        try ensureCurrent(generation: generation, authorization: authorization)
         recordingDetails[fileID, default: [:]][alternative.recordingID] = MBRecordingDetails(recording: recording, requestedID: alternative.recordingID)
         return try Self.assembleCandidate(alternative: alternative, recording: recording, baseline: baseline)
     }
@@ -174,9 +181,10 @@ final class AutoTaggerService: ObservableObject {
         return RecordingMatchAssessment(score: candidate.score, plausibleRecordingCount: assessment.plausibleRecordingCount)
     }
 
-    private func ensureCurrent(generation: Int) throws {
+    private func ensureCurrent(generation: Int, authorization: LibrarySyncReadiness.Authorization? = nil) throws {
         try Task.checkCancellation()
         guard generation == runGeneration else { throw CancellationError() }
+        try (authorization ?? syncAuthorization)?.check()
     }
 
     private static func metadataFailureDescription(_ error: Error) -> String {
@@ -227,6 +235,13 @@ final class AutoTaggerService: ObservableObject {
         // for a keyless pass is .stopped, for every requested row.
         rows = Dictionary(fileIDs.map { ($0, RowState.pending) }, uniquingKeysWith: { first, _ in first })
 
+        do { syncAuthorization = try readiness?.capture() }
+        catch {
+            fatalError = error.localizedDescription
+            stopUnresolvedRows(among: fileIDs, message: error.localizedDescription, generation: generation)
+            return
+        }
+
         let apiKey: String
         do {
             guard let loadedKey = try keyStore.load(), !loadedKey.isEmpty else {
@@ -273,6 +288,9 @@ final class AutoTaggerService: ObservableObject {
                 let reason = Self.describe(lookupError)
                 fatalError = "Auto-tag pass stopped: \(reason)"
                 stopUnresolvedRows(among: fileIDs, message: reason, generation: generation)
+                return
+            } catch is LibrarySyncReadinessError {
+                stopUnresolvedRows(among: fileIDs, message: "Library synchronization superseded this scan. Scan again after sync finishes.", generation: generation)
                 return
             } catch is CancellationError {
                 // The pass was cancelled — a New Scan superseded it, or the user
@@ -479,6 +497,8 @@ final class AutoTaggerService: ObservableObject {
     /// processed this file yet. The Chromaprint decode is CPU-bound, so it
     /// runs off the main actor to keep the UI responsive.
     private func currentFingerprint(for file: FileRecord) async throws -> (bytes: Data, basis: FileFreshnessSnapshot?) {
+        let authorization = syncAuthorization
+        try authorization?.check()
         if file.fingerprintStatus == .done, let existing = file.chromaprintFingerprint,
            await storedFingerprintIsFresh(for: file)
         {
@@ -535,12 +555,15 @@ final class AutoTaggerService: ObservableObject {
             // omit the basis rather than record a wrong one — the fallback to
             // the index snapshot then applies.
             try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis,
-                                         expectedMembershipToken: FileMembershipToken(fileId: fileID, revision: file.membershipRevision))
+                                         expectedMembershipToken: FileMembershipToken(fileId: fileID, revision: file.membershipRevision), authorization: authorization)
             return (serialized, freshnessBasis)
         } catch {
             let decodeError = error
+            if decodeError is LibrarySyncReadinessError || decodeError is CancellationError {
+                throw decodeError
+            }
             do {
-                try await persistFingerprintFailure(for: file)
+                try await persistFingerprintFailure(for: file, authorization: authorization)
             } catch {
                 throw AutoTaggerRowFailure(
                     "failed to compute fingerprint for file \(fileID): \(decodeError); could not persist failure: \(error)"
@@ -553,8 +576,9 @@ final class AutoTaggerService: ObservableObject {
         }
     }
 
-    private func persistFingerprintFailure(for original: FileRecord) async throws {
+    private func persistFingerprintFailure(for original: FileRecord, authorization: LibrarySyncReadiness.Authorization?) async throws {
         try await database.writer.write { db in
+            try authorization?.check()
             guard let fileID = original.id,
                   let current = try FileRecord.fetchOne(db, key: fileID),
                   current.path == original.path,
@@ -674,10 +698,14 @@ final class AutoTaggerService: ObservableObject {
         })
     }
 
-    private func requireCurrent(_ token: FileMembershipToken) async throws {
+    private func requireCurrent(_ token: FileMembershipToken, authorization: LibrarySyncReadiness.Authorization? = nil) async throws {
+        let authorization = authorization ?? syncAuthorization
+        try authorization?.check()
         try await database.writer.read { database in
+            try authorization?.check()
             try FileProcessingEligibility.requireCurrent(token, in: database)
         }
+        try authorization?.check()
     }
 
     private func fetchFile(fileID: Int64) async throws -> FileRecord? {
@@ -692,9 +720,11 @@ final class AutoTaggerService: ObservableObject {
         status: FingerprintStatus,
         freshnessBasis: FileFreshnessSnapshot? = nil,
         requirePendingStatus: Bool = false,
-        expectedMembershipToken: FileMembershipToken
+        expectedMembershipToken: FileMembershipToken,
+        authorization: LibrarySyncReadiness.Authorization?
     ) async throws {
         try await database.writer.write { db in
+            try authorization?.check()
             try FileProcessingEligibility.requireCurrent(expectedMembershipToken, in: db)
             try FingerprintPersistence.write(
                 fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis,

@@ -27,6 +27,10 @@ public actor FilesystemSyncCoordinator {
         return requested
     }
 
+    public func restoreReconciliationRequest() {
+        requiresReconciliation = true
+    }
+
     public func handleBatch(_ batch: FilesystemEventBatch) async throws {
         requiresReconciliation = requiresReconciliation || batch.requiresReconciliation
         try await handleObservations(batch.observations)
@@ -136,7 +140,7 @@ public actor FilesystemSyncCoordinator {
                                                             path: metadata.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode)))
             }
         }
-        _ = try await operationEngine.applyBatch(mutations, batchId: batchID)
+        _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID)
     }
 }
 

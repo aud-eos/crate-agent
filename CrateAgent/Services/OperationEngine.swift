@@ -55,6 +55,7 @@ public actor OperationEngine {
     /// files into the user's Trash.
     public typealias FileTrasher = @Sendable (String) throws -> Void
 
+    private let readiness: LibrarySyncReadiness?
     private let database: LibraryDatabase
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
@@ -105,8 +106,10 @@ public actor OperationEngine {
             let url = URL(fileURLWithPath: path)
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         },
-        activityLog: ActivityLog? = nil
+        activityLog: ActivityLog? = nil,
+        readiness: LibrarySyncReadiness? = nil
     ) {
+        self.readiness = readiness
         self.database = database
         self.seratoWatchdog = seratoWatchdog
         self.seratoLocator = seratoLocator
@@ -135,8 +138,12 @@ public actor OperationEngine {
     /// Returns nil when an observation confirms an unchanged state.
     @discardableResult
     public func apply(_ mutation: TrackMutation, batchId: String) async throws -> Int64? {
+        let authorization = try readinessAuthorization(for: [mutation])
         let executionResult: GuardedExecutionResult = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { db, moves in
-            try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db, physicalMoves: moves)
+            try authorization?.check()
+            let result = try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db, physicalMoves: moves)
+            try authorization?.check()
+            return result
         }
 
         try await routeSeratoWrites(executionResult.seratoWrites, batchId: batchId)
@@ -146,9 +153,13 @@ public actor OperationEngine {
 
     @discardableResult
     public func apply(_ mutation: TrackMutation, expectedMembershipToken: FileMembershipToken, batchId: String = UUID().uuidString) async throws -> Int64? {
+        let authorization = try readinessAuthorization(for: [mutation])
         let result = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { database, moves in
+            try authorization?.check()
             try Self.requireCurrentToken(expectedMembershipToken, mutation: mutation, in: database)
-            return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: database, physicalMoves: moves)
+            let result = try Self.executeAndLog(mutation: mutation, batchId: batchId, in: database, physicalMoves: moves)
+            try authorization?.check()
+            return result
         }
         try await routeSeratoWrites(result.seratoWrites, batchId: batchId)
         return result.eventId
@@ -179,10 +190,39 @@ public actor OperationEngine {
         batchId: String,
         expectedMembershipTokens: [Int64: FileMembershipToken]? = nil
     ) async throws -> [Int64] {
-        guard !mutations.isEmpty else { return [] }
+        try await executeBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens)
+    }
 
+    func applyFilesystemObservations(_ mutations: [TrackMutation], batchId: String) async throws -> [Int64] {
+        for mutation in mutations {
+            switch mutation {
+            case .setFileLibraryState, .observeFileLocation: break
+            case let .renameFile(payload) where payload.physicalMove != true: break
+            default: throw LibrarySyncReadinessError.synchronizationRequired
+            }
+        }
+        return try await executeBatch(mutations, batchId: batchId, filesystemObservation: true)
+    }
+
+    private func readinessAuthorization(for mutations: [TrackMutation]) throws -> LibrarySyncReadiness.Authorization? {
+        let requiresReady = mutations.contains { mutation in
+            switch mutation {
+            case .indexNewFile, .beginFileImport, .addTrackToSerato: false
+            default: true
+            }
+        }
+        return requiresReady ? try readiness?.capture() : nil
+    }
+
+    private func executeBatch(_ mutations: [TrackMutation], batchId: String,
+                              expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              filesystemObservation: Bool = false) async throws -> [Int64]
+    {
+        guard !mutations.isEmpty else { return [] }
+        let authorization = filesystemObservation ? nil : try readinessAuthorization(for: mutations)
         let executionResults: [GuardedExecutionResult] = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { db, moves in
-            try mutations.map { mutation in
+            try authorization?.check()
+            let results = try mutations.map { mutation in
                 if let expectedMembershipTokens, let fileID = mutation.processingFileID {
                     guard let token = expectedMembershipTokens[fileID] else {
                         throw FileProcessingEligibilityError.superseded(fileId: fileID)
@@ -191,6 +231,8 @@ public actor OperationEngine {
                 }
                 return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db, physicalMoves: moves)
             }
+            try authorization?.check()
+            return results
         }
 
         let pendingWrites = executionResults.flatMap { $0.seratoWrites }
@@ -200,15 +242,19 @@ public actor OperationEngine {
     }
 
     func organizeFiles(_ plans: [LibraryOrganizer.Plan], batchId: String) async throws -> LibraryOrganizer.Outcome {
+        let authorization = try readiness?.capture()
         var results: [GuardedExecutionResult] = []
         var errors: [String] = []
         for plan in plans {
             do {
                 let result = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { database, moves in
+                    try authorization?.check()
                     let token = FileMembershipToken(fileId: plan.id, revision: plan.membershipRevision)
                     try FileProcessingEligibility.requireCurrent(token, in: database)
-                    return try Self.executeAndLog(mutation: .renameFile(.init(fileId: plan.id, newPath: plan.destinationPath,
+                    let result = try Self.executeAndLog(mutation: .renameFile(.init(fileId: plan.id, newPath: plan.destinationPath,
                                                                               previousPath: plan.sourcePath, physicalMove: true)), batchId: batchId, in: database, physicalMoves: moves)
+                    try authorization?.check()
+                    return result
                 }
                 results.append(result)
             } catch let error as OperationEngineError {
@@ -290,7 +336,7 @@ public actor OperationEngine {
     ) async throws {
         guard !writes.isEmpty else { return }
         let isSeratoRunning = await seratoWatchdog.isSeratoRunning
-        if isSeratoRunning {
+        if isSeratoRunning || readiness?.permitsExternalWrites == false {
             pendingSeratoWrites.append(contentsOf: writes)
             queueDepthSubject.send(pendingSeratoWrites.count)
             return
@@ -387,7 +433,7 @@ public actor OperationEngine {
 
         let isSeratoRunning = await seratoWatchdog.isSeratoRunning
         let outcome: ResyncOutcome
-        if isSeratoRunning {
+        if isSeratoRunning || readiness?.permitsExternalWrites == false {
             pendingSeratoWrites.append(contentsOf: writes)
             queueDepthSubject.send(pendingSeratoWrites.count)
             outcome = ResyncOutcome(appliedCount: 0, queuedCount: replayedEventCount, supersededCount: supersededCount)
@@ -771,6 +817,7 @@ public actor OperationEngine {
 
     @discardableResult
     public func undoBatch(_ batchId: String) async throws -> String {
+        let authorization = try readiness?.capture()
         let events: [EventRecord] = try await database.writer.read { db in
             try EventRecord
                 .filter(Column("batch_id") == batchId)
@@ -810,6 +857,7 @@ public actor OperationEngine {
         // pre-batch shape) we'd risk leaving the DB half-undone if
         // one inverse hit a fileNotFound mid-loop.
         let results = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: undoBatchId) { database, moves in
+            try authorization?.check()
             for event in events {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
@@ -819,9 +867,11 @@ public actor OperationEngine {
                     throw FileProcessingEligibilityError.superseded(fileId: fileID)
                 }
             }
-            return try inverseMutations.map { mutation in
+            let results = try inverseMutations.map { mutation in
                 try Self.executeAndLog(mutation: mutation, batchId: undoBatchId, in: database, physicalMoves: moves)
             }
+            try authorization?.check()
+            return results
         }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
         return undoBatchId
@@ -1024,6 +1074,7 @@ public actor OperationEngine {
     /// the remaining entries queued for retry.
     @discardableResult
     public func drainPendingSeratoUpdates() async throws -> ResyncOutcome {
+        guard readiness?.permitsExternalWrites != false else { throw LibrarySyncReadinessError.synchronizationRequired }
         guard !isDraining else {
             return ResyncOutcome(appliedCount: 0, queuedCount: Set(pendingSeratoWrites.map(\.eventId)).count)
         }
@@ -1080,10 +1131,13 @@ public actor OperationEngine {
         _ writes: [GuardedSeratoWrite], operation: @escaping @Sendable () throws -> Result
     ) async throws -> Result {
         let watchdog = seratoWatchdog
+        let readiness = readiness
+        let drainAuthorization = LibrarySyncReadiness.drainAuthorization
         // Releasing writer serialization before I/O lets retirement commit against old authorization.
         return try await database.writer.write { database in
             guard try Self.eligibleWrites(writes, in: database).count == writes.count,
-                  !watchdog.isRunningForExternalWrite
+                  !watchdog.isRunningForExternalWrite,
+                  readiness?.permitsExternalWrites(drain: drainAuthorization) != false
             else {
                 throw ExternalWriteInterruption.deferred
             }
@@ -1093,7 +1147,7 @@ public actor OperationEngine {
 
     private func requireExternalWriteEligibility(_ writes: [GuardedSeratoWrite]) async throws {
         let eligible = try await eligibleWrites(writes)
-        guard eligible.count == writes.count, !(await seratoWatchdog.isSeratoRunning) else {
+        guard eligible.count == writes.count, !(await seratoWatchdog.isSeratoRunning), readiness?.permitsExternalWrites != false else {
             throw ExternalWriteInterruption.deferred
         }
     }

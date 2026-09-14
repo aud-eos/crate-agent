@@ -48,6 +48,7 @@ public actor FingerprintWorker {
         category: "FingerprintWorker"
     )
 
+    private let readiness: LibrarySyncReadiness?
     private let database: LibraryDatabase
     private let concurrency: Int
     private let fingerprintFunction: FingerprintFunction
@@ -66,8 +67,10 @@ public actor FingerprintWorker {
         concurrency: Int? = nil,
         fingerprintFunction: @escaping FingerprintFunction = { try fingerprintAudioFile(filePath: $0) },
         pollIntervalSeconds: Double = 5,
-        batchCooldownMillis: UInt64 = 200
+        batchCooldownMillis: UInt64 = 200,
+        readiness: LibrarySyncReadiness? = nil
     ) {
+        self.readiness = readiness
         self.database = database
         // Conservative default: a *quarter* of the cores. Earlier
         // versions used cores - 2 which pegged a real 32k-track
@@ -173,6 +176,8 @@ public actor FingerprintWorker {
                     continue
                 }
                 try await processBatch(batch, totalPending: pendingCount, fingerprintFunction: fingerprintFunction)
+            } catch is LibrarySyncReadinessError {
+                return
             } catch {
                 guard !Task.isCancelled, self.runID == runID else { return }
                 lastError = "Fingerprint processing stopped: \(error.localizedDescription)"
@@ -197,6 +202,8 @@ public actor FingerprintWorker {
         totalPending: Int,
         fingerprintFunction: @escaping FingerprintFunction
     ) async throws {
+        let authorization = try readiness?.capture()
+        try Task.checkCancellation()
         // Build a dedup plan: copy from already-done byte-twins
         // where possible, fingerprint one representative per
         // (size, hash) group and propagate to siblings.
@@ -215,7 +222,7 @@ public actor FingerprintWorker {
                 let representative = assignment.representative
                 group.addTask {
                     let result = try await Self.runOne(
-                        file: representative, database: database, function: fingerprintFunction
+                        file: representative, database: database, function: fingerprintFunction, authorization: authorization
                     )
                     return GroupResult(index: index, result: result)
                 }
@@ -228,7 +235,7 @@ public actor FingerprintWorker {
                     let representative = next.representative
                     group.addTask {
                         let result = try await Self.runOne(
-                            file: representative, database: database, function: fingerprintFunction
+                            file: representative, database: database, function: fingerprintFunction, authorization: authorization
                         )
                         return GroupResult(index: index, result: result)
                     }
@@ -241,20 +248,23 @@ public actor FingerprintWorker {
         try await flushBatchPlan(
             plan: plan,
             representativeResults: representativeResults,
-            totalPending: totalPending
+            totalPending: totalPending, authorization: authorization
         )
     }
 
     private func flushBatchPlan(
         plan: BatchPlan,
         representativeResults: [(BatchPlan.Group, ProcessResult)],
-        totalPending: Int
+        totalPending: Int,
+        authorization: LibrarySyncReadiness.Authorization?
     ) async throws {
         let totalFiles = plan.toCopyFromExistingTwin.count
             + representativeResults.reduce(0) { $0 + 1 + $1.0.siblingIds.count }
         guard totalFiles > 0 else { return }
 
         let counts = try await database.writer.write { database in
+            try Task.checkCancellation()
+            try authorization?.check()
             var completed = 0
             var failed = 0
             for entry in plan.toCopyFromExistingTwin {
@@ -447,8 +457,11 @@ public actor FingerprintWorker {
     private static func runOne(
         file: FileRecord,
         database: LibraryDatabase,
-        function: @escaping FingerprintFunction
+        function: @escaping FingerprintFunction,
+        authorization: LibrarySyncReadiness.Authorization?
     ) async throws -> ProcessResult {
+        try Task.checkCancellation()
+        try authorization?.check()
         guard let fileId = file.id else {
             return ProcessResult(fileId: 0, path: file.path, outcome: .failure)
         }

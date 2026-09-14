@@ -99,10 +99,29 @@ transfer fingerprints to replacement files.
 
 ## Ordering and stale work
 
-Startup while Serato is closed: read and validate membership, commit reconciliation,
-then permit normal worker scheduling and external writes. Startup while Serato is
+Startup while Serato is closed: strict read → reconcile that snapshot →
+`scanner.scan(snapshot:reader:)` → authorized outbound drain → worker scheduling.
+Use the same reader for reconciliation and scanning. Draining changes V2, so any
+subsequent scan needs a fresh strict snapshot; the pre-drain source authorization
+cannot be reused. Startup while Serato is
 running may display the existing index, but does not infer removals from its
 potentially stale on-disk library.
+
+The application installs a closed session readiness gate before starting any
+service. Source failure, cancellation, or a new synchronization pass closes it and
+advances its generation. Normal mutation transactions and asynchronous fingerprint
+completion retain and verify their original generation, even if a later retry
+reopens readiness without changing a file's membership revision. Explicit imports
+may retain pending intent while gated, but cannot write externally. Verified
+filesystem observations may update local state and queue a nonphysical rename;
+this exemption cannot carry a physical move, metadata edit, or match mutation.
+
+Session epochs fence in-flight work, not completed user review proposals. A
+completed Auto-Tag review may remain actionable after a successful resync if its
+original file membership revision, identity, and freshness still pass and current
+readiness permits the action. New alternative-detail or selection requests capture
+current session authorization while retaining the original candidate's file token.
+Retirement/replacement cannot be bypassed by renewing a session authorization.
 
 On Serato exit, serialize reconciliation before draining queued external writes.
 Do not overwrite newly observed membership with an older concurrent scan. Recheck

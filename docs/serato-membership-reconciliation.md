@@ -34,7 +34,7 @@ the generalized name replaces the earlier retirement-only name.
 
 ## Consumer contract
 
-The consumer should read one snapshot, reconcile it, and call
+`SeratoLibrarySyncSession` reads one snapshot, reconciles it, and calls
 `LibraryScanner.scan(snapshot:reader:)` before draining outbound writes. A drain
 can legitimately change `database V2`; consumers that scan after draining must
 read a fresh strict snapshot. The snapshot overload uses only the supplied
@@ -61,8 +61,38 @@ same-file rename.
 
 `reconcileRequestedFilesystemChanges()` supplies one bounded reconciliation pass
 for a coalesced filesystem request. The filesystem consumer owns retaining a
-failed request/batch and advancing its checkpoint only after success. This stage
-does not enable automatic scheduling or replace the application error UI.
+failed request/batch and advancing its checkpoint only after success. The running
+application routes these requests through the same serialized session as startup
+and Serato exit, including snapshot-authorized scanning and outbound drain. The
+session never waits on the filesystem processor. A filesystem failure remains
+latched across automatic Serato-exit requests. Retry Sync permits only strict
+read/reconcile/scan while the retained processor head is being recovered; it cannot
+drain queued writes, reopen normal readiness, or start the worker in that scope.
+Only successful replay and checkpoint clear the latch. A fresh normal session then
+drains and schedules work, avoiding both a cyclic wait and a premature ready state.
+
+The session installs a closed readiness gate before service startup. It invalidates
+the gate's generation before stopping work or reading a new snapshot. Ordinary
+mutation transactions and fingerprint completions verify the captured generation;
+a close/reopen cannot authorize old work. Explicit import intent and verified local
+filesystem observations remain possible, while external writes queue. Only the
+session's scoped drain authorization can write before normal readiness opens.
+Serato launch during a sync cancels it and leaves queued intent intact. After an
+already validated session, Serato being open permits local processing with outbound
+writes queued; initial startup while Serato is open never enables processing.
+
+Main window and menu bar share waiting, reconciliation, result, and failure status
+with Retry Sync. Missing or corrupt source errors retain queued writes. Unexpected
+worker database errors stop processing and publish a monitored failure. Readiness
+supersession is cancellation, not a decoder or database failure. A successful retry
+starts a new worker generation. Initial completion becomes true only after the
+whole sequence succeeds.
+
+Completed Auto-Tag reviews survive successful synchronization when original file
+revision, identity, and freshness checks still pass. New explicit alternative
+requests capture the current session epoch but retain the candidate's original file
+token. In-flight lookup/decode/persistence keeps its original epoch. This permits
+review persistence without granting retired or replaced candidates new authority.
 
 Successful explicit adds and snapshots use the same volume UUID plus canonical
 directory ownership identifier. Add confirmation remains the engine's existing

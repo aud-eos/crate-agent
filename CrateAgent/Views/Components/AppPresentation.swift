@@ -1,5 +1,56 @@
 import SwiftUI
 
+struct LibrarySyncStatusView: View {
+    let state: SeratoLibrarySyncSession.State
+    let retry: () -> Void
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+
+    var body: some View {
+        HStack(spacing: density.spacing) {
+            if case .reconciling = state {
+                ProgressView().controlSize(density.controlSize)
+            } else {
+                Image(systemName: symbol).foregroundStyle(color)
+            }
+            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: density.spacing)
+            if case .failed = state {
+                Button("Retry Sync", action: retry)
+            }
+        }
+        .padding(.horizontal, density.pagePadding)
+        .padding(.vertical, density.rowPadding)
+        .background(color.opacity(0.06))
+    }
+
+    private var message: String {
+        switch state {
+        case .waitingForSerato: "Waiting for Serato to close before checking its saved library."
+        case .reconciling: "Checking saved Serato membership and synchronizing changes…"
+        case let .failed(message): message
+        case let .ready(summary): "Library synced · \(summary.retired) removed from Serato · \(summary.reactivated) activated · \(summary.unavailable) unavailable"
+        }
+    }
+
+    private var symbol: String {
+        switch state {
+        case .failed: "exclamationmark.triangle.fill"
+        case .waitingForSerato: "clock"
+        case .reconciling: "arrow.triangle.2.circlepath"
+        case .ready: "checkmark.circle"
+        }
+    }
+
+    private var color: Color {
+        switch state {
+        case .failed: .red
+        case .waitingForSerato: .orange
+        case .reconciling: .accentColor
+        case .ready: .secondary
+        }
+    }
+}
+
 enum AppDensity: String, CaseIterable, Identifiable {
     case comfortable
     case compact
