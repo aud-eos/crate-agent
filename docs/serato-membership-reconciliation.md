@@ -143,6 +143,13 @@ path transition; an unrelated occupant of an old path cannot authorize rewriting
 or removing that occupant's V2/crate references. Expected supersession removes only
 the obsolete queued work; unexpected I/O failure stays visible and retryable.
 
+Coalesced metadata and consecutive rename groups retain each physically rejected
+event's identity. The engine rebuilds the FFI payload from the still-eligible,
+ordered survivors and rechecks them at the serialized writer boundary. Valid
+survivors stay coalesced; a Serato restart queues them for guarded completion.
+Rejecting one target never discards or reports supersession for its valid siblings,
+and retrying the external subset does not repeat the local mutation journal.
+
 Duplicate cleanup retains the original keeper and target authority for every step.
 V2 removal, both crate forms, and Trash must actually complete before it reports
 completion. The row remains while external work is pending or failed; its final

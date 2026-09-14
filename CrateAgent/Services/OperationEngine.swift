@@ -74,7 +74,10 @@ public actor OperationEngine {
     private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
     private var isDraining = false
 
-    private enum ExternalWriteInterruption: Error { case deferred, superseded }
+    private enum ExternalWriteInterruption: Error {
+        case deferred
+        case superseded(Set<Int64>)
+    }
 
     /// Backing subject for `queueDepthPublisher`. CurrentValueSubject
     /// emits the latest value on subscribe, so UI bindings render
@@ -1405,10 +1408,17 @@ public actor OperationEngine {
             else {
                 throw ExternalWriteInterruption.deferred
             }
+            var superseded = Set<Int64>()
             for write in writes {
-                guard let file = try FileRecord.fetchOne(database, key: write.token.fileId) else { throw ExternalWriteInterruption.superseded }
+                guard let file = try FileRecord.fetchOne(database, key: write.token.fileId) else {
+                    superseded.insert(write.eventId)
+                    continue
+                }
                 do { try SeratoWriteEligibility.requirePhysicalTarget(write, file: file, in: database) }
-                catch is FileProcessingEligibilityError { throw ExternalWriteInterruption.superseded }
+                catch is FileProcessingEligibilityError { superseded.insert(write.eventId) }
+            }
+            if !superseded.isEmpty {
+                throw ExternalWriteInterruption.superseded(superseded)
             }
             guard !watchdog.isRunningForExternalWrite,
                   readiness?.permitsExternalWrites(drain: drainAuthorization) != false else { throw ExternalWriteInterruption.deferred }
@@ -1451,24 +1461,30 @@ public actor OperationEngine {
                 return ResyncOutcome(appliedCount: applied.count,
                                      queuedCount: Set(remainder.map(\.eventId)).count, supersededCount: superseded.count)
             }
-            let eligible = try await eligibleWrites(group)
+            var eligible = try await eligibleWrites(group)
             superseded.formUnion(Set(group.map(\.eventId)).subtracting(eligible.map(\.eventId)))
-            do {
-                try await requireExternalWriteEligibility(eligible)
-                try await applyConsecutiveSeratoWrites(eligible.map(\.write), guardedWrites: eligible)
-            } catch ExternalWriteInterruption.superseded {
-                superseded.formUnion(eligible.map(\.eventId))
-                continue
-            } catch ExternalWriteInterruption.deferred {
-                let interrupted = eligible + groups.dropFirst(index + 1).flatMap { $0 }
-                let remainder = try await eligibleWrites(interrupted)
-                superseded.formUnion(Set(interrupted.map(\.eventId)).subtracting(remainder.map(\.eventId)))
-                pendingSeratoWrites.append(contentsOf: remainder)
-                queueDepthSubject.send(pendingSeratoWrites.count)
-                return ResyncOutcome(appliedCount: applied.count,
-                                     queuedCount: Set(remainder.map(\.eventId)).count, supersededCount: superseded.count)
+            while !eligible.isEmpty {
+                do {
+                    try await requireExternalWriteEligibility(eligible)
+                    try await applyConsecutiveSeratoWrites(eligible.map(\.write), guardedWrites: eligible)
+                } catch let ExternalWriteInterruption.superseded(rejectedEvents) {
+                    superseded.formUnion(rejectedEvents)
+                    let survivors = eligible.filter { !rejectedEvents.contains($0.eventId) }
+                    eligible = try await eligibleWrites(survivors)
+                    superseded.formUnion(Set(survivors.map(\.eventId)).subtracting(eligible.map(\.eventId)))
+                    continue
+                } catch ExternalWriteInterruption.deferred {
+                    let interrupted = eligible + groups.dropFirst(index + 1).flatMap { $0 }
+                    let remainder = try await eligibleWrites(interrupted)
+                    superseded.formUnion(Set(interrupted.map(\.eventId)).subtracting(remainder.map(\.eventId)))
+                    pendingSeratoWrites.append(contentsOf: remainder)
+                    queueDepthSubject.send(pendingSeratoWrites.count)
+                    return ResyncOutcome(appliedCount: applied.count,
+                                         queuedCount: Set(remainder.map(\.eventId)).count, supersededCount: superseded.count)
+                }
+                applied.formUnion(eligible.map(\.eventId))
+                break
             }
-            applied.formUnion(eligible.map(\.eventId))
         }
         return ResyncOutcome(appliedCount: applied.count, queuedCount: 0, supersededCount: superseded.count)
     }
