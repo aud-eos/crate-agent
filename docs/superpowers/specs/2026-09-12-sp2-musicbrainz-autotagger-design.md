@@ -203,6 +203,18 @@ successful replay.
 Undo and redo use the same throwing decoder for their forward-payload safety
 checks; a malformed payload cannot silently bypass protection of later edits.
 
+**Open correctness constraint:** queued audio-tag writes capture paths that can
+become stale after Finder renames, blocking the drain or writing to a replacement
+file at the old path. [#117](https://github.com/aud-eos/crate-agent/issues/117)
+tracks stable target identity together with removal/undo/retry lifecycle rules.
+Resolving only a live file ID is insufficient: removing an indexed row can strand
+its queued writes even when the physical file remains.
+
+**Open correctness constraint:** final Serato-session edits are not reconciled
+before queued metadata drains. This can overwrite a newer Serato edit; [#115](https://github.com/aud-eos/crate-agent/issues/115)
+tracks the required baseline/current/queued reconciliation design. Simply scanning
+first would misclassify unchanged external values as edits against queued intent.
+
 ## Lookup pipeline
 
 ### Rust FFI additions (the only Rust changes)

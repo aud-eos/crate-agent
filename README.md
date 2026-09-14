@@ -51,6 +51,11 @@ make test-rust      # Only Rust core
 make test-swift     # Only Swift app
 ```
 
+The hosted Swift test process currently starts normal services when a personal
+library is configured. Run it only in an isolated test account/library until
+[test-host isolation #116](https://github.com/aud-eos/crate-agent/issues/116) is
+implemented; a passing suite does not guarantee that live library state was untouched.
+
 ### Iterate
 
 ```sh
