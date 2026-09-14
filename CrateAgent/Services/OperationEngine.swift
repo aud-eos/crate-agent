@@ -381,6 +381,20 @@ public actor OperationEngine {
         .metadataCommittedToSerato, .fileTagsWritten,
     ]
 
+    /// Event types that determine which event is the latest to OWN a field,
+    /// for re-sync supersession. A superset of the projecting types above:
+    /// it also includes `.metadataSet` — a Serato-authoritative import (the
+    /// scanner importing a user's in-Serato edit) or hygiene merge. Such an
+    /// event emits no outbound write of its own (`resyncWrites` returns [] for
+    /// it), but it IS the newest authoritative value of the database-V2 field
+    /// it set, so it must supersede an older MusicBrainz match's V2 write —
+    /// otherwise re-syncing that older batch clobbers the user's newer Serato
+    /// value (finding #4001251164). It claims V2 ownership only: a Serato edit
+    /// does not rewrite the audio file's embedded tags, so the match keeps
+    /// ownership of the audio-tag field.
+    private static let fieldOwnershipEventTypes: Set<EventType> =
+        metadataOrTagProjectingEventTypes.union([.metadataSet])
+
     /// The non-nil fields of a `SeratoMetadata`, keyed by a stable field name.
     /// An empty-string value (a clear) is a real value and IS included.
     private static func metadataFieldMap(_ metadata: SeratoMetadata) -> [String: String] {
@@ -457,7 +471,7 @@ public actor OperationEngine {
     ) async throws -> (v2: [Int64: [String: Int64]], tag: [Int64: [String: Int64]]) {
         let fileIds = Array(pathByFileId.keys)
         guard !fileIds.isEmpty else { return ([:], [:]) }
-        let typeValues = Self.metadataOrTagProjectingEventTypes.map(\.rawValue)
+        let typeValues = Self.fieldOwnershipEventTypes.map(\.rawValue)
         let sql = """
             SELECT * FROM events
             WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
@@ -474,6 +488,28 @@ public actor OperationEngine {
         let decoder = JSONDecoder()
         for event in history {
             guard let fileId = event.fileId, let eventId = event.eventId else { continue }
+            // A Serato-authoritative import/set claims the database-V2 field it
+            // wrote (so a later such edit supersedes an older match's V2 write)
+            // but emits no outbound write and never claims the audio-TAG field —
+            // a Serato edit doesn't touch the file's embedded tags
+            // (finding #4001251164). It claims ownership only of the fields it
+            // actually CHANGED (`metadata` vs `previousMetadata`), NOT every
+            // field in its snapshot: the scanner imports a FULL snapshot of the
+            // V2 row whenever any one field drifts, so claiming the whole
+            // snapshot would wrongly strip the older match's ownership of
+            // co-imported fields the user never touched — and with it their
+            // re-sync restore path (independent-review concern on #4001251164).
+            if event.eventType == .metadataSet {
+                if let data = event.payloadJson.data(using: .utf8),
+                   let payload = try? decoder.decode(SetMetadataPayload.self, from: data) {
+                    let newFields = Self.metadataFieldMap(payload.metadata)
+                    let previousFields = Self.metadataFieldMap(payload.previousMetadata)
+                    for (key, value) in newFields where value != previousFields[key] {
+                        v2[fileId, default: [:]][key] = eventId
+                    }
+                }
+                continue
+            }
             // ASC order → the last event to write a field wins for that field.
             for write in Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder) {
                 switch write {
@@ -2145,8 +2181,7 @@ public actor OperationEngine {
         } ?? false
         let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
 
-        // Whether THIS file is the row's current identity owner: the latest
-        // `musicBrainzMatchApplied` event for the track is this file's. This
+        // Whether THIS file is the row's current identity owner. This
         // distinguishes the two cases the reference count conflates for a
         // PRE-EXISTING row (finding #4000261456): an OLDER file that already
         // referenced the row before this match — whose captured state is
@@ -2155,15 +2190,33 @@ public actor OperationEngine {
         // its own file's match, which must. (The out-of-order guard in
         // `undoBatch` already rejects the case where THIS file was itself
         // re-matched later, so a later event for this same file can't reach
-        // here.) `nil` — no match event for the track (e.g. a row seeded
+        // here.) `nil` — no live matcher for the track (e.g. a row seeded
         // outside the match path) — falls back to the reference-count gate.
+        //
+        // The current matcher is the latest file to apply a match to this row
+        // that is STILL linked to it — filtered on the file's live `track_id`,
+        // NOT merely the latest historical apply. When two files sharing this
+        // row are undone in one batch, reverting the newer sibling first clears
+        // its row link (above, in its own inverse) but leaves its apply as the
+        // latest historical apply in the log. A bare "latest apply" query would
+        // then wrongly name that just-reverted sibling the owner, so the next
+        // inverse (the older sibling's) would skip restoring its
+        // `previousTrackIdentifiers` and leave the row's metadata changed after
+        // the whole batch was undone (finding #4001251152). Requiring the
+        // applier to still reference the row drops the reverted sibling —
+        // reverts key their event to the file's PREVIOUS track, not this row,
+        // so they can't be counted directly — and correctly names the older
+        // file. THIS file is still linked here (it is unlinked below), so it
+        // remains a candidate.
         let thisFileIsRowLatestMatcher: Bool? = try track.flatMap { row -> Bool? in
             guard let trackID = row.id else { return nil }
             let latestMatcherFileId = try Int64.fetchOne(db, sql: """
-                SELECT file_id FROM events
-                WHERE track_id = ? AND event_type = ?
-                ORDER BY event_id DESC LIMIT 1
-                """, arguments: [trackID, EventType.musicBrainzMatchApplied.rawValue])
+                SELECT events.file_id FROM events
+                JOIN files ON files.id = events.file_id
+                WHERE events.track_id = ? AND events.event_type = ?
+                  AND files.track_id = ?
+                ORDER BY events.event_id DESC LIMIT 1
+                """, arguments: [trackID, EventType.musicBrainzMatchApplied.rawValue, trackID])
             return latestMatcherFileId.map { $0 == applied.fileID }
         }
 

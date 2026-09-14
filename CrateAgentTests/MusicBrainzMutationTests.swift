@@ -915,6 +915,89 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// A SINGLE Auto-Tag batch matches TWO files sharing one fingerprint while
+    /// an OLDER file already references the pre-existing shared row. Undoing that
+    /// one batch reverts the two siblings newest-first within the batch. When the
+    /// older sibling's inverse runs, the newer sibling has already been unlinked
+    /// but its apply is still the latest historical apply — so the ownership
+    /// check must not name that reverted sibling the owner (which, combined with
+    /// the older file's surviving reference defeating the sole-owner fallback,
+    /// would skip restoring the older sibling's captured previous identity and
+    /// strand the shared row at the batch's value). The row must be fully
+    /// restored to its pre-batch release (finding #4001251152).
+    func testUndoOfSingleBatchWithTwoSiblingsRestoresSharedRowWhenOlderFileReferencesIt() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileA) = try await MainActor.run {
+            try makeEngineWithFile(
+                artist: "a", title: "t", album: "al",
+                recorder: recorder, path: "/Music/A/a.mp3", inode: 1
+            )
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // A sibling that shares the fingerprint (also matched in the batch), plus
+        // an OLDER file that already references the shared row.
+        let (fileB, fileOld) = try await database.writer.write { db -> (Int64, Int64) in
+            var sibling = FileRecord(
+                path: "/Music/A/b.flac", volumeUuid: "v1", inode: 2,
+                fileSize: 1, mtime: 1, artist: "a", title: "t", album: "al"
+            )
+            try sibling.insert(db)
+            var older = FileRecord(
+                path: "/Music/A/old.mp3", volumeUuid: "v1", inode: 3,
+                fileSize: 1, mtime: 1, artist: "a", title: "t", album: "al"
+            )
+            try older.insert(db)
+            return (sibling.id!, older.id!)
+        }
+
+        // Pre-existing shared row (recA/relX) referenced by the older file. Both
+        // siblings match the SAME recording (recA) so no fingerprint-collision
+        // conflict fires; only the release drifts.
+        try await database.writer.write { db in
+            var track = TrackRecord(
+                fingerprintHash: fingerprint, musicbrainzRecordingId: "recA",
+                musicbrainzReleaseId: "relX", artist: "X"
+            )
+            try track.insert(db)
+            var older = try FileRecord.fetchOne(db, key: fileOld)!
+            older.trackId = track.id
+            try older.update(db)
+        }
+
+        // ONE batch matches both siblings (fileA then fileB), drifting the shared
+        // row's release relX → rel1 → rel2.
+        try await engine.applyBatch(
+            [
+                .applyMusicBrainzMatch(fullPayload(
+                    fileID: fileA, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel1"
+                )),
+                .applyMusicBrainzMatch(fullPayload(
+                    fileID: fileB, fingerprintHash: fingerprint, recordingMBID: "recA", releaseMBID: "rel2"
+                )),
+            ],
+            batchId: "autoTag"
+        )
+
+        // Undo the whole batch.
+        try await engine.undoBatch("autoTag")
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(
+                track.musicbrainzReleaseId, "relX",
+                "undoing the whole batch restores the shared row's pre-batch release the older file relies on"
+            )
+            XCTAssertEqual(
+                try FileRecord.fetchOne(db, key: fileOld)!.trackId, track.id,
+                "the older file still references the row"
+            )
+            XCTAssertNil(try FileRecord.fetchOne(db, key: fileA)!.trackId, "sibling A unlinked")
+            XCTAssertNil(try FileRecord.fetchOne(db, key: fileB)!.trackId, "sibling B unlinked")
+        }
+    }
+
     /// After the documented LIFO recovery — re-match file, then undo the newer
     /// match — the ORIGINAL match must become undoable again. A later match that
     /// was itself undone leaves applied+reverted rows in the log but is no

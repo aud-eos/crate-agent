@@ -155,6 +155,19 @@ struct AutoTaggerView: View {
     /// stage never materializes the whole library.
     private var selectionStage: some View {
         VStack(spacing: 0) {
+            // A scan aborted by a failed metadata load returns here with the
+            // reason in `actionError` (finding #4001251160); surface it so the
+            // user knows why, above the still-usable search controls.
+            if let actionError {
+                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                Divider()
+            }
             searchField
             Divider()
             selectionResultsSection
@@ -529,8 +542,16 @@ struct AutoTaggerView: View {
     /// candidate's on-disk tag snapshot (see `AutoTagRowModel`), so this no
     /// longer loads canonical `tracks.year` — `filesByID` is retained only
     /// for the non-review lookups elsewhere in the view.
-    private func loadCurrentMetadata(forFileIDs fileIDs: [Int64]) async {
-        guard !fileIDs.isEmpty else { return }
+    ///
+    /// Returns `false` on a read failure so the caller can abort the scan
+    /// instead of launching the long remote lookup pass over a selection we
+    /// couldn't load. A failure routes to `actionError` (the recoverable
+    /// review/selection banner), never the library-level `loadError`, which
+    /// hides the whole selection UI and would strand the user with no way
+    /// back (finding #4001251160).
+    @discardableResult
+    private func loadCurrentMetadata(forFileIDs fileIDs: [Int64]) async -> Bool {
+        guard !fileIDs.isEmpty else { return true }
         do {
             let loadedFiles = try await services.database.writer.read { db in
                 try FileRecord.filter(keys: fileIDs).fetchAll(db)
@@ -539,8 +560,10 @@ struct AutoTaggerView: View {
                 guard let fileID = file.id else { continue }
                 filesByID[fileID] = file
             }
+            return true
         } catch {
-            loadError = "\(error.localizedDescription)"
+            actionError = "Couldn't load the selected tracks: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -584,14 +607,21 @@ struct AutoTaggerView: View {
         let idsToScan = selectedFileIDs.sorted()
         guard !idsToScan.isEmpty else { return }
 
-        scannedFileIDs = idsToScan
         confirmedFileIDs.removeAll()
         appliedFileIDs.removeAll()
         rowModels.removeAll()
         actionError = nil
         lastResult = nil
         pendingResyncBatchId = nil
-        await loadCurrentMetadata(forFileIDs: idsToScan)
+
+        // Load the selection's current rows BEFORE entering the review stage.
+        // If that read fails, abort: stay on the selection stage (don't set
+        // `scannedFileIDs`) with the error shown, rather than launch the long
+        // remote lookup pass invisibly behind an unrecoverable placeholder
+        // (finding #4001251160).
+        guard await loadCurrentMetadata(forFileIDs: idsToScan) else { return }
+
+        scannedFileIDs = idsToScan
         await autoTaggerService.run(fileIDs: idsToScan)
     }
 

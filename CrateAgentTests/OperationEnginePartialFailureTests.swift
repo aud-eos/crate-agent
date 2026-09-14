@@ -509,6 +509,129 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         XCTAssertEqual(record?.title, "A Title", "A's title survives B's artist-only write")
     }
 
+    // MARK: - #4001251164: a later Serato import supersedes an older match's V2 field
+
+    /// A user edits a field directly in Serato after an Auto-Tag batch; the
+    /// scanner imports that newer value as a `.metadataSet` event. Re-syncing
+    /// the older match must NOT re-write its stale value over the user's newer
+    /// Serato edit — the import is the latest OWNER of that database-V2 field
+    /// even though it emits no outbound write of its own. (The match keeps
+    /// ownership of the audio-TAG field, which a Serato edit doesn't touch, so
+    /// the tag write still replays — only the V2 field is dropped.)
+    func testResyncDropsMatchV2FieldSupersededByLaterSeratoImport() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let file = fileIds[0]
+        let databaseV2Path = seratoDirectory.appendingPathComponent("database V2").path
+
+        // Batch A: a match writes artist "Nas" to database V2 (and the tag).
+        try await engine.applyBatch(
+            [.applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload(
+                fileID: file, acoustID: "aid", recordingMBID: "recA", releaseMBID: "relA",
+                artistMBID: "art", isrc: "isrc", fingerprintHash: sha256(Data("fp".utf8)),
+                expectedFileSize: 1, expectedMtime: 1,
+                artist: "Nas", title: nil, album: nil, year: nil
+            ))],
+            batchId: "batchA"
+        )
+
+        // The user then edits the artist directly in Serato → database V2 now
+        // holds "User Edit"; the scanner imports that as a `.metadataSet` event.
+        _ = try batchUpdateDatabaseRecords(
+            databasePath: databaseV2Path,
+            updates: [SeratoTrackMetadataUpdate(
+                trackPath: "Music/A/one.mp3",
+                update: SeratoMetadataUpdate(
+                    artist: "User Edit", title: nil, album: nil, genre: nil, bpm: nil,
+                    key: nil, comment: nil, length: nil, label: nil
+                )
+            )]
+        )
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(fileId: file, metadata: SeratoMetadata(artist: "User Edit"))),
+            batchId: "seratoImport"
+        )
+
+        // Re-syncing batch A must NOT overwrite the user's newer V2 artist with
+        // the stale match value: the later import owns that field.
+        _ = try await engine.resyncSeratoForBatch("batchA")
+
+        let records = try readDatabaseRecords(databasePath: databaseV2Path)
+        let record = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertEqual(
+            record?.artist, "User Edit",
+            "the user's newer in-Serato edit (imported as .metadataSet) must survive — resync must not clobber it with the stale match artist"
+        )
+    }
+
+    /// A `.metadataSet` claims ownership only of the fields it actually CHANGED,
+    /// not every field in its snapshot. The scanner imports a FULL V2 snapshot
+    /// when any one field drifts, so a user editing ONLY artist in Serato must
+    /// not let the import strip the older match's ownership of the co-imported,
+    /// unchanged title — otherwise a later V2 clobber of that title could never
+    /// be restored by re-syncing the match (independent-review concern on
+    /// #4001251164).
+    func testResyncStillRestoresCoImportedFieldNotChangedByLaterSeratoImport() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let file = fileIds[0]
+        let databaseV2Path = seratoDirectory.appendingPathComponent("database V2").path
+
+        // Batch A: a match writes artist "Nas" and title "NY State" to V2.
+        try await engine.applyBatch(
+            [.applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload(
+                fileID: file, acoustID: "aid", recordingMBID: "recA", releaseMBID: "relA",
+                artistMBID: "art", isrc: "isrc", fingerprintHash: sha256(Data("fp".utf8)),
+                expectedFileSize: 1, expectedMtime: 1,
+                artist: "Nas", title: "NY State", album: nil, year: nil
+            ))],
+            batchId: "batchA"
+        )
+
+        // The user edits ONLY the artist in Serato. The scanner imports the full
+        // V2 snapshot (artist changed, title unchanged) as one `.metadataSet`;
+        // applySetMetadata captures previousMetadata from the post-match row, so
+        // only artist differs.
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(
+                fileId: file,
+                metadata: SeratoMetadata(artist: "User Edit", title: "NY State")
+            )),
+            batchId: "seratoImport"
+        )
+
+        // Serato then clobbers the title in V2 (running-write loss / reimport).
+        _ = try batchUpdateDatabaseRecords(
+            databasePath: databaseV2Path,
+            updates: [SeratoTrackMetadataUpdate(
+                trackPath: "Music/A/one.mp3",
+                update: SeratoMetadataUpdate(
+                    artist: "User Edit", title: "CLOBBERED", album: nil, genre: nil, bpm: nil,
+                    key: nil, comment: nil, length: nil, label: nil
+                )
+            )]
+        )
+
+        // Re-syncing batch A must restore the title (the match still owns it —
+        // the import only changed artist) while leaving the user's artist edit.
+        _ = try await engine.resyncSeratoForBatch("batchA")
+
+        let records = try readDatabaseRecords(databasePath: databaseV2Path)
+        let record = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertEqual(
+            record?.title, "NY State",
+            "the match still owns the co-imported title the user never edited, so resync restores it after a clobber"
+        )
+        XCTAssertEqual(
+            record?.artist, "User Edit",
+            "the user's edited artist is owned by the import and is not overwritten"
+        )
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {
