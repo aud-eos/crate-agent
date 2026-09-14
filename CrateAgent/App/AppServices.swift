@@ -53,6 +53,7 @@ public final class AppServices: ObservableObject {
 
     private let seratoSyncCoordinator: SeratoSyncCoordinator
     private let fsEventsWatcher: FSEventsWatcher
+    private var filesystemEventsTask: Task<Void, Never>?
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -154,21 +155,24 @@ public final class AppServices: ObservableObject {
             forWatchedPath: watchedFolderPath
         ) ?? FSEventsWatcher.sinceNow
 
-        // FSEventsWatcher hands the coordinator each batched event
-        // group via a detached Task; the watcher's dispatch queue
-        // stays free for the next callback. The checkpoint callback
-        // persists the highest event ID we've processed so the next
-        // launch's `sinceWhen` picks up exactly where we left off.
-        fsEventsWatcher = FSEventsWatcher(
-            watchedPaths: [watchedFolderPath],
-            sinceWhen: resumeFromEventId,
-            handler: { observations in
-                Task { await filesystemCoordinator.handleObservations(observations) }
-            },
-            onEventIdCheckpoint: { eventId in
+        let eventStream = AsyncStream<FilesystemEventBatch>.makeStream()
+        let processor = FilesystemEventProcessor(
+            handler: { batch in try await filesystemCoordinator.handleBatch(batch) },
+            checkpoint: { eventId in
                 UserPreferences.setLastFSEventId(eventId, forWatchedPath: watchedFolderPath)
             }
         )
+        fsEventsWatcher = FSEventsWatcher(
+            watchedPaths: [watchedFolderPath],
+            sinceWhen: resumeFromEventId,
+            handler: { batch in eventStream.continuation.yield(batch) }
+        )
+        filesystemEventsTask = Task {
+            for await batch in eventStream.stream {
+                do { try await processor.enqueue(batch) }
+                catch { fatalError("Filesystem synchronization failed before checkpoint \(batch.highestEventID): \(error)") }
+            }
+        }
 
         // All stored properties are now assigned; start lifecycle.
         seratoWatchdog.startObservingWorkspace()
@@ -210,6 +214,7 @@ public final class AppServices: ObservableObject {
     }
 
     deinit {
+        filesystemEventsTask?.cancel()
         fsEventsWatcher.stop()
         let worker = fingerprintWorker
         Task { await worker.stop() }

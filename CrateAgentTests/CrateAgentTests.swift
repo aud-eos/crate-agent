@@ -1581,7 +1581,7 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         let observation = FSEventsObservation(
             path: audioFile.path, isFile: true, wasCreated: true
         )
-        await coordinator.handleObservations([observation])
+        try await coordinator.handleObservations([observation])
 
         let count = try await database.writer.read { db in
             try FileRecord.fetchCount(db)
@@ -1597,7 +1597,7 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         let observation = FSEventsObservation(
             path: textFile.path, isFile: true, wasCreated: true
         )
-        await coordinator.handleObservations([observation])
+        try await coordinator.handleObservations([observation])
 
         let count = try await database.writer.read { db in
             try FileRecord.fetchCount(db)
@@ -1614,7 +1614,7 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
             isDirectory: true,
             wasCreated: true
         )
-        await coordinator.handleObservations([observation])
+        try await coordinator.handleObservations([observation])
 
         let count = try await database.writer.read { db in
             try FileRecord.fetchCount(db)
@@ -1650,7 +1650,7 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         let observation = FSEventsObservation(
             path: audioFile.path, isFile: true, wasRenamed: true
         )
-        await coordinator.handleObservations([observation])
+        try await coordinator.handleObservations([observation])
 
         let updated = try await database.writer.read { db in
             try FileRecord.fetchOne(db, sql: "SELECT * FROM files WHERE inode = ?",
@@ -1675,7 +1675,7 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
         let observation = FSEventsObservation(
             path: nonexistentPath, isFile: true, wasRenamed: true
         )
-        await coordinator.handleObservations([observation])
+        try await coordinator.handleObservations([observation])
 
         let fileCount = try await database.writer.read { db in
             try FileRecord.fetchCount(db)
@@ -1731,7 +1731,7 @@ final class FSEventsWatcherTests: XCTestCase {
         XCTAssertTrue(observation.isFile)
     }
 
-    func testEventIdCheckpointFiresWithMonotonicMaxId() throws {
+    func testBatchesCarryMonotonicMaxId() throws {
         let watchedDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("crate-agent-test-fsevents-checkpoint-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: watchedDirectory, withIntermediateDirectories: true)
@@ -1746,8 +1746,8 @@ final class FSEventsWatcherTests: XCTestCase {
         let watcher = FSEventsWatcher(
             watchedPaths: [watchedDirectory.path],
             coalescingLatency: 0.05,
-            handler: { _ in },
-            onEventIdCheckpoint: { eventId in
+            handler: { batch in
+                let eventId = batch.highestEventID
                 lock.lock()
                 receivedCheckpoints.append(eventId)
                 lock.unlock()
@@ -1801,7 +1801,7 @@ final class FSEventsWatcherTests: XCTestCase {
             coalescingLatency: 0.05  // tight latency for test snappiness
         ) { batch in
             observationLock.lock()
-            observationsCollected.append(contentsOf: batch)
+            observationsCollected.append(contentsOf: batch.observations)
             let matched = observationsCollected.contains {
                 $0.path.contains("new-track.mp3") && $0.wasCreated
             }
@@ -2231,7 +2231,7 @@ extension FilesystemSyncCoordinatorTests {
         let observation = FSEventsObservation(
             path: audioFile.path, isFile: true, wasRenamed: true
         )
-        await coordinator.handleObservations([observation])
+        try await coordinator.handleObservations([observation])
 
         let updated = try await database.writer.read { db in
             try FileRecord.fetchOne(db, key: fileId)
@@ -2261,7 +2261,7 @@ extension FilesystemSyncCoordinatorTests {
         let observation = FSEventsObservation(
             path: audioFile.path, isFile: true, wasRenamed: true
         )
-        await coordinator.handleObservations([observation])
+        try await coordinator.handleObservations([observation])
 
         let fileCount = try await database.writer.read { db in
             try FileRecord.fetchCount(db)

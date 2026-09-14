@@ -601,7 +601,7 @@ public actor OperationEngine {
             return true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileImportRequested:
+             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileImportRequested:
             return false
         }
     }
@@ -696,7 +696,7 @@ public actor OperationEngine {
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileImportRequested:
             return []
         }
     }
@@ -912,7 +912,7 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
-        case .fileLibraryStateChanged, .fileImportRequested:
+        case .fileLibraryStateChanged, .fileLocationObserved, .fileImportRequested:
             // Observation inverses preserve audit evidence, not permission to
             // reverse an external Serato decision or re-add its membership.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
@@ -1696,6 +1696,9 @@ public actor OperationEngine {
             let eventId = try applyRemoveFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .observeFileLocation(payload):
+            let eventId = try FileLocationObservationMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .setFileLibraryState(payload):
             let eventId = try FileLibraryStateMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
@@ -2752,6 +2755,7 @@ public enum TrackMutation: Sendable {
     case renameFile(RenameFilePayload)
     case removeFile(RemoveFilePayload)
     case setFileLibraryState(SetFileLibraryStatePayload)
+    case observeFileLocation(ObserveFileLocationPayload)
     case beginFileImport(BeginFileImportPayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)

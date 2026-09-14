@@ -127,6 +127,7 @@ public enum EventHistoryQuery {
         // removeTrackFromSerato FFI we don't have yet).
         let unsupportedRaw: Set<String> = [
             EventType.trackAddedToSerato.rawValue,
+            EventType.fileLocationObserved.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
             EventType.fileImportRequested.rawValue,
             EventType.fileTrashed.rawValue,
@@ -164,6 +165,8 @@ public enum EventHistoryQuery {
     private static func phrase(for eventType: EventType, count: Int) -> String {
         let pluralS = count == 1 ? "" : "s"
         switch eventType {
+        case .fileLocationObserved:
+            return "Observed location for \(count) file\(pluralS)"
         case .fileLibraryStateChanged:
             return "Observed library state for \(count) file\(pluralS)"
         case .fileImportRequested:
