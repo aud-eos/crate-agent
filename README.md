@@ -49,6 +49,14 @@ make build          # Rust core + Xcode project + app (Debug)
 make run            # Open the built CrateAgent.app
 ```
 
+Both commands use this checkout's `build-output/DerivedData` directory, so
+`make run` cannot pick an older app from another worktree or Xcode build.
+Run `make build` once after updating to this layout. `make clean` removes this
+checkout's build, while builds made directly in Xcode remain separate.
+
+Run `python3 scripts/test-make-run.py` to check build/launch path selection
+without launching the app.
+
 ### Test
 
 ```sh
