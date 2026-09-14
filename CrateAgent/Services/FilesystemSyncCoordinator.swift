@@ -18,11 +18,13 @@ public actor FilesystemSyncCoordinator {
 
     private struct PendingMove: Sendable {
         let original: FileObservationExpectation
+        let sourceReadIdentity: AudioFileReadIdentity
         var destinations: [Destination]
     }
 
     // At most two destinations per indexed row: the second records ambiguity.
     private var pendingMoves: [Int64: PendingMove] = [:]
+    private var invalidatedSources: [Int64: AudioFileReadIdentity] = [:]
     public private(set) var requiresReconciliation = false
 
     public init(operationEngine: OperationEngine, database: LibraryDatabase,
@@ -115,15 +117,15 @@ public actor FilesystemSyncCoordinator {
             existing = candidates.first
         }
         guard let existing else { return }
+        if let fileID = existing.id, invalidatedSources[fileID] != nil {
+            requiresReconciliation = true
+            return
+        }
         let previousAvailability = try inspectKnownIdentity(existing)
         guard previousAvailability == .missing || previousAvailability == .offline else {
             requiresReconciliation = true
             if previousAvailability == .available {
-                if try FileMetadataCollector.collectVerified(at: existing.path) == existing.identity {
-                    try rememberDestination(at: observation.path, for: existing)
-                } else if let fileID = existing.id {
-                    pendingMoves.removeValue(forKey: fileID)
-                }
+                try rememberDestination(at: observation.path, for: existing)
             }
             try await observe(file: existing, availability: previousAvailability, metadata: nil, batchID: batchID)
             return
@@ -143,10 +145,24 @@ public actor FilesystemSyncCoordinator {
         let metadata = try FileMetadataCollector.collectVerified(at: path)
         try readIdentity.requireUnchanged(at: path)
         guard FileIdentityObservationMutation.matchesContent(file, identity: metadata) else { return }
-        var pending = try pendingMoves[fileID] ?? PendingMove(original: FileObservationExpectation(file: file), destinations: [])
+        var pending: PendingMove
+        if let retained = pendingMoves[fileID] {
+            pending = retained
+        } else {
+            let sourceReadIdentity = try AudioFileReadIdentity.read(at: file.path)
+            guard try FileMetadataCollector.collectVerified(at: file.path) == file.identity else {
+                requiresReconciliation = true
+                return
+            }
+            try sourceReadIdentity.requireUnchanged(at: file.path)
+            pending = try PendingMove(original: FileObservationExpectation(file: file), sourceReadIdentity: sourceReadIdentity, destinations: [])
+        }
         guard matchesOriginal(file, pending: pending) else {
             pendingMoves.removeValue(forKey: fileID)
             requiresReconciliation = true
+            return
+        }
+        if try inspectKnownIdentity(file) == .available, try invalidateChangedSource(pending) {
             return
         }
         let alreadyObserved = pending.destinations.contains { $0.metadata.path == path }
@@ -171,6 +187,25 @@ public actor FilesystemSyncCoordinator {
                                                      libraryID: original.state.libraryID, retiredAt: original.state.retiredAt)
         return file.membershipRevision == original.revision && file.identity == original.identity
             && (file.libraryState == original.state || observedSourceMissing)
+    }
+
+    private func invalidateSource(_ pending: PendingMove) {
+        pendingMoves.removeValue(forKey: pending.original.fileId)
+        invalidatedSources[pending.original.fileId] = pending.sourceReadIdentity
+        requiresReconciliation = true
+    }
+
+    private func invalidateChangedSource(_ pending: PendingMove) throws -> Bool {
+        let original = pending.original
+        var unchanged = false
+        defer {
+            if !unchanged {
+                invalidateSource(pending)
+            }
+        }
+        unchanged = try FileMetadataCollector.collectVerified(at: original.identity.path) == original.identity
+            && AudioFileReadIdentity.read(at: original.identity.path) == pending.sourceReadIdentity
+        return !unchanged
     }
 
     private func validDestinations(_ destinations: [Destination]) throws -> [Destination] {
@@ -203,15 +238,17 @@ public actor FilesystemSyncCoordinator {
             requiresReconciliation = true
             return false
         }
+        let sourceAvailability = try inspectKnownIdentity(file)
+        if sourceAvailability == .available, try invalidateChangedSource(pending) {
+            return false
+        }
         pending.destinations = try validDestinations(pending.destinations)
         pendingMoves[fileID] = pending.destinations.isEmpty ? nil : pending
         guard pending.destinations.count < 2 else { throw SeratoReconciliationError.ambiguousIdentity(file.path) }
         guard let destination = pending.destinations.first else { return false }
-        let sourceAvailability = try inspectKnownIdentity(file)
         guard sourceAvailability == .missing else {
             if sourceAvailability != .available {
-                pendingMoves.removeValue(forKey: fileID)
-                requiresReconciliation = true
+                invalidateSource(pending)
             }
             return false
         }

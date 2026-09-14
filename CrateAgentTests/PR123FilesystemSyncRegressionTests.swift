@@ -418,6 +418,144 @@ final class PR123FilesystemSyncRegressionTests: XCTestCase {
         XCTAssertEqual(try savedPaths(fixture), [destination.path])
     }
 
+    func testRetainedMoveRejectsObservedInPlaceSourceEdit() async throws {
+        try await retainedMoveRejectsObservedSourceEdit(outsideHashWindows: false)
+    }
+
+    func testRetainedMoveRejectsObservedMiddleEditWithUnchangedSampledIdentity() async throws {
+        try await retainedMoveRejectsObservedSourceEdit(outsideHashWindows: true)
+    }
+
+    func testRepeatedDestinationCannotRenewChangedSourceAuthority() async throws {
+        try await retainedMoveRejectsObservedSourceEdit(outsideHashWindows: true, repeatDestination: true)
+    }
+
+    func testInvalidatedDestinationCannotRegainAuthorityOnLaterObservation() async throws {
+        try await retainedMoveRejectsObservedSourceEdit(outsideHashWindows: true, repeatDestination: true, rediscoverAfterInvalidation: true)
+    }
+
+    func testInaccessibleRetainedSourceCannotPromoteCopyAfterRemoval() async throws {
+        let readiness = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: readiness)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("source.wav", bytes: FinalRemovalIntegrationTests.wav())
+        try fixture.save(paths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: file.path)])
+        let reads = StartupReplayProbe()
+        let reader = SeratoMembershipSnapshotReader(locator: fixture.locator, watchdog: fixture.watchdog, afterParsing: { await reads.handled(0) })
+        let reconciler = SeratoMembershipReconciler(database: fixture.database, operationEngine: fixture.engine, reader: reader)
+        let session = SeratoLibrarySyncSession(reader: reader, reconciler: reconciler, scanner: scanner(fixture), operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: readiness)
+        try await session.synchronize()
+        let destination = fixture.directory.appendingPathComponent("stale-copy.wav")
+        try FileManager.default.copyItem(atPath: file.path, toPath: destination.path)
+        let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        let handler = FilesystemSyncBatchHandler(coordinator: coordinator, session: session)
+        let checkpoints = StartupReplayProbe()
+        let processor = FilesystemEventProcessor(handler: { try await handler.handle($0) }, checkpoint: { await checkpoints.checkpoint($0) })
+        try await processor.enqueue(.init(observations: [.init(path: destination.path, isFile: true, wasCreated: true, eventID: 93)], highestEventID: 93))
+        let priorReads = await reads.snapshot().handled.count
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+        XCTAssertEqual(try FileAvailabilityResolver().inspect(path: file.path, volumeID: file.volumeUuid), .inaccessible)
+        XCTAssertThrowsError(try FileMetadataCollector.collectVerified(at: file.path))
+        try await processor.enqueue(.init(observations: [.init(path: file.path, isFile: true, wasModified: true, eventID: 94)], highestEventID: 94))
+        let inaccessible = try await fixture.row(file)
+        XCTAssertEqual(inaccessible.fileAvailability, .inaccessible)
+        let reconciledReads = await reads.snapshot().handled.count
+        XCTAssertGreaterThan(reconciledReads, priorReads)
+        try FileManager.default.removeItem(atPath: file.path)
+        try await processor.enqueue(.init(observations: [.init(path: file.path, isFile: true, wasRemoved: true, eventID: 95)], highestEventID: 95))
+        let after = try await fixture.row(file)
+        XCTAssertEqual(after.path, file.path)
+        XCTAssertEqual(after.fileAvailability, .missing)
+        XCTAssertEqual(try savedPaths(fixture), [file.path])
+        let renames = try await fixture.database.writer.read { connection in
+            try EventRecord.filter(Column("event_type") == EventType.fileRenamed.rawValue).fetchCount(connection)
+        }
+        XCTAssertEqual(renames, 0)
+        let completed = await checkpoints.snapshot()
+        XCTAssertEqual(completed.checkpoints, [93, 94, 95])
+    }
+
+    private func retainedMoveRejectsObservedSourceEdit(outsideHashWindows: Bool, repeatDestination: Bool = false,
+                                                       rediscoverAfterInvalidation: Bool = false) async throws
+    {
+        let readiness = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: readiness)
+        defer { fixture.cleanup() }
+        var bytes = FinalRemovalIntegrationTests.wav()
+        if outsideHashWindows {
+            bytes.append(Data(repeating: 0, count: 3 * LightweightHashCalculator.windowSize))
+            var riffSize = UInt32(bytes.count - 8).littleEndian
+            var sampleSize = UInt32(bytes.count - 44).littleEndian
+            bytes.replaceSubrange(4 ..< 8, with: withUnsafeBytes(of: &riffSize) { Data($0) })
+            bytes.replaceSubrange(40 ..< 44, with: withUnsafeBytes(of: &sampleSize) { Data($0) })
+        }
+        let file = try await fixture.add("source.wav", bytes: bytes)
+        try fixture.save(paths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: file.path)])
+        let reads = StartupReplayProbe()
+        let reader = SeratoMembershipSnapshotReader(locator: fixture.locator, watchdog: fixture.watchdog, afterParsing: { await reads.handled(0) })
+        let reconciler = SeratoMembershipReconciler(database: fixture.database, operationEngine: fixture.engine, reader: reader)
+        let session = SeratoLibrarySyncSession(reader: reader, reconciler: reconciler, scanner: scanner(fixture), operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: readiness)
+        try await session.synchronize()
+        let destination = fixture.directory.appendingPathComponent("stale-copy.wav")
+        try FileManager.default.copyItem(atPath: file.path, toPath: destination.path)
+        let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        let handler = FilesystemSyncBatchHandler(coordinator: coordinator, session: session)
+        let checkpoints = StartupReplayProbe()
+        let processor = FilesystemEventProcessor(handler: { try await handler.handle($0) }, checkpoint: { await checkpoints.checkpoint($0) })
+        try await processor.enqueue(.init(observations: [.init(path: destination.path, isFile: true, wasCreated: true, eventID: 90)], highestEventID: 90))
+        let retained = try await fixture.row(file)
+        XCTAssertEqual(retained.path, file.path)
+        XCTAssertEqual(try savedPaths(fixture), [file.path])
+        let pendingReconciliation = await coordinator.takeReconciliationRequest()
+        XCTAssertFalse(pendingReconciliation, "The destination batch must finish its initial strict pass")
+        let priorReads = await reads.snapshot().handled.count
+        let original = try FileMetadataCollector.collectVerified(at: file.path)
+        let originalRead = try AudioFileReadIdentity.read(at: file.path)
+        let duration = try readAudioTags(filePath: file.path).durationSeconds
+        XCTAssertGreaterThan(try XCTUnwrap(duration), 0)
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: file.path))
+        try handle.seek(toOffset: outsideHashWindows ? UInt64(LightweightHashCalculator.windowSize + 1024) : 44)
+        try handle.write(contentsOf: Data([4, 3, 2, 1]))
+        try handle.close()
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: TimeInterval(original.mtime))], ofItemAtPath: file.path)
+        let changed = try FileMetadataCollector.collectVerified(at: file.path)
+        XCTAssertEqual(changed.inode, original.inode)
+        XCTAssertEqual(changed.volumeUuid, original.volumeUuid)
+        XCTAssertEqual(changed.fileSize, original.fileSize)
+        XCTAssertEqual(changed.mtime, original.mtime)
+        XCTAssertNotEqual(try AudioFileReadIdentity.read(at: file.path), originalRead)
+        XCTAssertEqual(try readAudioTags(filePath: file.path).durationSeconds, duration)
+        if outsideHashWindows {
+            XCTAssertEqual(changed, original, "Precise source authority must detect edits outside the sampled hash")
+        } else {
+            XCTAssertNotEqual(changed.lightweightHash, original.lightweightHash)
+        }
+        let sourceObservation = FSEventsObservation(path: file.path, isFile: true, wasModified: true, eventID: 91)
+        let destinationObservation = FSEventsObservation(path: destination.path, isFile: true, wasCreated: true, eventID: 91)
+        try await processor.enqueue(.init(observations: [repeatDestination ? destinationObservation : sourceObservation], highestEventID: 91))
+        let reconciledReads = await reads.snapshot().handled.count
+        XCTAssertGreaterThan(reconciledReads, priorReads, "Observed source drift must request the existing strict reconciliation path")
+        if case .ready = session.state {} else {
+            XCTFail("Source observation must finish reconciliation")
+        }
+        if rediscoverAfterInvalidation {
+            try await processor.enqueue(.init(observations: [.init(path: destination.path, isFile: true, wasCreated: true, eventID: 92)], highestEventID: 92))
+        }
+        try FileManager.default.removeItem(atPath: file.path)
+        let removedEventID: UInt64 = rediscoverAfterInvalidation ? 93 : 92
+        try await processor.enqueue(.init(observations: [.init(path: file.path, isFile: true, wasRemoved: true, eventID: removedEventID)], highestEventID: removedEventID))
+        let after = try await fixture.row(file)
+        XCTAssertEqual(after.path, file.path)
+        XCTAssertEqual(after.fileAvailability, .missing)
+        XCTAssertEqual(try savedPaths(fixture), [file.path])
+        let renames = try await fixture.database.writer.read { connection in
+            try EventRecord.filter(Column("event_type") == EventType.fileRenamed.rawValue).fetchCount(connection)
+        }
+        XCTAssertEqual(renames, 0, "Discarded source authority must never rename to the stale destination")
+        let completed = await checkpoints.snapshot()
+        XCTAssertEqual(completed.checkpoints, rediscoverAfterInvalidation ? [90, 91, 92, 93] : [90, 91, 92])
+    }
+
     func testCancelledStartupSubscriptionDoesNotResumeAfterBusySession() async throws {
         let readiness = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: readiness)

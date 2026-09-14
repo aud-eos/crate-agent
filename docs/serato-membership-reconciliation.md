@@ -119,8 +119,19 @@ so startup does not wait for a filesystem handler that can itself request sync.
 
 A destination-first copy/move observation retains a verified candidate against
 the original indexed file's revision, state, and identity. A live source remains
-a copy. A later source disappearance revalidates the destination and commits the
-move through the engine, checking original authority inside the serialized
+a copy. The first discovery also captures the source's precise read identity.
+Later observations of that available source, including repeated destination
+events, compare against the original identity. In-place drift discards the
+candidate and requests reconciliation even when size, whole-second mtime, and
+sampled content hash are unchanged; it never renews the candidate's authority.
+The rejected original precise source identity is retained per file ID as a fence.
+Later destination events request reconciliation without creating new move
+authority for that row during the coordinator's lifetime, since the coordinator
+cannot establish a refreshed precise source baseline from the scanner's coarse
+identity projection. An unverifiable live source also discards and fences its
+retained authority before reporting a verification error.
+For a still-authorized candidate, source disappearance revalidates the destination
+and commits the move through the engine, checking original authority inside the serialized
 transaction and physical targets again before commit. Replacement, retirement,
 or changed/missing destinations discard that candidate and request reconciliation.
 A strict observation of an active source becoming missing is allowed progress
