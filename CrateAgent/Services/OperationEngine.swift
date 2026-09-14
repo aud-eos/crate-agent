@@ -501,6 +501,10 @@ public actor OperationEngine {
             // re-sync restore path (independent-review concern on #4001251164).
             if event.eventType == .metadataSet {
                 let payload = try Self.decodeEventPayload(SetMetadataPayload.self, event: event, decoder: decoder)
+                // Legacy undo batches predate the explicit authority flag.
+                // Their metadata snapshots only restored SQLite; the paired
+                // commit event owns the outbound V2 restore.
+                guard payload.isSeratoAuthoritative ?? !event.batchId.hasPrefix("undo:") else { continue }
                 let newFields = Self.metadataFieldMap(payload.metadata)
                 let previousFields = Self.metadataFieldMap(payload.previousMetadata)
                 // Union of both key sets so a CLEAR (a field going from a
@@ -822,7 +826,10 @@ public actor OperationEngine {
             return .renameFile(payload)
         case .metadataSet:
             let payload = try decoder.decode(SetMetadataPayload.self, from: inverseJsonData)
-            return .setMetadata(payload)
+            return .setMetadata(SetMetadataPayload(
+                fileId: payload.fileId, metadata: payload.metadata,
+                previousMetadata: payload.previousMetadata, isSeratoAuthoritative: false
+            ))
         case .trackImported:
             let payload = try decoder.decode(RemoveFilePayload.self, from: inverseJsonData)
             return .removeFile(payload)
@@ -1639,12 +1646,14 @@ public actor OperationEngine {
         let forwardPayload = SetMetadataPayload(
             fileId: payload.fileId,
             metadata: payload.metadata,
-            previousMetadata: originalMetadata
+            previousMetadata: originalMetadata,
+            isSeratoAuthoritative: payload.isSeratoAuthoritative
         )
         let inversePayload = SetMetadataPayload(
             fileId: payload.fileId,
             metadata: originalMetadata,
-            previousMetadata: payload.metadata
+            previousMetadata: payload.metadata,
+            isSeratoAuthoritative: false
         )
 
         return try insertEvent(
@@ -2816,19 +2825,22 @@ public struct SeratoMetadata: Codable, Sendable, Equatable, Hashable {
 public struct SetMetadataPayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public let metadata: SeratoMetadata
-    /// Engine populates this at apply time from the row's current
-    /// state. Callers pass `.empty` for forward invocation; the
-    /// engine swaps it for the real previous values before journaling.
+    /// Engine captures the row's current values before journaling.
     public let previousMetadata: SeratoMetadata
+    /// Imports reflect values already present in Serato. Local snapshots,
+    /// including every undo, do not establish V2 ownership. Nil is legacy.
+    public let isSeratoAuthoritative: Bool?
 
     public init(
         fileId: Int64,
         metadata: SeratoMetadata,
-        previousMetadata: SeratoMetadata = .empty
+        previousMetadata: SeratoMetadata = .empty,
+        isSeratoAuthoritative: Bool? = true
     ) {
         self.fileId = fileId
         self.metadata = metadata
         self.previousMetadata = previousMetadata
+        self.isSeratoAuthoritative = isSeratoAuthoritative
     }
 }
 

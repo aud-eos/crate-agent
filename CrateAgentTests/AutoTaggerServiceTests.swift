@@ -74,6 +74,79 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
     }
 
+
+    func testNewScanEvictsCompletedRowsOutsideItsSelection() async throws {
+        let database = try makeDatabase()
+        let firstID = try insertFile(in: database, path: "/music/first.mp3")
+        let secondID = try insertFile(in: database, path: "/music/second.mp3")
+        let recording = makeRecording()
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                [AcoustIDResult(id: "match-1", score: 0.99, recordingIDs: ["recording-1"])]
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+        await service.run(fileIDs: [firstID])
+        XCTAssertNotNil(service.candidate(for: firstID))
+        await service.run(fileIDs: [secondID, secondID])
+        XCTAssertEqual(Set(service.rows.keys), [secondID])
+        XCTAssertNil(service.candidate(for: firstID))
+        await service.run(fileIDs: [])
+        XCTAssertTrue(service.rows.isEmpty)
+    }
+
+    func testFailedRecomputeClearsStaleCompletedFingerprint() async throws {
+        let database = try makeDatabase()
+        let audioURL = FileManager.default.temporaryDirectory.appendingPathComponent("invalid-audio-\(UUID().uuidString).mp3")
+        try Data(repeating: 0, count: 2000).write(to: audioURL)
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        let fileID = try insertFile(in: database, path: audioURL.path)
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in
+                XCTFail("invalid audio must fail before lookup")
+                return []
+            },
+            musicBrainzClient: StubMusicBrainzClient { _ in throw LookupError.transport("unreachable") },
+            keyStore: StubKeyProvider()
+        )
+        await service.run(fileIDs: [fileID])
+        guard case .failed = service.rows[fileID] else { return XCTFail("expected a decode failure") }
+        let persisted = try await database.writer.read { db in try FileRecord.fetchOne(db, key: fileID) }
+        XCTAssertEqual(persisted?.fingerprintStatus, .failed)
+        XCTAssertNil(persisted?.chromaprintFingerprint)
+    }
+
+    func testFailedStaleRecomputePreservesNewerCompletedFingerprint() async throws {
+        let database = try makeDatabase()
+        let audioURL = FileManager.default.temporaryDirectory.appendingPathComponent("changed-audio-\(UUID().uuidString).mp3")
+        try Data(repeating: 0, count: 2000).write(to: audioURL)
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        let fileID = try insertFile(in: database, path: audioURL.path)
+        let newerBytes = FingerprintEncoder.serialize([9, 8, 7])
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in [] },
+            musicBrainzClient: StubMusicBrainzClient { _ in throw LookupError.transport("unreachable") },
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in
+                try database.writer.write { db in
+                    try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
+                        freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
+                }
+                throw NSError(domain: "decode-test", code: 1)
+            }
+        )
+        await service.run(fileIDs: [fileID])
+        let persisted = try await database.writer.read { db in try FileRecord.fetchOne(db, key: fileID) }
+        XCTAssertEqual(persisted?.fingerprintStatus, .done)
+        XCTAssertEqual(persisted?.chromaprintFingerprint, newerBytes)
+        XCTAssertEqual(persisted?.fingerprintedMtime, 123)
+    }
+
     // MARK: - Classification
 
     func testClassifiesStrongWeakAndNoMatch() async throws {

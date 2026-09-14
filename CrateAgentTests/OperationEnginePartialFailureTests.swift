@@ -334,6 +334,68 @@ final class OperationEnginePartialFailureTests: XCTestCase {
     /// its forward writes — they'd resurrect the reverted artist/title/album/
     /// year over the current (reverted) state. Its applied events are
     /// superseded by the later revert events on the same files.
+    func testHygieneUndoLocalSnapshotDoesNotSuppressV2Recovery() async throws {
+        try await assertHygieneUndoV2Recovery(legacyJournal: false)
+    }
+
+    func testLegacyHygieneUndoLocalSnapshotDoesNotSuppressV2Recovery() async throws {
+        try await assertHygieneUndoV2Recovery(legacyJournal: true)
+    }
+
+    private func stripMetadataAuthority(in database: LibraryDatabase) async throws {
+        try await database.writer.write { db in
+            let events = try EventRecord.filter(Column("event_type") == EventType.metadataSet.rawValue).fetchAll(db)
+            for event in events {
+                let eventID = try XCTUnwrap(event.eventId)
+                var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(event.payloadJson.utf8)) as? [String: Any])
+                payload.removeValue(forKey: "isSeratoAuthoritative")
+                var inverse = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(event.inversePayloadJson.utf8)) as? [String: Any])
+                inverse.removeValue(forKey: "isSeratoAuthoritative")
+                let payloadJSON = String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
+                let inverseJSON = String(decoding: try JSONSerialization.data(withJSONObject: inverse), as: UTF8.self)
+                try db.execute(sql: "UPDATE events SET payload_json = ?, inverse_payload_json = ? WHERE event_id = ?",
+                               arguments: [payloadJSON, inverseJSON, eventID])
+            }
+        }
+    }
+
+    private func assertHygieneUndoV2Recovery(legacyJournal: Bool) async throws {
+        let tagWriter = ThrowingTagWriter()
+        let (engine, database, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let fileID = fileIds[0]
+        let original = SeratoMetadata(artist: "old", title: "old", album: "old")
+        let edited = SeratoMetadata(artist: "Edited", title: "Edited title", album: "old")
+        let batchID = "hygiene-undo-v2-recovery"
+        _ = try await engine.applyBatch([
+            .setMetadata(SetMetadataPayload(fileId: fileID, metadata: edited)),
+            .commitMetadataToSerato(CommitMetadataToSeratoPayload(fileId: fileID, metadata: edited, previousMetadata: original)),
+            .writeFileTags(WriteFileTagsPayload(fileId: fileID, metadata: edited, previousMetadata: original)),
+        ], batchId: batchID)
+        let databaseURL = seratoDirectory.appendingPathComponent("database V2")
+        let appliedBytes = try Data(contentsOf: databaseURL)
+        if legacyJournal { try await stripMetadataAuthority(in: database) }
+        try Data([0xFF, 0xFF, 0xFF]).write(to: databaseURL)
+        var undoID: String?
+        do {
+            _ = try await engine.undoBatch(batchID)
+            XCTFail("corrupt V2 must fail the real undo writer")
+        } catch let OperationEngineError.externalSyncIncomplete(failedBatchID, _) {
+            undoID = failedBatchID
+        }
+        let undoBatchID = try XCTUnwrap(undoID)
+        let restored = try await database.writer.read { db in try FileRecord.fetchOne(db, key: fileID) }
+        XCTAssertEqual(restored?.artist, "old")
+        try appliedBytes.write(to: databaseURL)
+        if legacyJournal { try await stripMetadataAuthority(in: database) }
+        _ = try await engine.resyncSeratoForBatch(undoBatchID)
+        let records = try readDatabaseRecords(databasePath: databaseURL.path)
+        let record = try XCTUnwrap(records.first { $0.path == "Music/A/one.mp3" })
+        XCTAssertEqual(record.artist, "old")
+        XCTAssertEqual(record.title, "old")
+    }
+
     func testResyncOfUndoneBatchSkipsSupersededForwardWrites() async throws {
         let tagWriter = ThrowingTagWriter() // never throws
         let (engine, _, _, fileIds) = try await MainActor.run {

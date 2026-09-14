@@ -31,10 +31,7 @@ struct AutoTaggerView: View {
     /// `loadCurrentMetadata(forFileIDs:)`.
     @State private var filesByID: [Int64: FileRecord] = [:]
 
-    /// Total row count in the `files` table, used only to distinguish
-    /// "library is genuinely empty" from "nothing matches the current
-    /// search" — a cheap `SELECT COUNT(*)`, never a full-table fetch.
-    @State private var libraryFileCount: Int = 0
+    @StateObject private var libraryState = AutoTagLibraryState()
 
     /// The selection-stage search box and its debounced, capped results.
     @State private var searchState = AutoTagSearchState()
@@ -50,10 +47,7 @@ struct AutoTaggerView: View {
     /// searching again to find more tracks doesn't lose earlier picks.
     @State private var selectedFileIDs: Set<Int64> = []
     /// The exact file IDs the most recent scan was run against.
-    /// Drives which rows `reviewList` renders — NOT
-    /// `autoTaggerService.rows`' full key set, which is shared,
-    /// long-lived service state that can carry entries from a prior
-    /// scan the current view instance never asked for.
+    /// Drives which rows `reviewList` renders for this view's scan.
     @State private var scannedFileIDs: [Int64] = []
     @State private var rowModels: [Int64: AutoTagRowModel] = [:]
     @State private var confirmedFileIDs: Set<Int64> = []
@@ -62,9 +56,7 @@ struct AutoTaggerView: View {
     /// "Applied" indicator instead of silently vanishing from the list.
     @State private var appliedFileIDs: Set<Int64> = []
 
-    @State private var isLoadingLibraryCount: Bool = false
     @State private var isApplying: Bool = false
-    @State private var loadError: String?
     @State private var actionError: String?
     @State private var lastResult: String?
     /// Set when `applyBatch` committed the batch to the DB but one or
@@ -90,15 +82,7 @@ struct AutoTaggerView: View {
         }
         .navigationTitle("Auto-Tag")
         .frame(minWidth: 680, minHeight: 480)
-        .task { await loadLibraryFileCount() }
-        // If the panel was opened while the initial library scan was still
-        // populating an empty database, the one-shot count above recorded 0 and
-        // the view would stay on "No tracks indexed yet". Re-count when the
-        // scan finishes so newly-indexed files become selectable without
-        // closing and reopening the panel (finding #4000806490).
-        .onChange(of: services.initialScanComplete) { _, complete in
-            if complete { Task { await loadLibraryFileCount() } }
-        }
+        .task { await libraryState.observe(in: services.database) }
         // Leaving the Auto-Tag panel entirely (not just "New Scan", which
         // already cancels via resetToSelectionStage) must also stop an
         // in-flight pass — otherwise it keeps issuing rate-limited
@@ -126,12 +110,12 @@ struct AutoTaggerView: View {
 
     @ViewBuilder
     private var content: some View {
-        if isLoadingLibraryCount {
+        if libraryState.isLoading {
             ProgressView("Loading library…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let loadError {
+        } else if let loadError = libraryState.error {
             placeholder(icon: "exclamationmark.triangle", color: .orange, headline: "Couldn't load library", detail: loadError)
-        } else if libraryFileCount == 0 {
+        } else if libraryState.fileCount == 0 {
             placeholder(
                 icon: "tray",
                 color: .secondary,
@@ -320,7 +304,7 @@ struct AutoTaggerView: View {
 
     @ViewBuilder
     private var footer: some View {
-        if !isLoadingLibraryCount && loadError == nil && libraryFileCount > 0 {
+        if !libraryState.isLoading && libraryState.error == nil && libraryState.fileCount > 0 {
             if scannedFileIDs.isEmpty {
                 selectionFooter
             } else {
@@ -469,22 +453,6 @@ struct AutoTaggerView: View {
     }
 
     // MARK: - Loading
-
-    /// Cheap `SELECT COUNT(*)` used only to tell "library genuinely
-    /// empty" apart from "nothing matches the current search" — never
-    /// a full-table fetch.
-    private func loadLibraryFileCount() async {
-        isLoadingLibraryCount = true
-        defer { isLoadingLibraryCount = false }
-        loadError = nil
-        do {
-            libraryFileCount = try await services.database.writer.read { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
-            }
-        } catch {
-            loadError = "\(error.localizedDescription)"
-        }
-    }
 
     /// Runs the debounced search behind the selection stage. Bounded by
     /// `AutoTagFileSearch.resultCap` — this never loads the whole

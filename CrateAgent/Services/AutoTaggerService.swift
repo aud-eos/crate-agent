@@ -119,9 +119,7 @@ final class AutoTaggerService: ObservableObject {
         // IDs still carrying a STALE result from a PRIOR pass and leave it
         // standing. Resetting first ensures the only thing left standing
         // for a keyless pass is .stopped, for every requested row.
-        for fileID in fileIDs {
-            rows[fileID] = .pending
-        }
+        rows = Dictionary(fileIDs.map { ($0, RowState.pending) }, uniquingKeysWith: { first, _ in first })
 
         let apiKey: String
         do {
@@ -434,19 +432,35 @@ final class AutoTaggerService: ObservableObject {
             // the index snapshot then applies.
             try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis)
             return (serialized, freshnessBasis)
-        } catch let failure as AutoTaggerRowFailure {
-            throw failure
         } catch {
-            // Guard the failure write on the row still being `.pending`: the
-            // background worker may have persisted a valid `.done` fingerprint
-            // for this file while this on-demand decode was running, and
-            // clobbering it with `.failed` would strip the fingerprint and force
-            // a later scan to decode again (finding #4001064040). This is the
-            // mirror of the worker's own `requirePendingStatus` guard
-            // (#4000806487): there the worker yields to a newer on-demand
-            // result; here the on-demand FAILURE yields to the worker's success.
-            try? await persistFingerprint(fileID: fileID, bytes: nil, status: .failed, requirePendingStatus: true)
-            throw AutoTaggerRowFailure("failed to compute fingerprint for file \(fileID): \(error)")
+            let decodeError = error
+            do {
+                try await persistFingerprintFailure(for: file)
+            } catch {
+                throw AutoTaggerRowFailure(
+                    "failed to compute fingerprint for file \(fileID): \(decodeError); could not persist failure: \(error)"
+                )
+            }
+            if let failure = decodeError as? AutoTaggerRowFailure { throw failure }
+            throw AutoTaggerRowFailure("failed to compute fingerprint for file \(fileID): \(decodeError)")
+        }
+    }
+
+    private func persistFingerprintFailure(for original: FileRecord) async throws {
+        try await database.writer.write { db in
+            guard let fileID = original.id,
+                  let current = try FileRecord.fetchOne(db, key: fileID),
+                  current.path == original.path,
+                  current.fileSize == original.fileSize,
+                  current.mtime == original.mtime,
+                  current.fingerprintStatus == original.fingerprintStatus,
+                  current.chromaprintFingerprint == original.chromaprintFingerprint,
+                  current.fingerprintedSize == original.fingerprintedSize,
+                  current.fingerprintedMtime == original.fingerprintedMtime
+            else { return }
+            // Compare and write in one transaction: a failure of stale .done
+            // bytes is real, but cannot erase a concurrent successful decode.
+            try FingerprintPersistence.write(fileID: fileID, fingerprint: nil, status: .failed, in: db)
         }
     }
 

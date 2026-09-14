@@ -195,6 +195,9 @@ immediately, including from Select All Results, throughout debounce and the DB r
 Existing checkbox selections persist across searches.
 Changing the normalized query invalidates the completed outcome, so revisiting
 an earlier query or returning through New Scan waits for fresh results.
+The empty-library state observes the database row count throughout the panel's
+lifetime, including scans after startup. Each lookup pass replaces the service's
+result collection with its selected file IDs, releasing candidates from prior scans.
 
 Re-sync decodes all replayable payloads and relevant field-ownership history before
 issuing external writes. An undecodable event fails recovery with its event ID,
@@ -202,6 +205,16 @@ batch ID, event type, and decoding diagnostic; it is never reported as an empty
 successful replay.
 Undo and redo use the same throwing decoder for their forward-payload safety
 checks; a malformed payload cannot silently bypass protection of later edits.
+Metadata imports claim V2 field ownership only when they are Serato-authoritative.
+Local hygiene snapshots and undo snapshots carry an explicit false authority flag;
+their paired commit events retain ownership of outbound V2 writes. Legacy undo
+journals without the flag are recognized by the engine's `undo:` batch namespace.
+This keeps a failed hygiene undo recoverable through Re-sync.
+
+A failed fingerprint recompute clears the stale completed fingerprint only if its
+stored bytes, status, freshness basis, path, and indexed size/mtime still match the
+snapshot that failed. The comparison and update share a transaction, preserving a
+concurrent successful fingerprint. Failure to persist the error is surfaced in the row.
 
 **Open correctness constraint:** queued audio-tag writes capture paths that can
 become stale after Finder renames, blocking the drain or writing to a replacement
