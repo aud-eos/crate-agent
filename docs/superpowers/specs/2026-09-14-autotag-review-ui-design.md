@@ -1,4 +1,83 @@
-# Auto-Tag review: List, Focus, and recording alternatives
+# App-wide readability and Auto-Tag workflow
+
+## Shared visual design
+
+Apply a consistent native macOS style across Library, Organize, all five Cleanup
+panels, Auto-Tag, History and Settings. Include onboarding, rename/migration
+sheets, shared banners, the activity strip and menu-bar status so secondary
+surfaces retain the same vocabulary and hierarchy.
+
+Comfortable is the default density; Compact is an app-wide preference persisted
+between launches. Put the control in the main toolbar and expose the same setting
+in General settings. Both controls edit one preference. It adjusts row padding,
+control spacing and secondary detail density, not the underlying information or
+selection state. Compact must still have legible text and usable hit targets.
+List/Focus is a separate Auto-Tag presentation choice.
+
+Use system typography with readable body text for values, larger headings for
+track identity, and secondary text for filenames, paths and explanation. Reserve
+monospaced text for technical input such as filename templates and aligned
+numeric counts. Avoid tiny all-caps field labels and decorative quotation marks.
+Support light/dark appearance, system contrast settings and VoiceOver labels;
+status must not rely on color alone.
+
+Shared components should cover page headings with a short task explanation,
+track identity headers, Current/Proposed comparisons, empty/loading/error states,
+status badges and bottom action bars. A shared density style supplies the spacing
+and sizing values. Components share presentation mechanics, while each screen
+keeps its distinct operation and validation rules. Do not force a table, grouped
+duplicate chooser and settings form into the same layout.
+
+Keep the main action predictable: selection/result count and feedback on the
+left, secondary actions and one explicitly named primary action on the right.
+Use wrapping or a two-row layout at narrow widths; do not shrink text to fit all
+controls. Action labels state what will happen and how many items are affected.
+Counts distinguish field fixes from tracks when they differ. Respect existing
+selection and confirmation rules; a visual refresh must not broaden write scope.
+
+## Screen-specific readability
+
+- Library: retain its bounded native table, with readable rows, clear search and
+  sorting controls, and secondary path access. Density changes do not reset
+  selection, sort order or search and do not expand the fetched row cap.
+- Organize and migration: show the track first, then labeled current/proposed
+  filename or location. Separate conflicts and unavailable actions from valid
+  moves, using text as well as color. Keep full paths accessible without forcing
+  them into every heading.
+- Cleanup: explain the selected cleanup operation above its results. All five
+  panels use consistent result hierarchy and action bars. Current and Proposed
+  values align and wrap without clipping. Duplicate groups retain their keeper
+  selection and removal safeguards; case and missing-field panels retain their
+  distinct editing controls.
+- Whitespace: render spaces/tabs/newlines with visible markers in the change
+  preview and an explanatory legend, with readable descriptions such as Remove
+  leading spaces, Remove trailing spaces or Normalize internal whitespace derived
+  from the actual before/after values. Show Empty for empty results. The display
+  formatter never modifies the underlying mutation values. Multiple kinds of
+  whitespace edits must be described accurately rather than reduced to a false
+  single cause. Name the action Apply N whitespace fixes.
+- History: make operation, affected track/batch, time and outcome distinguishable
+  at a glance. Undo and recovery retain existing eligibility and error handling;
+  visual polish does not imply the open undo/re-sync defects are fixed.
+- Settings and secondary surfaces: use consistent headings, readable help text,
+  spacing, control labels and feedback. Preserve native controls and existing
+  credential storage; do not expose secret values in previews or logs.
+
+## Delivery and verification of shared style
+
+Implement shared styling and comparison components first, then adopt them across
+all listed surfaces. Keep Auto-Tag's session/chooser behavior in separate focused
+components and commits within this work, so functional changes can be reviewed
+independently from style adoption. Complete the full agreed scope, not just the
+two screens shown in the screenshots.
+
+Use fixture-only visual checks for both densities, light/dark appearance, long
+track names and paths, blank values, errors and narrow windows. Never launch the
+normal app host against the user's library for automated screenshot collection.
+If fixture rendering is unavailable, rely on build checks and have the user
+verify the built app's appearance. Add behavior tests for whitespace display
+formatting and preference/state preservation; do not write tests that merely
+assert particular font or padding constants.
 
 ## Goal
 
