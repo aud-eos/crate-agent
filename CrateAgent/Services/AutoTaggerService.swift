@@ -170,6 +170,13 @@ final class AutoTaggerService: ObservableObject {
                 fatalError = "Auto-tag pass stopped: \(reason)"
                 stopUnresolvedRows(among: fileIDs, message: reason, generation: generation)
                 return
+            } catch is CancellationError {
+                // The pass was cancelled — a New Scan superseded it, or the user
+                // left Auto-Tag. Now that backoff sleeps propagate cancellation
+                // (finding #4001501076), stop the pass silently: never stamp a
+                // spurious `.failed` on the in-flight row. A New Scan resets rows
+                // itself; a plain cancel leaves already-resolved rows as-is.
+                return
             } catch {
                 guard generation == runGeneration else { return }
                 rows[fileID] = .failed(String(describing: error))
@@ -276,7 +283,18 @@ final class AutoTaggerService: ObservableObject {
             return .noMatch
         }
 
-        let recording = try await musicBrainzClient.recording(mbid: recordingMBID)
+        // The AcoustID key-bearing request already succeeded above, so a 401
+        // from the KEYLESS MusicBrainz request must not be reported as a
+        // rejected AcoustID key (which would send the user to replace a valid
+        // key). Translate it to a service-neutral message instead of letting
+        // the shared requester's `.unauthorized` reach `describe` as an
+        // AcoustID-key failure (finding #4001501075).
+        let recording: MBRecording
+        do {
+            recording = try await musicBrainzClient.recording(mbid: recordingMBID)
+        } catch LookupError.unauthorized {
+            throw LookupError.transport("MusicBrainz rejected the metadata request (HTTP 401)")
+        }
 
         // Default the release from the file's ON-DISK album tag (just read
         // above), not the Serato-imported `FileRecord.album` snapshot — the

@@ -998,6 +998,42 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// Confirming a first match for a fingerprint with the display fields left
+    /// unchecked / Keep (payload fields nil) must still seed the NEW canonical
+    /// row from the KEPT on-disk values, not store NULL — the kept value is
+    /// known in the payload's currentFile* snapshot (finding #4001501073).
+    func testNewTrackRowSeedsKeptDisplayFieldsFromOnDiskValues() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        let fingerprint = sha256(sampleFingerprintBytes)
+
+        // Every display toggle off (payload artist/title/album/year == nil), but
+        // the on-disk values are known. A fresh fingerprint → new canonical row.
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: file1, fingerprintHash: fingerprint,
+                artist: nil, title: nil, album: nil, year: nil,
+                currentFileYear: 1990,
+                currentFileArtist: "Disk Artist",
+                currentFileTitle: "Disk Title",
+                currentFileAlbum: "Disk Album"
+            )),
+            batchId: "match"
+        )
+
+        try await database.writer.read { db in
+            let track = try TrackRecord
+                .filter(Column("fingerprint_hash") == fingerprint).fetchOne(db)!
+            XCTAssertEqual(track.artist, "Disk Artist", "new row seeds the kept artist from the on-disk value")
+            XCTAssertEqual(track.title, "Disk Title", "new row seeds the kept title from the on-disk value")
+            XCTAssertEqual(track.album, "Disk Album", "new row seeds the kept album from the on-disk value")
+            XCTAssertEqual(track.year, 1990, "new row seeds the kept year from the on-disk value")
+            XCTAssertEqual(track.musicbrainzRecordingId, "rec", "identifiers are still set")
+        }
+    }
+
     /// After the documented LIFO recovery — re-match file, then undo the newer
     /// match — the ORIGINAL match must become undoable again. A later match that
     /// was itself undone leaves applied+reverted rows in the log but is no

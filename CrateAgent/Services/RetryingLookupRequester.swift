@@ -44,6 +44,13 @@ public struct RetryingLookupRequester: Sendable {
     public func perform(_ request: URLRequest) async throws -> Data {
         var attempt = 0
         while true {
+            // Stop before doing any more work if the enclosing task was
+            // cancelled (e.g. the user started a New Scan or left Auto-Tag)
+            // — including during the previous iteration's backoff sleep, whose
+            // cancellation now propagates rather than being swallowed. Prevents
+            // a superseded scan from spending its remaining retries against the
+            // service concurrently with its replacement (finding #4001501076).
+            try Task.checkCancellation()
             attempt += 1
             await limiter.acquire()
 
@@ -67,7 +74,7 @@ public struct RetryingLookupRequester: Sendable {
                 guard attempt < maxAttempts else {
                     throw httpResponse.statusCode == 429 ? LookupError.rateLimited : LookupError.server
                 }
-                await sleeper.sleep(seconds: retryDelay(forAttempt: attempt, response: httpResponse))
+                try await sleeper.sleep(seconds: retryDelay(forAttempt: attempt, response: httpResponse))
             case 500 ... 599:
                 // Non-transient 5xx (e.g. 501 Not Implemented) — no retry.
                 throw LookupError.server

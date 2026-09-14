@@ -252,6 +252,11 @@ struct AutoTaggerView: View {
             rowContainer(fileID: fileID, path: filesByID[fileID]?.path ?? "(file \(fileID) — no longer in the library)")
         }
         .listStyle(.inset)
+        // Lock the review surface once Apply captures its payloads: applyConfirmed
+        // snapshots the confirmed rows and then suspends (revalidating up to 200
+        // files), so a field/release edit during that wait would be silently
+        // dropped yet the row still marked Applied (finding #4001501070).
+        .disabled(isApplying)
     }
 
     @ViewBuilder
@@ -388,14 +393,17 @@ struct AutoTaggerView: View {
                     confirmAllStrongMatches()
                 }
                 .controlSize(.small)
+                .disabled(isApplying)
                 Button("Select All") {
                     confirmedFileIDs = Set(rowModels.keys)
                 }
                 .controlSize(.small)
+                .disabled(isApplying)
                 Button("Select None") {
                     confirmedFileIDs.removeAll()
                 }
                 .controlSize(.small)
+                .disabled(isApplying)
                 Button("Apply") {
                     Task { await applyConfirmed() }
                 }

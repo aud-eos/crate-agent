@@ -2083,6 +2083,13 @@ public actor OperationEngine {
         } else {
             previousTrackIdentifiers = nil
             createdTrackRow = true
+            // Seed a BRAND-NEW canonical row's display fields from the kept
+            // on-disk values when the user left a field unchecked / chose Keep
+            // (payload.<field> == nil). Otherwise a normal first confirmation
+            // would create a recording with identifiers but a NULL
+            // title/artist/album/year even though the kept value is known in the
+            // payload's currentFile* snapshot (finding #4001501073). For an
+            // EXISTING row (the branch above) nil still means leave-unchanged.
             var newTrack = TrackRecord(
                 fingerprintHash: payload.fingerprintHash,
                 acoustidId: payload.acoustID,
@@ -2090,10 +2097,10 @@ public actor OperationEngine {
                 musicbrainzReleaseId: payload.releaseMBID,
                 musicbrainzArtistId: payload.artistMBID,
                 isrc: payload.isrc,
-                artist: payload.artist,
-                title: payload.title,
-                album: payload.album,
-                year: payload.year
+                artist: payload.artist ?? payload.currentFileArtist,
+                title: payload.title ?? payload.currentFileTitle,
+                album: payload.album ?? payload.currentFileAlbum,
+                year: payload.year ?? payload.currentFileYear
             )
             try newTrack.insert(db)
             guard let newId = newTrack.id else {

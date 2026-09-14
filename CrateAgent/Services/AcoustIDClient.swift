@@ -36,7 +36,15 @@ public struct AcoustIDClient: Sendable {
         // lookup for this fingerprint would replay the same failure
         // forever instead of retrying the network.
         let results = try Self.decodeSortedResults(from: responseData)
-        cache.store(responseData, forKey: cacheKey)
+        // Never persist a NEGATIVE (empty) result. AcoustID may gain the
+        // recording, or a fingerprint may be linked, after this scan; a cached
+        // empty has no expiration and would make every subsequent scan return
+        // `.noMatch` without contacting the service, leaving the file
+        // permanently unmatchable on this install (finding #4001501078). An
+        // empty lookup simply re-hits the network next time.
+        if !results.isEmpty {
+            cache.store(responseData, forKey: cacheKey)
+        }
         return results
     }
 

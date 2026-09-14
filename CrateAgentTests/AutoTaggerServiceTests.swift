@@ -131,6 +131,69 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertNil(service.fatalError)
     }
 
+    /// A 401 from the KEYLESS MusicBrainz request must not be reported as a
+    /// rejected AcoustID key (the AcoustID request already succeeded), and must
+    /// not halt the whole pass. It is a per-row `.failed` with a service-neutral
+    /// message (finding #4001501075).
+    func testMusicBrainz401IsNotReportedAsRejectedAcoustIDKey() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/x.mp3")
+
+        let acoustIDClient = StubAcoustIDClient { _ in
+            [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])]
+        }
+        let musicBrainzClient = StubMusicBrainzClient { _ in throw LookupError.unauthorized }
+
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: musicBrainzClient,
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        guard case let .failed(reason) = service.rows[fileID] else {
+            return XCTFail("expected per-row .failed (a MusicBrainz 401 must not halt the pass), got \(String(describing: service.rows[fileID]))")
+        }
+        XCTAssertFalse(
+            reason.contains("AcoustID"),
+            "a MusicBrainz 401 must not blame the AcoustID key; reason was: \(reason)"
+        )
+        XCTAssertTrue(reason.contains("MusicBrainz"), "the reason should name MusicBrainz; was: \(reason)")
+        XCTAssertNil(service.fatalError, "a MusicBrainz 401 must not halt the whole pass")
+    }
+
+    /// A cancelled lookup (New Scan / left Auto-Tag) now propagates
+    /// `CancellationError` because backoff sleeps stopped swallowing it
+    /// (#4001501076). The pass must stop silently — never stamp a spurious
+    /// `.failed(CancellationError())` on the in-flight row.
+    func testCancelledLookupDoesNotStampSpuriousFailedRow() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/x.mp3")
+
+        let acoustIDClient = StubAcoustIDClient { _ in throw CancellationError() }
+        let unreachableRecording = makeRecording()
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: acoustIDClient,
+            musicBrainzClient: StubMusicBrainzClient { _ in
+                XCTFail("MusicBrainz should not be reached after a cancelled AcoustID lookup")
+                return unreachableRecording
+            },
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileID])
+
+        if case .failed = service.rows[fileID] {
+            XCTFail("a cancelled lookup must not stamp a .failed row; got \(String(describing: service.rows[fileID]))")
+        }
+        XCTAssertNil(service.fatalError, "cancellation is not a fatal pass error")
+    }
+
     // MARK: - E-A: an empty ASSEMBLED artist name is nil, not just an empty credit array
 
     /// A recording whose `artistCredit` is NON-empty but whose entries all

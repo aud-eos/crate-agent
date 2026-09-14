@@ -65,6 +65,75 @@ final class AcoustIDClientTests: XCTestCase {
         XCTAssertEqual(results.count, 2)
     }
 
+    func testEmptyResultIsNotCachedAndRetriesOnNextCall() async throws {
+        // A successful-but-EMPTY AcoustID result must not be persisted: the
+        // recording may be added / a fingerprint linked later, and a cached
+        // empty (no TTL) would leave the file permanently unmatchable
+        // (finding #4001501078). The second lookup must re-hit the network.
+        let loader = SequencedStubLoader(responses: [
+            (status: 200, body: fixture("acoustid_empty.json"), headers: [:]),
+            (status: 200, body: fixture("acoustid_multi.json"), headers: [:]),
+        ])
+        let client = AcoustIDClient(loader: loader, limiter: .noop, cache: .memory())
+
+        let first = try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")
+        XCTAssertTrue(first.isEmpty, "AcoustID returned no matches")
+
+        let second = try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")
+        XCTAssertEqual(loader.callCount, 2, "an empty result must not be cached — the second lookup re-hits the network")
+        XCTAssertEqual(second.count, 2, "the later non-empty result is now returned")
+    }
+
+    func testCancellationDuringBackoffStopsRetrying() async {
+        // A cancellation while a retry is mid-backoff must propagate and stop the
+        // loop, not be swallowed so the superseded scan burns its remaining
+        // attempts against the rate-limited service (finding #4001501076).
+        let loader = StubLoader(status: 429, body: Data())
+        let client = AcoustIDClient(
+            loader: loader, limiter: .noop, cache: .memory(), sleeper: CancellingSleeper()
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K")
+        ) {
+            XCTAssertTrue($0 is CancellationError, "cancellation during backoff must propagate; got \($0)")
+        }
+        XCTAssertEqual(loader.callCount, 1, "no further attempts after the cancelled backoff")
+    }
+
+    func testSystemBackoffSleeperPropagatesCancellation() async {
+        // The production sleeper itself must surface CancellationError (the
+        // `try?` -> `try` change), not swallow it — otherwise the retry loop
+        // above can't see the cancellation (finding #4001501076).
+        let sleeper = SystemBackoffSleeper()
+        let task = Task { try await sleeper.sleep(seconds: 3600) }
+        task.cancel()
+        await XCTAssertThrowsErrorAsync(try await task.value) {
+            XCTAssertTrue($0 is CancellationError, "SystemBackoffSleeper must propagate cancellation; got \($0)")
+        }
+    }
+
+    func testRealTaskCancellationStopsRetryLoop() async {
+        // Exercises the REAL production path end-to-end: a genuinely cancelled
+        // enclosing Task must stop the retry loop, via `try await sleeper.sleep`
+        // propagating a real `Task.sleep` cancellation and the loop-top
+        // `Task.checkCancellation()`. Unlike the stub-throws-directly test, this
+        // would fail if either production mechanism were reverted (#4001501076).
+        let loader = StubLoader(status: 429, body: Data())
+        let box = CancelBox()
+        let client = AcoustIDClient(
+            loader: loader, limiter: .noop, cache: .memory(),
+            sleeper: CancelThenRealSleep(box: box)
+        )
+        let task = Task { try await client.lookup(fingerprintBase64: "F", durationSeconds: 1, apiKey: "K") }
+        box.set { task.cancel() }
+
+        await XCTAssertThrowsErrorAsync(try await task.value) {
+            XCTAssertTrue($0 is CancellationError, "a real cancelled task must stop the retry loop; got \($0)")
+        }
+        XCTAssertEqual(loader.callCount, 1, "no further attempts after the cancelled backoff")
+    }
+
     func testRetriesAfterRateLimitAndSucceedsWithoutRealDelay() async throws {
         let loader = SequencedStubLoader(responses: [
             (status: 429, body: Data(), headers: [:]),
@@ -447,7 +516,39 @@ private final class RecordingSleeper: BackoffSleeping, @unchecked Sendable {
         lock.withLock { delays }
     }
 
-    func sleep(seconds: TimeInterval) async {
+    func sleep(seconds: TimeInterval) async throws {
         lock.withLock { delays.append(seconds) }
+    }
+}
+
+/// A `BackoffSleeping` that simulates the task being cancelled during the wait:
+/// it throws `CancellationError` exactly as a real `Task.sleep` would when the
+/// enclosing task is cancelled mid-backoff.
+private struct CancellingSleeper: BackoffSleeping {
+    func sleep(seconds _: TimeInterval) async throws {
+        throw CancellationError()
+    }
+}
+
+/// Holds a cancel action set after the Task under test is created, so a sleeper
+/// can cancel the very Task whose retry loop it is running inside.
+private final class CancelBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelAction: (() -> Void)?
+    func set(_ action: @escaping () -> Void) { lock.withLock { cancelAction = action } }
+    func cancel() { (lock.withLock { cancelAction })?() }
+}
+
+/// Cancels the enclosing Task, then performs a REAL `Task.sleep` — which, on the
+/// now-cancelled task, throws `CancellationError` immediately (no wall-clock
+/// wait). This drives the actual production cancellation path rather than
+/// throwing a fabricated error, so it catches a regression of the loop's
+/// `try await sleeper.sleep` / `Task.checkCancellation()`.
+private final class CancelThenRealSleep: BackoffSleeping, @unchecked Sendable {
+    private let box: CancelBox
+    init(box: CancelBox) { self.box = box }
+    func sleep(seconds: TimeInterval) async throws {
+        box.cancel()
+        try await Task.sleep(for: .seconds(seconds))
     }
 }
