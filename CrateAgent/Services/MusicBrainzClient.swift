@@ -42,9 +42,72 @@ public struct MusicBrainzClient: Sendable {
 
         let request = makeRequest(mbid: mbid)
         let responseData = try await requester.perform(request)
-        let recording = try Self.decodeRecording(from: responseData)
-        cache.store(responseData, forKey: cacheKey)
+        var recording = try Self.decodeRecording(from: responseData)
+        guard let canonicalID = recording.id else {
+            throw LookupError.transport("MusicBrainz recording response has no canonical ID")
+        }
+        if recording.releases.count >= 25 {
+            recording = recording.replacingReleases(with: try await allReleases(recordingID: canonicalID))
+        }
+        try Task.checkCancellation()
+        let completeData = try JSONEncoder().encode(recording)
+        cache.store(completeData, forKey: cacheKey)
+        cache.store(completeData, forKey: Self.cacheKey(forMBID: canonicalID))
         return recording
+    }
+
+    private struct ReleasePage: Decodable {
+        let count: Int
+        let offset: Int
+        let releases: [MBRelease]
+
+        enum CodingKeys: String, CodingKey {
+            case count = "release-count"
+            case offset = "release-offset"
+            case releases
+        }
+    }
+
+    private func allReleases(recordingID: String) async throws -> [MBRelease] {
+        var releases: [MBRelease] = []
+        var seenIDs: Set<String> = []
+        var expectedCount: Int?
+        var offset = 0
+        repeat {
+            var components = URLComponents(string: "https://musicbrainz.org/ws/2/release")!
+            components.queryItems = [
+                URLQueryItem(name: "recording", value: recordingID),
+                URLQueryItem(name: "inc", value: "release-groups"),
+                URLQueryItem(name: "fmt", value: "json"),
+                URLQueryItem(name: "limit", value: "100"),
+                URLQueryItem(name: "offset", value: String(offset)),
+            ]
+            var request = URLRequest(url: components.url!)
+            request.setValue(userAgentHeaderValue, forHTTPHeaderField: "User-Agent")
+            let data = try await requester.perform(request)
+            let page: ReleasePage
+            do {
+                page = try JSONDecoder().decode(ReleasePage.self, from: data)
+            } catch {
+                throw LookupError.transport("invalid MusicBrainz release page at offset \(offset): \(error.localizedDescription)")
+            }
+            guard page.offset == offset, page.count >= offset,
+                  page.releases.count <= page.count - offset,
+                  expectedCount == nil || expectedCount == page.count,
+                  !page.releases.isEmpty || offset == page.count else {
+                throw LookupError.transport("incomplete or changing MusicBrainz release list at offset \(offset) — retry the scan")
+            }
+            for release in page.releases {
+                guard seenIDs.insert(release.id).inserted else {
+                    throw LookupError.transport("duplicate MusicBrainz release across pages — retry the scan")
+                }
+                releases.append(release)
+            }
+            expectedCount = page.count
+            // Release pages can be shorter than limit due to track counts.
+            offset += page.releases.count
+        } while offset < (expectedCount ?? 0)
+        return releases
     }
 
     private func makeRequest(mbid: String) -> URLRequest {
@@ -57,7 +120,11 @@ public struct MusicBrainzClient: Sendable {
 
     private static func decodeRecording(from data: Data) throws -> MBRecording {
         do {
-            return try JSONDecoder().decode(MBRecording.self, from: data)
+            let recording = try JSONDecoder().decode(MBRecording.self, from: data)
+            guard let canonicalID = recording.id, !canonicalID.isEmpty else {
+                throw LookupError.transport("MusicBrainz recording response has no canonical ID")
+            }
+            return recording
         } catch {
             throw LookupError.transport("invalid MusicBrainz recording response body: \(error.localizedDescription)")
         }
@@ -67,7 +134,7 @@ public struct MusicBrainzClient: Sendable {
     /// corrupt cache entry (`@testable import` only lifts `private` up to
     /// `internal`, not below it).
     static func cacheKey(forMBID mbid: String) -> String {
-        "mb:\(mbid)"
+        "mb:complete-v2:\(mbid)"
     }
 
     public static func bundleAppVersion() -> String {

@@ -1,5 +1,6 @@
 import CryptoKit
 import GRDB
+import SQLite3
 import XCTest
 @testable import CrateAgent
 
@@ -19,6 +20,38 @@ import XCTest
 ///   4. An N-row apply coalesces the `database V2` metadata updates into
 ///      exactly ONE read/rewrite pass (C2b), not N.
 final class OperationEnginePartialFailureTests: XCTestCase {
+    func testLargeHygieneResyncChunksRealSQLiteQueriesAndPreservesOwners() async throws {
+        let (engine, database, directory, _) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: ThrowingTagWriter(), seratoIsRunning: true)
+        }
+        defer { try? FileManager.default.removeItem(at: directory.deletingLastPathComponent()) }
+        let fileIDs = try await database.writer.write { db in
+            try (0..<1100).map { index in
+                var file = FileRecord(path: "/large/\(index).mp3", volumeUuid: "large", inode: Int64(index), fileSize: 1, mtime: 1)
+                try file.insert(db)
+                return try XCTUnwrap(file.id)
+            }
+        }
+        let mutations = fileIDs.flatMap { fileID in [
+            TrackMutation.commitMetadataToSerato(CommitMetadataToSeratoPayload(fileId: fileID, metadata: SeratoMetadata(artist: "Artist"))),
+            .writeFileTags(WriteFileTagsPayload(fileId: fileID, metadata: SeratoMetadata(title: "Original"))),
+        ] }
+        _ = try await engine.applyBatch(mutations, batchId: "large-hygiene")
+        _ = try await engine.applyBatch([fileIDs.first!, fileIDs.last!].map { fileID in
+            .writeFileTags(WriteFileTagsPayload(fileId: fileID, metadata: SeratoMetadata(title: "Newer")))
+        }, batchId: "newer-tags")
+        try await database.writer.write { db in
+            _ = sqlite3_limit(db.sqliteConnection, SQLITE_LIMIT_VARIABLE_NUMBER, 1000)
+            XCTAssertEqual(sqlite3_limit(db.sqliteConnection, SQLITE_LIMIT_VARIABLE_NUMBER, -1), 1000)
+        }
+        let before = try await eventCount(in: database, batchId: "large-hygiene")
+        let outcome = try await engine.resyncSeratoForBatch("large-hygiene")
+        XCTAssertEqual(outcome.queuedCount, 2198)
+        XCTAssertEqual(outcome.appliedCount, 0)
+        let after = try await eventCount(in: database, batchId: "large-hygiene")
+        XCTAssertEqual(after, before)
+    }
+
     func testResyncRejectsMalformedReplayablePayloadsBeforeWriting() async throws {
         for eventType in [EventType.fileRenamed, .musicBrainzMatchApplied, .musicBrainzMatchReverted,
                           .metadataCommittedToSerato, .fileTagsWritten] {

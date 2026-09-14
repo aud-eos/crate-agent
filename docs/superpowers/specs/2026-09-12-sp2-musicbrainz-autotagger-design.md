@@ -209,6 +209,9 @@ batch ID, event type, and decoding diagnostic; it is never reported as an empty
 successful replay.
 Undo and redo use the same throwing decoder for their forward-payload safety
 checks; a malformed payload cannot silently bypass protection of later edits.
+Re-sync and undo safety reads deduplicate file IDs and query bounded chunks,
+including the per-file event histories, so large hygiene batches do not exceed
+SQLite's parameter limit. Event order within each file remains unchanged.
 Metadata imports claim V2 field ownership only when they are Serato-authoritative.
 Local hygiene snapshots and undo snapshots carry an explicit false authority flag;
 their paired commit events retain ownership of outbound V2 writes. Legacy undo
@@ -271,6 +274,13 @@ is routed through the existing `FingerprintWorker` before lookup.
 - `GET https://musicbrainz.org/ws/2/recording/<mbid>?inc=releases+release-groups+artist-credits+isrcs&fmt=json`
 - Resolves a recording → releases (album), release-group (`first-release-date` →
   year), artist-credit (name + artist MBID), ISRC.
+- Uses the response's canonical recording ID after MusicBrainz redirects.
+  When the embedded release list reaches its 25-item cap, browses all release
+  pages with the canonical ID before choosing an edition or original year.
+  Offsets advance by actual page size; incomplete, overlapping or changing page
+  sequences fail rather than publishing partial metadata.
+- Caches only complete recordings under requested and canonical IDs. The
+  `mb:complete-v2:` namespace bypasses older potentially truncated cache entries.
 
 ### Rate limiting & caching
 

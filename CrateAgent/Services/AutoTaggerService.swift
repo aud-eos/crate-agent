@@ -314,7 +314,7 @@ final class AutoTaggerService: ObservableObject {
             fileID: fileID,
             score: topResult.score,
             acoustID: topResult.id,
-            recordingMBID: recordingMBID,
+            recordingMBID: recording.id ?? recordingMBID,
             artistMBID: artistCredit?.artist.id,
             fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
             expectedFileSize: lookupFreshness.fileSize,

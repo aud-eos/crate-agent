@@ -75,6 +75,24 @@ final class AutoTaggerServiceTests: XCTestCase {
     }
 
 
+    func testUsesCanonicalRecordingIdentityFromRealClientResponseAndCache() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/merged.mp3")
+        let response = Data(#"{"id":"canonical-id","title":"Song","releases":[{"id":"release","title":"Album","release-group":{"id":"group","first-release-date":"1980"}}]}"#.utf8)
+        let loader = MusicBrainzSequenceLoader(bodies: [response])
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory())
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in [AcoustIDResult(id: "match", score: 0.99, recordingIDs: ["merged-id"])] },
+            musicBrainzClient: client, keyStore: StubKeyProvider(), audioTagsReader: stubAudioTagsReader()
+        )
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(service.candidate(for: fileID)?.recordingMBID, "canonical-id")
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(service.candidate(for: fileID)?.recordingMBID, "canonical-id")
+        XCTAssertEqual(loader.requests.count, 1)
+    }
+
     func testNewScanEvictsCompletedRowsOutsideItsSelection() async throws {
         let database = try makeDatabase()
         let firstID = try insertFile(in: database, path: "/music/first.mp3")

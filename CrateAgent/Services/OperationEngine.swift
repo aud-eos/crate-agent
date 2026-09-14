@@ -322,9 +322,7 @@ public actor OperationEngine {
             pathByFileId = [:]
         } else {
             pathByFileId = try await database.writer.read { db in
-                try FileRecord
-                    .filter(keys: pathDependentFileIds)
-                    .fetchAll(db)
+                try Self.fetchFiles(fileIDs: pathDependentFileIds, in: db)
                     .reduce(into: [Int64: String]()) { accumulator, file in
                         if let id = file.id { accumulator[id] = file.path }
                     }
@@ -462,6 +460,33 @@ public actor OperationEngine {
         }
     }
 
+    private static func fileIDChunks(_ fileIDs: [Int64]) -> [[Int64]] {
+        let uniqueIDs = Array(Set(fileIDs)).sorted()
+        // Leave room for event-type bindings even on a 999-variable SQLite.
+        let chunkSize = 900
+        return stride(from: 0, to: uniqueIDs.count, by: chunkSize).map { start in
+            Array(uniqueIDs[start..<min(start + chunkSize, uniqueIDs.count)])
+        }
+    }
+
+    private static func fetchFiles(fileIDs: [Int64], in db: GRDB.Database) throws -> [FileRecord] {
+        try fileIDChunks(fileIDs).flatMap { chunk in try FileRecord.filter(keys: chunk).fetchAll(db) }
+    }
+
+    private static func fetchFileEvents(
+        fileIDs: [Int64], eventTypes: Set<EventType>, in db: GRDB.Database
+    ) throws -> [EventRecord] {
+        let typeValues = eventTypes.map(\.rawValue)
+        return try fileIDChunks(fileIDs).flatMap { chunk in
+            try EventRecord.fetchAll(db, sql: """
+                SELECT * FROM events
+                WHERE file_id IN (\(databaseQuestionMarks(count: chunk.count)))
+                  AND event_type IN (\(databaseQuestionMarks(count: typeValues.count)))
+                ORDER BY event_id ASC
+                """, arguments: StatementArguments(chunk) + StatementArguments(typeValues))
+        }
+    }
+
     /// For each file in `pathByFileId`, the latest event id that actually wrote
     /// each FIELD, per target (Serato V2 and the audio tag), across EVERY batch.
     /// Ranking per field (not per whole target) is what lets a still-current
@@ -471,16 +496,8 @@ public actor OperationEngine {
     ) async throws -> (v2: [Int64: [String: Int64]], tag: [Int64: [String: Int64]]) {
         let fileIds = Array(pathByFileId.keys)
         guard !fileIds.isEmpty else { return ([:], [:]) }
-        let typeValues = Self.fieldOwnershipEventTypes.map(\.rawValue)
-        let sql = """
-            SELECT * FROM events
-            WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
-              AND event_type IN (\(databaseQuestionMarks(count: typeValues.count)))
-            ORDER BY event_id ASC
-            """
-        let arguments = StatementArguments(fileIds) + StatementArguments(typeValues)
         let history = try await database.writer.read { db in
-            try EventRecord.fetchAll(db, sql: sql, arguments: arguments)
+            try Self.fetchFileEvents(fileIDs: fileIds, eventTypes: Self.fieldOwnershipEventTypes, in: db)
         }
 
         var v2: [Int64: [String: Int64]] = [:]
@@ -738,21 +755,14 @@ public actor OperationEngine {
 
         // Per-file MATCH-event history (for the LIFO stack), plus each file's
         // CURRENT row (for the value comparison), read together.
-        let typeValues = [EventType.musicBrainzMatchApplied.rawValue, EventType.musicBrainzMatchReverted.rawValue]
-        let sql = """
-            SELECT * FROM events
-            WHERE file_id IN (\(databaseQuestionMarks(count: fileIds.count)))
-              AND event_type IN (\(databaseQuestionMarks(count: typeValues.count)))
-            ORDER BY event_id ASC
-            """
-        let arguments = StatementArguments(fileIds) + StatementArguments(typeValues)
         let (history, currentFiles): ([EventRecord], [Int64: FileRecord]) = try await database.writer.read { db in
-            let hist = try EventRecord.fetchAll(db, sql: sql, arguments: arguments)
-            let files = try FileRecord.filter(keys: fileIds).fetchAll(db)
+            let history = try Self.fetchFileEvents(fileIDs: fileIds,
+                                                  eventTypes: [.musicBrainzMatchApplied, .musicBrainzMatchReverted], in: db)
+            let files = try Self.fetchFiles(fileIDs: fileIds, in: db)
                 .reduce(into: [Int64: FileRecord]()) { accumulator, file in
                     if let id = file.id { accumulator[id] = file }
                 }
-            return (hist, files)
+            return (history, files)
         }
         var historyByFile: [Int64: [EventRecord]] = [:]
         for event in history {

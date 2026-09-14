@@ -86,6 +86,7 @@ public struct AcoustIDResult: Codable, Equatable {
 /// artist credit) never throws — every collection defaults to empty
 /// and `releaseGroup` to nil.
 public struct MBRecording: Codable, Equatable {
+    let id: String?
     let title: String
     let artistCredit: [MBArtistCredit]
     let releases: [MBRelease]
@@ -106,8 +107,10 @@ public struct MBRecording: Codable, Equatable {
         artistCredit: [MBArtistCredit],
         releases: [MBRelease],
         releaseGroup: MBReleaseGroup?,
-        isrcs: [String]
+        isrcs: [String],
+        id: String? = nil
     ) {
+        self.id = id
         self.title = title
         self.artistCredit = artistCredit
         self.releases = releases
@@ -116,7 +119,7 @@ public struct MBRecording: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case title
+        case id, title
         case artistCredit = "artist-credit"
         case releases
         case isrcs
@@ -124,13 +127,22 @@ public struct MBRecording: Codable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
         artistCredit = try container.decodeIfPresent([MBArtistCredit].self, forKey: .artistCredit) ?? []
         releases = try container.decodeIfPresent([MBRelease].self, forKey: .releases) ?? []
-        releaseGroup = releases
-            .compactMap(\.releaseGroup)
-            .min { $0.sortableFirstReleaseDate < $1.sortableFirstReleaseDate }
+        releaseGroup = Self.earliestReleaseGroup(in: releases)
         isrcs = try container.decodeIfPresent([String].self, forKey: .isrcs) ?? []
+    }
+
+    func replacingReleases(with releases: [MBRelease]) -> MBRecording {
+        MBRecording(title: title, artistCredit: artistCredit, releases: releases,
+                    releaseGroup: Self.earliestReleaseGroup(in: releases), isrcs: isrcs, id: id)
+    }
+
+    private static func earliestReleaseGroup(in releases: [MBRelease]) -> MBReleaseGroup? {
+        releases.compactMap(\.releaseGroup)
+            .min { $0.sortableFirstReleaseDate < $1.sortableFirstReleaseDate }
     }
 
     /// The full, ordered multi-artist credit as MusicBrainz displays it —
