@@ -3,6 +3,193 @@ import GRDB
 import XCTest
 
 final class RetiredFileWriteGuardTests: XCTestCase {
+    private final class ReadCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func reaches(_ target: Int) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            count += 1
+            return count == target
+        }
+    }
+
+    @MainActor
+    func testLifecycleCommitCannotInterleaveFinalValidationAndSynchronousAudioWrite() async throws {
+        let retirementCommitted = DispatchSemaphore(value: 0)
+        let retirementFinished = expectation(description: "Serialized retirement completed")
+        let fixture = try await Fixture.make(tagWriter: { path, _ in
+            XCTAssertEqual(retirementCommitted.wait(timeout: .now() + 1), .timedOut,
+                           "A lifecycle transaction committed between final validation and actual audio I/O")
+            try Data("authorized audio".utf8).write(to: URL(fileURLWithPath: path))
+        })
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try await fixture.engine.apply(.writeFileTags(WriteFileTagsPayload(fileId: fixture.fileID, metadata: SeratoMetadata(title: "authorized"))))
+        let writer = fixture.database.writer
+        let fileID = fixture.fileID
+        let counter = ReadCounter()
+        try await writer.write { database in
+            database.trace { event in
+                guard event.description.contains("SELECT"), event.description.contains("FROM \"files\""), counter.reaches(3) else { return }
+                writer.asyncWrite { database in
+                    _ = try FileLibraryStateMutation.apply(SetFileLibraryStatePayload(fileId: fileID, expectedRevision: 0,
+                                                                                      state: FileLibraryState(membership: .retired, availability: .available, libraryID: "test", retiredAt: 1)),
+                                                           batchId: "serialized-retirement", timestamp: 1, in: database)
+                } completion: { _, result in
+                    if case let .failure(error) = result {
+                        XCTFail("Lifecycle transaction failed: \(error)")
+                    }
+                    retirementCommitted.signal()
+                    retirementFinished.fulfill()
+                }
+            }
+        }
+        fixture.closeSerato()
+        _ = try await fixture.engine.drainPendingSeratoUpdates()
+        await fulfillment(of: [retirementFinished], timeout: 10)
+        XCTAssertEqual(try Data(contentsOf: fixture.audio), Data("authorized audio".utf8))
+        try await writer.write { database in database.trace(options: []) }
+    }
+
+    @MainActor
+    func testRetirementBetweenFinalReadAndIOBlocksSingleAndBulkWrites() async throws {
+        for bulk in [false, true] {
+            for reactivate in [false, true] {
+                let fixture = try await Fixture.make()
+                defer { try? FileManager.default.removeItem(at: fixture.root) }
+                try await fixture.engine.apply(.commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                    fileId: fixture.fileID, metadata: SeratoMetadata(title: "stale race")
+                )), batchId: "race")
+                if bulk {
+                    try await fixture.engine.apply(.commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                        fileId: fixture.fileID, metadata: SeratoMetadata(artist: "stale bulk artist")
+                    )), batchId: "race")
+                }
+                let databaseURL = fixture.library.appendingPathComponent("database V2")
+                let before = try Data(contentsOf: databaseURL)
+                let mainActorBlocked = DispatchSemaphore(value: 0)
+                let releaseMainActor = DispatchSemaphore(value: 0)
+                let mutationCommitted = expectation(description: "Lifecycle mutation committed after old final read")
+                let counter = ReadCounter()
+                let writer = fixture.database.writer
+                let fileID = fixture.fileID
+                try await writer.write { database in
+                    database.trace { event in
+                        guard event.description.contains("SELECT"), event.description.contains("FROM \"files\""),
+                              counter.reaches(bulk ? 3 : 2) else { return }
+                        Task { @MainActor in
+                            mainActorBlocked.signal()
+                            XCTAssertEqual(releaseMainActor.wait(timeout: .now() + 10), .success)
+                        }
+                        XCTAssertEqual(mainActorBlocked.wait(timeout: .now() + 10), .success)
+                        writer.asyncWrite { database in
+                            _ = try FileLibraryStateMutation.apply(SetFileLibraryStatePayload(fileId: fileID, expectedRevision: 0,
+                                                                                              state: FileLibraryState(membership: .retired, availability: .available, libraryID: "test", retiredAt: 1)),
+                                                                   batchId: "race-retire", timestamp: 1, in: database)
+                            if reactivate {
+                                _ = try FileLibraryStateMutation.apply(SetFileLibraryStatePayload(fileId: fileID, expectedRevision: 1,
+                                                                                                  state: FileLibraryState(membership: .active, availability: .available, libraryID: "test", retiredAt: nil)),
+                                                                       batchId: "race-reactivate", timestamp: 2, in: database)
+                            }
+                        } completion: { _, result in
+                            if case let .failure(error) = result {
+                                XCTFail("Lifecycle intervention failed: \(error)")
+                            }
+                            mutationCommitted.fulfill()
+                            releaseMainActor.signal()
+                        }
+                    }
+                }
+                fixture.closeSerato()
+                let outcome: ResyncOutcome
+                if bulk {
+                    outcome = try await fixture.engine.resyncSeratoForBatch("race")
+                } else {
+                    outcome = try await fixture.engine.drainPendingSeratoUpdates()
+                }
+                await fulfillment(of: [mutationCommitted], timeout: 10)
+                XCTAssertEqual(outcome.appliedCount, 0)
+                XCTAssertEqual(outcome.supersededCount, bulk ? 2 : 1)
+                XCTAssertEqual(try Data(contentsOf: databaseURL), before, "bulk=\(bulk), reactivate=\(reactivate)")
+                try await writer.write { database in database.trace(options: []) }
+            }
+        }
+    }
+
+    @MainActor
+    func testWatchdogSynchronousSnapshotMatchesPublishedTransitions() async {
+        let state = RunningState()
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { state.running ? ["com.serato.djpro"] : [] })
+        let observation = watchdog.$isSeratoRunning.sink { running in
+            XCTAssertEqual(watchdog.isRunningForExternalWrite, running)
+        }
+        defer { observation.cancel() }
+        for running in [false, true, false] {
+            let previousRevision = watchdog.stateRevision
+            state.running = running
+            watchdog.refresh()
+            XCTAssertEqual(watchdog.stateRevision, previousRevision + 1)
+            XCTAssertEqual(watchdog.isSeratoRunning, running)
+            let snapshot = await Task.detached { watchdog.isRunningForExternalWrite }.value
+            XCTAssertEqual(snapshot, running)
+            watchdog.refresh()
+            XCTAssertEqual(watchdog.stateRevision, previousRevision + 1)
+        }
+    }
+
+    @MainActor
+    func testOldIndexUndoPreservesRetiredAndReactivatedFileIdentityAndHistory() async throws {
+        for reactivate in [false, true] {
+            for legacy in [false, true] {
+                let fixture = try await Fixture.make()
+                defer { try? FileManager.default.removeItem(at: fixture.root) }
+                let indexedPath = fixture.root.appendingPathComponent("indexed.mp3").path
+                try await fixture.engine.apply(.indexNewFile(IndexNewFilePayload(path: indexedPath, volumeUuid: "test", inode: 2,
+                                                                                 fileSize: 14, mtime: 1)), batchId: "old-index")
+                if legacy {
+                    try await fixture.database.writer.write { database in
+                        var event = try XCTUnwrap(EventRecord.filter(Column("batch_id") == "old-index").fetchOne(database))
+                        let payload = try JSONDecoder().decode(IndexNewFilePayload.self, from: Data(event.payloadJson.utf8))
+                        event.payloadJson = try XCTUnwrap(String(data: JSONEncoder().encode(payload), encoding: .utf8))
+                        try event.update(database)
+                    }
+                }
+                let indexedID = try await fixture.database.writer.write { database in
+                    var track = TrackRecord(fingerprintHash: Data("same-recording".utf8))
+                    try track.insert(database)
+                    var indexed = try XCTUnwrap(FileRecord.filter(Column("path") == indexedPath).fetchOne(database))
+                    var sibling = try XCTUnwrap(FileRecord.fetchOne(database, key: fixture.fileID))
+                    indexed.trackId = track.id
+                    sibling.trackId = track.id
+                    try indexed.update(database)
+                    try sibling.update(database)
+                    return try XCTUnwrap(indexed.id)
+                }
+                try await fixture.engine.apply(.setFileLibraryState(SetFileLibraryStatePayload(fileId: indexedID, expectedRevision: 0,
+                                                                                               state: FileLibraryState(membership: .retired, availability: .available, libraryID: "test", retiredAt: 1))))
+                if reactivate {
+                    try await fixture.engine.apply(.setFileLibraryState(SetFileLibraryStatePayload(fileId: indexedID, expectedRevision: 1,
+                                                                                                   state: FileLibraryState(membership: .active, availability: .available, libraryID: "test", retiredAt: nil))))
+                }
+                let before = try await fixture.database.writer.read { database in try EventRecord.order(Column("event_id")).fetchAll(database) }
+                do {
+                    try await fixture.engine.undoBatch("old-index")
+                    XCTFail("Old index undo deleted a retired or reactivated file")
+                } catch is FileProcessingEligibilityError {}
+                try await fixture.database.writer.read { database in
+                    let indexed = try FileRecord.fetchOne(database, key: indexedID)
+                    let sibling = try XCTUnwrap(FileRecord.fetchOne(database, key: fixture.fileID))
+                    XCTAssertEqual(indexed?.id, indexedID)
+                    XCTAssertEqual(indexed?.trackId, sibling.trackId)
+                    let after = try EventRecord.order(Column("event_id")).fetchAll(database)
+                    XCTAssertEqual(after.map(\.eventId), before.map(\.eventId))
+                    XCTAssertEqual(after.map(\.fileId), before.map(\.fileId))
+                    XCTAssertEqual(after.map(\.trackId), before.map(\.trackId))
+                }
+            }
+        }
+    }
+
     @MainActor
     private struct Fixture {
         let root: URL

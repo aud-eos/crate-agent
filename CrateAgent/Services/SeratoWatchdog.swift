@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import os
 
 /// Observes whether any Serato application is currently running and
 /// publishes the state to UI bindings and to the OperationEngine.
@@ -25,6 +26,11 @@ public final class SeratoWatchdog: ObservableObject {
 
     @Published public private(set) var isSeratoRunning: Bool = false
     public private(set) var stateRevision: UInt64 = 0
+    private nonisolated let externalWriteState = OSAllocatedUnfairLock(initialState: false)
+
+    nonisolated var isRunningForExternalWrite: Bool {
+        externalWriteState.withLock { $0 }
+    }
 
     private let runningBundleIdentifiersProvider: () -> [String]
     private let workspaceNotificationCenter: NotificationCenter
@@ -112,6 +118,7 @@ public final class SeratoWatchdog: ObservableObject {
         }
         if running != isSeratoRunning {
             stateRevision += 1
+            externalWriteState.withLock { $0 = running }
             isSeratoRunning = running
         }
     }

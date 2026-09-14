@@ -742,9 +742,10 @@ public actor OperationEngine {
         // pre-batch shape) we'd risk leaving the DB half-undone if
         // one inverse hit a fileNotFound mid-loop.
         let results = try await database.writer.write { database in
-            for (event, mutation) in zip(events, inverseMutations) {
-                guard let fileID = mutation.processingFileID else { continue }
+            for event in events {
+                guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
+                      file.libraryMembership != .retired,
                       try SeratoWriteEligibility.replayToken(event: event, file: file) != nil
                 else {
                     throw FileProcessingEligibilityError.superseded(fileId: fileID)
@@ -968,10 +969,13 @@ public actor OperationEngine {
                 do {
                     try await requireExternalWriteEligibility([next])
                     try await applySeratoWrite(next.write, guardedWrites: [next])
+                    applied.insert(next.eventId)
                 } catch ExternalWriteInterruption.deferred {
-                    break
+                    if try await isEligible(next) {
+                        break
+                    }
+                    superseded.insert(next.eventId)
                 }
-                applied.insert(next.eventId)
             } else {
                 superseded.insert(next.eventId)
             }
@@ -990,13 +994,32 @@ public actor OperationEngine {
 
     private func eligibleWrites(_ writes: [GuardedSeratoWrite]) async throws -> [GuardedSeratoWrite] {
         try await database.writer.read { database in
-            let files = try Self.fetchFiles(fileIDs: writes.map { $0.token.fileId }, in: database)
-                .reduce(into: [Int64: FileRecord]()) { files, file in
-                    if let fileID = file.id {
-                        files[fileID] = file
-                    }
+            try Self.eligibleWrites(writes, in: database)
+        }
+    }
+
+    private static func eligibleWrites(_ writes: [GuardedSeratoWrite], in database: GRDB.Database) throws -> [GuardedSeratoWrite] {
+        let files = try fetchFiles(fileIDs: writes.map { $0.token.fileId }, in: database)
+            .reduce(into: [Int64: FileRecord]()) { files, file in
+                if let fileID = file.id {
+                    files[fileID] = file
                 }
-            return writes.filter { SeratoWriteEligibility.permits($0, file: files[$0.token.fileId]) }
+            }
+        return writes.filter { SeratoWriteEligibility.permits($0, file: files[$0.token.fileId]) }
+    }
+
+    private func performExternalWrite<Result: Sendable>(
+        _ writes: [GuardedSeratoWrite], operation: @escaping @Sendable () throws -> Result
+    ) async throws -> Result {
+        let watchdog = seratoWatchdog
+        // Releasing writer serialization before I/O lets retirement commit against old authorization.
+        return try await database.writer.write { database in
+            guard try Self.eligibleWrites(writes, in: database).count == writes.count,
+                  !watchdog.isRunningForExternalWrite
+            else {
+                throw ExternalWriteInterruption.deferred
+            }
+            return try operation()
         }
     }
 
@@ -1041,7 +1064,9 @@ public actor OperationEngine {
                 try await requireExternalWriteEligibility(eligible)
                 try await applyConsecutiveSeratoWrites(eligible.map(\.write), guardedWrites: eligible)
             } catch ExternalWriteInterruption.deferred {
-                let remainder = eligible + groups.dropFirst(index + 1).flatMap { $0 }
+                let interrupted = eligible + groups.dropFirst(index + 1).flatMap { $0 }
+                let remainder = try await eligibleWrites(interrupted)
+                superseded.formUnion(Set(interrupted.map(\.eventId)).subtracting(remainder.map(\.eventId)))
                 pendingSeratoWrites.append(contentsOf: remainder)
                 queueDepthSubject.send(pendingSeratoWrites.count)
                 return ResyncOutcome(appliedCount: applied.count,
@@ -1054,12 +1079,12 @@ public actor OperationEngine {
 
     private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
         switch write {
-        case .rename(let rename):
+        case let .rename(rename):
             try await applySeratoRename(rename, guardedWrites: guardedWrites)
-        case .metadataUpdate(let update):
-            try await applySeratoMetadataUpdate(update)
-        case .addTrack(let add):
-            try await applySeratoAddTrack(add)
+        case let .metadataUpdate(update):
+            try await applySeratoMetadataUpdate(update, guardedWrites: guardedWrites)
+        case let .addTrack(add):
+            try await applySeratoAddTrack(add, guardedWrites: guardedWrites)
             guard let guardedWrite = guardedWrites.first else {
                 throw OperationEngineError.insertDidNotReturnRowId
             }
@@ -1076,29 +1101,29 @@ public actor OperationEngine {
                     batchId: "import-confirmed:\(guardedWrite.eventId)", timestamp: Int64(Date().timeIntervalSince1970 * 1000), in: database
                 )
             }
-        case .fileTagWrite(let write):
-            try await applyFileTagWrite(write)
-        case .removeFromDatabase(let removal):
-            try await applySeratoDatabaseRemoval(removal)
-        case .removeFromCrates(let removal):
+        case let .fileTagWrite(write):
+            try await applyFileTagWrite(write, guardedWrites: guardedWrites)
+        case let .removeFromDatabase(removal):
+            try await applySeratoDatabaseRemoval(removal, guardedWrites: guardedWrites)
+        case let .removeFromCrates(removal):
             try await applySeratoCrateSweepRemoval(removal, guardedWrites: guardedWrites)
-        case .trashFile(let trash):
-            try await applyTrashFileOperation(trash)
+        case let .trashFile(trash):
+            try await applyTrashFileOperation(trash, guardedWrites: guardedWrites)
         }
     }
 
-    private func applyTrashFileOperation(_ trash: SeratoPendingTrash) async throws {
-        do {
-            try fileTrasher(trash.absolutePath)
-        } catch {
-            throw OperationEngineError.trashFailed(
-                path: trash.absolutePath,
-                underlying: String(describing: error)
-            )
+    private func applyTrashFileOperation(_ trash: SeratoPendingTrash, guardedWrites: [GuardedSeratoWrite]) async throws {
+        let trasher = fileTrasher
+        try await performExternalWrite(guardedWrites) {
+            do {
+                try trasher(trash.absolutePath)
+            } catch {
+                throw OperationEngineError.trashFailed(path: trash.absolutePath, underlying: String(describing: error))
+            }
         }
     }
 
-    private func applySeratoDatabaseRemoval(_ removal: SeratoPendingRemoval) async throws {
+    private func applySeratoDatabaseRemoval(_ removal: SeratoPendingRemoval, guardedWrites: [GuardedSeratoWrite]) async throws {
         let databaseV2Path = seratoLocator.databaseV2Url.path
         guard FileManager.default.fileExists(atPath: databaseV2Path) else {
             // No database V2 yet — nothing to remove from. Same
@@ -1109,10 +1134,12 @@ public actor OperationEngine {
             fromAbsolute: removal.absolutePath
         )
         do {
-            _ = try removeTrackFromDatabase(
+            _ = try await performExternalWrite(guardedWrites) { try removeTrackFromDatabase(
                 databasePath: databaseV2Path,
                 trackPath: seratoRelativePath
-            )
+            ) }
+        } catch ExternalWriteInterruption.deferred {
+            throw ExternalWriteInterruption.deferred
         } catch {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
@@ -1143,10 +1170,12 @@ public actor OperationEngine {
         for crateFile in crateFiles {
             try await requireExternalWriteEligibility(guardedWrites)
             do {
-                _ = try removePathFromCrate(
+                _ = try await performExternalWrite(guardedWrites) { try removePathFromCrate(
                     cratePath: crateFile.path,
                     trackPath: seratoRelativePath
-                )
+                ) }
+            } catch ExternalWriteInterruption.deferred {
+                throw ExternalWriteInterruption.deferred
             } catch {
                 perCrateFailures.append((crateFile, error))
                 let crateName = crateFile.lastPathComponent
@@ -1155,7 +1184,7 @@ public actor OperationEngine {
         }
         // Only throw if EVERY crate failed — a partial sweep is
         // still useful (most user crates will succeed).
-        if !crateFiles.isEmpty && perCrateFailures.count == crateFiles.count {
+        if !crateFiles.isEmpty, perCrateFailures.count == crateFiles.count {
             let firstFailure = perCrateFailures[0]
             throw OperationEngineError.seratoRewriteFailed(
                 path: firstFailure.0.path,
@@ -1164,7 +1193,7 @@ public actor OperationEngine {
         }
     }
 
-    private func applyFileTagWrite(_ write: SeratoPendingFileTagWrite) async throws {
+    private func applyFileTagWrite(_ write: SeratoPendingFileTagWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
         let update = AudioTagUpdate(
             artist: write.metadata.artist,
             title: write.metadata.title,
@@ -1181,8 +1210,11 @@ public actor OperationEngine {
             year: write.year.flatMap { $0 >= 0 ? UInt32($0) : nil },
             clearYear: write.clearYear
         )
+        let tagWriter = fileTagWriter
         do {
-            try fileTagWriter(write.absolutePath, update)
+            try await performExternalWrite(guardedWrites) { try tagWriter(write.absolutePath, update) }
+        } catch ExternalWriteInterruption.deferred {
+            throw ExternalWriteInterruption.deferred
         } catch {
             throw OperationEngineError.fileTagWriteFailed(
                 path: write.absolutePath,
@@ -1191,7 +1223,7 @@ public actor OperationEngine {
         }
     }
 
-    private func applySeratoAddTrack(_ add: SeratoPendingAddTrack) async throws {
+    private func applySeratoAddTrack(_ add: SeratoPendingAddTrack, guardedWrites: [GuardedSeratoWrite]) async throws {
         let databaseV2Path = seratoLocator.databaseV2Url.path
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: add.absolutePath
@@ -1210,12 +1242,12 @@ public actor OperationEngine {
                 withTrackPath: seratoRelativePath,
                 metadata: add.metadata
             )
-            try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+            try await performExternalWrite(guardedWrites) { try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path)) }
             return
         }
 
         do {
-            _ = try addTrackToDatabase(
+            _ = try await performExternalWrite(guardedWrites) { try addTrackToDatabase(
                 databasePath: databaseV2Path,
                 trackPath: seratoRelativePath,
                 metadata: SeratoMetadataUpdate(
@@ -1229,7 +1261,9 @@ public actor OperationEngine {
                     length: add.metadata.length,
                     label: add.metadata.label
                 )
-            )
+            ) }
+        } catch ExternalWriteInterruption.deferred {
+            throw ExternalWriteInterruption.deferred
         } catch {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
@@ -1338,11 +1372,11 @@ public actor OperationEngine {
         let databaseV2Path = seratoLocator.databaseV2Url.path
         if FileManager.default.fileExists(atPath: databaseV2Path) {
             do {
-                databaseV2Rewrites = try rewriteDatabasePath(
+                databaseV2Rewrites = try await performExternalWrite(guardedWrites) { try rewriteDatabasePath(
                     databasePath: databaseV2Path,
                     oldPath: oldSeratoPath,
                     newPath: newSeratoPath
-                )
+                ) }
                 if databaseV2Rewrites == 0 {
                     // Old path wasn't in database V2. Surprising —
                     // surface so the user can see something is off
@@ -1351,6 +1385,8 @@ public actor OperationEngine {
                     // Serato to begin with).
                     await note("⚠️ database V2 had no entry for \(oldSeratoPath) — \(displayFilename) won't appear in Serato until re-imported.")
                 }
+            } catch ExternalWriteInterruption.deferred {
+                throw ExternalWriteInterruption.deferred
             } catch {
                 databaseV2Error = error
                 await note("Failed to update database V2 for \(displayFilename): \(error.localizedDescription)")
@@ -1377,11 +1413,13 @@ public actor OperationEngine {
         for crateFile in crateFiles {
             try await requireExternalWriteEligibility(guardedWrites)
             do {
-                _ = try rewriteCratePath(
+                _ = try await performExternalWrite(guardedWrites) { try rewriteCratePath(
                     cratePath: crateFile.path,
                     oldPath: oldSeratoPath,
                     newPath: newSeratoPath
-                )
+                ) }
+            } catch ExternalWriteInterruption.deferred {
+                throw ExternalWriteInterruption.deferred
             } catch {
                 // Per-crate fault tolerance: log and continue. A
                 // single bad crate file can't poison the entire
@@ -1398,7 +1436,7 @@ public actor OperationEngine {
         // disk has no matching library update.
         let everyCrateFailed = !crateFiles.isEmpty
             && perCrateFailures.count == crateFiles.count
-        if databaseV2Error != nil && (everyCrateFailed || crateFiles.isEmpty) {
+        if databaseV2Error != nil, everyCrateFailed || crateFiles.isEmpty {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
                 underlying: String(describing: databaseV2Error!)
@@ -1440,10 +1478,12 @@ public actor OperationEngine {
         let databaseV2Path = seratoLocator.databaseV2Url.path
         if FileManager.default.fileExists(atPath: databaseV2Path) {
             do {
-                _ = try batchRewriteDatabasePaths(
+                _ = try await performExternalWrite(guardedWrites) { try batchRewriteDatabasePaths(
                     databasePath: databaseV2Path,
                     renames: pairs
-                )
+                ) }
+            } catch ExternalWriteInterruption.deferred {
+                throw ExternalWriteInterruption.deferred
             } catch {
                 databaseV2Error = error
                 await note("Failed to update database V2 for \(renames.count) renames: \(error.localizedDescription)")
@@ -1468,10 +1508,12 @@ public actor OperationEngine {
         for crateFile in crateFiles {
             try await requireExternalWriteEligibility(guardedWrites)
             do {
-                _ = try batchRewriteCratePaths(
+                _ = try await performExternalWrite(guardedWrites) { try batchRewriteCratePaths(
                     cratePath: crateFile.path,
                     renames: pairs
-                )
+                ) }
+            } catch ExternalWriteInterruption.deferred {
+                throw ExternalWriteInterruption.deferred
             } catch {
                 perCrateFailures.append((crateFile, error))
                 await note("Skipped crate \(crateFile.lastPathComponent) during batch rename: \(error.localizedDescription)")
@@ -1480,7 +1522,7 @@ public actor OperationEngine {
 
         let everyCrateFailed = !crateFiles.isEmpty
             && perCrateFailures.count == crateFiles.count
-        if databaseV2Error != nil && (everyCrateFailed || crateFiles.isEmpty) {
+        if databaseV2Error != nil, everyCrateFailed || crateFiles.isEmpty {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
                 underlying: String(describing: databaseV2Error!)
@@ -1509,7 +1551,7 @@ public actor OperationEngine {
         var metadataUpdates: [SeratoPendingMetadataUpdate] = []
         var remaining: [SeratoPendingWrite] = []
         for write in writes {
-            if case .metadataUpdate(let update) = write {
+            if case let .metadataUpdate(update) = write {
                 metadataUpdates.append(update)
             } else {
                 remaining.append(write)
@@ -1517,14 +1559,14 @@ public actor OperationEngine {
         }
 
         if !metadataUpdates.isEmpty {
-            try await applySeratoMetadataUpdateBatch(metadataUpdates)
+            try await applySeratoMetadataUpdateBatch(metadataUpdates, guardedWrites: guardedWrites)
         }
 
         var index = 0
         while index < remaining.count {
             if case .rename = remaining[index] {
                 var renames: [SeratoPendingRename] = []
-                while index < remaining.count, case .rename(let rename) = remaining[index] {
+                while index < remaining.count, case let .rename(rename) = remaining[index] {
                     renames.append(rename)
                     index += 1
                 }
@@ -1541,8 +1583,8 @@ public actor OperationEngine {
     /// processes one queued write at a time. Delegates to the batch
     /// writer so every `database V2` metadata write goes through one
     /// seam.
-    private func applySeratoMetadataUpdate(_ update: SeratoPendingMetadataUpdate) async throws {
-        try await applySeratoMetadataUpdateBatch([update])
+    private func applySeratoMetadataUpdate(_ update: SeratoPendingMetadataUpdate, guardedWrites: [GuardedSeratoWrite]) async throws {
+        try await applySeratoMetadataUpdateBatch([update], guardedWrites: guardedWrites)
     }
 
     /// Write every metadata update in one `database V2` read+rewrite
@@ -1550,7 +1592,7 @@ public actor OperationEngine {
     /// missing `database V2` (Serato never ran here) the same way the
     /// single-update path always was — nothing for Serato to "see" yet.
     private func applySeratoMetadataUpdateBatch(
-        _ updates: [SeratoPendingMetadataUpdate]
+        _ updates: [SeratoPendingMetadataUpdate], guardedWrites: [GuardedSeratoWrite]
     ) async throws {
         guard !updates.isEmpty else { return }
         let databaseV2Path = seratoLocator.databaseV2Url.path
@@ -1575,8 +1617,11 @@ public actor OperationEngine {
             )
         }
 
+        let metadataWriter = seratoMetadataBatchWriter
         do {
-            _ = try seratoMetadataBatchWriter(databaseV2Path, trackUpdates)
+            _ = try await performExternalWrite(guardedWrites) { try metadataWriter(databaseV2Path, trackUpdates) }
+        } catch ExternalWriteInterruption.deferred {
+            throw ExternalWriteInterruption.deferred
         } catch {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
