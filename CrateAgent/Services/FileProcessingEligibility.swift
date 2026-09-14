@@ -1,10 +1,31 @@
 import Foundation
+import GRDB
 
 public enum FileProcessingEligibility {
+    public static let activeSQL = "files.library_membership != '\(LibraryMembership.retired.rawValue)'"
+    public static let processableSQL = "files.library_membership = '\(LibraryMembership.active.rawValue)' AND files.file_availability = '\(FileAvailability.available.rawValue)'"
+
+    public static func requireCurrent(_ token: FileMembershipToken, in database: Database) throws {
+        guard let file = try FileRecord.fetchOne(database, key: token.fileId), file.membershipRevision == token.revision else {
+            throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
+        }
+        try requireProcessable(file)
+    }
+
     public static func requireProcessable(_ file: FileRecord) throws {
         guard file.libraryMembership == .active, file.fileAvailability == .available else {
             throw FileProcessingEligibilityError.unavailable(fileId: file.id, membership: file.libraryMembership, availability: file.fileAvailability)
         }
+    }
+}
+
+public extension QueryInterfaceRequest where RowDecoder == FileRecord {
+    func activeInLibrary() -> Self {
+        filter(sql: FileProcessingEligibility.activeSQL)
+    }
+
+    func processableInLibrary() -> Self {
+        filter(sql: FileProcessingEligibility.processableSQL)
     }
 }
 

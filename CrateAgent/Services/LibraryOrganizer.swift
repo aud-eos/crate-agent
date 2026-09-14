@@ -13,10 +13,9 @@ import Foundation
 /// Built on the same primitives as the single-file rename dialog:
 ///   1. `RenameDestinationPlanner.destination` computes the
 ///      canonical URL from artist/title/etc. metadata.
-///   2. `FileManager.moveItem` does the on-disk move.
-///   3. `OperationEngine.apply(.renameFile(...))` updates Serato
-///      references + the DB row (or no-ops if FSEvents already
-///      observed the move).
+///   2. OperationEngine validates the original plan and moves audio
+///      with its journaled rename under a compensated transaction.
+///   3. Successful renames share one coalesced Serato rewrite.
 ///
 /// Per-file errors don't abort the loop — the move set is
 /// best-effort and partial outcomes are reported in
@@ -27,6 +26,7 @@ public actor LibraryOrganizer {
     /// One proposed move. Returned from `findMoves` for the
     /// preview UI; consumed by `organize` at apply time.
     public struct Plan: Identifiable, Hashable, Sendable {
+        public let membershipRevision: Int64
         public let id: Int64
         public let sourcePath: String
         public let destinationPath: String
@@ -40,9 +40,11 @@ public actor LibraryOrganizer {
             id: Int64,
             sourcePath: String,
             destinationPath: String,
-            isOutsideMusicFolder: Bool
+            isOutsideMusicFolder: Bool,
+            membershipRevision: Int64 = 0
         ) {
             self.id = id
+            self.membershipRevision = membershipRevision
             self.sourcePath = sourcePath
             self.destinationPath = destinationPath
             self.isOutsideMusicFolder = isOutsideMusicFolder
@@ -127,24 +129,15 @@ public actor LibraryOrganizer {
                 id: fileId,
                 sourcePath: file.path,
                 destinationPath: resolvedDestination,
-                isOutsideMusicFolder: isOutside
+                isOutsideMusicFolder: isOutside,
+                membershipRevision: file.membershipRevision
             ))
         }
         return plans
     }
 
-    /// Apply a set of moves. Two-phase:
-    ///   1. Move every file on disk (per-file failures recorded,
-    ///      loop continues)
-    ///   2. One `applyBatch` with a `.renameFile` mutation for
-    ///      every successful move — single SQLite transaction,
-    ///      single batched Serato library rewrite
-    ///
-    /// The previous per-file `apply(.renameFile)` triggered one
-    /// full read + full write of the (~25 MB) `database V2` file
-    /// *per moved track* — a 5000-file Organize batch wrote 250 GB
-    /// of Serato library state. The batched apply collapses that
-    /// to one V2 rewrite + one rewrite per crate file.
+    /// Per-file compensated transactions preserve partial outcomes;
+    /// coalescing their Serato writes avoids rewriting V2 per track.
     @discardableResult
     public func organize(
         _ plans: [Plan],
@@ -155,66 +148,12 @@ public actor LibraryOrganizer {
         let effectiveBatchId = batchId ?? "organize-\(UUID().uuidString)"
         await note("Organizing \(plans.count) file\(plans.count == 1 ? "" : "s")…")
 
-        var renameMutations: [TrackMutation] = []
-        var failures = 0
-        var errors: [String] = []
-
-        for plan in plans {
-            do {
-                try await moveFileOnDisk(plan)
-                renameMutations.append(.renameFile(RenameFilePayload(
-                    fileId: plan.id,
-                    newPath: plan.destinationPath
-                )))
-            } catch {
-                failures += 1
-                let filename = (plan.sourcePath as NSString).lastPathComponent
-                let message = "\(filename): \(error.localizedDescription)"
-                errors.append(message)
-                await note("Skipped \(filename) — \(error.localizedDescription)")
-            }
-        }
-
-        if !renameMutations.isEmpty {
-            try await operationEngine.applyBatch(
-                renameMutations,
-                batchId: effectiveBatchId
-            )
-        }
-
-        let moved = renameMutations.count
-        await note("Organize complete — moved \(moved), \(failures) skipped")
-        return Outcome(
-            batchId: effectiveBatchId,
-            movedCount: moved,
-            failureCount: failures,
-            errors: errors
-        )
+        let outcome = try await operationEngine.organizeFiles(plans, batchId: effectiveBatchId)
+        await note("Organize complete — moved \(outcome.movedCount), \(outcome.failureCount) skipped")
+        return outcome
     }
 
     // MARK: - Internals
-
-    private func moveFileOnDisk(_ plan: Plan) async throws {
-        let source = URL(fileURLWithPath: plan.sourcePath)
-        let destination = URL(fileURLWithPath: plan.destinationPath)
-        let fileManager = FileManager.default
-
-        guard fileManager.fileExists(atPath: source.path) else {
-            throw OrganizerError.sourceNoLongerExists(path: source.path)
-        }
-        if fileManager.fileExists(atPath: destination.path) {
-            throw OrganizerError.destinationAlreadyExists(path: destination.path)
-        }
-
-        let parentDirectory = destination.deletingLastPathComponent()
-        try fileManager.createDirectory(
-            at: parentDirectory,
-            withIntermediateDirectories: true
-        )
-
-        await note("Moving \(source.lastPathComponent) → \(destination.lastPathComponent)")
-        try fileManager.moveItem(at: source, to: destination)
-    }
 
     private func note(_ message: String) async {
         guard let log = activityLog else { return }

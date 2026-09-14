@@ -22,14 +22,22 @@ enum FingerprintPersistence {
     ///   basis is up to date) does not clobber it with the worker's older bytes
     ///   and a stale/absent basis (finding #4000806487). The on-demand path
     ///   leaves it false — it is the authoritative recompute.
-    static func write(
+    @discardableResult static func write(
         fileID: Int64,
         fingerprint: Data?,
         status: FingerprintStatus,
         freshnessBasis: FileFreshnessSnapshot? = nil,
         requirePendingStatus: Bool = false,
+        expectedMembershipToken: FileMembershipToken? = nil,
         in db: Database
-    ) throws {
+    ) throws -> Bool {
+        if let expectedMembershipToken {
+            do {
+                try FileProcessingEligibility.requireCurrent(expectedMembershipToken, in: db)
+            } catch is FileProcessingEligibilityError {
+                return false
+            }
+        }
         let pendingGuard = requirePendingStatus ? " AND fingerprint_status = 'pending'" : ""
         if let basis = freshnessBasis {
             try db.execute(
@@ -54,5 +62,6 @@ enum FingerprintPersistence {
                 arguments: [fingerprint, status.rawValue, fileID]
             )
         }
+        return db.changesCount > 0
     }
 }

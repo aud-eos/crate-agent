@@ -49,7 +49,7 @@ enum AutoTagFileBrowse {
         }
         let source = """
         FROM files LEFT JOIN tracks ON tracks.id = files.track_id
-        WHERE \(predicate)
+        WHERE \(FileProcessingEligibility.activeSQL) AND (\(predicate))
         """
         let countArguments: StatementArguments = ["whitespace": whitespaceCharacters]
         guard let total = try Int.fetchOne(db, sql: "SELECT COUNT(*) \(source)", arguments: countArguments) else {

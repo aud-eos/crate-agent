@@ -31,6 +31,8 @@ final class AutoTaggerServiceTests: XCTestCase {
             fingerprintStatus: fingerprintStatus,
             album: album
         )
+        record.libraryMembership = .active
+        record.fileAvailability = .available
         try database.writer.write { db in
             try record.insert(db)
         }
@@ -567,6 +569,32 @@ final class AutoTaggerServiceTests: XCTestCase {
             return XCTFail("expected .stopped so the row doesn't look permanently pending, got \(String(describing: service.rows[fileID]))")
         }
         XCTAssertEqual(reason, fatalMessage)
+    }
+
+    func testLookupRejectsRetirementAndReactivation() async throws {
+        for reactivate in [false, true] {
+            let database = try makeDatabase()
+            let fileID = try insertFile(in: database, path: "/music/race.mp3")
+            let started = AsyncGate()
+            let release = AsyncGate()
+            let recording = makeRecording()
+            let service = AutoTaggerService(database: database,
+                                            acoustIDClient: SuspendingAcoustIDClient(onStart: {
+                    await started.open()
+                    await release.wait()
+                }, result: [AcoustIDResult(id: "match", score: 0.99, recordingIDs: ["recording"])]),
+                                            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+                                            keyStore: StubKeyProvider(), audioTagsReader: stubAudioTagsReader())
+            let task = Task { await service.run(fileIDs: [fileID]) }
+            await started.wait()
+            try await database.writer.write { database in
+                try database.execute(sql: "UPDATE files SET library_membership = ?, membership_revision = 2 WHERE id = ?", arguments: [reactivate ? "active" : "retired", fileID])
+            }
+            await release.open()
+            await task.value
+            XCTAssertNil(service.candidate(for: fileID))
+            guard case .failed = service.rows[fileID] else { return XCTFail("stale lookup must fail") }
+        }
     }
 
     // MARK: - Cancellation

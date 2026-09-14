@@ -135,8 +135,8 @@ public actor OperationEngine {
     /// Returns nil when an observation confirms an unchanged state.
     @discardableResult
     public func apply(_ mutation: TrackMutation, batchId: String) async throws -> Int64? {
-        let executionResult: GuardedExecutionResult = try await database.writer.write { db in
-            try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
+        let executionResult: GuardedExecutionResult = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { db, moves in
+            try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db, physicalMoves: moves)
         }
 
         try await routeSeratoWrites(executionResult.seratoWrites, batchId: batchId)
@@ -146,9 +146,9 @@ public actor OperationEngine {
 
     @discardableResult
     public func apply(_ mutation: TrackMutation, expectedMembershipToken: FileMembershipToken, batchId: String = UUID().uuidString) async throws -> Int64? {
-        let result = try await database.writer.write { database in
+        let result = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { database, moves in
             try Self.requireCurrentToken(expectedMembershipToken, mutation: mutation, in: database)
-            return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: database)
+            return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: database, physicalMoves: moves)
         }
         try await routeSeratoWrites(result.seratoWrites, batchId: batchId)
         return result.eventId
@@ -181,7 +181,7 @@ public actor OperationEngine {
     ) async throws -> [Int64] {
         guard !mutations.isEmpty else { return [] }
 
-        let executionResults: [GuardedExecutionResult] = try await database.writer.write { db in
+        let executionResults: [GuardedExecutionResult] = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { db, moves in
             try mutations.map { mutation in
                 if let expectedMembershipTokens, let fileID = mutation.processingFileID {
                     guard let token = expectedMembershipTokens[fileID] else {
@@ -189,7 +189,7 @@ public actor OperationEngine {
                     }
                     try Self.requireCurrentToken(token, mutation: mutation, in: db)
                 }
-                return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
+                return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db, physicalMoves: moves)
             }
         }
 
@@ -197,6 +197,31 @@ public actor OperationEngine {
         try await routeSeratoWrites(pendingWrites, batchId: batchId)
 
         return executionResults.compactMap(\.eventId)
+    }
+
+    func organizeFiles(_ plans: [LibraryOrganizer.Plan], batchId: String) async throws -> LibraryOrganizer.Outcome {
+        var results: [GuardedExecutionResult] = []
+        var errors: [String] = []
+        for plan in plans {
+            do {
+                let result = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { database, moves in
+                    let token = FileMembershipToken(fileId: plan.id, revision: plan.membershipRevision)
+                    try FileProcessingEligibility.requireCurrent(token, in: database)
+                    return try Self.executeAndLog(mutation: .renameFile(.init(fileId: plan.id, newPath: plan.destinationPath,
+                                                                              previousPath: plan.sourcePath, physicalMove: true)), batchId: batchId, in: database, physicalMoves: moves)
+                }
+                results.append(result)
+            } catch let error as OperationEngineError {
+                if case .externalSyncIncomplete = error {
+                    throw error
+                }
+                errors.append(error.localizedDescription)
+            } catch {
+                errors.append("\((plan.sourcePath as NSString).lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: batchId)
+        return LibraryOrganizer.Outcome(batchId: batchId, movedCount: results.count, failureCount: errors.count, errors: errors)
     }
 
     func applyObservedBatch(_ mutations: [TrackMutation], authorization: SeratoSnapshotAuthorization,
@@ -784,7 +809,7 @@ public actor OperationEngine {
         // reverts or none of it does. With N transactions (the
         // pre-batch shape) we'd risk leaving the DB half-undone if
         // one inverse hit a fileNotFound mid-loop.
-        let results = try await database.writer.write { database in
+        let results = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: undoBatchId) { database, moves in
             for event in events {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
@@ -795,7 +820,7 @@ public actor OperationEngine {
                 }
             }
             return try inverseMutations.map { mutation in
-                try Self.executeAndLog(mutation: mutation, batchId: undoBatchId, in: database)
+                try Self.executeAndLog(mutation: mutation, batchId: undoBatchId, in: database, physicalMoves: moves)
             }
         }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
@@ -1679,7 +1704,8 @@ public actor OperationEngine {
     private static func executeAndLog(
         mutation: TrackMutation,
         batchId: String,
-        in database: GRDB.Database
+        in database: GRDB.Database,
+        physicalMoves: PhysicalFileMoveTransaction? = nil
     ) throws -> GuardedExecutionResult {
         if let fileID = mutation.processingFileID {
             guard let file = try FileRecord.fetchOne(database, key: fileID) else {
@@ -1693,7 +1719,16 @@ public actor OperationEngine {
                 try FileProcessingEligibility.requireProcessable(file)
             }
         }
-        let result = try executeMutation(mutation: mutation, batchId: batchId, in: database)
+        var effectiveMutation = mutation
+        if case let .renameFile(payload) = mutation, payload.physicalMove == true {
+            guard let physicalMoves, let file = try FileRecord.fetchOne(database, key: payload.fileId) else {
+                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            }
+            let moved = try physicalMoves.move(payload, file: file)
+            effectiveMutation = .renameFile(RenameFilePayload(fileId: payload.fileId, newPath: payload.newPath,
+                                                              previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true))
+        }
+        let result = try executeMutation(mutation: effectiveMutation, batchId: batchId, in: database)
         guard !result.seratoWrites.isEmpty else {
             return GuardedExecutionResult(eventId: result.eventId, seratoWrites: [])
         }
@@ -1998,7 +2033,8 @@ public actor OperationEngine {
             newVolumeUuid: payload.newVolumeUuid,
             newInode: payload.newInode,
             previousVolumeUuid: payload.newVolumeUuid == nil ? nil : originalVolumeUuid,
-            previousInode: payload.newInode == nil ? nil : originalInode
+            previousInode: payload.newInode == nil ? nil : originalInode,
+            physicalMove: payload.physicalMove
         )
         let inversePayload = RenameFilePayload(
             fileId: payload.fileId,
@@ -2007,7 +2043,8 @@ public actor OperationEngine {
             newVolumeUuid: payload.newVolumeUuid == nil ? nil : originalVolumeUuid,
             newInode: payload.newInode == nil ? nil : originalInode,
             previousVolumeUuid: payload.newVolumeUuid,
-            previousInode: payload.newInode
+            previousInode: payload.newInode,
+            physicalMove: payload.physicalMove
         )
 
         let eventId = try insertEvent(
@@ -3196,6 +3233,7 @@ public struct CommitMetadataToSeratoPayload: Codable, Sendable, Equatable {
 }
 
 public struct RenameFilePayload: Codable, Sendable, Equatable {
+    public let physicalMove: Bool?
     public let fileId: Int64
     public let newPath: String
     public let previousPath: String
@@ -3216,8 +3254,10 @@ public struct RenameFilePayload: Codable, Sendable, Equatable {
         newVolumeUuid: String? = nil,
         newInode: Int64? = nil,
         previousVolumeUuid: String? = nil,
-        previousInode: Int64? = nil
+        previousInode: Int64? = nil,
+        physicalMove: Bool? = nil
     ) {
+        self.physicalMove = physicalMove
         self.fileId = fileId
         self.newPath = newPath
         self.previousPath = previousPath

@@ -189,7 +189,7 @@ struct AutoTaggerView: View {
                                  model: Binding(get: { session.rowModels[fileID] ?? model }, set: { model in session.updateReviewModel(model, for: fileID) }),
                                  isConfirmed: Binding(get: { session.confirmedFileIDs.contains(fileID) }, set: { approved in session.setApproved(approved, for: fileID) }),
                                  canChooseRecording: hasAlternatives(fileID), onChooseRecording: { chooserFile = ChooserFile(id: fileID) }, isFocused: isFocused,
-                                 isReadOnly: session.appliedFileIDs.contains(fileID) || session.isApplying || session.pendingRecordingFileIDs.contains(fileID),
+                                 isReadOnly: session.processingErrorByFileID[fileID] != nil || session.appliedFileIDs.contains(fileID) || session.isApplying || session.pendingRecordingFileIDs.contains(fileID),
                                  isApplied: session.appliedFileIDs.contains(fileID))
             } else {
                 TrackHeading(artist: file?.artist, title: file?.title, filename: (path as NSString).lastPathComponent, prominent: isFocused)
@@ -201,6 +201,9 @@ struct AutoTaggerView: View {
             }
             if session.pendingRecordingFileIDs.contains(fileID) {
                 ProgressView("Loading replacement recording…")
+            }
+            if let error = session.processingErrorByFileID[fileID] {
+                ActionErrorMessage(message: error)
             }
             if let error = session.selectionErrorByFileID[fileID] {
                 ActionErrorMessage(message: error)

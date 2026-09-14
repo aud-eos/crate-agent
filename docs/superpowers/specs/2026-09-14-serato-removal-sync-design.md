@@ -191,3 +191,32 @@ Update README and the Auto-Tag guide with membership/availability behavior. Run
 appropriate isolated Swift and Rust checks, production build, scoped formatting,
 and independent review before opening the implementation PR. No live-library
 mutation is part of implementation verification.
+
+### Task 6 execution refinement: physical Organize moves
+
+Inspection found that Organize moved audio before entering OperationEngine. Filtering
+its query or validating a revision after the move could not protect an already-open
+plan. Organize plans and hygiene projections therefore retain the original membership
+revision; Organize also retains the original source path.
+
+Physical renames opt in through the existing RenameFilePayload and journal the same
+opt-in in their inverse. OperationEngine validates lifecycle, revision, source path,
+and physical identity before moving audio inside its serialized writer transaction.
+Apply, batch apply, and Undo share a compensated transaction wrapper, including actual
+SQLite COMMIT failures. Organize reports per-file failures and coalesces Serato writes
+after its successful per-file transactions. This trades the old single SQLite batch
+for coherent per-file filesystem compensation without multiplying Serato rewrites.
+
+Cross-volume moves retain the original file at its original path until COMMIT and
+copy to the destination. Both identities are verified before committing. Rollback
+removes only the verified copy; COMMIT cleanup removes the original only after
+revalidating both files. Cleanup failure surfaces the committed batch and retained
+source path through externalSyncIncomplete. Abrupt process termination may leave
+duplicate copies, but the DB-referenced source or destination remains available.
+This is in-process compensation, not a crash-durable filesystem transaction. General queue durability (#110) and
+shared recording-row redesign (#113) remain outside this change.
+
+Task 8 must complete pending/legacy/unavailable status projections in BrowserRow and
+status badges in Library and Auto-Tag selection. Task 6 provides read-only Auto-Tag
+review reasons and original-token approval/application guards; it does not claim the
+final diagnostics UI or startup readiness integration is complete.

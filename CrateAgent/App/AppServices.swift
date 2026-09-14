@@ -134,7 +134,7 @@ public final class AppServices: ObservableObject {
         )
         autoTagSession = AutoTagSession(
             database: database, lookupService: autoTaggerService,
-            applyBatch: { mutations, batchID in _ = try await engine.applyBatch(mutations, batchId: batchID) },
+            applyBatch: { mutations, batchID, tokens in _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens) },
             resyncBatch: { batchID in try await engine.resyncSeratoForBatch(batchID) }
         )
 

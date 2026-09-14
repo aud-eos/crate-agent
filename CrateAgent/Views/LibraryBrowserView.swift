@@ -278,7 +278,7 @@ struct LibraryBrowserView: View {
     private func observeRowCount() async {
         let observation = ValueObservation
             .tracking { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files WHERE \(FileProcessingEligibility.activeSQL)") ?? 0
             }
             .removeDuplicates()
         do {
@@ -331,6 +331,7 @@ struct LibraryBrowserView: View {
         var sql = """
         SELECT id, path, artist, title, album, bpm, musical_key
         FROM files
+        WHERE \(FileProcessingEligibility.activeSQL)
         """
         var arguments: [DatabaseValueConvertible] = []
 
@@ -340,10 +341,10 @@ struct LibraryBrowserView: View {
             // supports custom collations — out of scope for this
             // pass.
             sql += """
-             WHERE (path LIKE ? COLLATE NOCASE)
+             AND ((path LIKE ? COLLATE NOCASE)
                 OR (COALESCE(artist, '') LIKE ? COLLATE NOCASE)
                 OR (COALESCE(title, '') LIKE ? COLLATE NOCASE)
-                OR (COALESCE(album, '') LIKE ? COLLATE NOCASE)
+                OR (COALESCE(album, '') LIKE ? COLLATE NOCASE))
             """
             let pattern = "%\(search)%"
             arguments = [pattern, pattern, pattern, pattern]

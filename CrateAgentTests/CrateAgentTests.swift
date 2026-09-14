@@ -2483,6 +2483,8 @@ final class FingerprintWorkerTests: XCTestCase {
                 mtime: 1_700_000_000,
                 fingerprintStatus: .pending
             )
+            record.libraryMembership = .active
+            record.fileAvailability = .available
             try record.insert(db)
             return record.id!
         }
@@ -2564,6 +2566,8 @@ final class FingerprintWorkerTests: XCTestCase {
                 chromaprintFingerprint: Data([0xBE, 0xEF]),
                 fingerprintStatus: .done
             )
+            done.libraryMembership = .active
+            done.fileAvailability = .available
             try done.insert(db)
         }
         try await insertPendingFile(path: "/Music/A/fresh.mp3", in: database, inode: 2)
@@ -2651,6 +2655,8 @@ final class FingerprintWorkerTests: XCTestCase {
                 lightweightHash: lightweightHash,
                 fingerprintStatus: .pending
             )
+            record.libraryMembership = .active
+            record.fileAvailability = .available
             try record.insert(db)
             return record.id!
         }
@@ -2720,6 +2726,8 @@ final class FingerprintWorkerTests: XCTestCase {
                 chromaprintFingerprint: existingFingerprint,
                 fingerprintStatus: .done
             )
+            record.libraryMembership = .active
+            record.fileAvailability = .available
             try record.insert(db)
         }
         // Insert a new pending row with the same (size, hash).
@@ -3476,6 +3484,7 @@ final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "the strokes", album: "Is This It")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3509,6 +3518,7 @@ final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "demo artist")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3681,6 +3691,7 @@ final class LibraryHygieneCaseRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "The Strokes")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3716,6 +3727,7 @@ final class LibraryHygieneCaseRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "The Doors")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3850,6 +3862,7 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: "Existing", genre: nil)
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3880,6 +3893,7 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(genre: "Existing")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3907,6 +3921,7 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(genre: nil)
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3932,6 +3947,7 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(genre: nil)
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -3982,6 +3998,7 @@ final class LibraryHygieneRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: " Artist  ", title: "Title ")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -4005,6 +4022,7 @@ final class LibraryHygieneRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: " Artist")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -4032,6 +4050,7 @@ final class LibraryHygieneRunnerTests: XCTestCase {
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
             metadata: SeratoMetadata(artist: " Aphex Twin ", title: "Windowlicker ")
         )))
+        try await seedProcessableHygieneFiles(database)
         let files = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
@@ -5130,5 +5149,11 @@ final class ActivityLogTests: XCTestCase {
         log.log("trashing", category: .duplicate)
 
         XCTAssertEqual(log.recent.map(\.category), [.duplicate, .rename, .sync])
+    }
+}
+
+private func seedProcessableHygieneFiles(_ database: LibraryDatabase) async throws {
+    try await database.writer.write { database in
+        try database.execute(sql: "UPDATE files SET library_membership = ?, file_availability = ?", arguments: [LibraryMembership.active.rawValue, FileAvailability.available.rawValue])
     }
 }

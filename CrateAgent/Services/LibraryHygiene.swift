@@ -11,6 +11,7 @@ import Foundation
 /// fingerprint state.
 public protocol HygieneFileSource {
     var id: Int64? { get }
+    var membershipRevision: Int64 { get }
     var path: String { get }
     var artist: String? { get }
     var title: String? { get }
@@ -821,7 +822,8 @@ public actor LibraryHygieneRunner {
                     previousMetadata: previousSnapshot
                 )),
             ],
-            batchId: batchId
+            batchId: batchId,
+            expectedMembershipTokens: [fileId: FileMembershipToken(fileId: fileId, revision: file.membershipRevision)]
         )
     }
 

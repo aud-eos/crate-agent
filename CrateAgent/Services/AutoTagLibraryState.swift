@@ -12,8 +12,7 @@ final class AutoTagLibraryState: ObservableObject {
         error = nil
         do {
             let observation = ValueObservation.tracking { database in
-                try FileRecord.filter(Column("library_membership") == LibraryMembership.active.rawValue)
-                    .filter(Column("file_availability") == FileAvailability.available.rawValue).fetchCount(database)
+                try FileRecord.all().processableInLibrary().fetchCount(database)
             }.removeDuplicates()
             for try await count in observation.values(in: database.writer) {
                 guard !Task.isCancelled else { return }

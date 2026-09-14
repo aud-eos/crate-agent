@@ -1207,7 +1207,7 @@ private struct DuplicatesPanel: View {
         actionError = nil
         do {
             files = try await services.database.writer.read { db in
-                try FileRecord.fetchAll(db)
+                try FileRecord.all().processableInLibrary().fetchAll(db)
             }
             groups = DuplicateFinder.findDuplicates(in: files, mode: mode)
             // Refresh the cached perceptual-coverage tuple here so

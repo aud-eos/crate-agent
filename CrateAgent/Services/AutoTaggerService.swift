@@ -50,6 +50,7 @@ final class AutoTaggerService: ObservableObject {
 
     private struct LookupBaseline {
         let fileID: Int64
+        let membershipToken: FileMembershipToken
         let fingerprintHash: Data
         let freshness: FileFreshnessSnapshot
         let tags: AudioTags
@@ -157,6 +158,7 @@ final class AutoTaggerService: ObservableObject {
         try ensureCurrent(generation: generation)
         let recording = try await loadRecording(mbid: alternative.recordingID)
         try ensureCurrent(generation: generation)
+        try await requireCurrent(baseline.membershipToken)
         recordingDetails[fileID, default: [:]][alternative.recordingID] = MBRecordingDetails(recording: recording, requestedID: alternative.recordingID)
         return try Self.assembleCandidate(alternative: alternative, recording: recording, baseline: baseline)
     }
@@ -339,6 +341,8 @@ final class AutoTaggerService: ObservableObject {
         guard let file = try await fetchFile(fileID: fileID) else {
             throw AutoTaggerRowFailure("file \(fileID) not found in the library")
         }
+        try FileProcessingEligibility.requireProcessable(file)
+        let membershipToken = FileMembershipToken(fileId: fileID, revision: file.membershipRevision)
 
         let (fingerprintBytes, fingerprintBasis) = try await currentFingerprint(for: file)
         guard let fingerprintBase64 = FingerprintEncoder.base64(fromStoredBytes: fingerprintBytes) else {
@@ -373,6 +377,7 @@ final class AutoTaggerService: ObservableObject {
             )
         }
 
+        try await requireCurrent(membershipToken)
         let acoustIDResults = try await acoustIDClient.lookup(
             fingerprintBase64: fingerprintBase64,
             durationSeconds: Int(durationSeconds),
@@ -380,9 +385,10 @@ final class AutoTaggerService: ObservableObject {
         )
 
         try ensureCurrent(generation: generation)
+        try await requireCurrent(membershipToken)
         let alternatives = RecordingAlternatives(results: acoustIDResults)
         recordingAlternatives[fileID] = alternatives
-        let baseline = LookupBaseline(fileID: fileID, fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
+        let baseline = LookupBaseline(fileID: fileID, membershipToken: membershipToken, fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
                                       freshness: lookupFreshness, tags: tags)
         lookupBaselines[fileID] = baseline
         guard let firstRecordingID = acoustIDResults.first(where: { result in !result.recordingIDs.isEmpty })?.recordingIDs.first,
@@ -390,6 +396,7 @@ final class AutoTaggerService: ObservableObject {
 
         let recording = try await loadRecording(mbid: selected.recordingID)
         try ensureCurrent(generation: generation)
+        try await requireCurrent(membershipToken)
         recordingDetails[fileID, default: [:]][selected.recordingID] = MBRecordingDetails(recording: recording, requestedID: selected.recordingID)
         let candidate = try Self.assembleCandidate(alternative: selected, recording: recording, baseline: baseline)
         let assessment = alternatives.assessment(for: selected, details: recordingDetails[fileID] ?? [:])
@@ -527,7 +534,8 @@ final class AutoTaggerService: ObservableObject {
             // re-decoded up to 120s of audio. If the file can't be stat'd we
             // omit the basis rather than record a wrong one — the fallback to
             // the index snapshot then applies.
-            try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis)
+            try await persistFingerprint(fileID: fileID, bytes: serialized, status: .done, freshnessBasis: freshnessBasis,
+                                         expectedMembershipToken: FileMembershipToken(fileId: fileID, revision: file.membershipRevision))
             return (serialized, freshnessBasis)
         } catch {
             let decodeError = error
@@ -559,7 +567,8 @@ final class AutoTaggerService: ObservableObject {
             else { return }
             // Compare and write in one transaction: a failure of stale .done
             // bytes is real, but cannot erase a concurrent successful decode.
-            try FingerprintPersistence.write(fileID: fileID, fingerprint: nil, status: .failed, in: db)
+            try FingerprintPersistence.write(fileID: fileID, fingerprint: nil, status: .failed,
+                                             expectedMembershipToken: FileMembershipToken(fileId: fileID, revision: original.membershipRevision), in: db)
         }
     }
 
@@ -619,10 +628,13 @@ final class AutoTaggerService: ObservableObject {
         // (e.g. the SQLite file went missing or reports corruption) behind a
         // misleading recovery instruction. `applyConfirmed` reports it
         // distinctly.
+        let originalTokens = membershipTokens(for: fileIDs)
         let pathByFileID = try await database.writer.read { db in
             try FileRecord.filter(keys: fileIDs).fetchAll(db)
                 .reduce(into: [Int64: String]()) { accumulator, file in
-                    if let id = file.id {
+                    if let id = file.id, file.libraryMembership == .active, file.fileAvailability == .available,
+                       originalTokens[id].map({ $0.revision == file.membershipRevision }) != false
+                    {
                         accumulator[id] = file.path
                     }
                 }
@@ -630,6 +642,7 @@ final class AutoTaggerService: ObservableObject {
 
         var stale: Set<Int64> = []
         for payload in payloads {
+            guard pathByFileID[payload.fileID] != nil else { stale.insert(payload.fileID); continue }
             guard let expectedFileSize = payload.expectedFileSize,
                   let expectedMtime = payload.expectedMtime
             else {
@@ -655,6 +668,18 @@ final class AutoTaggerService: ObservableObject {
 
     // MARK: - Database
 
+    func membershipTokens(for fileIDs: [Int64]) -> [Int64: FileMembershipToken] {
+        Dictionary(uniqueKeysWithValues: fileIDs.compactMap { fileID in
+            lookupBaselines[fileID].map { (fileID, $0.membershipToken) }
+        })
+    }
+
+    private func requireCurrent(_ token: FileMembershipToken) async throws {
+        try await database.writer.read { database in
+            try FileProcessingEligibility.requireCurrent(token, in: database)
+        }
+    }
+
     private func fetchFile(fileID: Int64) async throws -> FileRecord? {
         try await database.writer.read { db in
             try FileRecord.fetchOne(db, key: fileID)
@@ -666,12 +691,14 @@ final class AutoTaggerService: ObservableObject {
         bytes: Data?,
         status: FingerprintStatus,
         freshnessBasis: FileFreshnessSnapshot? = nil,
-        requirePendingStatus: Bool = false
+        requirePendingStatus: Bool = false,
+        expectedMembershipToken: FileMembershipToken
     ) async throws {
         try await database.writer.write { db in
+            try FileProcessingEligibility.requireCurrent(expectedMembershipToken, in: db)
             try FingerprintPersistence.write(
                 fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis,
-                requirePendingStatus: requirePendingStatus, in: db
+                requirePendingStatus: requirePendingStatus, expectedMembershipToken: expectedMembershipToken, in: db
             )
         }
     }

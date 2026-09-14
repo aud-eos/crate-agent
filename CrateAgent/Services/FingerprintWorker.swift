@@ -188,6 +188,7 @@ public actor FingerprintWorker {
         // where possible, fingerprint one representative per
         // (size, hash) group and propagate to siblings.
         let plan = await planBatch(batch)
+        let database = database
 
         var representativeResults: [(BatchPlan.Group, ProcessResult)] = []
         representativeResults.reserveCapacity(plan.toFingerprint.count)
@@ -201,7 +202,7 @@ public actor FingerprintWorker {
                 let representative = assignment.representative
                 group.addTask {
                     let result = await Self.runOne(
-                        file: representative, function: fingerprintFunction
+                        file: representative, database: database, function: fingerprintFunction
                     )
                     return GroupResult(index: index, result: result)
                 }
@@ -214,7 +215,7 @@ public actor FingerprintWorker {
                     let representative = next.representative
                     group.addTask {
                         let result = await Self.runOne(
-                            file: representative, function: fingerprintFunction
+                            file: representative, database: database, function: fingerprintFunction
                         )
                         return GroupResult(index: index, result: result)
                     }
@@ -245,54 +246,39 @@ public actor FingerprintWorker {
         var lastPath: String?
 
         do {
-            try await database.writer.write { db in
-                // Step 1: copy-from-existing — files whose byte-twin
-                // already had a fingerprint in the DB. No decode work
-                // was needed; just write the same hash to this row.
+            let counts = try await database.writer.write { database in
+                var completed = 0
+                var failed = 0
                 for entry in plan.toCopyFromExistingTwin {
-                    // requirePendingStatus: don't clobber a newer on-demand
-                    // fingerprint the auto-tagger may have written for this row
-                    // since it was claimed (finding #4000806487).
-                    try FingerprintPersistence.write(
+                    if try FingerprintPersistence.write(
                         fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done,
-                        requirePendingStatus: true, in: db
-                    )
+                        requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[entry.fileId]!, in: database
+                    ) { completed += 1 }
                 }
-
-                // Step 2: representative results — write the outcome
-                // to the representative AND to every sibling. Siblings
-                // share the byte content so they share the outcome
-                // (success or failure).
                 for (assignment, result) in representativeResults {
-                    let (hash, status): (Data?, FingerprintStatus) = {
-                        switch result.outcome {
-                        case .success(let bytes): return (bytes, .done)
-                        case .failure: return (nil, .failed)
+                    let fingerprint: Data?
+                    let status: FingerprintStatus
+                    switch result.outcome {
+                    case let .success(bytes): fingerprint = bytes; status = .done
+                    case .failure: fingerprint = nil; status = .failed
+                    }
+                    for fileID in [result.fileId] + assignment.siblingIds {
+                        if try FingerprintPersistence.write(
+                            fileID: fileID, fingerprint: fingerprint, status: status,
+                            requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[fileID]!, in: database
+                        ) {
+                            if status == .done {
+                                completed += 1
+                            } else {
+                                failed += 1
+                            }
                         }
-                    }()
-                    // Apply to the representative (only while still pending, so a
-                    // newer on-demand fingerprint isn't overwritten — #4000806487).
-                    try FingerprintPersistence.write(
-                        fileID: result.fileId, fingerprint: hash, status: status,
-                        requirePendingStatus: true, in: db
-                    )
-                    // Propagate to siblings.
-                    for siblingId in assignment.siblingIds {
-                        try FingerprintPersistence.write(
-                            fileID: siblingId, fingerprint: hash, status: status,
-                            requirePendingStatus: true, in: db
-                        )
                     }
                 }
+                return (completed, failed)
             }
-
-            doneCount = plan.toCopyFromExistingTwin.count
-            for (assignment, result) in representativeResults {
-                switch result.outcome {
-                case .success: doneCount += 1 + assignment.siblingIds.count
-                case .failure: failedCount += 1 + assignment.siblingIds.count
-                }
-            }
+            doneCount = counts.0
+            failedCount = counts.1
             lastPath = representativeResults.last?.1.path
         } catch {
             Self.logger.error(
@@ -388,6 +374,9 @@ public actor FingerprintWorker {
         }
 
         return BatchPlan(
+            membershipTokens: Dictionary(uniqueKeysWithValues: batch.compactMap { file in
+                file.id.map { fileID in (fileID, FileMembershipToken(fileId: fileID, revision: file.membershipRevision)) }
+            }),
             toCopyFromExistingTwin: copyFromExisting,
             toFingerprint: assignments
         )
@@ -429,12 +418,13 @@ public actor FingerprintWorker {
             static let databaseColumnDecodingStrategy =
                 DatabaseColumnDecodingStrategy.convertFromSnakeCase
         }
+        let queryArguments = StatementArguments(arguments)!
         do {
             let rows = try await database.writer.read { db -> [TwinRow] in
                 try TwinRow.fetchAll(
                     db,
                     sql: sql,
-                    arguments: StatementArguments(arguments)
+                    arguments: queryArguments
                 )
             }
             // Multiple rows may share the same (size, hash) — pick
@@ -458,12 +448,16 @@ public actor FingerprintWorker {
 
     private static func runOne(
         file: FileRecord,
+        database: LibraryDatabase,
         function: @escaping FingerprintFunction
     ) async -> ProcessResult {
         guard let fileId = file.id else {
             return ProcessResult(fileId: 0, path: file.path, outcome: .failure)
         }
         do {
+            try await database.writer.read { database in
+                try FileProcessingEligibility.requireCurrent(FileMembershipToken(fileId: fileId, revision: file.membershipRevision), in: database)
+            }
             let hashes = try function(file.path)
             return ProcessResult(
                 fileId: fileId,
@@ -490,6 +484,7 @@ public actor FingerprintWorker {
     private func fetchPendingCount() async throws -> Int {
         try await database.writer.read { db in
             try FileRecord
+                .all().processableInLibrary()
                 .filter(Column("fingerprint_status") == FingerprintStatus.pending.rawValue)
                 .fetchCount(db)
         }
@@ -498,6 +493,7 @@ public actor FingerprintWorker {
     private func fetchPendingBatch(limit: Int) async throws -> [FileRecord] {
         try await database.writer.read { db in
             try FileRecord
+                .all().processableInLibrary()
                 .filter(Column("fingerprint_status") == FingerprintStatus.pending.rawValue)
                 .limit(limit)
                 .fetchAll(db)
@@ -531,6 +527,7 @@ private struct GroupResult: Sendable {
 /// fingerprint copied to siblings, and (c) standalone files with
 /// no hash to dedup against.
 struct BatchPlan: Sendable, Equatable {
+    let membershipTokens: [Int64: FileMembershipToken]
     /// Files that get a fingerprint copied from a DB row whose
     /// (file_size, lightweight_hash) matches. No Chromaprint work
     /// needed at all — these write straight to the DB at flush
