@@ -6,6 +6,12 @@ A macOS-native companion app for Serato DJ library management.
 
 **Status:** SP-1 (Serato rename-sync), SP-1.5 (library hygiene tools), and SP-2 (MusicBrainz auto-tagging — the Auto-Tag panel, which needs a free [AcoustID API key](https://acoustid.org) set in Settings) are shipped, along with a desktop-scale performance pass. Soulseek acquisition Phase 1 is shipped as a standalone MCP server (see [below](#soulseek-acquisition-mcp)). Next planned milestone is SP-3 (rule engine for proactive auto-rename). See [design plan](#design-plan) below.
 
+Auto-Tag supports browsing untagged tracks, List or Focus review, and choosing
+between recording candidates. Scans and review choices survive navigation to
+other screens while the app remains open. See the [Auto-Tag guide](docs/auto-tag.md).
+Use the shared Comfortable/Compact density setting to adjust spacing throughout
+the app.
+
 ## Why this exists
 
 Serato stores absolute file paths in its binary library files. When you rename a file in Finder, Serato silently loses access to it. Serato has no public API, plugin system, or library-management hooks. Third-party tools that bridge the gap (Lexicon, Rekordbuddy) are excellent but commercial; this project exists to be a small, focused, native alternative that the author can shape to fit their own DJ workflow.
@@ -87,7 +93,7 @@ docs/              Design docs, Soulseek setup, planning artifacts
 `rust-core/` is a Cargo workspace:
 
 ```
-crate-agent-core/  Serato library I/O + tag I/O; the uniffi FFI surface for the Swift app
+src/               crate-agent-core package: Serato/tag I/O and the Swift FFI surface
 fingerprint-core/  Chromaprint audio fingerprinting (shared by crate-agent-core and soulseek-core)
 soulseek-core/     Soulseek acquisition logic (slskd client, candidate ranking, download confirmation)
 soulseek-mcp/      MCP server binary exposing soulseek-core to Claude

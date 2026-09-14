@@ -62,7 +62,7 @@ final class AutoTaggerViewSearchGuardTests: XCTestCase {
     }
 
     func testPublishesWhenNotCancelledAndQueryStillMatches() {
-        XCTAssertTrue(AutoTaggerView.shouldPublishSearchResult(
+        XCTAssertTrue(AutoTagSession.shouldPublishSearchResult(
             queryTaskRanFor: "voodoo",
             currentQuery: "voodoo",
             isCancelled: false
@@ -70,7 +70,7 @@ final class AutoTaggerViewSearchGuardTests: XCTestCase {
     }
 
     func testDropsResultWhenTaskWasCancelled() {
-        XCTAssertFalse(AutoTaggerView.shouldPublishSearchResult(
+        XCTAssertFalse(AutoTagSession.shouldPublishSearchResult(
             queryTaskRanFor: "voodoo",
             currentQuery: "voodoo",
             isCancelled: true
@@ -83,7 +83,7 @@ final class AutoTaggerViewSearchGuardTests: XCTestCase {
     /// (cooperative cancellation can lose the race), so a query mismatch
     /// must independently block publishing.
     func testDropsResultWhenAnUncancelledOlderQueryLosesTheRaceToANewerOne() {
-        XCTAssertFalse(AutoTaggerView.shouldPublishSearchResult(
+        XCTAssertFalse(AutoTagSession.shouldPublishSearchResult(
             queryTaskRanFor: "voodoo",
             currentQuery: "voodoo ray",
             isCancelled: false
@@ -91,7 +91,7 @@ final class AutoTaggerViewSearchGuardTests: XCTestCase {
     }
 
     func testComparesAgainstTheTrimmedCurrentQuery() {
-        XCTAssertTrue(AutoTaggerView.shouldPublishSearchResult(
+        XCTAssertTrue(AutoTagSession.shouldPublishSearchResult(
             queryTaskRanFor: "voodoo",
             currentQuery: "  voodoo  ",
             isCancelled: false

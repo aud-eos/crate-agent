@@ -20,7 +20,6 @@ import os.log
 /// `no-silent-failures` invariant.
 @MainActor
 public final class AppServices: ObservableObject {
-
     public let watchedMusicFolder: URL
     public let database: LibraryDatabase
     public let seratoWatchdog: SeratoWatchdog
@@ -32,6 +31,7 @@ public final class AppServices: ObservableObject {
     public let fingerprintWorker: FingerprintWorker
     public let activityLog: ActivityLog
     let autoTaggerService: AutoTaggerService
+    let autoTagSession: AutoTagSession
 
     /// Latest progress from the running initial scan, or nil when no
     /// scan is in flight. Views observe via @Published.
@@ -81,9 +81,9 @@ public final class AppServices: ObservableObject {
     ) throws {
         self.watchedMusicFolder = watchedMusicFolder
         self.database = database
-        self.seratoWatchdog = SeratoWatchdog()
-        self.seratoLocator = try SeratoLibraryLocator.defaultLocation()
-        self.activityLog = ActivityLog()
+        seratoWatchdog = SeratoWatchdog()
+        seratoLocator = try SeratoLibraryLocator.defaultLocation()
+        activityLog = ActivityLog()
 
         let engine = OperationEngine(
             database: database,
@@ -91,27 +91,27 @@ public final class AppServices: ObservableObject {
             seratoLocator: seratoLocator,
             activityLog: activityLog
         )
-        self.operationEngine = engine
+        operationEngine = engine
 
         let filesystemCoordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
             database: database
         )
-        self.filesystemSyncCoordinator = filesystemCoordinator
+        filesystemSyncCoordinator = filesystemCoordinator
 
         let scanner = LibraryScanner(
             operationEngine: engine,
             database: database,
             seratoLocator: seratoLocator
         )
-        self.libraryScanner = scanner
+        libraryScanner = scanner
 
-        self.importCoordinator = ImportCoordinator(
+        importCoordinator = ImportCoordinator(
             operationEngine: engine,
             database: database
         )
 
-        self.fingerprintWorker = FingerprintWorker(database: database)
+        fingerprintWorker = FingerprintWorker(database: database)
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and
@@ -126,15 +126,20 @@ public final class AppServices: ObservableObject {
         let lookupCache = LookupCache(
             directory: applicationSupportUrl.appendingPathComponent("crate-agent/lookup-cache", isDirectory: true)
         )
-        self.autoTaggerService = AutoTaggerService(
+        autoTaggerService = AutoTaggerService(
             database: database,
             acoustIDClient: AcoustIDClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
             musicBrainzClient: MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache)
         )
+        autoTagSession = AutoTagSession(
+            database: database, lookupService: autoTaggerService,
+            applyBatch: { mutations, batchID in _ = try await engine.applyBatch(mutations, batchId: batchID) },
+            resyncBatch: { batchID in try await engine.resyncSeratoForBatch(batchID) }
+        )
 
         // Coordinator needs the scanner to trigger reload-on-exit;
         // wire it last so all upstream deps are constructed.
-        self.seratoSyncCoordinator = SeratoSyncCoordinator(
+        seratoSyncCoordinator = SeratoSyncCoordinator(
             operationEngine: engine,
             libraryScanner: scanner,
             seratoWatchdog: seratoWatchdog
@@ -154,7 +159,7 @@ public final class AppServices: ObservableObject {
         // stays free for the next callback. The checkpoint callback
         // persists the highest event ID we've processed so the next
         // launch's `sinceWhen` picks up exactly where we left off.
-        self.fsEventsWatcher = FSEventsWatcher(
+        fsEventsWatcher = FSEventsWatcher(
             watchedPaths: [watchedFolderPath],
             sinceWhen: resumeFromEventId,
             handler: { observations in

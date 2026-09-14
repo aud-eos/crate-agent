@@ -100,6 +100,7 @@ struct TrackHeading: View {
     var artist: String?
     var title: String?
     let filename: String
+    var prominent = false
 
     private var identity: String {
         let readableTitle = title.flatMap { value in value.isEmpty ? nil : value } ?? filename
@@ -110,7 +111,7 @@ struct TrackHeading: View {
     var body: some View {
         VStack(alignment: .leading, spacing: density.detailSpacing) {
             Text(identity)
-                .font(.title3.weight(.semibold))
+                .font(prominent ? .title2.weight(.semibold) : .title3.weight(.semibold))
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             if identity != filename {
@@ -143,6 +144,7 @@ struct MetadataComparison: View {
     let proposed: String?
     var field: String?
     var emptyLabel = "Not set"
+    var prominent = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.detailSpacing) {
@@ -161,7 +163,7 @@ struct MetadataComparison: View {
         GridRow(alignment: .top) {
             Text(label).font(.callout).foregroundStyle(.secondary).fixedSize()
             Text(value.flatMap { $0.isEmpty ? nil : $0 } ?? emptyLabel)
-                .font(.body)
+                .font(prominent ? .title3 : .body)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
@@ -225,10 +227,13 @@ struct StatusBadge: View {
     var tint: Color = .secondary
 
     var body: some View {
-        Label(title, systemImage: systemImage)
-            .font(.callout)
-            .foregroundStyle(tint)
-            .accessibilityElement(children: .combine)
+        Label {
+            Text(title).foregroundStyle(.primary)
+        } icon: {
+            Image(systemName: systemImage).foregroundStyle(tint)
+        }
+        .font(.callout)
+        .accessibilityElement(children: .combine)
     }
 }
 

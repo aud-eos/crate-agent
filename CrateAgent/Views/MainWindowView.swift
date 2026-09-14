@@ -54,6 +54,7 @@ struct MainWindowView: View {
                 detailView
             }
             Divider()
+            AutoTagActivityView(session: services.autoTagSession) { selection = .autoTag }
             ActivityStrip()
                 .environmentObject(services.activityLog)
         }
@@ -81,10 +82,47 @@ struct MainWindowView: View {
         case .cleanup:
             LibraryHygieneView()
         case .autoTag:
-            AutoTaggerView(autoTaggerService: services.autoTaggerService)
+            AutoTaggerView(session: services.autoTagSession)
         case .history:
             HistoryView()
         }
+    }
+}
+
+private struct AutoTagActivityView: View {
+    @ObservedObject var session: AutoTagSession
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    let openAutoTag: () -> Void
+
+    var body: some View {
+        if session.isScanning || session.isApplying || session.pendingResyncBatchId != nil {
+            HStack(spacing: density.spacing) {
+                if session.isScanning || session.isApplying {
+                    ProgressView().controlSize(density.controlSize)
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+                Text(status)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: density.spacing)
+                Button("Open Auto-Tag", action: openAutoTag)
+            }
+            .padding(.horizontal, density.pagePadding)
+            .padding(.vertical, density.rowPadding)
+            .background(Color.accentColor.opacity(0.06))
+            Divider()
+        }
+    }
+
+    private var status: String {
+        if session.isApplying {
+            return "Auto-Tag is applying approved tracks…"
+        }
+        if session.pendingResyncBatchId != nil {
+            return "Auto-Tag has an applied batch awaiting Re-sync."
+        }
+        return "Auto-Tag scan: \(session.completedCount) of \(session.totalCount) tracks finished. You can keep working."
     }
 }
 

@@ -68,12 +68,14 @@ struct RecordingAlternatives: Equatable, Sendable {
     }
 
     func assessment(for alternative: RecordingAlternative, details: [String: MBRecordingDetails] = [:]) -> RecordingMatchAssessment {
-        let topScore = entries.first?.score ?? alternative.score
-        let plausible = collapsed(using: details).filter { entry in
-            entry.score >= RecordingMatchAssessment.strongScoreThreshold
-                || entry.score >= topScore - RecordingMatchAssessment.competingScoreMargin
-        }
+        let plausible = collapsed(using: details).filter(isPlausible)
         return RecordingMatchAssessment(score: alternative.score, plausibleRecordingCount: plausible.count)
+    }
+
+    func isPlausible(_ alternative: RecordingAlternative) -> Bool {
+        let topScore = entries.first?.score ?? alternative.score
+        return alternative.score >= RecordingMatchAssessment.strongScoreThreshold
+            || alternative.score >= topScore - RecordingMatchAssessment.competingScoreMargin
     }
 }
 

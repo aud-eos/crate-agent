@@ -62,10 +62,10 @@ struct AutoTagRowModel {
         let resolvedCurrentArtist = candidate.currentFileArtist ?? ""
         let resolvedCurrentTitle = candidate.currentFileTitle ?? ""
         let resolvedCurrentAlbum = candidate.currentFileAlbum ?? ""
-        self.currentArtist = resolvedCurrentArtist
-        self.currentTitle = resolvedCurrentTitle
-        self.currentAlbum = resolvedCurrentAlbum
-        self.currentYear = candidate.currentFileYear
+        currentArtist = resolvedCurrentArtist
+        currentTitle = resolvedCurrentTitle
+        currentAlbum = resolvedCurrentAlbum
+        currentYear = candidate.currentFileYear
 
         let decision = TitleMatcher.decide(current: resolvedCurrentTitle, proposed: candidate.proposedTitle)
         titleTier = decision.tier
@@ -151,100 +151,172 @@ struct AutoTagRowModel {
     }
 }
 
-/// One row in `AutoTaggerView`'s review list: a confidence chip, the
-/// per-field current → proposed diffs with include toggles, a
-/// Keep/Merge/Take title control, and a disclosure to pick a different
-/// release. All state lives in `model` and `isConfirmed`, owned by the
-/// parent view.
 struct AutoTagReviewRow: View {
     let path: String
-    let score: Double
-    let isStrong: Bool
+    let assessment: RecordingMatchAssessment?
     @Binding var model: AutoTagRowModel
     @Binding var isConfirmed: Bool
+    let canChooseRecording: Bool
+    let onChooseRecording: () -> Void
+    var isFocused = false
+    var isReadOnly = false
+    var isApplied = false
 
-    @State private var showReleasePicker: Bool = false
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    @State private var showUnchanged = false
+    @State private var showReleasePicker = false
 
-    /// Unlike the plain `$model.includeAlbum` binding, flipping this marks
-    /// the toggle user-overridden — so a later `selectRelease` (picking a
-    /// different release from `releaseDisclosure`) leaves the user's
-    /// explicit choice alone instead of recomputing its automatic default.
+    init(path: String, assessment: RecordingMatchAssessment?, model: Binding<AutoTagRowModel>, isConfirmed: Binding<Bool>, canChooseRecording: Bool, onChooseRecording: @escaping () -> Void, isFocused: Bool = false, isReadOnly: Bool = false, isApplied: Bool = false) {
+        self.path = path
+        self.assessment = assessment
+        _model = model
+        _isConfirmed = isConfirmed
+        self.canChooseRecording = canChooseRecording
+        self.onChooseRecording = onChooseRecording
+        self.isFocused = isFocused
+        self.isReadOnly = isReadOnly
+        self.isApplied = isApplied
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: isFocused ? density.spacing * 1.5 : density.spacing) {
+            TrackHeading(
+                artist: model.currentArtist.isEmpty ? model.candidate.proposedArtist : model.currentArtist,
+                title: model.currentTitle.isEmpty ? model.candidate.proposedTitle : model.currentTitle,
+                filename: (path as NSString).lastPathComponent,
+                prominent: isFocused
+            )
+            .help(path)
+            matchExplanation
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    approval
+                    Spacer()
+                    recordingButton
+                }
+                VStack(alignment: .leading, spacing: density.detailSpacing) {
+                    approval
+                    recordingButton
+                }
+            }
+            Divider()
+            ForEach(ReviewField.allCases.filter { !isUnchanged($0) }) { field in
+                fieldEditor(field)
+            }
+            if ReviewField.allCases.contains(where: isUnchanged) {
+                DisclosureGroup("Show unchanged fields", isExpanded: $showUnchanged) {
+                    VStack(alignment: .leading, spacing: density.spacing) {
+                        ForEach(ReviewField.allCases.filter { isUnchanged($0) }) { field in
+                            fieldEditor(field)
+                        }
+                    }
+                    .padding(.top, density.detailSpacing)
+                }
+            }
+            releaseDisclosure
+        }
+        .padding(.vertical, density.rowPadding)
+    }
+
+    @ViewBuilder
+    private var approval: some View {
+        if !isApplied {
+            Toggle("Approved for Apply", isOn: $isConfirmed)
+                .toggleStyle(.checkbox)
+                .disabled(isReadOnly)
+                .help("Approval stages this proposal. Apply approved tracks writes the changes.")
+        }
+    }
+
+    private var recordingButton: some View {
+        Button("Choose recording…", action: onChooseRecording)
+            .disabled(!canChooseRecording)
+            .help("Inspect the recordings returned by this audio lookup. Changing recording resets field and release choices.")
+    }
+
+    private var matchExplanation: some View {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            Text("Audio match: \(Int(((assessment?.score ?? model.candidate.score) * 100).rounded()))%")
+                .font(.headline)
+                .help("AcoustID fingerprint score, not a probability that these tags or this release are correct. Recording IDs from the same result share its score.")
+            if assessment?.hasMultiplePlausibleRecordings == true {
+                Label {
+                    Text("Multiple plausible recordings — review recording choice")
+                } icon: {
+                    Image(systemName: "square.stack").foregroundStyle(.orange)
+                }
+            }
+            if assessment?.isBelowStrongThreshold == true {
+                Label {
+                    Text("Lower audio match — review carefully")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                }
+            } else if assessment?.isBulkApprovalEligible == true {
+                Label("Suggested match — check the version and release", systemImage: "waveform")
+            } else if assessment == nil {
+                Label("Review recording choice", systemImage: "questionmark.circle")
+            }
+        }
+        .font(.callout)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private enum ReviewField: String, CaseIterable, Identifiable {
+        case artist, title, album, year
+        var id: String {
+            rawValue
+        }
+    }
+
+    private func isUnchanged(_ field: ReviewField) -> Bool {
+        switch field {
+        case .artist: model.candidate.proposedArtist == model.currentArtist
+        case .title: model.candidate.proposedTitle == model.currentTitle
+        case .album: model.candidate.proposedAlbum == model.currentAlbum
+        case .year: model.candidate.proposedYear == model.currentYear && model.candidate.proposedYear != nil
+        }
+    }
+
+    @ViewBuilder
+    private func fieldEditor(_ field: ReviewField) -> some View {
+        switch field {
+        case .artist:
+            fieldDiff(name: "Artist", current: model.currentArtist, proposed: model.candidate.proposedArtist, include: $model.includeArtist)
+        case .title:
+            titleEditor
+        case .album:
+            fieldDiff(name: "Album", current: model.currentAlbum, proposed: model.candidate.proposedAlbum, include: albumIncludeBinding)
+        case .year:
+            fieldDiff(name: "Year", current: model.currentYear.map(String.init), proposed: model.candidate.proposedYear.map(String.init), include: $model.includeYear)
+        }
+    }
+
     private var albumIncludeBinding: Binding<Bool> {
         Binding(
             get: { model.includeAlbum },
             set: { newValue in
-                model.includeAlbum = newValue
-                model.markAlbumToggleUserOverridden()
+                var edited = model
+                edited.includeAlbum = newValue
+                edited.markAlbumToggleUserOverridden()
+                model = edited
             }
         )
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            header
-            // E-A: an unavailable (nil) proposed artist renders as
-            // current → current — a visible no-op, never an empty "→ "
-            // overwrite — matching includeArtist's "never included" default.
-            fieldDiff(name: "Artist", current: model.currentArtist, proposed: model.candidate.proposedArtist ?? model.currentArtist, include: $model.includeArtist)
-            titleRow
-            fieldDiff(name: "Album", current: model.currentAlbum, proposed: model.candidate.proposedAlbum, include: albumIncludeBinding)
-            if model.candidate.proposedYear != nil {
-                fieldDiff(
-                    name: "Year",
-                    current: model.currentYear.map(String.init) ?? "—",
-                    proposed: model.candidate.proposedYear.map(String.init) ?? "—",
-                    include: $model.includeYear
-                )
+    private var titleEditor: some View {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            MetadataComparison(current: model.currentTitle, proposed: model.candidate.proposedTitle, field: "Title", prominent: isFocused)
+            Picker("Title choice", selection: $model.titleChoice) {
+                Text("Keep current").tag(TitleChoice.keep)
+                Text("Merge").tag(TitleChoice.merge).disabled(!isMergeAvailable)
+                Text("Use suggestion").tag(TitleChoice.take)
             }
-            releaseDisclosure
-        }
-        .padding(.vertical, 6)
-    }
-
-    private var header: some View {
-        HStack(spacing: 8) {
-            Toggle(isOn: $isConfirmed) { EmptyView() }
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-            confidenceChip
-            Text((path as NSString).lastPathComponent)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-    }
-
-    private var confidenceChip: some View {
-        Text("\(Int(score * 100))% \(isStrong ? "strong" : "weak")")
-            .font(.caption2.smallCaps())
-            .padding(.horizontal, 6)
-            .padding(.vertical, 1)
-            .background(
-                Capsule().fill((isStrong ? Color.green : Color.orange).opacity(0.18))
-            )
-            .foregroundStyle(isStrong ? Color.green : Color.orange)
-    }
-
-    private var titleRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Text("Title")
-                    .font(.caption.smallCaps())
-                    .foregroundStyle(.tint)
-                Picker("", selection: $model.titleChoice) {
-                    Text("Keep").tag(TitleChoice.keep)
-                    Text("Merge").tag(TitleChoice.merge)
-                        .disabled(!isMergeAvailable)
-                    Text("Take").tag(TitleChoice.take)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 220)
-            }
-            Text("«\(model.resolvedTitle)»")
-                .font(.caption.monospaced())
-                .foregroundStyle(.primary)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(isReadOnly || isApplied)
+            .frame(maxWidth: 460)
+            savedValue(model.resolvedTitle)
         }
     }
 
@@ -255,58 +327,60 @@ struct AutoTagReviewRow: View {
         return false
     }
 
-    private func fieldDiff(name: String, current: String, proposed: String, include: Binding<Bool>) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Toggle(isOn: include) { EmptyView() }
+    private func fieldDiff(name: String, current: String?, proposed: String?, include: Binding<Bool>) -> some View {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            MetadataComparison(current: current, proposed: proposed ?? "Unavailable from MusicBrainz", field: name, prominent: isFocused)
+            Toggle("Apply suggestion", isOn: include)
                 .toggleStyle(.checkbox)
-                .labelsHidden()
-            VStack(alignment: .leading, spacing: 2) {
-                Text(name)
-                    .font(.caption.smallCaps())
-                    .foregroundStyle(.tint)
-                HStack(spacing: 8) {
-                    Text("«\(current)»")
-                        .foregroundStyle(.secondary)
-                    Image(systemName: "arrow.right")
-                        .foregroundStyle(.tertiary)
-                    Text("«\(proposed)»")
-                        .foregroundStyle(.primary)
-                }
-                .font(.caption.monospaced())
-            }
+                .disabled(proposed == nil || isReadOnly || isApplied)
+                .accessibilityLabel("Apply suggested \(name.lowercased())")
+            savedValue(include.wrappedValue && proposed != nil ? proposed : current)
         }
     }
 
-    @ViewBuilder
+    private func savedValue(_ value: String?) -> some View {
+        Text("\(isApplied ? "Reviewed result" : "Will save"): \(value.flatMap { $0.isEmpty ? nil : $0 } ?? "Not set")")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+    }
+
     private var releaseDisclosure: some View {
-        if model.candidate.availableReleases.count > 1 {
-            DisclosureGroup("Pick a different release…", isExpanded: $showReleasePicker) {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(model.candidate.availableReleases, id: \.id) { release in
-                        Button {
-                            model.selectRelease(release)
-                        } label: {
-                            HStack {
-                                Image(systemName: release.id == model.candidate.chosenRelease.id ? "largecircle.fill.circle" : "circle")
-                                Text(releaseLabel(release))
-                                Spacer()
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            Text("Release: \(releaseLabel(model.candidate.chosenRelease))")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            if model.candidate.availableReleases.count > 1 {
+                DisclosureGroup("Choose release…", isExpanded: $showReleasePicker) {
+                    LazyVStack(alignment: .leading, spacing: density.detailSpacing) {
+                        ForEach(model.candidate.availableReleases, id: \.id) { release in
+                            Button {
+                                guard release.id != model.candidate.chosenRelease.id else { return }
+                                model.selectRelease(release)
+                            } label: {
+                                HStack(alignment: .top) {
+                                    Image(systemName: release.id == model.candidate.chosenRelease.id ? "largecircle.fill.circle" : "circle")
+                                    Text(releaseLabel(release))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Spacer()
+                                }
+                                .contentShape(Rectangle())
+                                .padding(.vertical, density.detailSpacing)
                             }
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+                            .disabled(isReadOnly || isApplied)
+                            .accessibilityLabel("\(release.id == model.candidate.chosenRelease.id ? "Selected release" : "Choose release"): \(releaseLabel(release))")
                         }
-                        .buttonStyle(.plain)
                     }
                 }
-                .font(.caption)
-                .padding(.leading, 24)
-                .padding(.top, 2)
             }
-            .font(.caption)
         }
     }
 
     private func releaseLabel(_ release: MBRelease) -> String {
-        let year = release.date.map { String($0.prefix(4)) } ?? "—"
-        let country = release.country ?? "—"
+        let year = release.date.map { String($0.prefix(4)) } ?? "Year unknown"
+        let country = release.country ?? "Country unknown"
         return "\(release.title) · \(year) · \(country)"
     }
 }

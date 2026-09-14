@@ -195,6 +195,15 @@ final class AutoTaggerService: ObservableObject {
         stopUnresolvedRows(among: Array(rows.keys), message: "Scan stopped", generation: runGeneration)
     }
 
+    func reset() {
+        cancel()
+        rows = [:]
+        recordingAlternatives = [:]
+        recordingDetails = [:]
+        lookupBaselines = [:]
+        fatalError = nil
+    }
+
     /// Runs the lookup pipeline for `fileIDs`, publishing each row's result
     /// to `rows` as it resolves. Replaces any previously in-flight run.
     func run(fileIDs: [Int64]) async {

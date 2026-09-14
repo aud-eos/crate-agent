@@ -37,7 +37,6 @@ extension HygieneFileRow: HygieneFileSource {}
 /// `commitMetadataToSerato` mutations so undo + history come for
 /// free per Rules 1 and 2.
 public enum LibraryHygiene {
-
     public static func normalizedMissingFieldValue(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -52,7 +51,9 @@ public enum LibraryHygiene {
         public let oldValue: String
         public let newValue: String
 
-        public var id: String { "\(fileId):\(field.rawValue)" }
+        public var id: String {
+            "\(fileId):\(field.rawValue)"
+        }
     }
 
     /// Scan the file list for trim-worthy whitespace in any text
@@ -96,7 +97,9 @@ public enum LibraryHygiene {
         public let oldValue: String
         public let newValue: String
 
-        public var id: String { "\(fileId):\(field.rawValue)" }
+        public var id: String {
+            "\(fileId):\(field.rawValue)"
+        }
     }
 
     /// Parameters for a find/replace scan. Bundled together so the
@@ -217,7 +220,7 @@ public enum LibraryHygiene {
     /// canonical spelling.
     public struct CaseInconsistencyGroup: Sendable, Equatable, Identifiable {
         public let field: SeratoMetadataField
-        public let canonicalKey: String  // lowercased identity
+        public let canonicalKey: String // lowercased identity
         /// All distinct cased spellings observed in this group,
         /// sorted by descending count then alphabetical for
         /// deterministic UI rendering.
@@ -228,13 +231,15 @@ public enum LibraryHygiene {
         public let suggestedCanonical: String
         public let totalFiles: Int
 
-        public var id: String { "\(field.rawValue):\(canonicalKey)" }
+        public var id: String {
+            "\(field.rawValue):\(canonicalKey)"
+        }
     }
 
     public struct CaseVariant: Sendable, Equatable {
-        public let value: String       // the cased spelling
-        public let count: Int          // how many files use it
-        public let fileIds: [Int64]    // files using this variant
+        public let value: String // the cased spelling
+        public let count: Int // how many files use it
+        public let fileIds: [Int64] // files using this variant
     }
 
     /// Scan for groups where the same field has 2+ different
@@ -259,7 +264,9 @@ public enum LibraryHygiene {
                 let variants = variantsByCasing
                     .map { CaseVariant(value: $0.key, count: $0.value.count, fileIds: $0.value) }
                     .sorted { lhs, rhs in
-                        if lhs.count != rhs.count { return lhs.count > rhs.count }
+                        if lhs.count != rhs.count {
+                            return lhs.count > rhs.count
+                        }
                         return lhs.value < rhs.value
                     }
                 let totalFiles = variants.reduce(0) { $0 + $1.count }
@@ -294,7 +301,9 @@ public enum LibraryHygiene {
         public let oldValue: String
         public let newValue: String
 
-        public var id: String { "\(fileId):\(field.rawValue)" }
+        public var id: String {
+            "\(fileId):\(field.rawValue)"
+        }
     }
 
     /// Project per-group canonical choices onto a flat list of
@@ -345,7 +354,9 @@ public enum LibraryHygiene {
         public let path: String
         public let field: SeratoMetadataField
 
-        public var id: String { "\(fileId):\(field.rawValue)" }
+        public var id: String {
+            "\(fileId):\(field.rawValue)"
+        }
     }
 
     /// Per-field count of how many files have no value for that
@@ -355,7 +366,9 @@ public enum LibraryHygiene {
         public let field: SeratoMetadataField
         public let count: Int
 
-        public var id: String { field.rawValue }
+        public var id: String {
+            field.rawValue
+        }
     }
 
     /// Empty-field detection: a row "is missing" a field when the
@@ -569,7 +582,6 @@ public enum SeratoMetadataField: String, CaseIterable, Sendable {
 /// `commitMetadataToSerato` mutation pair under a shared `batch_id`
 /// so a single Undo on the History view reverts the entire cleanup.
 public actor LibraryHygieneRunner {
-
     private let operationEngine: OperationEngine
     private let activityLog: ActivityLog?
 
