@@ -66,10 +66,17 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
     }
 
     let mut format = symphonia::default::get_probe()
-        .probe(&hint, media_source, FormatOptions::default(), MetadataOptions::default())
+        .probe(
+            &hint,
+            media_source,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
         .map_err(|err| FingerprintError::Decode(err.to_string()))?;
 
-    let track = format.default_track(TrackType::Audio).ok_or(FingerprintError::NoAudioTracks)?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or(FingerprintError::NoAudioTracks)?;
     let track_id = track.id;
 
     let codec_params = track
@@ -77,10 +84,13 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
         .as_ref()
         .ok_or(FingerprintError::MissingCodecParameter("codec_params"))?
         .audio()
-        .ok_or(FingerprintError::MissingCodecParameter("audio_codec_params"))?;
+        .ok_or(FingerprintError::MissingCodecParameter(
+            "audio_codec_params",
+        ))?;
 
-    let sample_rate =
-        codec_params.sample_rate.ok_or(FingerprintError::MissingCodecParameter("sample_rate"))?;
+    let sample_rate = codec_params
+        .sample_rate
+        .ok_or(FingerprintError::MissingCodecParameter("sample_rate"))?;
     let channel_count = codec_params
         .channels
         .as_ref()
@@ -110,8 +120,9 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
     let max_frames = sample_rate as u64 * FINGERPRINT_MAX_DURATION_SECONDS;
     let mut frames_consumed: u64 = 0;
 
-    while let Some(packet) =
-        format.next_packet().map_err(|err| FingerprintError::Decode(err.to_string()))?
+    while let Some(packet) = format
+        .next_packet()
+        .map_err(|err| FingerprintError::Decode(err.to_string()))?
     {
         if packet.track_id != track_id {
             continue;
@@ -135,8 +146,7 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
                 // sample count / channel count). Once we've fed
                 // Chromaprint 120 seconds of audio, the hash has
                 // converged; reading more wastes decode cycles.
-                frames_consumed +=
-                    (interleaved as u64) / channel_count.max(1) as u64;
+                frames_consumed += (interleaved as u64) / channel_count.max(1) as u64;
                 if frames_consumed >= max_frames {
                     break;
                 }
