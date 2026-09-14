@@ -5,6 +5,83 @@ import XCTest
 final class PhysicalFileMoveTransactionTests: XCTestCase {
     private static let disposableVolume = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume")
 
+    func testCrossVolumeReplacedDestinationBeforeVerificationIsRetained() async throws {
+        try await assertCrossVolumeReplacementRetained(replacementMatchesSource: false)
+    }
+
+    func testCrossVolumeSameContentReplacementIsStillUnowned() async throws {
+        try await assertCrossVolumeReplacementRetained(replacementMatchesSource: true)
+    }
+
+    private func assertCrossVolumeReplacementRetained(replacementMatchesSource: Bool) async throws {
+        guard FileManager.default.fileExists(atPath: Self.disposableVolume.appendingPathComponent(".task6-test-volume").path) else {
+            throw XCTSkip("Requires the explicitly created disposable Task 6 disk image")
+        }
+        let fixture = try await MoveFixture(destinationRoot: Self.disposableVolume)
+        defer { fixture.remove() }
+        let replacement = replacementMatchesSource ? fixture.bytes : Data([9, 8, 7, 6])
+        do {
+            try await PhysicalFileMoveTransaction.write(to: fixture.database.writer, batchId: "replaced", afterTransfer: { destination in
+                try FileManager.default.removeItem(at: destination)
+                try replacement.write(to: destination)
+            }) { database, moves in
+                let file = try XCTUnwrap(FileRecord.fetchOne(database, key: fixture.fileID))
+                _ = try moves.move(.init(fileId: fixture.fileID, newPath: fixture.destination.path, previousPath: fixture.source.path, physicalMove: true), file: file)
+            }
+            XCTFail("replacement must reject the move")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("Retained audio paths")) }
+        XCTAssertEqual(try Data(contentsOf: fixture.source), fixture.bytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.destination), replacement)
+    }
+
+    func testSameVolumeReplacementCannotBecomeRollbackAuthority() async throws {
+        let fixture = try await MoveFixture()
+        defer { fixture.remove() }
+        let retained = fixture.directory.appendingPathComponent("original-retained-by-writer.mp3")
+        let original = try FileMetadataCollector.collectVerified(at: fixture.source.path)
+        do {
+            try await PhysicalFileMoveTransaction.write(to: fixture.database.writer, batchId: "same-volume-replacement", afterTransfer: { destination in
+                try FileManager.default.moveItem(at: destination, to: retained)
+                try fixture.bytes.write(to: destination)
+            }) { database, moves in
+                let file = try XCTUnwrap(FileRecord.fetchOne(database, key: fixture.fileID))
+                _ = try moves.move(.init(fileId: fixture.fileID, newPath: fixture.destination.path, previousPath: fixture.source.path, physicalMove: true), file: file)
+                try database.execute(sql: "INSERT INTO deliberately_missing_table VALUES (1)")
+            }
+            XCTFail("replacement must reject the move")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("Retained audio paths")) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.source.path))
+        XCTAssertEqual(try Data(contentsOf: retained), fixture.bytes)
+        XCTAssertEqual(try FileMetadataCollector.collectVerified(at: retained.path).inode, original.inode)
+        XCTAssertEqual(try Data(contentsOf: fixture.destination), fixture.bytes)
+        XCTAssertNotEqual(try FileMetadataCollector.collectVerified(at: fixture.destination.path).inode, original.inode)
+    }
+
+    func testCrossVolumeMiddleEditBeforeRollbackIsRetained() async throws {
+        guard FileManager.default.fileExists(atPath: Self.disposableVolume.appendingPathComponent(".task6-test-volume").path) else {
+            throw XCTSkip("Requires the explicitly created disposable Task 6 disk image")
+        }
+        let fixture = try await MoveFixture(destinationRoot: Self.disposableVolume, bytes: Data(repeating: 3, count: 4 * 1024 * 1024))
+        defer { fixture.remove() }
+        do {
+            try await PhysicalFileMoveTransaction.write(to: fixture.database.writer, batchId: "middle-edit") { database, moves in
+                let file = try XCTUnwrap(FileRecord.fetchOne(database, key: fixture.fileID))
+                _ = try moves.move(.init(fileId: fixture.fileID, newPath: fixture.destination.path, previousPath: fixture.source.path, physicalMove: true), file: file)
+                let handle = try FileHandle(forWritingTo: fixture.destination)
+                try handle.seek(toOffset: 2 * 1024 * 1024)
+                try handle.write(contentsOf: Data([9]))
+                try handle.close()
+                try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: TimeInterval(file.mtime + 10))], ofItemAtPath: fixture.destination.path)
+                try database.execute(sql: "INSERT INTO deliberately_missing_table VALUES (1)")
+            }
+            XCTFail("database failure must roll back")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("Retained audio paths")) }
+        XCTAssertEqual(try Data(contentsOf: fixture.source), fixture.bytes)
+        let changed = try Data(contentsOf: fixture.destination)
+        XCTAssertEqual(changed[2 * 1024 * 1024], 9)
+        XCTAssertEqual(changed.count, fixture.bytes.count)
+    }
+
     func testCrossVolumeOrganizeAndUndo() async throws {
         guard FileManager.default.fileExists(atPath: Self.disposableVolume.appendingPathComponent(".task6-test-volume").path) else {
             throw XCTSkip("Requires the explicitly created disposable Task 6 disk image")
@@ -87,7 +164,7 @@ private struct MoveFixture {
     let directory: URL
     let source: URL
     let destination: URL
-    let bytes = Data([1, 2, 3, 4])
+    let bytes: Data
     let database: LibraryDatabase
     let engine: OperationEngine
     let fileID: Int64
@@ -100,7 +177,8 @@ private struct MoveFixture {
         .renameFile(.init(fileId: fileID, newPath: destination.path, previousPath: source.path, physicalMove: true))
     }
 
-    init(destinationRoot: URL? = nil) async throws {
+    init(destinationRoot: URL? = nil, bytes: Data = Data([1, 2, 3, 4])) async throws {
+        self.bytes = bytes
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         source = directory.appendingPathComponent("source.mp3")

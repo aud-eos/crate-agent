@@ -1,15 +1,22 @@
+import Darwin
 import Foundation
 import GRDB
 
 /// Compensation stays inside the serialized writer even when COMMIT fails.
 final class PhysicalFileMoveTransaction {
-    private var moves: [(source: String, destination: String, identity: FileMetadata, retainedSource: FileMetadata?)] = []
+    private let afterTransfer: @Sendable (URL) throws -> Void
+    private var moves: [(source: String, destination: String, identity: FileMetadata?, retainedSource: FileMetadata?)] = []
+
+    private init(afterTransfer: @escaping @Sendable (URL) throws -> Void) {
+        self.afterTransfer = afterTransfer
+    }
 
     static func write<Result: Sendable>(to writer: any DatabaseWriter, batchId: String,
+                                        afterTransfer: @escaping @Sendable (URL) throws -> Void = { _ in },
                                         _ body: @escaping @Sendable (Database, PhysicalFileMoveTransaction) throws -> Result) async throws -> Result
     {
         try await writer.writeWithoutTransaction { database in
-            let transaction = PhysicalFileMoveTransaction()
+            let transaction = PhysicalFileMoveTransaction(afterTransfer: afterTransfer)
             var result: Result?
             do {
                 try database.inTransaction {
@@ -49,22 +56,71 @@ final class PhysicalFileMoveTransaction {
         guard let destinationVolume else { throw MoveError.changedDestination(destination.path) }
         if destinationVolume == source.volumeUuid {
             try FileManager.default.moveItem(atPath: source.path, toPath: destination.path)
-            moves.append((source.path, destination.path, source, nil))
-        } else {
-            moves.append((source.path, destination.path, source, source))
-            try FileManager.default.copyItem(atPath: source.path, toPath: destination.path)
+            let expected = FileMetadata(path: destination.path, volumeUuid: source.volumeUuid, inode: source.inode,
+                                        fileSize: source.fileSize, mtime: source.mtime, lightweightHash: source.lightweightHash)
+            moves.append((source.path, destination.path, expected, nil))
+            try afterTransfer(destination)
+            guard try FileMetadataCollector.collectVerified(at: destination.path) == expected else {
+                throw MoveError.changedDestination(destination.path)
+            }
+            return expected
         }
-        let moved = try FileMetadataCollector.collectVerified(at: destination.path)
+        moves.append((source.path, destination.path, nil, source))
+        let moved = try copyOwnedDestination(source: source, destination: destination, volume: destinationVolume)
         moves[moves.count - 1].identity = moved
-        guard moved.fileSize == source.fileSize, moved.lightweightHash == source.lightweightHash else {
-            throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
-        }
-        if moves.last?.retainedSource != nil {
-            guard try FileMetadataCollector.collectVerified(at: source.path) == source else {
-                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+        return moved
+    }
+
+    private func copyOwnedDestination(source: FileMetadata, destination: URL, volume: String) throws -> FileMetadata {
+        try withDescriptor(path: source.path, flags: O_RDONLY | O_NOFOLLOW) { sourceDescriptor in
+            let sourceStat = try descriptorStat(sourceDescriptor, path: source.path)
+            guard Int64(sourceStat.st_ino) == source.inode, sourceStat.st_size == source.fileSize,
+                  sourceStat.st_mtimespec.tv_sec == source.mtime
+            else {
+                throw MoveError.changedDestination(source.path)
+            }
+            return try withDescriptor(path: destination.path, flags: O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW) { destinationDescriptor in
+                let ownedStat = try descriptorStat(destinationDescriptor, path: destination.path)
+                guard fcopyfile(sourceDescriptor, destinationDescriptor, nil, copyfile_flags_t(COPYFILE_ALL)) == 0 else {
+                    throw posixFailure(operation: "Copy audio and metadata", path: destination.path)
+                }
+                try afterTransfer(destination)
+                let copied = try FileMetadataCollector.collectVerified(at: destination.path)
+                guard copied.inode == Int64(ownedStat.st_ino), copied.volumeUuid == volume,
+                      copied.fileSize == source.fileSize, copied.mtime == source.mtime,
+                      copied.lightweightHash == source.lightweightHash,
+                      try FileMetadataCollector.collectVerified(at: source.path) == source
+                else {
+                    throw MoveError.changedDestination(destination.path)
+                }
+                return copied
             }
         }
-        return moved
+    }
+
+    private func withDescriptor<Value>(path: String, flags: Int32, _ body: (Int32) throws -> Value) throws -> Value {
+        let descriptor = Darwin.open(path, flags, mode_t(0o600))
+        guard descriptor >= 0 else { throw posixFailure(operation: "Open audio", path: path) }
+        let outcome = Result { try body(descriptor) }
+        if Darwin.close(descriptor) != 0 {
+            let closeFailure = posixFailure(operation: "Close audio", path: path)
+            if case let .failure(original) = outcome {
+                throw MoveError.descriptorFailure("\(original.localizedDescription); \(closeFailure.localizedDescription)")
+            }
+            throw closeFailure
+        }
+        return try outcome.get()
+    }
+
+    private func descriptorStat(_ descriptor: Int32, path: String) throws -> stat {
+        var identity = stat()
+        guard fstat(descriptor, &identity) == 0 else { throw posixFailure(operation: "Inspect audio", path: path) }
+        return identity
+    }
+
+    private func posixFailure(operation: String, path: String) -> NSError {
+        let errorCode = errno
+        return NSError(domain: NSPOSIXErrorDomain, code: Int(errorCode), userInfo: [NSLocalizedDescriptionKey: "\(operation) at \(path): \(String(cString: strerror(errorCode)))"])
     }
 
     private func compensate() throws {
@@ -80,9 +136,7 @@ final class PhysicalFileMoveTransaction {
             }
             if FileManager.default.fileExists(atPath: move.destination) {
                 let current = try FileMetadataCollector.collectVerified(at: move.destination)
-                guard current.volumeUuid == move.identity.volumeUuid, current.inode == move.identity.inode,
-                      current.fileSize == move.identity.fileSize, current.lightweightHash == move.identity.lightweightHash
-                else {
+                guard current == move.identity else {
                     throw MoveError.changedDestination(move.destination)
                 }
                 if move.retainedSource != nil {
@@ -114,12 +168,14 @@ final class PhysicalFileMoveTransaction {
         case changedDestination(String)
         case compensationFailed(original: String, compensation: String)
         case cleanupFailed(String, String)
+        case descriptorFailure(String)
 
         var errorDescription: String? {
             switch self {
             case let .changedDestination(path): "Cannot restore moved audio because its destination changed: \(path)."
             case let .compensationFailed(original, compensation): "Move transaction failed: \(original). Restoring audio also failed: \(compensation)"
             case let .cleanupFailed(path, reason): "Audio move committed, but its retained source could not be removed at \(path): \(reason)"
+            case let .descriptorFailure(reason): reason
             }
         }
     }

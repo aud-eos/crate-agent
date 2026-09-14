@@ -153,7 +153,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             keyStore: StubKeyProvider(),
             fingerprintFunction: { _ in
                 try database.writer.write { db in
-                    try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
+                    _ = try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
                                                      freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
                 }
                 throw NSError(domain: "decode-test", code: 1)

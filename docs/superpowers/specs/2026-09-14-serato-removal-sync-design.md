@@ -225,3 +225,19 @@ The single-file Rename dialog uses the same physical rename primitive with its
 captured file revision and source path. It performs no pre-engine filesystem move
 or post-move FSEvents deduplication read. A committed rename with incomplete cleanup
 or external sync remains visible as an error; History retries external writes.
+
+Predecode lifecycle rejection is a superseded result, not a decoder failure. It
+leaves eligible siblings pending for a later representative. Unexpected database
+errors propagate from one-shot processing; the background loop stops and publishes
+`Progress.error` (default nil for existing callers), also retained in actor-isolated
+`lastError`. Task 7 connects this terminal failure to monitored UI and retry; a new
+`start()` clears the error and starts a new generation.
+
+Physical move compensation requires verified ownership. Same-volume moves retain
+the original inode and volume as authority. Cross-volume copies use an exclusively
+created destination descriptor and native `COPYFILE_ALL` to preserve file metadata,
+ACLs, extended attributes, and resource forks. The destination path must still name
+that descriptor's inode and match the unchanged source before rollback authority is
+recorded. Compensation and post-commit cleanup compare all collected metadata,
+including modification time. Unknown or changed destinations remain in place with
+an actionable error; observing a replacement never grants permission to remove it.

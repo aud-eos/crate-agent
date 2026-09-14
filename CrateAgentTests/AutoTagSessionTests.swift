@@ -6,6 +6,41 @@ import XCTest
 
 @MainActor
 final class AutoTagSessionTests: XCTestCase {
+    func testApplyKeepsOriginalTokenAcrossFreshnessSuspensionAndReactivation() async throws {
+        let started = expectation(description: "apply freshness suspended")
+        let freshness = SessionFreshnessSuspension(started: started)
+        let fixture = try SessionFixture(fileCount: 1, fileFreshnessReader: { freshness.read($0) })
+        let recorded = SessionTokenRecorder()
+        let engine = OperationEngine(database: fixture.database,
+                                     seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
+                                     fileTagWriter: { _, _ in })
+        let session = AutoTagSession(database: fixture.database, lookupService: fixture.service, applyBatch: { mutations, batchID, tokens in
+            await recorded.record(tokens)
+            _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens)
+        }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: nil)
+        session.selectVisibleFileIDs(fixture.fileIDs)
+        await session.startScan()
+        session.approveAllSuggested()
+        freshness.arm()
+        let apply = Task { await session.applyConfirmed() }
+        await fulfillment(of: [started], timeout: 5)
+        let fileID = fixture.fileIDs[0]
+        _ = try await engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: 0, state: .init(membership: .retired, availability: .available, libraryID: nil, retiredAt: 1))))
+        _ = try await engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: 1, state: .init(membership: .active, availability: .available, libraryID: nil, retiredAt: nil))))
+        freshness.release()
+        await apply.value
+        let tokens = await recorded.tokens
+        XCTAssertEqual(tokens, [fileID: FileMembershipToken(fileId: fileID, revision: 0)])
+        XCTAssertTrue(session.appliedFileIDs.isEmpty)
+        XCTAssertTrue(session.actionError?.contains("superseded") == true)
+        let file = try await fixture.database.writer.read { try XCTUnwrap(FileRecord.fetchOne($0, key: fileID)) }
+        XCTAssertEqual(file.membershipRevision, 2)
+        XCTAssertNil(file.artist)
+        let matchCount = try await fixture.database.writer.read { try EventRecord.filter(Column("event_type") == EventType.musicBrainzMatchApplied.rawValue).fetchCount($0) }
+        XCTAssertEqual(matchCount, 0)
+    }
+
     func testRetiredChoicesStayInspectableButCannotBeApprovedAfterReactivation() async throws {
         let fixture = try SessionFixture(fileCount: 2)
         fixture.session.selectVisibleFileIDs(fixture.fileIDs)
@@ -482,6 +517,7 @@ private struct SessionFixture {
 
     init(fileCount: Int, alternatives: Bool = false, firstLookupHasNoMatch: Bool = false, lowScoreAlternative: Bool = false, blockedRecordingID: String? = nil,
          started: SessionGate = SessionGate(), release: SessionGate = SessionGate(),
+         fileFreshnessReader: @escaping FileFreshnessReading = { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 10) },
          apply: @escaping @Sendable ([TrackMutation], String) async throws -> Void = { _, _ in },
          resync: @escaping @Sendable (String) async throws -> ResyncOutcome = { _ in ResyncOutcome(appliedCount: 1, queuedCount: 0) }) throws
     {
@@ -505,8 +541,47 @@ private struct SessionFixture {
                                     keyStore: SessionTestKey(), audioTagsReader: { _ in
                                         AudioTags(bitrateKbps: nil, title: "Current title", artist: "Current artist", album: "Current album", albumArtist: nil,
                                                   genre: nil, year: 1990, trackNumber: nil, totalTracks: nil, bpm: nil, comment: nil, durationSeconds: 200)
-                                    }, fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 10) })
+                                    }, fileFreshnessReader: fileFreshnessReader)
         session = AutoTagSession(database: database, lookupService: service, applyBatch: { mutations, batchID, _ in try await apply(mutations, batchID) }, resyncBatch: resync, preferences: nil)
+    }
+}
+
+private actor SessionTokenRecorder {
+    private(set) var tokens: [Int64: FileMembershipToken]?
+    func record(_ tokens: [Int64: FileMembershipToken]) {
+        self.tokens = tokens
+    }
+}
+
+private final class SessionFreshnessSuspension: @unchecked Sendable {
+    private let lock = NSLock()
+    private let started: XCTestExpectation
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var armed = false
+
+    init(started: XCTestExpectation) {
+        self.started = started
+    }
+
+    func arm() {
+        lock.withLock { armed = true }
+    }
+
+    func release() {
+        semaphore.signal()
+    }
+
+    func read(_: String) -> FileFreshnessSnapshot {
+        let shouldWait = lock.withLock {
+            let shouldWait = armed
+            armed = false
+            return shouldWait
+        }
+        if shouldWait {
+            started.fulfill()
+            semaphore.wait()
+        }
+        return FileFreshnessSnapshot(fileSize: 1000, mtime: 10)
     }
 }
 
