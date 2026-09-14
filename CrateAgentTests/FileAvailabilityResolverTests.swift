@@ -65,5 +65,16 @@ final class FileAvailabilityResolverTests: XCTestCase {
             XCTAssertEqual(events.count, 1)
             XCTAssertFalse(events.contains { $0.eventType.hasReplayableSeratoProjection })
         }
+        try Data([99, 100]).write(to: source)
+        try await coordinator.handleObservations([.init(path: source.path, isFile: true, wasCreated: true)])
+        try await database.writer.read { connection in
+            let file = try XCTUnwrap(FileRecord.fetchOne(connection, key: 51))
+            XCTAssertEqual(file.fileAvailability, .trashed)
+            XCTAssertEqual(file.inode, metadata.inode)
+            XCTAssertEqual(try EventRecord.fetchCount(connection), 1)
+        }
+        let reconciliationRequested = await coordinator.takeReconciliationRequest()
+        XCTAssertTrue(reconciliationRequested)
+        XCTAssertEqual(try FileAvailabilityResolver().inspect(path: trashed.path, volumeID: volume), .trashed)
     }
 }

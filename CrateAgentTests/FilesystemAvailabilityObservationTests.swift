@@ -3,6 +3,121 @@ import GRDB
 import XCTest
 
 final class FilesystemAvailabilityObservationTests: XCTestCase {
+    func testPreviouslyAvailablePathReplacementInvalidatesEligibility() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("original.mp3")
+        let held = directory.appendingPathComponent("held.mp3")
+        try Data([1, 2]).write(to: source)
+        let metadata = try XCTUnwrap(FileMetadataCollector.collect(at: source.path))
+        let database = try LibraryDatabase.openInMemory()
+        try await database.writer.write { connection in
+            var file = FileRecord(id: 51, path: source.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode, fileSize: metadata.fileSize, mtime: metadata.mtime)
+            file.libraryMembership = .active
+            file.fileAvailability = .available
+            try file.insert(connection)
+        }
+        let engine = await MainActor.run {
+            OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }), seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
+        }
+        let coordinator = FilesystemSyncCoordinator(operationEngine: engine, database: database)
+        try FileManager.default.moveItem(at: source, to: held)
+        try Data([99, 100]).write(to: source)
+        try await coordinator.handleObservations([.init(path: source.path, isFile: true, wasCreated: true)])
+        try await database.writer.read { connection in
+            let file = try XCTUnwrap(FileRecord.fetchOne(connection, key: 51))
+            XCTAssertEqual(file.fileAvailability, .unknown)
+            XCTAssertEqual(file.inode, metadata.inode)
+            XCTAssertEqual(file.libraryMembership, .active)
+            XCTAssertEqual(file.membershipRevision, 0)
+            XCTAssertThrowsError(try FileProcessingEligibility.requireProcessable(file))
+            let event = try XCTUnwrap(EventRecord.fetchOne(connection))
+            XCTAssertEqual(event.eventType, .fileLibraryStateChanged)
+            let inverse = try JSONDecoder().decode(SetFileLibraryStatePayload.self, from: Data(event.inversePayloadJson.utf8))
+            XCTAssertEqual(inverse.state.availability, .available)
+        }
+        let requested = await coordinator.takeReconciliationRequest()
+        XCTAssertTrue(requested)
+    }
+
+    func testMissingPathReplacementDoesNotRestoreOriginalButSameIdentityDoes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("original.mp3")
+        let held = directory.appendingPathComponent("held.mp3")
+        try Data([1, 2]).write(to: source)
+        let metadata = try XCTUnwrap(FileMetadataCollector.collect(at: source.path))
+        let database = try LibraryDatabase.openInMemory()
+        try await database.writer.write { connection in
+            var file = FileRecord(id: 51, path: source.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode, fileSize: metadata.fileSize, mtime: metadata.mtime)
+            file.libraryMembership = .active
+            file.fileAvailability = .missing
+            try file.insert(connection)
+        }
+        let engine = await MainActor.run {
+            OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }), seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
+        }
+        let coordinator = FilesystemSyncCoordinator(operationEngine: engine, database: database)
+        try FileManager.default.moveItem(at: source, to: held)
+        try Data([99, 100]).write(to: source)
+        try await coordinator.handleObservations([.init(path: source.path, isFile: true, wasCreated: true)])
+        try await database.writer.read { connection in
+            let file = try XCTUnwrap(FileRecord.fetchOne(connection, key: 51))
+            XCTAssertEqual(file.fileAvailability, .missing)
+            XCTAssertEqual(file.inode, metadata.inode)
+            XCTAssertThrowsError(try FileProcessingEligibility.requireProcessable(file))
+            XCTAssertEqual(try EventRecord.fetchCount(connection), 0)
+        }
+        let request = await coordinator.takeReconciliationRequest()
+        XCTAssertTrue(request)
+        try FileManager.default.removeItem(at: source)
+        try FileManager.default.moveItem(at: held, to: source)
+        try await coordinator.handleObservations([.init(path: source.path, isFile: true, wasRenamed: true)])
+        try await database.writer.read { connection in
+            let file = try XCTUnwrap(FileRecord.fetchOne(connection, key: 51))
+            XCTAssertEqual(file.fileAvailability, .available)
+            XCTAssertEqual(file.inode, metadata.inode)
+            XCTAssertEqual(file.membershipRevision, 0)
+            XCTAssertEqual(try EventRecord.fetchCount(connection), 1)
+        }
+        let restoreRequest = await coordinator.takeReconciliationRequest()
+        XCTAssertFalse(restoreRequest)
+    }
+
+    func testCreatedHardLinkPreservesOriginalLocationAndSeratoBytes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("original.mp3")
+        let linked = directory.appendingPathComponent("linked.mp3")
+        try Data([1, 2]).write(to: source)
+        let metadata = try XCTUnwrap(FileMetadataCollector.collect(at: source.path))
+        let seratoURL = directory.appendingPathComponent("database V2")
+        let originalBytes = OperationEngineTests.synthesizeDatabaseV2BytesForTest(withTrackPaths: [String(source.path.dropFirst())])
+        try originalBytes.write(to: seratoURL)
+        let database = try LibraryDatabase.openInMemory()
+        try await database.writer.write { connection in
+            var file = FileRecord(id: 51, path: source.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode, fileSize: metadata.fileSize, mtime: metadata.mtime)
+            file.libraryMembership = .active
+            file.fileAvailability = .available
+            try file.insert(connection)
+        }
+        let engine = await MainActor.run {
+            OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }), seratoLocator: SeratoLibraryLocator(seratoDirectory: directory))
+        }
+        let coordinator = FilesystemSyncCoordinator(operationEngine: engine, database: database)
+        try FileManager.default.linkItem(at: source, to: linked)
+        try await coordinator.handleObservations([.init(path: linked.path, isFile: true, wasCreated: true)])
+        try await database.writer.read { connection in
+            XCTAssertEqual(try FileRecord.fetchOne(connection, key: 51)?.path, source.path)
+            XCTAssertEqual(try EventRecord.fetchCount(connection), 0)
+        }
+        XCTAssertEqual(try Data(contentsOf: seratoURL), originalBytes)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
+
     func testDatabaseFailureThrowsPathContext() async throws {
         let database = try LibraryDatabase.openInMemory()
         let engine = await MainActor.run {

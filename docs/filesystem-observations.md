@@ -18,6 +18,15 @@ observation-only location event with its previous path, volume and inode in the
 inverse. It preserves membership revision and has no Serato projection or Undo
 action. Active normal moves continue through the guarded rename mutation.
 
+A path becoming readable does not prove that the tracked file returned. Positive
+availability also requires the stored inode and volume to match. A different file
+at the same path requests reconciliation and keeps the original unavailable;
+previously available rows become unknown until association is resolved. A genuine
+same-identity restore can become available. Both inode and hash move candidates
+require evidence that the original identity is absent at its previous location;
+creating a hard link while the original remains present does not rename the row or
+Serato references.
+
 The watcher delivers batches and original kernel event IDs through one ordered
 stream. `FilesystemEventProcessor` handles one batch at a time and checkpoints
 only after success. Failed heads remain queued and block later checkpoints until

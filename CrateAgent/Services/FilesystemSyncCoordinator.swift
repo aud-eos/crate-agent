@@ -58,7 +58,7 @@ public actor FilesystemSyncCoordinator {
             try FileRecord.filter(Column("path") == observation.path).fetchOne(connection)
         }
         if let knownPath {
-            var availability = try availabilityResolver.inspect(path: observation.path, volumeID: knownPath.volumeUuid)
+            var availability = try inspectKnownIdentity(knownPath)
             // An old-path removal is not evidence that a positively identified Trash item disappeared.
             if availability == .missing, knownPath.fileAvailability == .trashed {
                 availability = .trashed
@@ -94,14 +94,28 @@ public actor FilesystemSyncCoordinator {
                 return
             }
             existing = candidates.first
-            if let existing {
-                let previousAvailability = try availabilityResolver.inspect(path: existing.path, volumeID: existing.volumeUuid)
-                guard previousAvailability == .missing || previousAvailability == .offline else { return }
-            }
         }
         guard let existing else { return }
+        let previousAvailability = try inspectKnownIdentity(existing)
+        guard previousAvailability == .missing || previousAvailability == .offline else {
+            requiresReconciliation = true
+            try await observe(file: existing, availability: previousAvailability, metadata: nil, batchID: batchID)
+            return
+        }
         let availability = try availabilityResolver.inspect(path: observation.path, volumeID: metadata.volumeUuid)
         try await observe(file: existing, availability: availability, metadata: metadata, batchID: batchID)
+    }
+
+    private func inspectKnownIdentity(_ file: FileRecord) throws -> FileAvailability {
+        let availability = try availabilityResolver.inspect(path: file.path, volumeID: file.volumeUuid)
+        guard availability == .available || availability == .trashed else { return availability }
+        guard let metadata = FileMetadataCollector.collect(at: file.path),
+              metadata.inode == file.inode, metadata.volumeUuid == file.volumeUuid
+        else {
+            requiresReconciliation = true
+            return file.fileAvailability == .missing || file.fileAvailability == .trashed ? file.fileAvailability : .unknown
+        }
+        return availability
     }
 
     private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, batchID: String) async throws {
