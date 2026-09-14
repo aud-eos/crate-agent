@@ -218,6 +218,13 @@ pub fn read_database_records(database_path: String) -> Result<Vec<SeratoTrackRec
     Ok(database.track_records())
 }
 
+pub fn read_database_records_strict(
+    database_path: String,
+) -> Result<Vec<SeratoTrackRecord>, CoreError> {
+    let database = serato::DatabaseV2::read_from_path(database_path)?;
+    Ok(database.strict_track_records()?)
+}
+
 pub fn update_database_record(
     database_path: String,
     track_path: String,

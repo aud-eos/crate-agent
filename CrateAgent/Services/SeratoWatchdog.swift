@@ -24,6 +24,7 @@ public final class SeratoWatchdog: ObservableObject {
     public static let seratoBundleIdentifierPrefix = "com.serato."
 
     @Published public private(set) var isSeratoRunning: Bool = false
+    public private(set) var stateRevision: UInt64 = 0
 
     private let runningBundleIdentifiersProvider: () -> [String]
     private var observers: [NSObjectProtocol] = []
@@ -40,7 +41,7 @@ public final class SeratoWatchdog: ObservableObject {
     public init(
         runningBundleIdentifiersProvider customProvider: (() -> [String])? = nil
     ) {
-        self.runningBundleIdentifiersProvider = customProvider ?? {
+        runningBundleIdentifiersProvider = customProvider ?? {
             NSWorkspace.shared.runningApplications.compactMap { app in
                 app.bundleIdentifier
             }
@@ -84,9 +85,12 @@ public final class SeratoWatchdog: ObservableObject {
     /// when NSWorkspace notifications fire.
     public func refresh() {
         let runningIdentifiers = runningBundleIdentifiersProvider()
-        isSeratoRunning = runningIdentifiers.contains { identifier in
+        let running = runningIdentifiers.contains { identifier in
             identifier.hasPrefix(Self.seratoBundleIdentifierPrefix)
         }
+        if running != isSeratoRunning {
+            stateRevision += 1
+            isSeratoRunning = running
+        }
     }
-
 }
