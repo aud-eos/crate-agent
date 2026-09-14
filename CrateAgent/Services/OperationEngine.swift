@@ -199,9 +199,14 @@ public actor OperationEngine {
         return executionResults.compactMap(\.eventId)
     }
 
-    func applyObservedBatch(_ mutations: [TrackMutation], authorization: SeratoSnapshotAuthorization, batchId: String = UUID().uuidString) async throws -> [Int64] {
+    func applyObservedBatch(_ mutations: [TrackMutation], authorization: SeratoSnapshotAuthorization,
+                            expectedFiles: [FileObservationExpectation] = [], batchId: String = UUID().uuidString) async throws -> [Int64]
+    {
         try await database.writer.write { connection in
             try authorization.check()
+            for expected in expectedFiles {
+                try expected.validate(in: connection)
+            }
             let results = try mutations.map { mutation in
                 try Self.validateObservedIdentity(mutation, in: connection)
                 let result = try Self.executeAndLog(mutation: mutation, batchId: batchId, in: connection)

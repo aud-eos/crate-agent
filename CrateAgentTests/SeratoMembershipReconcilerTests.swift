@@ -4,6 +4,74 @@ import XCTest
 
 @MainActor
 final class SeratoMembershipReconcilerTests: XCTestCase {
+    func testSameRevisionFilesystemObservationRejectsStaleReconciliationState() async throws {
+        for (relocate, currentAvailability) in [(false, FileAvailability.available), (true, .available), (true, .missing)] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("race.mp3")
+            let held = fixture.directory.appendingPathComponent("held.mp3").path
+            let destination = relocate ? fixture.directory.appendingPathComponent("saved.mp3").path : file.path
+            let fileID = try XCTUnwrap(file.id)
+            try FileManager.default.moveItem(atPath: file.path, toPath: held)
+            _ = try await fixture.engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: 0,
+                                                                          state: .init(membership: .active, availability: .missing, libraryID: file.seratoLibraryId, retiredAt: nil))))
+            try fixture.save(paths: [destination])
+            let engine = fixture.engine
+            let reconciler = SeratoMembershipReconciler(database: fixture.database, operationEngine: engine, reader: fixture.reader, beforeCommit: {
+                try FileManager.default.moveItem(atPath: held, toPath: destination)
+                _ = try await engine.applyBatch([
+                    .observeFileLocation(.init(fileId: fileID, expectedRevision: 0, path: destination, volumeUuid: file.volumeUuid, inode: file.inode)),
+                    .setFileLibraryState(.init(fileId: fileID, expectedRevision: 0, state: .init(membership: .active, availability: currentAvailability, libraryID: file.seratoLibraryId, retiredAt: nil))),
+                ], batchId: "interleaved-filesystem")
+            })
+            do {
+                _ = try await reconciler.reconcile(fixture.reader.read())
+                XCTFail("Stale reconciliation overwrote a same-revision filesystem observation")
+            } catch {
+                guard case FileProcessingEligibilityError.superseded(fileId: fileID) = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+            }
+            let result = try await fixture.row(file)
+            XCTAssertEqual(result.path, destination)
+            XCTAssertEqual(result.fileAvailability, currentAvailability)
+            XCTAssertEqual(result.libraryMembership, .active)
+            XCTAssertEqual(result.membershipRevision, 0)
+            let count = try await fixture.events()
+            XCTAssertEqual(count, 1 + (relocate ? 1 : 0) + (currentAvailability == .available ? 1 : 0))
+        }
+    }
+
+    func testRestoredPendingRenameUsesCurrentAvailabilityInsteadOfCachedState() async throws {
+        for cachedAvailability in [FileAvailability.missing, .unknown] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("before.mp3")
+            let fileID = try XCTUnwrap(file.id)
+            try fixture.save(paths: [file.path])
+            fixture.lifecycle.running = true
+            fixture.watchdog.refresh()
+            let destination = fixture.directory.appendingPathComponent("after.mp3").path
+            let held = fixture.directory.appendingPathComponent("temporarily-gone.mp3").path
+            try FileManager.default.moveItem(atPath: file.path, toPath: destination)
+            _ = try await fixture.engine.apply(.renameFile(.init(fileId: fileID, newPath: destination)))
+            try FileManager.default.moveItem(atPath: destination, toPath: held)
+            _ = try await fixture.engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: 0,
+                                                                          state: .init(membership: .active, availability: cachedAvailability, libraryID: file.seratoLibraryId, retiredAt: nil))))
+            try FileManager.default.moveItem(atPath: held, toPath: destination)
+            fixture.lifecycle.running = false
+            fixture.watchdog.refresh()
+            let before = try Data(contentsOf: fixture.locator.databaseV2Url)
+            let summary = try await fixture.reconcile()
+            let result = try await fixture.row(file)
+            XCTAssertEqual(summary.retired, 0)
+            XCTAssertEqual(result.libraryMembership, .active)
+            XCTAssertEqual(result.fileAvailability, .available)
+            XCTAssertEqual(result.membershipRevision, 0)
+            XCTAssertEqual(try Data(contentsOf: fixture.locator.databaseV2Url), before)
+        }
+    }
+
     func testReplacementInvalidatesLegacyUnversionedHistoryProjection() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }

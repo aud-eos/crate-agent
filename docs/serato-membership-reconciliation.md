@@ -50,6 +50,15 @@ Identity, expected membership revision, and expected availability/membership are
 also checked when metadata observations commit. Starting a newer read invalidates
 an older authorization even when source bytes and membership revisions match.
 
+Reconciler batches preflight every observed row's prior physical identity, library
+state, and membership revision before applying any mutation. This rejects a
+same-revision filesystem location/availability update that arrived after the
+decision, including when the planned availability is missing or offline. The
+preflight precedes the batch's own identity refresh so that a verified move and
+its state update can still commit together. Pending rename decisions use verified
+current availability; a stale cached missing/unknown flag cannot cancel a restored
+same-file rename.
+
 `reconcileRequestedFilesystemChanges()` supplies one bounded reconciliation pass
 for a coalesced filesystem request. The filesystem consumer owns retaining a
 failed request/batch and advancing its checkpoint only after success. This stage

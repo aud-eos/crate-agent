@@ -33,12 +33,16 @@ actor SeratoMembershipReconciler {
     private let operationEngine: OperationEngine
     private let reader: SeratoMembershipSnapshotReader
     private let availability = FileAvailabilityResolver()
+    private let beforeCommit: @Sendable () async throws -> Void
     private var running = false
 
-    init(database: LibraryDatabase, operationEngine: OperationEngine, reader: SeratoMembershipSnapshotReader) {
+    init(database: LibraryDatabase, operationEngine: OperationEngine, reader: SeratoMembershipSnapshotReader,
+         beforeCommit: @escaping @Sendable () async throws -> Void = {})
+    {
         self.database = database
         self.operationEngine = operationEngine
         self.reader = reader
+        self.beforeCommit = beforeCommit
     }
 
     func reconcile(_ snapshot: SeratoMembershipSnapshot) async throws -> ReconciliationSummary {
@@ -95,7 +99,7 @@ actor SeratoMembershipReconciler {
                 if saved {
                     membership = .active
                 } else if membership != .pendingImport,
-                          try !(await hasApplicableRename(file, savedPaths: savedPaths))
+                          try !(await hasApplicableRename(file, observedAvailability: observed, savedPaths: savedPaths))
                 {
                     membership = .retired
                 }
@@ -104,8 +108,10 @@ actor SeratoMembershipReconciler {
                                          libraryID: observed == .offline ? file.seratoLibraryId : snapshot.libraryID,
                                          retiredAt: membership == .retired ? (file.retiredAt ?? Int64(Date().timeIntervalSince1970 * 1000)) : nil)
             mutations.append(.setFileLibraryState(.init(fileId: fileID, expectedRevision: revision, state: state)))
+            try await beforeCommit()
             let authorization = try await reader.authorization(for: snapshot)
-            _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, batchId: batchID)
+            let expected = FileObservationExpectation(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)
+            _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
             if membership == .retired, file.libraryMembership != .retired {
                 summary.retired += 1
             }
@@ -153,8 +159,8 @@ actor SeratoMembershipReconciler {
         return moves
     }
 
-    private func hasApplicableRename(_ file: FileRecord, savedPaths: Set<String>) async throws -> Bool {
-        guard file.libraryMembership == .active, file.fileAvailability == .available,
+    private func hasApplicableRename(_ file: FileRecord, observedAvailability: FileAvailability, savedPaths: Set<String>) async throws -> Bool {
+        guard file.libraryMembership == .active, observedAvailability == .available,
               let fileID = file.id,
               try availability.inspect(path: file.path, volumeID: file.volumeUuid) == .available,
               try Self.matchesKnownFile(file, identity: FileMetadataCollector.collectVerified(at: file.path)) else { return false }

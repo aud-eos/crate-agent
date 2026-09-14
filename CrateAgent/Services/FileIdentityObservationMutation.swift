@@ -1,6 +1,23 @@
 import Foundation
 import GRDB
 
+struct FileObservationExpectation: Sendable {
+    let fileId: Int64
+    let revision: Int64
+    let identity: FileMetadata
+    let state: FileLibraryState
+
+    func validate(in database: GRDB.Database) throws {
+        guard let current = try FileRecord.fetchOne(database, key: fileId),
+              current.membershipRevision == revision,
+              current.identity == identity,
+              current.libraryState == state
+        else {
+            throw FileProcessingEligibilityError.superseded(fileId: fileId)
+        }
+    }
+}
+
 public struct ObserveFileIdentityPayload: Codable, Sendable {
     public let fileId: Int64
     public let expectedRevision: Int64
