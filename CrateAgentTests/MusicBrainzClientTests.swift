@@ -2,6 +2,54 @@
 import XCTest
 
 final class MusicBrainzClientTests: XCTestCase {
+    func testLightweightDetailsDecodeVersionDurationCreditsAndCacheCanonicalAlias() async throws {
+        let loader = MusicBrainzSequenceLoader(bodies: [Data(#"{"id":"canonical","title":"Song","length":245123,"disambiguation":"extended mix","artist-credit":[{"name":"Artist A","joinphrase":" feat. ","artist":{"id":"artist-a","name":"Artist A"}},{"name":"Artist B","artist":{"id":"artist-b","name":"Artist B"}}]}"#.utf8)])
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory(), appVersion: "test")
+        let details = try await client.recordingDetails(mbid: "old-id")
+        XCTAssertEqual(details.id, "canonical")
+        XCTAssertEqual(details.title, "Song")
+        XCTAssertEqual(details.creditedArtistName, "Artist A feat. Artist B")
+        XCTAssertEqual(details.disambiguation, "extended mix")
+        XCTAssertEqual(details.durationMilliseconds, 245_123)
+        let cachedAlias = try await client.recordingDetails(mbid: "old-id")
+        let cachedCanonical = try await client.recordingDetails(mbid: "canonical")
+        XCTAssertEqual(cachedAlias, details)
+        XCTAssertEqual(cachedCanonical, details)
+        XCTAssertEqual(loader.requests.count, 1)
+        let request = try XCTUnwrap(loader.requests.first)
+        let query = try XCTUnwrap(try URLComponents(url: XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems)
+        XCTAssertEqual(query.first { $0.name == "inc" }?.value, "artist-credits")
+        XCTAssertTrue(request.value(forHTTPHeaderField: "User-Agent")?.contains("crate-agent/test") == true)
+    }
+
+    func testSparseDetailsStayUnknownAndNeverPoisonCompleteRecordingCache() async throws {
+        let loader = MusicBrainzSequenceLoader(bodies: [
+            Data(#"{"id":"recording","title":"Sparse"}"#.utf8),
+            Data(#"{"id":"recording","title":"Complete","length":123000,"disambiguation":"album version","releases":[{"id":"release","title":"Album"}]}"#.utf8),
+        ])
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory())
+        let sparse = try await client.recordingDetails(mbid: "recording")
+        XCTAssertNil(sparse.disambiguation)
+        XCTAssertNil(sparse.durationMilliseconds)
+        XCTAssertTrue(sparse.creditedArtistName.isEmpty)
+        let complete = try await client.recording(mbid: "recording")
+        XCTAssertEqual(complete.releases.count, 1)
+        let refreshed = try await client.recordingDetails(mbid: "recording")
+        XCTAssertEqual(refreshed.title, "Complete")
+        XCTAssertEqual(refreshed.disambiguation, "album version")
+        XCTAssertEqual(refreshed.durationMilliseconds, 123_000)
+        XCTAssertEqual(loader.requests.count, 2)
+    }
+
+    func testInvalidDetailsFailWithoutCachingAndRetryCanSucceed() async throws {
+        let loader = MusicBrainzSequenceLoader(bodies: [Data(#"{"title":"Missing identity"}"#.utf8), Data(#"{"id":"canonical","title":"Good"}"#.utf8)])
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory())
+        await XCTAssertThrowsErrorAsync(try await client.recordingDetails(mbid: "alias"))
+        let details = try await client.recordingDetails(mbid: "alias")
+        XCTAssertEqual(details.id, "canonical")
+        XCTAssertEqual(loader.requests.count, 2)
+    }
+
     private func fixture(_ name: String) -> Data {
         let bundle = Bundle(for: Self.self)
         guard let url = bundle.url(forResource: name, withExtension: nil) else {
@@ -12,12 +60,12 @@ final class MusicBrainzClientTests: XCTestCase {
     }
 
     func testLoadsShortReleasePagesBeforeCachingCompleteRecording() async throws {
-        let embedded = (0..<25).map { releaseJSON(index: $0, year: "2001") }
-        let loader = MusicBrainzSequenceLoader(bodies: [
-            try jsonData(["id": "canonical", "title": "Song", "releases": embedded]),
-            try jsonData(["release-count": 27, "release-offset": 0, "releases": Array(embedded.prefix(10))]),
-            try jsonData(["release-count": 27, "release-offset": 10, "releases": Array(embedded.dropFirst(10))]),
-            try jsonData(["release-count": 27, "release-offset": 25, "releases": [releaseJSON(index: 25, year: "1980"), releaseJSON(index: 26, year: "1990")]]),
+        let embedded = (0 ..< 25).map { releaseJSON(index: $0, year: "2001") }
+        let loader = try MusicBrainzSequenceLoader(bodies: [
+            jsonData(["id": "canonical", "title": "Song", "releases": embedded]),
+            jsonData(["release-count": 27, "release-offset": 0, "releases": Array(embedded.prefix(10))]),
+            jsonData(["release-count": 27, "release-offset": 10, "releases": Array(embedded.dropFirst(10))]),
+            jsonData(["release-count": 27, "release-offset": 25, "releases": [releaseJSON(index: 25, year: "1980"), releaseJSON(index: 26, year: "1990")]]),
         ])
         let cache = LookupCache.memory()
         let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache, appVersion: "test")
@@ -31,11 +79,11 @@ final class MusicBrainzClientTests: XCTestCase {
             URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!.first { $0.name == "offset" }!.value!
         }, ["0", "10", "25"])
         for request in requests.dropFirst() {
-            let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
+            let query = try XCTUnwrap(try URLComponents(url: XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems)
             XCTAssertEqual(query.first { $0.name == "recording" }?.value, "canonical")
             XCTAssertEqual(query.first { $0.name == "limit" }?.value, "100")
             XCTAssertEqual(query.first { $0.name == "inc" }?.value, "release-groups")
-            XCTAssertTrue(request.value(forHTTPHeaderField: "User-Agent")!.contains("crate-agent/test"))
+            XCTAssertTrue(try XCTUnwrap(request.value(forHTTPHeaderField: "User-Agent")?.contains("crate-agent/test")))
         }
         let cached = try await client.recording(mbid: "old-id")
         XCTAssertEqual(cached, recording)
@@ -46,8 +94,8 @@ final class MusicBrainzClientTests: XCTestCase {
 
     func testLegacyPartialCacheIsNotReused() async throws {
         let cache = LookupCache.memory()
-        cache.store(try jsonData(["id": "old-id", "title": "Stale", "releases": []]), forKey: "mb:old-id")
-        let loader = MusicBrainzSequenceLoader(bodies: [try jsonData(["id": "canonical", "title": "Fresh", "releases": []])])
+        try cache.store(jsonData(["id": "old-id", "title": "Stale", "releases": []]), forKey: "mb:old-id")
+        let loader = try MusicBrainzSequenceLoader(bodies: [jsonData(["id": "canonical", "title": "Fresh", "releases": []])])
         let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache)
         let recording = try await client.recording(mbid: "old-id")
         XCTAssertEqual(recording.title, "Fresh")
@@ -56,24 +104,24 @@ final class MusicBrainzClientTests: XCTestCase {
 
     func testMissingCanonicalIDFailsInsteadOfCachingUnverifiableIdentity() async throws {
         let cache = LookupCache.memory()
-        let loader = MusicBrainzSequenceLoader(bodies: [try jsonData(["title": "Song", "releases": []])])
+        let loader = try MusicBrainzSequenceLoader(bodies: [jsonData(["title": "Song", "releases": []])])
         let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache)
         await XCTAssertThrowsErrorAsync(try await client.recording(mbid: "old-id"))
         XCTAssertNil(cache.data(forKey: MusicBrainzClient.cacheKey(forMBID: "old-id")))
     }
 
     func testChangingOrOverlappingReleasePagesFailWithoutCaching() async throws {
-        let embedded = (0..<25).map { releaseJSON(index: $0, year: "2001") }
+        let embedded = (0 ..< 25).map { releaseJSON(index: $0, year: "2001") }
         for secondPage in [
             ["release-count": 28, "release-offset": 25, "releases": [releaseJSON(index: 25, year: "1980")]],
             ["release-count": 27, "release-offset": 0, "releases": [releaseJSON(index: 25, year: "1980")]],
             ["release-count": 27, "release-offset": 25, "releases": [embedded[0], embedded[1]]],
         ] {
             let cache = LookupCache.memory()
-            let loader = MusicBrainzSequenceLoader(bodies: [
-                try jsonData(["id": "canonical", "title": "Song", "releases": embedded]),
-                try jsonData(["release-count": 27, "release-offset": 0, "releases": embedded]),
-                try jsonData(secondPage),
+            let loader = try MusicBrainzSequenceLoader(bodies: [
+                jsonData(["id": "canonical", "title": "Song", "releases": embedded]),
+                jsonData(["release-count": 27, "release-offset": 0, "releases": embedded]),
+                jsonData(secondPage),
             ])
             let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache)
             await XCTAssertThrowsErrorAsync(try await client.recording(mbid: "old-id"))
@@ -83,9 +131,9 @@ final class MusicBrainzClientTests: XCTestCase {
 
     func testIncompleteReleaseBrowseNeverPoisonsCache() async throws {
         let cache = LookupCache.memory()
-        let loader = MusicBrainzSequenceLoader(bodies: [
-            try jsonData(["id": "canonical", "title": "Song", "releases": (0..<25).map { releaseJSON(index: $0, year: "2001") }]),
-            try jsonData(["release-count": 27, "release-offset": 0, "releases": []]),
+        let loader = try MusicBrainzSequenceLoader(bodies: [
+            jsonData(["id": "canonical", "title": "Song", "releases": (0 ..< 25).map { releaseJSON(index: $0, year: "2001") }]),
+            jsonData(["release-count": 27, "release-offset": 0, "releases": []]),
         ])
         let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache)
         await XCTAssertThrowsErrorAsync(try await client.recording(mbid: "old-id"))
@@ -174,9 +222,13 @@ final class MusicBrainzSequenceLoader: URLLoading, @unchecked Sendable {
     private let bodies: [Data]
     private var storedRequests: [URLRequest] = []
 
-    init(bodies: [Data]) { self.bodies = bodies }
+    init(bodies: [Data]) {
+        self.bodies = bodies
+    }
 
-    var requests: [URLRequest] { lock.withLock { storedRequests } }
+    var requests: [URLRequest] {
+        lock.withLock { storedRequests }
+    }
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         let body = try lock.withLock {

@@ -74,7 +74,6 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
     }
 
-
     func testUsesCanonicalRecordingIdentityFromRealClientResponseAndCache() async throws {
         let database = try makeDatabase()
         let fileID = try insertFile(in: database, path: "/music/merged.mp3")
@@ -153,7 +152,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             fingerprintFunction: { _ in
                 try database.writer.write { db in
                     try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
-                        freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
+                                                     freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
                 }
                 throw NSError(domain: "decode-test", code: 1)
             }
@@ -610,11 +609,14 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         await runHandle.value
 
-        guard case .strong = service.rows[file1] else {
-            return XCTFail("expected the in-flight file to still resolve, got \(String(describing: service.rows[file1]))")
+        for fileID in [file1, file2, file3] {
+            guard case let .stopped(reason) = service.rows[fileID] else {
+                return XCTFail("Explicit Stop must leave unfinished rows stopped, got \(String(describing: service.rows[fileID]))")
+            }
+            XCTAssertFalse(reason.isEmpty)
         }
-        XCTAssertEqual(service.rows[file2], .pending, "cancellation should stop the pass before file2 is attempted")
-        XCTAssertEqual(service.rows[file3], .pending, "cancellation should stop the pass before file3 is attempted")
+        XCTAssertNil(service.candidate(for: file1), "A late response must not revive a stopped row")
+        XCTAssertTrue(service.recordingAlternatives.isEmpty, "An obsolete lookup must not restore chooser entries")
     }
 
     // MARK: - On-demand fingerprinting
@@ -1078,7 +1080,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         // The freshness reader returns a DIFFERENT stat pre- vs post-decode,
         // simulating the file changing while `fingerprintFunction` read it.
         let freshness = SequencedFreshnessReader(snapshots: [
-            FileFreshnessSnapshot(fileSize: 1000, mtime: 0),   // pre-decode basis
+            FileFreshnessSnapshot(fileSize: 1000, mtime: 0), // pre-decode basis
             FileFreshnessSnapshot(fileSize: 2000, mtime: 999), // post-decode: changed
         ])
         let service = AutoTaggerService(
@@ -1189,7 +1191,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         // Freshness reader: the freshness check sees the unchanged file (basis),
         // then the lookup snapshot sees the replacement.
         let freshness = SequencedFreshnessReader(snapshots: [
-            FileFreshnessSnapshot(fileSize: 1000, mtime: 0),   // storedFingerprintIsFresh → fresh
+            FileFreshnessSnapshot(fileSize: 1000, mtime: 0), // storedFingerprintIsFresh → fresh
             FileFreshnessSnapshot(fileSize: 5000, mtime: 777), // lookup snapshot → changed
         ])
         let service = AutoTaggerService(
@@ -1226,7 +1228,10 @@ final class AutoTaggerServiceTests: XCTestCase {
 private final class SequencedFreshnessReader: @unchecked Sendable {
     private let lock = NSLock()
     private var snapshots: [FileFreshnessSnapshot?]
-    init(snapshots: [FileFreshnessSnapshot?]) { self.snapshots = snapshots }
+    init(snapshots: [FileFreshnessSnapshot?]) {
+        self.snapshots = snapshots
+    }
+
     func next(_: String) -> FileFreshnessSnapshot? {
         lock.lock(); defer { lock.unlock() }
         guard !snapshots.isEmpty else { return nil }
@@ -1239,8 +1244,13 @@ private final class SequencedFreshnessReader: @unchecked Sendable {
 private final class FingerprintCallCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
-    func increment() { lock.lock(); count += 1; lock.unlock() }
-    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func increment() {
+        lock.lock(); count += 1; lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock(); defer { lock.unlock() }; return count
+    }
 }
 
 // MARK: - Test doubles

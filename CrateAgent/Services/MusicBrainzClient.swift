@@ -47,13 +47,29 @@ public struct MusicBrainzClient: Sendable {
             throw LookupError.transport("MusicBrainz recording response has no canonical ID")
         }
         if recording.releases.count >= 25 {
-            recording = recording.replacingReleases(with: try await allReleases(recordingID: canonicalID))
+            recording = try await recording.replacingReleases(with: allReleases(recordingID: canonicalID))
         }
         try Task.checkCancellation()
         let completeData = try JSONEncoder().encode(recording)
         cache.store(completeData, forKey: cacheKey)
         cache.store(completeData, forKey: Self.cacheKey(forMBID: canonicalID))
+        cache.store(completeData, forKey: Self.detailsCacheKey(forMBID: mbid))
+        cache.store(completeData, forKey: Self.detailsCacheKey(forMBID: canonicalID))
         return recording
+    }
+
+    public func recordingDetails(mbid: String) async throws -> MBRecordingDetails {
+        let cacheKey = Self.detailsCacheKey(forMBID: mbid)
+        if let cached = cache.cachedValue(forKey: cacheKey, decode: Self.decodeRecording) {
+            return MBRecordingDetails(recording: cached, requestedID: mbid)
+        }
+        let responseData = try await requester.perform(makeRequest(mbid: mbid, includes: "artist-credits"))
+        let recording = try Self.decodeRecording(from: responseData)
+        let details = MBRecordingDetails(recording: recording, requestedID: mbid)
+        try Task.checkCancellation()
+        cache.store(responseData, forKey: cacheKey)
+        cache.store(responseData, forKey: Self.detailsCacheKey(forMBID: details.id))
+        return details
     }
 
     private struct ReleasePage: Decodable {
@@ -94,7 +110,8 @@ public struct MusicBrainzClient: Sendable {
             guard page.offset == offset, page.count >= offset,
                   page.releases.count <= page.count - offset,
                   expectedCount == nil || expectedCount == page.count,
-                  !page.releases.isEmpty || offset == page.count else {
+                  !page.releases.isEmpty || offset == page.count
+            else {
                 throw LookupError.transport("incomplete or changing MusicBrainz release list at offset \(offset) — retry the scan")
             }
             for release in page.releases {
@@ -110,9 +127,9 @@ public struct MusicBrainzClient: Sendable {
         return releases
     }
 
-    private func makeRequest(mbid: String) -> URLRequest {
+    private func makeRequest(mbid: String, includes: String = "releases+release-groups+artist-credits+isrcs") -> URLRequest {
         let encodedMBID = mbid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? mbid
-        let url = URL(string: "\(Self.baseURLString)\(encodedMBID)?inc=releases+release-groups+artist-credits+isrcs&fmt=json")!
+        let url = URL(string: "\(Self.baseURLString)\(encodedMBID)?inc=\(includes)&fmt=json")!
         var request = URLRequest(url: url)
         request.setValue(userAgentHeaderValue, forHTTPHeaderField: "User-Agent")
         return request
@@ -135,6 +152,10 @@ public struct MusicBrainzClient: Sendable {
     /// `internal`, not below it).
     static func cacheKey(forMBID mbid: String) -> String {
         "mb:complete-v2:\(mbid)"
+    }
+
+    private static func detailsCacheKey(forMBID mbid: String) -> String {
+        "mb:details-v1:\(mbid)"
     }
 
     public static func bundleAppVersion() -> String {

@@ -38,15 +38,24 @@ final class AutoTaggerService: ObservableObject {
     /// `.noMatch` is reserved for "AcoustID found nothing usable" — a low
     /// score still resolves to `.weak`, never `.noMatch`, since a
     /// candidate did in fact resolve and the user can still inspect it.
-    private static let strongScoreThreshold = 0.9
-
-    /// Near ties still require review when they straddle the strong cutoff.
-    private static let competingScoreMargin = 0.05
+    private static let strongScoreThreshold = RecordingMatchAssessment.strongScoreThreshold
 
     private static let noAPIKeyConfiguredMessage =
         "No AcoustID API key is configured. Add one in Settings to use the auto-tagger."
+    private static let musicBrainzUnauthorizedMessage = "MusicBrainz rejected the metadata request (HTTP 401)"
 
     @Published private(set) var rows: [Int64: RowState] = [:]
+    @Published private(set) var recordingAlternatives: [Int64: RecordingAlternatives] = [:]
+    @Published private(set) var recordingDetails: [Int64: [String: MBRecordingDetails]] = [:]
+
+    private struct LookupBaseline {
+        let fileID: Int64
+        let fingerprintHash: Data
+        let freshness: FileFreshnessSnapshot
+        let tags: AudioTags
+    }
+
+    private var lookupBaselines: [Int64: LookupBaseline] = [:]
     /// Set only when the whole pass has been halted (bad API key, or the
     /// lookup server itself is down) — as opposed to a single row's
     /// `.failed`, which leaves the rest of the pass running.
@@ -94,16 +103,96 @@ final class AutoTaggerService: ObservableObject {
     func candidate(for fileID: Int64) -> MatchCandidate? {
         switch rows[fileID] {
         case let .strong(candidate), let .weak(candidate):
-            return candidate
+            candidate
         case .pending, .noMatch, .failed, .stopped, .none:
-            return nil
+            nil
         }
+    }
+
+    /// Offsets address the original ranked IDs, so learning that two entries
+    /// are aliases cannot skip the next page. Failures stay attached to their ID.
+    func loadAlternativeDetails(fileID: Int64, offset: Int, limit: Int = 10) async throws -> [RecordingAlternativeDetailResult] {
+        guard offset >= 0, limit > 0, limit <= 10 else {
+            throw AutoTaggerRowFailure("Recording detail pages require a nonnegative offset and a limit from 1 to 10")
+        }
+        guard let alternatives = recordingAlternatives[fileID] else {
+            throw AutoTaggerRowFailure("No recording alternatives for file \(fileID) — scan it first")
+        }
+        let generation = runGeneration
+        var results: [RecordingAlternativeDetailResult] = []
+        for alternative in alternatives.entries.dropFirst(offset).prefix(limit) {
+            try ensureCurrent(generation: generation)
+            do {
+                let details: MBRecordingDetails = if let loaded = recordingDetails[fileID]?[alternative.recordingID] {
+                    loaded
+                } else {
+                    try await musicBrainzClient.recordingDetails(mbid: alternative.recordingID)
+                }
+                try ensureCurrent(generation: generation)
+                recordingDetails[fileID, default: [:]][alternative.recordingID] = details
+                results.append(RecordingAlternativeDetailResult(alternative: alternative, state: .loaded(details)))
+            } catch {
+                try ensureCurrent(generation: generation)
+                if error is CancellationError {
+                    throw error
+                }
+                results.append(RecordingAlternativeDetailResult(alternative: alternative, state: .failed(Self.metadataFailureDescription(error))))
+            }
+        }
+        try ensureCurrent(generation: generation)
+        return results
+    }
+
+    /// Returns a complete replacement; editable review state belongs to the
+    /// session, which checks selection identity before committing it.
+    func resolveAlternative(fileID: Int64, recordingID: String) async throws -> MatchCandidate {
+        guard let baseline = lookupBaselines[fileID],
+              let alternative = recordingAlternatives[fileID]?.alternative(
+                  for: recordingID, details: recordingDetails[fileID] ?? [:]
+              )
+        else {
+            throw AutoTaggerRowFailure("Recording \(recordingID) was not returned by this file's scan")
+        }
+        let generation = runGeneration
+        try ensureCurrent(generation: generation)
+        let recording = try await loadRecording(mbid: alternative.recordingID)
+        try ensureCurrent(generation: generation)
+        recordingDetails[fileID, default: [:]][alternative.recordingID] = MBRecordingDetails(recording: recording, requestedID: alternative.recordingID)
+        return try Self.assembleCandidate(alternative: alternative, recording: recording, baseline: baseline)
+    }
+
+    func matchAssessment(fileID: Int64, recordingID: String) -> RecordingMatchAssessment? {
+        guard let alternatives = recordingAlternatives[fileID],
+              let alternative = alternatives.alternative(for: recordingID, details: recordingDetails[fileID] ?? [:]) else { return nil }
+        return alternatives.assessment(for: alternative, details: recordingDetails[fileID] ?? [:])
+    }
+
+    func matchAssessment(for candidate: MatchCandidate) -> RecordingMatchAssessment? {
+        guard let assessment = matchAssessment(fileID: candidate.fileID, recordingID: candidate.recordingMBID) else { return nil }
+        return RecordingMatchAssessment(score: candidate.score, plausibleRecordingCount: assessment.plausibleRecordingCount)
+    }
+
+    private func ensureCurrent(generation: Int) throws {
+        try Task.checkCancellation()
+        guard generation == runGeneration else { throw CancellationError() }
+    }
+
+    private static func metadataFailureDescription(_ error: Error) -> String {
+        if case LookupError.unauthorized = error {
+            return musicBrainzUnauthorizedMessage
+        }
+        if let lookupError = error as? LookupError {
+            return describe(lookupError)
+        }
+        return String(describing: error)
     }
 
     /// Cancels the in-flight pass, if any. Already-resolved rows in `rows`
     /// are left as they are; only unresolved files stop getting processed.
     func cancel() {
         runTask?.cancel()
+        runGeneration += 1
+        stopUnresolvedRows(among: Array(rows.keys), message: "Scan stopped", generation: runGeneration)
     }
 
     /// Runs the lookup pipeline for `fileIDs`, publishing each row's result
@@ -113,6 +202,9 @@ final class AutoTaggerService: ObservableObject {
         runGeneration += 1
         let generation = runGeneration
         fatalError = nil
+        recordingAlternatives = [:]
+        recordingDetails = [:]
+        lookupBaselines = [:]
 
         // E-J: reset every requested row to .pending BEFORE validating the
         // key. `stopUnresolvedRows` deliberately preserves terminal states
@@ -141,7 +233,7 @@ final class AutoTaggerService: ObservableObject {
 
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.processAll(fileIDs: fileIDs, apiKey: apiKey, generation: generation)
+            await processAll(fileIDs: fileIDs, apiKey: apiKey, generation: generation)
         }
         runTask = task
         await task.value
@@ -155,7 +247,7 @@ final class AutoTaggerService: ObservableObject {
 
             let resolved: RowState
             do {
-                resolved = try await resolveRow(fileID: fileID, apiKey: apiKey)
+                resolved = try await resolveRow(fileID: fileID, apiKey: apiKey, generation: generation)
             } catch let lookupError as LookupError {
                 // Only reached for .unauthorized/.server/.offline — resolveRow
                 // converts every other LookupError into a per-row .failed
@@ -218,9 +310,9 @@ final class AutoTaggerService: ObservableObject {
     /// — a bad fingerprint, a missing duration tag, `.rateLimited`,
     /// `.transport` — is caught here and returned as `.failed`, isolating
     /// it to this row.
-    private func resolveRow(fileID: Int64, apiKey: String) async throws -> RowState {
+    private func resolveRow(fileID: Int64, apiKey: String, generation: Int) async throws -> RowState {
         do {
-            return try await lookUpCandidate(fileID: fileID, apiKey: apiKey)
+            return try await lookUpCandidate(fileID: fileID, apiKey: apiKey, generation: generation)
         } catch let lookupError as LookupError {
             switch lookupError {
             case .unauthorized, .server, .offline:
@@ -234,7 +326,7 @@ final class AutoTaggerService: ObservableObject {
         }
     }
 
-    private func lookUpCandidate(fileID: Int64, apiKey: String) async throws -> RowState {
+    private func lookUpCandidate(fileID: Int64, apiKey: String, generation: Int) async throws -> RowState {
         guard let file = try await fetchFile(fileID: fileID) else {
             throw AutoTaggerRowFailure("file \(fileID) not found in the library")
         }
@@ -278,47 +370,48 @@ final class AutoTaggerService: ObservableObject {
             apiKey: apiKey
         )
 
-        guard let topResult = acoustIDResults.first(where: { !$0.recordingIDs.isEmpty }),
-              let recordingMBID = topResult.recordingIDs.first
-        else {
-            return .noMatch
-        }
+        try ensureCurrent(generation: generation)
+        let alternatives = RecordingAlternatives(results: acoustIDResults)
+        recordingAlternatives[fileID] = alternatives
+        let baseline = LookupBaseline(fileID: fileID, fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
+                                      freshness: lookupFreshness, tags: tags)
+        lookupBaselines[fileID] = baseline
+        guard let firstRecordingID = acoustIDResults.first(where: { result in !result.recordingIDs.isEmpty })?.recordingIDs.first,
+              let selected = alternatives.entries.first(where: { alternative in alternative.recordingID == firstRecordingID }) else { return .noMatch }
 
-        // The AcoustID key-bearing request already succeeded above, so a 401
-        // from the KEYLESS MusicBrainz request must not be reported as a
-        // rejected AcoustID key (which would send the user to replace a valid
-        // key). Translate it to a service-neutral message instead of letting
-        // the shared requester's `.unauthorized` reach `describe` as an
-        // AcoustID-key failure (finding #4001501075).
-        let recording: MBRecording
+        let recording = try await loadRecording(mbid: selected.recordingID)
+        try ensureCurrent(generation: generation)
+        recordingDetails[fileID, default: [:]][selected.recordingID] = MBRecordingDetails(recording: recording, requestedID: selected.recordingID)
+        let candidate = try Self.assembleCandidate(alternative: selected, recording: recording, baseline: baseline)
+        let assessment = alternatives.assessment(for: selected, details: recordingDetails[fileID] ?? [:])
+        return Self.classify(candidate, ambiguousRecording: assessment.hasMultiplePlausibleRecordings)
+    }
+
+    private func loadRecording(mbid: String) async throws -> MBRecording {
         do {
-            recording = try await musicBrainzClient.recording(mbid: recordingMBID)
+            return try await musicBrainzClient.recording(mbid: mbid)
         } catch LookupError.unauthorized {
-            throw LookupError.transport("MusicBrainz rejected the metadata request (HTTP 401)")
+            throw LookupError.transport(Self.musicBrainzUnauthorizedMessage)
         }
+    }
 
-        // Default the release from the file's ON-DISK album tag (just read
-        // above), not the Serato-imported `FileRecord.album` snapshot — the
-        // review baseline is the embedded tag, so release selection must agree
-        // with it, or a stale Serato album would pick (and persist, and bulk-
-        // overwrite the file with) a different pressing than the one the diff
-        // shows as current (finding #4000261459). `tags.album` is nil when the
-        // file has no album tag, and ReleaseSelector treats nil absence as
-        // "no preference" — the same absence semantics as the baseline.
-        guard let chosenRelease = ReleaseSelector.defaultRelease(from: recording.releases, existingAlbum: tags.album) else {
-            throw AutoTaggerRowFailure("MusicBrainz recording \(recordingMBID) has no releases")
+    private static func assembleCandidate(alternative: RecordingAlternative, recording: MBRecording, baseline: LookupBaseline) throws -> MatchCandidate {
+        // Release defaults must use the same embedded-tag baseline as review;
+        // the indexed Serato album can name a different pressing (#4000261459).
+        guard let chosenRelease = ReleaseSelector.defaultRelease(from: recording.releases, existingAlbum: baseline.tags.album) else {
+            throw AutoTaggerRowFailure("MusicBrainz recording \(alternative.recordingID) has no releases")
         }
 
         let artistCredit = recording.artistCredit.first
-        let candidate = MatchCandidate(
-            fileID: fileID,
-            score: topResult.score,
-            acoustID: topResult.id,
-            recordingMBID: recording.id ?? recordingMBID,
+        return MatchCandidate(
+            fileID: baseline.fileID,
+            score: alternative.score,
+            acoustID: alternative.acoustID,
+            recordingMBID: recording.id ?? alternative.recordingID,
             artistMBID: artistCredit?.artist.id,
-            fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
-            expectedFileSize: lookupFreshness.fileSize,
-            expectedMtime: lookupFreshness.mtime,
+            fingerprintHash: baseline.fingerprintHash,
+            expectedFileSize: baseline.freshness.fileSize,
+            expectedMtime: baseline.freshness.mtime,
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
@@ -332,21 +425,11 @@ final class AutoTaggerService: ObservableObject {
             proposedTitle: recording.title,
             proposedAlbum: chosenRelease.title,
             proposedYear: recording.releaseGroup?.firstReleaseDate.flatMap(Self.year(fromMusicBrainzDate:)),
-            currentFileYear: tags.year.map(Int.init),
-            currentFileArtist: tags.artist,
-            currentFileTitle: tags.title,
-            currentFileAlbum: tags.album
+            currentFileYear: baseline.tags.year.map(Int.init),
+            currentFileArtist: baseline.tags.artist,
+            currentFileTitle: baseline.tags.title,
+            currentFileAlbum: baseline.tags.album
         )
-
-        // The score belongs to an AcoustID result, not a unique recording.
-        // Distinct plausible recordings across results need the same review
-        // as multiple recordings attached to the winning result itself.
-        let competingRecordingIDs = Set(acoustIDResults.filter { result in
-            result.score >= Self.strongScoreThreshold
-                || result.score >= topResult.score - Self.competingScoreMargin
-        }.flatMap(\.recordingIDs)).union(topResult.recordingIDs)
-        let ambiguousRecording = competingRecordingIDs.count > 1
-        return Self.classify(candidate, ambiguousRecording: ambiguousRecording)
     }
 
     private static func classify(_ candidate: MatchCandidate, ambiguousRecording: Bool = false) -> RowState {
@@ -361,15 +444,15 @@ final class AutoTaggerService: ObservableObject {
     private static func describe(_ error: LookupError) -> String {
         switch error {
         case .unauthorized:
-            return "the AcoustID API key was rejected (401 Unauthorized)"
+            "the AcoustID API key was rejected (401 Unauthorized)"
         case .rateLimited:
-            return "the lookup was rate-limited and retries were exhausted"
+            "the lookup was rate-limited and retries were exhausted"
         case .server:
-            return "the lookup server returned repeated errors"
+            "the lookup server returned repeated errors"
         case let .offline(message):
-            return "the network is unavailable (\(message))"
+            "the network is unavailable (\(message))"
         case let .transport(message):
-            return message
+            message
         }
     }
 
@@ -446,7 +529,9 @@ final class AutoTaggerService: ObservableObject {
                     "failed to compute fingerprint for file \(fileID): \(decodeError); could not persist failure: \(error)"
                 )
             }
-            if let failure = decodeError as? AutoTaggerRowFailure { throw failure }
+            if let failure = decodeError as? AutoTaggerRowFailure {
+                throw failure
+            }
             throw AutoTaggerRowFailure("failed to compute fingerprint for file \(fileID): \(decodeError)")
         }
     }
@@ -537,7 +622,8 @@ final class AutoTaggerService: ObservableObject {
         var stale: Set<Int64> = []
         for payload in payloads {
             guard let expectedFileSize = payload.expectedFileSize,
-                  let expectedMtime = payload.expectedMtime else {
+                  let expectedMtime = payload.expectedMtime
+            else {
                 // Legacy event journaled before D-A captured the on-disk
                 // snapshot — nothing to revalidate against, and it predates
                 // the check by definition. Treat as not stale.
@@ -629,6 +715,13 @@ extension AcoustIDClient: AcoustIDLookupClient {}
 /// without a real network call.
 protocol MusicBrainzLookupClient: Sendable {
     func recording(mbid: String) async throws -> MBRecording
+    func recordingDetails(mbid: String) async throws -> MBRecordingDetails
+}
+
+extension MusicBrainzLookupClient {
+    func recordingDetails(mbid: String) async throws -> MBRecordingDetails {
+        try await MBRecordingDetails(recording: recording(mbid: mbid), requestedID: mbid)
+    }
 }
 
 extension MusicBrainzClient: MusicBrainzLookupClient {}
