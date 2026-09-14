@@ -104,6 +104,20 @@ namespace crate_agent_core {
     SeratoMetadataUpdate update
   );
 
+  // Bulk variant of `update_database_record`. One file read + one
+  // file write regardless of how many tracks are updated — the write-
+  // side twin of `batch_rewrite_database_paths`. Used by the SP-2
+  // Auto-Tag apply, which confirms many MusicBrainz matches at once;
+  // each would otherwise read+rewrite the multi-MB file on its own.
+  // Returns the number of otrks actually changed.
+  //
+  // Same SeratoWatchdog gating as update_database_record.
+  [Throws=CoreError]
+  u32 batch_update_database_records(
+    string database_path,
+    sequence<SeratoTrackMetadataUpdate> updates
+  );
+
   // Append a new track to Serato's `database V2`. Used by crate-
   // agent's drag-drop import flow to register a file with Serato
   // without going through Serato's own UI. Returns 1 if the track
@@ -123,6 +137,12 @@ namespace crate_agent_core {
   // re-encodings of the same recording within Chromaprint's tolerance.
   [Throws=CoreError]
   sequence<u32> fingerprint_audio_file(string file_path);
+
+  // Encode a raw Chromaprint fingerprint (as returned by
+  // fingerprint_audio_file) into the compressed, base64url string
+  // AcoustID's lookup API expects -- the same wire format fpcalc's
+  // FINGERPRINT= line emits.
+  string encode_fingerprint(sequence<u32> raw);
 
   // Read metadata tags and audio properties from an audio file. All
   // text fields are optional — real-world files often have partial
@@ -153,6 +173,15 @@ namespace crate_agent_core {
 dictionary SeratoPathRename {
   string old_path;
   string new_path;
+};
+
+// One track's metadata update in a `batch_update_database_records`
+// call. `track_path` is the Serato-relative `pfil` path to match;
+// `update` carries the field-by-field patch. The batch twin of
+// `SeratoPathRename`.
+dictionary SeratoTrackMetadataUpdate {
+  string track_path;
+  SeratoMetadataUpdate update;
 };
 
 // Full track-level metadata extracted from a Serato `database V2`
@@ -211,6 +240,12 @@ dictionary AudioTagUpdate {
   string? musical_key;
   string? comment;
   string? label;
+  u32? year;
+  // `year` cannot express "clear": null means leave-unchanged. This
+  // flag removes the file's date frame outright (used by MusicBrainz
+  // undo when the match added a year to a previously-yearless file).
+  // Takes precedence over `year`.
+  boolean clear_year = false;
 };
 
 dictionary AudioTags {

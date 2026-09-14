@@ -24,6 +24,9 @@ public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var fingerprintHash: Data
     public var acoustidId: String?
     public var musicbrainzRecordingId: String?
+    public var musicbrainzReleaseId: String?
+    public var musicbrainzArtistId: String?
+    public var isrc: String?
     public var artist: String?
     public var title: String?
     public var album: String?
@@ -39,6 +42,9 @@ public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
         fingerprintHash: Data,
         acoustidId: String? = nil,
         musicbrainzRecordingId: String? = nil,
+        musicbrainzReleaseId: String? = nil,
+        musicbrainzArtistId: String? = nil,
+        isrc: String? = nil,
         artist: String? = nil,
         title: String? = nil,
         album: String? = nil,
@@ -53,6 +59,9 @@ public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
         self.fingerprintHash = fingerprintHash
         self.acoustidId = acoustidId
         self.musicbrainzRecordingId = musicbrainzRecordingId
+        self.musicbrainzReleaseId = musicbrainzReleaseId
+        self.musicbrainzArtistId = musicbrainzArtistId
+        self.isrc = isrc
         self.artist = artist
         self.title = title
         self.album = album

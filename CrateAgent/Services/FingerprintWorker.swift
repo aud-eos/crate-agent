@@ -250,18 +250,12 @@ public actor FingerprintWorker {
                 // already had a fingerprint in the DB. No decode work
                 // was needed; just write the same hash to this row.
                 for entry in plan.toCopyFromExistingTwin {
-                    try db.execute(
-                        sql: """
-                            UPDATE files
-                            SET chromaprint_fingerprint = ?,
-                                fingerprint_status = ?
-                            WHERE id = ?
-                            """,
-                        arguments: [
-                            entry.fingerprint,
-                            FingerprintStatus.done.rawValue,
-                            entry.fileId,
-                        ]
+                    // requirePendingStatus: don't clobber a newer on-demand
+                    // fingerprint the auto-tagger may have written for this row
+                    // since it was claimed (finding #4000806487).
+                    try FingerprintPersistence.write(
+                        fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done,
+                        requirePendingStatus: true, in: db
                     )
                 }
 
@@ -276,26 +270,17 @@ public actor FingerprintWorker {
                         case .failure: return (nil, .failed)
                         }
                     }()
-                    // Apply to the representative.
-                    try db.execute(
-                        sql: """
-                            UPDATE files
-                            SET chromaprint_fingerprint = ?,
-                                fingerprint_status = ?
-                            WHERE id = ?
-                            """,
-                        arguments: [hash, status.rawValue, result.fileId]
+                    // Apply to the representative (only while still pending, so a
+                    // newer on-demand fingerprint isn't overwritten — #4000806487).
+                    try FingerprintPersistence.write(
+                        fileID: result.fileId, fingerprint: hash, status: status,
+                        requirePendingStatus: true, in: db
                     )
                     // Propagate to siblings.
                     for siblingId in assignment.siblingIds {
-                        try db.execute(
-                            sql: """
-                                UPDATE files
-                                SET chromaprint_fingerprint = ?,
-                                    fingerprint_status = ?
-                                WHERE id = ?
-                                """,
-                            arguments: [hash, status.rawValue, siblingId]
+                        try FingerprintPersistence.write(
+                            fileID: siblingId, fingerprint: hash, status: status,
+                            requirePendingStatus: true, in: db
                         )
                     }
                 }
@@ -483,7 +468,7 @@ public actor FingerprintWorker {
             return ProcessResult(
                 fileId: fileId,
                 path: file.path,
-                outcome: .success(serializeHashesToBytes(hashes))
+                outcome: .success(FingerprintEncoder.serialize(hashes))
             )
         } catch {
             return ProcessResult(fileId: fileId, path: file.path, outcome: .failure)
@@ -517,35 +502,6 @@ public actor FingerprintWorker {
                 .limit(limit)
                 .fetchAll(db)
         }
-    }
-
-    // MARK: - Encoding (testable static)
-
-    /// Little-endian byte-serialization of Chromaprint's `[UInt32]`.
-    /// Length-prefix isn't needed — the blob's length divided by 4
-    /// gives the count back, and the column is opaque to SQLite.
-    static func serializeHashesToBytes(_ hashes: [UInt32]) -> Data {
-        var data = Data(capacity: hashes.count * 4)
-        for hash in hashes {
-            var littleEndian = hash.littleEndian
-            withUnsafeBytes(of: &littleEndian) { rawBuffer in
-                data.append(contentsOf: rawBuffer)
-            }
-        }
-        return data
-    }
-
-    static func deserializeHashesFromBytes(_ data: Data) -> [UInt32] {
-        guard data.count % 4 == 0 else { return [] }
-        var hashes: [UInt32] = []
-        hashes.reserveCapacity(data.count / 4)
-        data.withUnsafeBytes { rawBuffer in
-            let typedBuffer = rawBuffer.bindMemory(to: UInt32.self)
-            for hash in typedBuffer {
-                hashes.append(UInt32(littleEndian: hash))
-            }
-        }
-        return hashes
     }
 }
 

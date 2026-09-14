@@ -793,7 +793,7 @@ public actor LibraryHygieneRunner {
         // over thousands of files.
         try await operationEngine.applyBatch(
             [
-                .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged)),
+                .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged, isSeratoAuthoritative: false)),
                 .commitMetadataToSerato(CommitMetadataToSeratoPayload(
                     fileId: fileId,
                     metadata: merged,

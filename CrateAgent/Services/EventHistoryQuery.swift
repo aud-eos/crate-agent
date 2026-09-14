@@ -23,10 +23,15 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     /// batch was itself produced by an undoBatch call. Surfaced so
     /// the UI can label "Undo of …" rows differently if desired.
     public let isUndoBatch: Bool
-    /// `true` when at least one event in the batch is a
-    /// `fileRenamed`. Drives the "Re-sync Serato" button visibility
-    /// — the recovery primitive only does anything for renames.
-    public let containsRenames: Bool
+    /// `true` when at least one event in the batch projects onto
+    /// Serato/audio-file writes that `resyncSeratoForBatch` can replay
+    /// (`EventType.hasReplayableSeratoProjection`). Drives the "Re-sync
+    /// Serato" button visibility. Previously this tracked only renames, which
+    /// left an Auto-Tag-only batch whose external writes partially failed with
+    /// no reachable recovery once the user navigated away from the review
+    /// panel (finding #3999114447) — the recovery is idempotent, so exposing
+    /// it for every re-syncable batch is safe.
+    public let canResync: Bool
 
     public var timestamp: Date {
         Date(timeIntervalSince1970: TimeInterval(firstTimestampMillis) / 1000)
@@ -74,6 +79,7 @@ public enum EventHistoryQuery {
             try Row.fetchAll(db, sql: sql, arguments: [limit])
         }
 
+        let allBatchIds = Set(rows.map(\.batchId))
         return rows.map { row in
             let typeList = row.eventTypes.split(separator: ",").map(String.init)
             let typeCounts = countOccurrences(in: typeList)
@@ -84,9 +90,20 @@ public enum EventHistoryQuery {
                 description: describeBatch(typeCounts: typeCounts),
                 canUndo: canUndoBatch(typeList: typeList),
                 isUndoBatch: row.batchId.hasPrefix("undo:"),
-                containsRenames: typeList.contains(EventType.fileRenamed.rawValue)
+                canResync: canResyncBatch(typeList: typeList)
+                    && !batchHasBeenUndone(row.batchId, allBatchIds: allBatchIds)
             )
         }
+    }
+
+    /// A batch has been undone when an `undo:<batchId>:<uuid>` batch exists for
+    /// it. Offering Re-sync on such a batch would replay its old forward writes
+    /// over the reverted state (finding #3999974013), so it's not eligible. The
+    /// undo batch itself remains eligible — that's how a failed tag-restore mid-
+    /// undo is recovered.
+    static func batchHasBeenUndone(_ batchId: String, allBatchIds: Set<String>) -> Bool {
+        let undoPrefix = "undo:\(batchId):"
+        return allBatchIds.contains { $0.hasPrefix(undoPrefix) }
     }
 
     // MARK: - Pure derivations (extracted for testing)
@@ -115,6 +132,16 @@ public enum EventHistoryQuery {
             EventType.fileRemovedFromCrates.rawValue,
         ]
         return !typeList.contains(where: unsupportedRaw.contains)
+    }
+
+    /// A batch is re-syncable when at least one of its events projects onto
+    /// Serato/audio-file writes that `resyncSeratoForBatch` can idempotently
+    /// replay — the same set the engine reconstructs. Unknown raw values
+    /// (from a newer schema) are conservatively ignored.
+    static func canResyncBatch(typeList: [String]) -> Bool {
+        typeList.contains { raw in
+            EventType(rawValue: raw)?.hasReplayableSeratoProjection ?? false
+        }
     }
 
     private static func countOccurrences(in typeRawValues: [String]) -> [(EventType, Int)] {
@@ -155,6 +182,10 @@ public enum EventHistoryQuery {
             return "Removed \(count) file\(pluralS) from Serato crates"
         case .trackAddedToSerato:
             return "Added \(count) track\(pluralS) to Serato"
+        case .musicBrainzMatchApplied:
+            return "Applied MusicBrainz match to \(count) track\(pluralS)"
+        case .musicBrainzMatchReverted:
+            return "Reverted MusicBrainz match on \(count) track\(pluralS)"
         }
     }
 }

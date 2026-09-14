@@ -28,6 +28,18 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var lightweightHash: Data?
     public var chromaprintFingerprint: Data?
     public var fingerprintStatus: FingerprintStatus
+    /// The file's on-disk size + mtime at the moment its current
+    /// `chromaprintFingerprint` was computed — the freshness basis the
+    /// auto-tagger compares the live file against before trusting a stored
+    /// fingerprint for a lookup. Written whenever the fingerprint is
+    /// (re)computed on demand (`AutoTaggerService`), so a recompute no longer
+    /// leaves the basis pinned to the stale index snapshot (which made every
+    /// later scan of an edited file re-decode its audio forever). Nil for rows
+    /// fingerprinted before migration #009 or by the background worker;
+    /// callers fall back to `fileSize`/`mtime` (the index-time snapshot, which
+    /// for those rows IS the fingerprint's basis) when these are nil.
+    public var fingerprintedSize: Int64?
+    public var fingerprintedMtime: Int64?
     public var trackId: Int64?
     /// Audio bitrate in kbps from lofty's audio_bitrate, populated
     /// during indexing. Nil for rows pre-dating the bitrate column
@@ -57,6 +69,8 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         lightweightHash: Data? = nil,
         chromaprintFingerprint: Data? = nil,
         fingerprintStatus: FingerprintStatus = .pending,
+        fingerprintedSize: Int64? = nil,
+        fingerprintedMtime: Int64? = nil,
         trackId: Int64? = nil,
         bitrateKbps: Int? = nil,
         artist: String? = nil,
@@ -78,6 +92,8 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         self.lightweightHash = lightweightHash
         self.chromaprintFingerprint = chromaprintFingerprint
         self.fingerprintStatus = fingerprintStatus
+        self.fingerprintedSize = fingerprintedSize
+        self.fingerprintedMtime = fingerprintedMtime
         self.trackId = trackId
         self.bitrateKbps = bitrateKbps
         self.artist = artist
@@ -93,6 +109,22 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
 
     public mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
+    }
+
+    /// Whether any file OTHER than `excludingFileId` links to `trackId`.
+    /// The shared reference-count probe behind both the D-C collision guard
+    /// (in `applyMusicBrainzMatch`) and the reference-aware undo teardown
+    /// (in `applyRevertMusicBrainzMatch`): a fingerprint-keyed track row
+    /// (invariant #4) may be shared by FLAC+MP3 of one recording, so both
+    /// paths must know whether another file still depends on it.
+    public static func hasOtherFilesReferencingTrack(
+        _ trackId: Int64?,
+        excluding excludingFileId: Int64,
+        in db: GRDB.Database
+    ) throws -> Bool {
+        try FileRecord
+            .filter(Column("track_id") == trackId && Column("id") != excludingFileId)
+            .fetchCount(db) > 0
     }
 }
 

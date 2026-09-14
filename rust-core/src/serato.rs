@@ -594,6 +594,56 @@ impl DatabaseV2 {
         }
         0
     }
+
+    /// Bulk variant of `update_track_metadata`: apply a whole map of
+    /// `pfil path -> update` in a SINGLE pass over the records, so the
+    /// (typically multi-MB) `database V2` file is read and written once
+    /// regardless of how many tracks are updated. This is the write-side
+    /// twin of `rewrite_paths` for renames — a 200-row Auto-Tag apply
+    /// would otherwise trigger 200 full-library read+rewrite cycles.
+    ///
+    /// Per-track semantics are identical to `update_track_metadata`
+    /// (`Some` sets, `None` leaves alone, no-op when values already
+    /// match). Returns the number of otrks actually changed; the FFI
+    /// caller skips the file write when that is zero.
+    pub fn batch_update_track_metadata(
+        &mut self,
+        updates: &HashMap<String, SeratoMetadataUpdate>,
+    ) -> usize {
+        if updates.is_empty() {
+            return 0;
+        }
+        let mut changed_tracks = 0;
+        for record in self.records.iter_mut() {
+            if &record.tag != TAG_OTRK {
+                continue;
+            }
+            let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
+                continue;
+            };
+            let track_path = nested.iter().find_map(|field| {
+                if &field.tag == TAG_PFIL {
+                    decode_utf16be(&field.payload)
+                } else {
+                    None
+                }
+            });
+            let Some(track_path) = track_path else {
+                continue;
+            };
+            let Some(update) = updates.get(&track_path) else {
+                continue;
+            };
+            if !apply_metadata_update_to_nested(&mut nested, update) {
+                continue;
+            }
+            let mut rebuilt = Vec::with_capacity(record.payload.len());
+            TlvRecord::write_all(&nested, &mut rebuilt).expect("writing to Vec<u8> cannot fail");
+            record.payload = rebuilt;
+            changed_tracks += 1;
+        }
+        changed_tracks
+    }
 }
 
 /// Field-by-field update for the metadata fields crate-agent can
@@ -1490,6 +1540,61 @@ mod tests {
 
         assert_eq!(updated, 0);
         assert_eq!(database.to_bytes().unwrap(), db_bytes);
+    }
+
+    #[test]
+    fn batch_update_track_metadata_updates_every_matching_track_in_one_pass() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &[
+                "Users/x/Music/A/one.mp3",
+                "Users/x/Music/A/two.mp3",
+                "Users/x/Music/A/three.mp3",
+            ],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "Users/x/Music/A/one.mp3".to_string(),
+            SeratoMetadataUpdate {
+                artist: Some("Artist One".to_string()),
+                ..Default::default()
+            },
+        );
+        updates.insert(
+            "Users/x/Music/A/three.mp3".to_string(),
+            SeratoMetadataUpdate {
+                title: Some("Title Three".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let changed = database.batch_update_track_metadata(&updates);
+        // Two of the three otrks matched an update entry; the middle
+        // one was left alone.
+        assert_eq!(changed, 2);
+
+        let after = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
+        let records = after.track_records();
+        assert_eq!(records[0].artist.as_deref(), Some("Artist One"));
+        assert!(records[1].artist.is_none());
+        assert!(records[1].title.is_none());
+        assert_eq!(records[2].title.as_deref(), Some("Title Three"));
+    }
+
+    #[test]
+    fn batch_update_track_metadata_empty_map_is_noop() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/one.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let changed = database.batch_update_track_metadata(&HashMap::new());
+        assert_eq!(changed, 0);
+        assert_eq!(database.to_bytes().unwrap(), bytes);
     }
 
     /// Opt-in integration test: parses a real Serato `database V2`

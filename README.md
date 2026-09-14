@@ -4,7 +4,7 @@ A macOS-native companion app for Serato DJ library management.
 
 `crate-agent` sits alongside Serato DJ, watches your filesystem, and keeps Serato's library in sync when you rename or move music files in Finder — the bug that has annoyed every working Serato DJ since 2005. It is also being built to grow into a full library-management toolkit: MusicBrainz auto-tagging, format conversion with cue-point preservation, library hygiene tools, Spotify playlist matching, chart-gap analysis, and more.
 
-**Status:** SP-1 (Serato rename-sync) and SP-1.5 (library hygiene tools) are shipped, along with a desktop-scale performance pass. Soulseek acquisition Phase 1 is shipped as a standalone MCP server (see [below](#soulseek-acquisition-mcp)). Next planned milestone is SP-2 (MusicBrainz auto-tagging). See [design plan](#design-plan) below.
+**Status:** SP-1 (Serato rename-sync), SP-1.5 (library hygiene tools), and SP-2 (MusicBrainz auto-tagging — the Auto-Tag panel, which needs a free [AcoustID API key](https://acoustid.org) set in Settings) are shipped, along with a desktop-scale performance pass. Soulseek acquisition Phase 1 is shipped as a standalone MCP server (see [below](#soulseek-acquisition-mcp)). Next planned milestone is SP-3 (rule engine for proactive auto-rename). See [design plan](#design-plan) below.
 
 ## Why this exists
 
@@ -50,6 +50,11 @@ make test           # All tests (Rust + Swift)
 make test-rust      # Only Rust core
 make test-swift     # Only Swift app
 ```
+
+The hosted Swift test process currently starts normal services when a personal
+library is configured. Run it only in an isolated test account/library until
+[test-host isolation #116](https://github.com/aud-eos/crate-agent/issues/116) is
+implemented; a passing suite does not guarantee that live library state was untouched.
 
 ### Iterate
 

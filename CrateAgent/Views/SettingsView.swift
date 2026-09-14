@@ -15,6 +15,8 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gear") }
             FilenameTemplateSettingsView()
                 .tabItem { Label("Filename Template", systemImage: "textformat") }
+            AutoTagSettingsView()
+                .tabItem { Label("Auto-Tag", systemImage: "wand.and.stars") }
             AboutSettingsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
@@ -133,6 +135,89 @@ struct FilenameTemplateSettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+// MARK: - Auto-Tag
+
+/// AcoustID API key entry, backed by `AcoustIDKeyStore` (Keychain-only —
+/// never written to UserDefaults, SQLite, or logs). The key itself never
+/// appears in any `Text` or log statement outside the `SecureField`
+/// binding itself.
+struct AutoTagSettingsView: View {
+    @State private var apiKey: String = ""
+    @State private var loadError: String?
+    @State private var saveConfirmation: String?
+    private let keyStore = AcoustIDKeyStore()
+
+    var body: some View {
+        Form {
+            Section {
+                SecureField("AcoustID API key", text: $apiKey)
+                    .textFieldStyle(.roundedBorder)
+            } header: {
+                Text("AcoustID API Key")
+            } footer: {
+                footerContent
+            }
+
+            Section {
+                HStack {
+                    if let loadError {
+                        Label(loadError, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    } else if let saveConfirmation {
+                        Text(saveConfirmation)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Save") {
+                        save()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear { load() }
+    }
+
+    @ViewBuilder
+    private var footerContent: some View {
+        if apiKey.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Auto-Tag needs a free AcoustID API key to look up matches.")
+                Link("Get a key at acoustid.org", destination: URL(string: "https://acoustid.org")!)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else {
+            Text("Stored securely in the macOS Keychain.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func load() {
+        loadError = nil
+        do {
+            apiKey = try keyStore.load() ?? ""
+        } catch {
+            loadError = "Couldn't read the API key from the Keychain: \(error.localizedDescription)"
+        }
+    }
+
+    private func save() {
+        loadError = nil
+        saveConfirmation = nil
+        do {
+            try keyStore.save(apiKey)
+            saveConfirmation = "Saved at \(Date().formatted(date: .omitted, time: .standard))"
+        } catch {
+            loadError = "Couldn't save the API key: \(error.localizedDescription)"
+        }
     }
 }
 

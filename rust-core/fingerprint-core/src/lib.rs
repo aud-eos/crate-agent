@@ -25,7 +25,9 @@ pub const FINGERPRINT_MAX_DURATION_SECONDS: u64 = 120;
 use std::fs::File;
 use std::path::Path;
 
-use rusty_chromaprint::{Configuration, Fingerprinter};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
@@ -89,7 +91,11 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|err| FingerprintError::Decode(err.to_string()))?;
 
-    let config = Configuration::preset_test1();
+    // TEST2 is chromaprint's default algorithm and the one AcoustID's
+    // fingerprint database is built from (`fpcalc` uses it too). TEST1
+    // uses a different classifier and produces fingerprints AcoustID
+    // cannot match against.
+    let config = Configuration::preset_test2();
     let mut fingerprinter = Fingerprinter::new(&config);
     fingerprinter
         .start(sample_rate, channel_count)
@@ -144,6 +150,22 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Result<Vec<u32>, FingerprintE
 
     fingerprinter.finish();
     Ok(fingerprinter.fingerprint().to_vec())
+}
+
+/// Encode a raw Chromaprint fingerprint (as produced by
+/// `fingerprint_file`) into the compressed, base64url string AcoustID's
+/// lookup API expects -- the same wire format `fpcalc`'s
+/// `FINGERPRINT=` line emits.
+///
+/// Must use the same `Configuration` `fingerprint_file` used to
+/// produce `raw`: `FingerprintCompressor` embeds the configuration's
+/// algorithm id as the first byte of the compressed payload, and a
+/// mismatched id makes AcoustID misinterpret the bit layout of every
+/// subfingerprint that follows.
+pub fn encode_fingerprint_to_base64(raw: &[u32]) -> String {
+    let config = Configuration::preset_test2();
+    let compressed = FingerprintCompressor::from(&config).compress(raw);
+    URL_SAFE_NO_PAD.encode(compressed)
 }
 
 #[cfg(test)]
@@ -201,7 +223,7 @@ mod tests {
         // to emit a non-trivial fingerprint, no symphonia involvement.
         let samples = sine_wave_samples(440.0, 10.0);
 
-        let config = Configuration::preset_test1();
+        let config = Configuration::preset_test2();
         let mut fingerprinter = Fingerprinter::new(&config);
         fingerprinter.start(SAMPLE_RATE, CHANNELS as u32).unwrap();
         fingerprinter.consume(&samples);
@@ -217,7 +239,7 @@ mod tests {
 
         let mut runs = Vec::new();
         for _ in 0..2 {
-            let config = Configuration::preset_test1();
+            let config = Configuration::preset_test2();
             let mut fingerprinter = Fingerprinter::new(&config);
             fingerprinter.start(SAMPLE_RATE, CHANNELS as u32).unwrap();
             fingerprinter.consume(&samples);
@@ -230,11 +252,18 @@ mod tests {
 
     #[test]
     fn fingerprint_differs_between_different_audio() {
+        // 660Hz, not 880Hz: chroma features are pitch-class (octave-
+        // invariant) by design, and 880Hz is exactly one octave above
+        // 440Hz -- the same pitch class. Under TEST2's classifier a
+        // pure sine at an exact octave collapses to an identical
+        // fingerprint, which is a property of chroma, not a bug. A
+        // perfect fifth (660Hz) is a genuinely different pitch class
+        // and asserts what this test actually means to check.
         let samples_a = sine_wave_samples(440.0, 10.0);
-        let samples_b = sine_wave_samples(880.0, 10.0);
+        let samples_b = sine_wave_samples(660.0, 10.0);
 
         let fingerprint = |samples: &[i16]| {
-            let config = Configuration::preset_test1();
+            let config = Configuration::preset_test2();
             let mut fingerprinter = Fingerprinter::new(&config);
             fingerprinter.start(SAMPLE_RATE, CHANNELS as u32).unwrap();
             fingerprinter.consume(samples);
@@ -246,6 +275,57 @@ mod tests {
             fingerprint(&samples_a),
             fingerprint(&samples_b),
             "different audio must produce different fingerprints"
+        );
+    }
+
+    // Ruling A (see task-2-report.md): `fpcalc` is not installed on this
+    // machine, so a golden string captured from it isn't available, and
+    // the installed `rusty_chromaprint` 0.3.0 exposes `FingerprintCompressor`
+    // (compress-only) with no public decode counterpart to round-trip
+    // through. This test instead proves the encoding is well-formed and
+    // stable: deterministic for the same input, and valid, unpadded
+    // base64url -- the wire format AcoustID's API and `fpcalc` both use.
+    #[test]
+    fn encode_fingerprint_to_base64_is_deterministic_and_valid_base64url() {
+        // TEST2 (id 1) is chromaprint's default and the algorithm
+        // AcoustID's fingerprint database is built from. Asserting the
+        // id here catches an accidental regression back to TEST1.
+        assert_eq!(
+            Configuration::preset_test2().id(),
+            1,
+            "encode_fingerprint_to_base64 must use TEST2 (id 1) for AcoustID compatibility"
+        );
+
+        // Representative raw fingerprint values -- these are opaque
+        // 32-bit perceptual hashes; their specific values don't matter
+        // for this test, only that encoding them is stable and produces
+        // a valid base64url string.
+        let raw: Vec<u32> = vec![
+            0x0FCA_F446,
+            0xE351_9E89,
+            0xD349_4DD6,
+            0x8F21_9806,
+            0x9200_D530,
+        ];
+
+        let encoded_first = encode_fingerprint_to_base64(&raw);
+        let encoded_second = encode_fingerprint_to_base64(&raw);
+
+        assert!(
+            !encoded_first.is_empty(),
+            "encoded fingerprint must not be empty"
+        );
+        assert_eq!(
+            encoded_first, encoded_second,
+            "encoding must be deterministic for the same input"
+        );
+
+        let decoded_bytes = URL_SAFE_NO_PAD
+            .decode(&encoded_first)
+            .expect("encoded fingerprint must be valid base64url");
+        assert!(
+            !decoded_bytes.is_empty(),
+            "decoded payload must not be empty"
         );
     }
 

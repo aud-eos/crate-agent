@@ -2461,21 +2461,6 @@ final class FingerprintWorkerTests: XCTestCase {
         }
     }
 
-    func testSerializeAndDeserializeRoundTripsHashes() {
-        let original: [UInt32] = [0xDEAD_BEEF, 0x1234_5678, 0, UInt32.max]
-        let bytes = FingerprintWorker.serializeHashesToBytes(original)
-        XCTAssertEqual(bytes.count, original.count * 4)
-        let decoded = FingerprintWorker.deserializeHashesFromBytes(bytes)
-        XCTAssertEqual(decoded, original)
-    }
-
-    func testSerializeUsesLittleEndian() {
-        // Pin the byte order so the on-disk format is documented:
-        // 0x01020304 → 04 03 02 01.
-        let bytes = FingerprintWorker.serializeHashesToBytes([0x01020304])
-        XCTAssertEqual(Array(bytes), [0x04, 0x03, 0x02, 0x01])
-    }
-
     func testProcessAllPendingOnceFingerprintsEveryPendingRow() async throws {
         let database = try await LibraryDatabase.openInMemory()
         let id1 = try await insertPendingFile(path: "/Music/A/one.mp3", in: database, inode: 1)
@@ -2502,7 +2487,7 @@ final class FingerprintWorkerTests: XCTestCase {
             XCTAssertEqual(row.fingerprintStatus, .done,
                            "every pending row must transition to .done")
             XCTAssertNotNil(row.chromaprintFingerprint)
-            let decoded = FingerprintWorker.deserializeHashesFromBytes(row.chromaprintFingerprint!)
+            let decoded = FingerprintEncoder.deserialize(row.chromaprintFingerprint!)
             XCTAssertEqual(decoded.count, 2)
             XCTAssertEqual(decoded[0], UInt32(row.path.count))
             XCTAssertEqual(decoded[1], 0xCAFE)
@@ -2575,7 +2560,7 @@ final class FingerprintWorkerTests: XCTestCase {
         }
         XCTAssertEqual(processed.fingerprintStatus, .done)
         XCTAssertEqual(
-            FingerprintWorker.deserializeHashesFromBytes(processed.chromaprintFingerprint!),
+            FingerprintEncoder.deserialize(processed.chromaprintFingerprint!),
             [99]
         )
     }

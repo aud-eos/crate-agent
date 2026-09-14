@@ -31,6 +31,7 @@ public final class AppServices: ObservableObject {
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
     public let activityLog: ActivityLog
+    let autoTaggerService: AutoTaggerService
 
     /// Latest progress from the running initial scan, or nil when no
     /// scan is in flight. Views observe via @Published.
@@ -111,6 +112,25 @@ public final class AppServices: ObservableObject {
         )
 
         self.fingerprintWorker = FingerprintWorker(database: database)
+
+        // Shared between AcoustID and MusicBrainz per Ruling G / the
+        // design plan: MusicBrainz requires ≤1 request/second, and
+        // AcoustID is routed through the same limiter conservatively.
+        let lookupRateLimiter = RateLimiter(minInterval: 1.0, clock: SystemClock())
+        let applicationSupportUrl = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let lookupCache = LookupCache(
+            directory: applicationSupportUrl.appendingPathComponent("crate-agent/lookup-cache", isDirectory: true)
+        )
+        self.autoTaggerService = AutoTaggerService(
+            database: database,
+            acoustIDClient: AcoustIDClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
+            musicBrainzClient: MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache)
+        )
 
         // Coordinator needs the scanner to trigger reload-on-exit;
         // wire it last so all upstream deps are constructed.

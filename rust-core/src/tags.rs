@@ -78,7 +78,13 @@ pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
         tags.artist = tag.artist().map(|cow| cow.into_owned());
         tags.album = tag.album().map(|cow| cow.into_owned());
         tags.genre = tag.genre().map(|cow| cow.into_owned());
-        tags.year = tag.get_string(ItemKey::Year).and_then(|value| value.parse::<u32>().ok());
+        // `Accessor::date()` reads `ItemKey::RecordingDate` (ID3v2.4 `TDRC` /
+        // Vorbis `DATE` / iTunes `©day`) falling back to the legacy
+        // `ItemKey::Year`, and parses whatever subset of the timestamp is
+        // present. `write_tags` below writes through the same accessor, so
+        // this must stay paired with `set_date` rather than reading
+        // `ItemKey::Year` directly.
+        tags.year = tag.date().map(|timestamp| u32::from(timestamp.year));
         tags.track_number = tag.track();
         tags.total_tracks = tag.track_total();
         tags.comment = tag.comment().map(|cow| cow.into_owned());
@@ -105,6 +111,13 @@ pub struct AudioTagUpdate {
     pub musical_key: Option<String>,
     pub comment: Option<String>,
     pub label: Option<String>,
+    pub year: Option<u32>,
+    /// Remove the file's date/year frame outright. `Option<u32>` cannot
+    /// express "clear" — `None` means leave-unchanged — so undoing a
+    /// match that added a year to a file with no prior year needs this
+    /// explicit flag. Takes precedence over `year`: when true, `year` is
+    /// ignored and the date frame is removed.
+    pub clear_year: bool,
 }
 
 /// Write the supplied fields to the audio file's primary tag. For
@@ -125,7 +138,19 @@ pub fn write_tags(path: impl AsRef<Path>, update: &AudioTagUpdate) -> Result<(),
 
     if tagged_file.primary_tag().is_none() {
         let primary_type = tagged_file.primary_tag_type();
-        tagged_file.insert_tag(Tag::new(primary_type));
+        // The file has no primary tag but may carry a legacy/secondary one
+        // (e.g. an MP3 with only ID3v1). Seed the new primary FROM that tag,
+        // re-mapped to the primary type, so a partial field patch followed by
+        // `remove_others(true)` below doesn't strip the unselected fields that
+        // lived only in the secondary tag (finding #4000261460). `re_map`
+        // carries over every field the primary type also supports; when there
+        // is no existing tag it starts empty.
+        let mut primary = tagged_file
+            .first_tag()
+            .cloned()
+            .unwrap_or_else(|| Tag::new(primary_type));
+        primary.re_map(primary_type);
+        tagged_file.insert_tag(primary);
     }
 
     let tag = tagged_file
@@ -169,11 +194,34 @@ fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) {
     if let Some(value) = &update.label {
         tag.insert_text(ItemKey::Label, value.clone());
     }
+    if update.clear_year {
+        // Undo of a match that added a year to a previously-yearless
+        // file: remove the date frame entirely rather than leaving the
+        // added value in place (which `year: None` would do).
+        tag.remove_date();
+    } else if let Some(year) = update.year {
+        // `Timestamp::year` is a `u16`; release years never approach that
+        // range, but clamp rather than panic on an out-of-range input.
+        let year = u16::try_from(year).unwrap_or(u16::MAX);
+        // Edit ONLY the year component: start from the file's existing date so
+        // a full recording date like `1994-05-09` keeps its month/day when the
+        // user applies a different year. Rebuilding from `Timestamp::default()`
+        // would collapse it to a year-only value and lose the month/day
+        // irrecoverably — the reader and the inverse payload capture only the
+        // year, so undo could never restore them. Because both this forward
+        // edit and undo (which comes back through here with the previous year)
+        // touch only `.year`, the month/day round-trip correctly. Falls back to
+        // a year-only timestamp when the file had no date frame.
+        let mut timestamp = tag.date().unwrap_or_default();
+        timestamp.year = year;
+        tag.set_date(timestamp);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lofty::tag::items::Timestamp;
     use std::io::Write;
 
     const SAMPLE_RATE: u32 = 44_100;
@@ -242,11 +290,9 @@ mod tests {
         let mut tagged_file = Probe::open(&path).unwrap().read().unwrap();
         let mut tag = Tag::new(TagType::RiffInfo);
         // Fields that round-trip reliably through RIFF INFO (the WAV
-        // tag format lofty chose for us). Year is intentionally omitted
-        // because the lofty 0.24 Accessor trait lacks set_year and the
-        // RIFF INFO mapping for ItemKey::Year is one-way on read but
-        // not on write — those are exercised against ID3-tagged files
-        // in higher-fidelity tests once we have real fixtures.
+        // tag format lofty chose for us). Year is exercised separately
+        // in `writes_and_reads_year`, via `set_date`/`date` rather than
+        // this test's direct `Tag` construction.
         tag.set_title("Test Title".to_string());
         tag.set_artist("Test Artist".to_string());
         tag.set_album("Test Album".to_string());
@@ -305,6 +351,9 @@ mod tests {
             bpm: Some("128.000".to_string()),
             musical_key: Some("Am".to_string()),
             label: Some("Test Label".to_string()),
+            // Year has a dedicated round-trip test (`writes_and_reads_year`).
+            year: None,
+            clear_year: false,
         };
         write_tags(&path, &update).unwrap();
 
@@ -355,6 +404,190 @@ mod tests {
             Some("Keep Me Too"),
             "fields with None in the update must be preserved verbatim"
         );
+    }
+
+    #[test]
+    fn writes_and_reads_year() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-write-year");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("year.wav");
+        write_silent_wav(&path, 2).unwrap();
+
+        let update = AudioTagUpdate { year: Some(1994), ..AudioTagUpdate::default() };
+        write_tags(&path, &update).unwrap();
+
+        let read_back = read_tags(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back.year, Some(1994));
+    }
+
+    /// The undo path relies on `apply_update_to_tag` distinguishing
+    /// "clear this field" (`Some(""))` from "leave it alone" (`None`).
+    /// Verified directly against a free-standing `Tag` — no file I/O — so
+    /// the semantics are pinned independent of any format's on-save
+    /// handling of empty frames.
+    #[test]
+    fn empty_string_clears_text_field_none_leaves_it_intact() {
+        use lofty::tag::{Tag, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Original Artist".to_string());
+        tag.set_album("Original Album".to_string());
+
+        // artist -> Some("") clears; album -> None leaves untouched.
+        let update = AudioTagUpdate {
+            artist: Some(String::new()),
+            ..Default::default()
+        };
+        apply_update_to_tag(&mut tag, &update);
+
+        assert!(
+            tag.artist().is_none_or(|value| value.is_empty()),
+            "Some(\"\") must clear the tag, not leave the prior value"
+        );
+        assert_eq!(
+            tag.album().as_deref(),
+            Some("Original Album"),
+            "None must leave the prior value intact"
+        );
+    }
+
+    /// `clear_year` removes the date frame; `year: None` alone leaves it.
+    #[test]
+    fn clear_year_removes_date_frame() {
+        use lofty::tag::{Tag, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_date(Timestamp {
+            year: 1994,
+            ..Timestamp::default()
+        });
+        assert_eq!(tag.date().map(|timestamp| timestamp.year), Some(1994));
+
+        // year: None must NOT clear the existing date.
+        apply_update_to_tag(&mut tag, &AudioTagUpdate::default());
+        assert_eq!(
+            tag.date().map(|timestamp| timestamp.year),
+            Some(1994),
+            "year: None with clear_year: false must leave the date frame alone"
+        );
+
+        // clear_year: true removes it.
+        apply_update_to_tag(
+            &mut tag,
+            &AudioTagUpdate {
+                clear_year: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(tag.date(), None, "clear_year must remove the date frame");
+    }
+
+    /// Editing only the year must preserve an existing full date's month/day
+    /// rather than collapsing `1994-05-09` to a year-only value — the reader
+    /// and inverse payload capture only the year, so a lost month/day could
+    /// never be restored (finding #3999974017). Because both the forward edit
+    /// and undo touch only `.year`, the month/day round-trip.
+    #[test]
+    fn editing_year_preserves_existing_month_and_day() {
+        use lofty::tag::{Tag, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_date(Timestamp {
+            year: 1994,
+            month: Some(5),
+            day: Some(9),
+            ..Timestamp::default()
+        });
+
+        // Forward: apply a different year only.
+        apply_update_to_tag(
+            &mut tag,
+            &AudioTagUpdate { year: Some(1995), ..Default::default() },
+        );
+        let edited = tag.date().expect("date frame must survive a year edit");
+        assert_eq!(edited.year, 1995, "the year is updated");
+        assert_eq!(edited.month, Some(5), "the month must be preserved");
+        assert_eq!(edited.day, Some(9), "the day must be preserved");
+
+        // Undo: restore the previous year, still preserving month/day.
+        apply_update_to_tag(
+            &mut tag,
+            &AudioTagUpdate { year: Some(1994), ..Default::default() },
+        );
+        let restored = tag.date().expect("date frame must survive undo");
+        assert_eq!(restored.year, 1994);
+        assert_eq!(restored.month, Some(5), "undo preserves the month");
+        assert_eq!(restored.day, Some(9), "undo preserves the day");
+    }
+
+    /// `write_tags` seeds a new primary tag from the file's existing (possibly
+    /// legacy/secondary) tag via `re_map`, so a partial patch doesn't strip
+    /// fields that lived only in that tag (finding #4000261460). This pins the
+    /// mechanism the seeding relies on: re-mapping a secondary tag to the
+    /// primary type carries the standard fields across.
+    #[test]
+    fn re_mapping_a_secondary_tag_preserves_standard_fields() {
+        use lofty::prelude::Accessor;
+        use lofty::tag::{Tag, TagType};
+
+        let mut legacy = Tag::new(TagType::Id3v1);
+        legacy.set_artist("Legacy Artist".to_string());
+        legacy.set_title("Legacy Title".to_string());
+        legacy.set_album("Legacy Album".to_string());
+
+        legacy.re_map(TagType::Id3v2);
+
+        assert_eq!(legacy.artist().as_deref(), Some("Legacy Artist"));
+        assert_eq!(legacy.title().as_deref(), Some("Legacy Title"));
+        assert_eq!(legacy.album().as_deref(), Some("Legacy Album"));
+    }
+
+    /// End-to-end proof that the undo clears actually land on disk:
+    /// seed artist + year, then clear both (empty string + `clear_year`),
+    /// and confirm a re-read no longer reports the seeded values. A text
+    /// clear becomes an empty frame in some tag formats (RIFF INFO here)
+    /// rather than a dropped one — either way the applied value is gone,
+    /// which is what undo needs. `clear_year` drops the date outright.
+    #[test]
+    fn clear_writes_read_back_absent_through_a_real_file() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-clear-roundtrip");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("clear.wav");
+        write_silent_wav(&path, 2).unwrap();
+
+        write_tags(
+            &path,
+            &AudioTagUpdate {
+                artist: Some("Seeded Artist".to_string()),
+                year: Some(1994),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_tags(&path).unwrap().artist.as_deref(), Some("Seeded Artist"));
+        assert_eq!(read_tags(&path).unwrap().year, Some(1994));
+
+        write_tags(
+            &path,
+            &AudioTagUpdate {
+                artist: Some(String::new()),
+                clear_year: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let read_back = read_tags(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            read_back.artist.as_deref().is_none_or(str::is_empty),
+            "cleared artist must no longer carry the seeded value (empty or absent), got {:?}",
+            read_back.artist
+        );
+        assert_eq!(read_back.year, None, "cleared year reads back absent");
     }
 
     #[test]
