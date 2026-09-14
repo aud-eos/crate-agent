@@ -38,15 +38,42 @@ public struct FileMetadata: Codable, Sendable, Equatable {
     }
 }
 
+/// Audio paths may be links. Keep both their directory entry and regular target
+/// stable across a read; database V2 deliberately uses the stricter lstat check.
+struct AudioFileReadIdentity: Equatable, Sendable {
+    let entry: SeratoSourceIdentity
+    let target: SeratoSourceIdentity
+    let resolvedPath: String
+
+    static func read(at path: String) throws -> Self {
+        var entry = stat()
+        var target = stat()
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        guard lstat(path, &entry) == 0, stat(path, &target) == 0 else {
+            throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: path])
+        }
+        guard target.st_mode & S_IFMT == S_IFREG else {
+            throw CocoaError(.fileReadUnsupportedScheme, userInfo: [NSFilePathErrorKey: path])
+        }
+        guard resolved == URL(fileURLWithPath: path).resolvingSymlinksInPath().path else {
+            throw SeratoMembershipSnapshotError.sourceChanged
+        }
+        return Self(entry: SeratoSourceIdentity(entry), target: SeratoSourceIdentity(target), resolvedPath: resolved)
+    }
+
+    func requireUnchanged(at path: String) throws {
+        guard try self == Self.read(at: path) else { throw SeratoMembershipSnapshotError.sourceChanged }
+    }
+}
+
 public enum FileMetadataCollector {
     static func collectVerified(at path: String) throws -> FileMetadata {
-        let url = URL(fileURLWithPath: path)
-        let before = try SeratoSourceIdentity.read(url)
-        guard let metadata = collect(at: path, includeLightweightHash: true), metadata.lightweightHash != nil,
-              try before == SeratoSourceIdentity.read(url)
+        let before = try AudioFileReadIdentity.read(at: path)
+        guard let metadata = collect(at: path, includeLightweightHash: true), metadata.lightweightHash != nil
         else {
             throw SeratoMembershipSnapshotError.sourceChanged
         }
+        try before.requireUnchanged(at: path)
         return metadata
     }
 
@@ -66,9 +93,9 @@ public enum FileMetadataCollector {
         includeLightweightHash: Bool = false
     ) -> FileMetadata? {
         var statBuffer = stat()
-        guard stat(path, &statBuffer) == 0 else { return nil }
+        guard stat(path, &statBuffer) == 0, statBuffer.st_mode & S_IFMT == S_IFREG else { return nil }
 
-        let url = URL(fileURLWithPath: path)
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
         guard let volumeUuidString = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?
             .volumeUUIDString else { return nil }
 

@@ -242,7 +242,9 @@ public actor LibraryScanner {
             try Task.checkCancellation()
             guard let record = records[path] else { preconditionFailure("Snapshot path index lost a record") }
             let existing = byPath[path]
-            if let existing, existing.libraryMembership != .active || existing.fileAvailability != .available {
+            if let existing, existing.libraryMembership != .active || existing.fileAvailability != .available
+                || (existing.seratoLibraryId != nil && existing.seratoLibraryId != snapshot.libraryID)
+            {
                 skipped += 1
                 continue
             }

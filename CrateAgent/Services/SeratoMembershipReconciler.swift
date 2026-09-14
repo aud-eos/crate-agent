@@ -28,6 +28,20 @@ enum SeratoPath {
         let absolute = path.hasPrefix("/") ? path : "/" + path
         return URL(fileURLWithPath: absolute).standardizedFileURL.path.precomposedStringWithCanonicalMapping
     }
+
+    static func isVerifiedCaseAlias(_ file: FileRecord, identity: FileMetadata) throws -> Bool {
+        let original = normalized(file.path)
+        let observed = normalized(identity.path)
+        guard original != observed, original.caseInsensitiveCompare(observed) == .orderedSame,
+              file.volumeUuid == identity.volumeUuid, file.inode == identity.inode,
+              FileIdentityObservationMutation.matchesContent(file, identity: identity),
+              try URL(fileURLWithPath: observed).resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames == false
+        else { return false }
+        let current = try FileMetadataCollector.collectVerified(at: file.path)
+        return current.volumeUuid == identity.volumeUuid && current.inode == identity.inode
+            && current.fileSize == identity.fileSize && current.mtime == identity.mtime
+            && current.lightweightHash == identity.lightweightHash
+    }
 }
 
 actor SeratoMembershipReconciler {
@@ -157,7 +171,8 @@ actor SeratoMembershipReconciler {
             guard candidates.count == 1, let candidate = candidates.first, let fileID = candidate.id,
                   moves[fileID] == nil,
                   FileIdentityObservationMutation.matchesContent(candidate, identity: identity),
-                  try availability.inspect(path: candidate.path, volumeID: candidate.volumeUuid) == .missing
+                  try (SeratoPath.isVerifiedCaseAlias(candidate, identity: identity)
+                      || availability.inspect(path: candidate.path, volumeID: candidate.volumeUuid) == .missing)
             else {
                 throw SeratoReconciliationError.ambiguousIdentity(path)
             }

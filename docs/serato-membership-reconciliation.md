@@ -17,7 +17,10 @@ destination is the verified indexed file, and its original location is missing.
 Prior-membership rename events do not grant permission after reactivation.
 
 A saved new path can retain a known file ID only through unique physical or
-content identity and a missing old location. Ambiguous paths, hard links with the
+content identity and a missing old location. Case-only spellings on a filesystem
+that reports case-insensitive names are accepted only when both paths still
+resolve to the same verified physical/content identity. The planner and journal
+transaction share this check. Ambiguous paths, distinct hard links with the
 original still present, and conflicting candidates throw an actionable sync
 error instead of choosing an association. Same-path replacements use a journaled
 identity observation: the previous complete file record is retained in the inverse
@@ -25,6 +28,12 @@ payload, the file's recording link and fingerprint cache are cleared, and its
 membership revision advances. Shared recording rows remain intact. Identity and
 membership observations are informational History entries with no Undo or Re-sync
 permission to write obsolete content.
+
+Audio verification follows symbolic links to regular files and checks precise
+directory-entry and target identities plus the resolved target path across the
+read. Repointed links, changed targets, broken links, and nonregular targets fail
+verification. This does not relax the strict `lstat` rule for `database V2`, or
+the native move transaction's ownership of its opened regular source.
 
 `lastProjectionInvalidationRevision` permanently fences unversioned historical
 projections after retirement, replacement, or an observed re-add following a
@@ -42,6 +51,11 @@ read a fresh strict snapshot. The snapshot overload uses only the supplied
 records and journals guarded metadata/derived identity observations. Its legacy
 `scan(progress:)` overload is a separate compatibility entry point and does not
 provide this authorization contract.
+
+Snapshot scanning applies the reconciler's library-owner check before observing
+an existing row. An active, available row owned by another library remains
+unchanged and is counted as skipped. Unowned legacy rows acquire membership
+through reconciliation before metadata scanning.
 
 The engine retains the last successfully authorized external metadata observation
 per file/revision for the lifetime of its in-process queue, including unchanged
@@ -93,6 +107,29 @@ read/reconcile/scan while the retained processor head is being recovered; it can
 drain queued writes, reopen normal readiness, or start the worker in that scope.
 Only successful replay and checkpoint clear the latch. A fresh normal session then
 drains and schedules work, avoiding both a cyclic wait and a premature ready state.
+
+At startup the watcher captures events immediately, but its processor buffers
+delivery and checkpoints until `initialSyncComplete` and the session is idle.
+This establishes migrated legacy membership from the saved old V2 paths before
+replaying renames. Waiting for Serato or a failed initial pass leaves the buffer
+paused; a successful retry opens it once. AppServices owns and cancels the startup
+wait task; cancellation is checked again after the session becomes idle, before
+any buffered replay. The processor owns pending delivery,
+so startup does not wait for a filesystem handler that can itself request sync.
+
+A destination-first copy/move observation retains a verified candidate against
+the original indexed file's revision, state, and identity. A live source remains
+a copy. A later source disappearance revalidates the destination and commits the
+move through the engine, checking original authority inside the serialized
+transaction and physical targets again before commit. Replacement, retirement,
+or changed/missing destinations discard that candidate and request reconciliation.
+A strict observation of an active source becoming missing is allowed progress
+only while its original revision, owner, and physical identity remain unchanged;
+it does not grant a replaced or reactivated row new move authority.
+Pending state is keyed by known file ID with at most two destinations per entry;
+the second represents ambiguity and stops checkpointing visibly. Retry can prune
+invalid destinations, but cannot choose between two remaining candidates. This
+observation state is in-process; it does not implement durable queue recovery.
 
 The session installs a closed readiness gate before service startup. It invalidates
 the gate's generation before stopping work or reading a new snapshot. Ordinary

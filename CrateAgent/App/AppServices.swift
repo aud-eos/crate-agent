@@ -57,6 +57,7 @@ public final class AppServices: ObservableObject {
     private let fsEventsWatcher: FSEventsWatcher
     private var filesystemEventsTask: Task<Void, Never>?
     private let filesystemProcessor: FilesystemEventProcessor
+    private let filesystemStartupTask: Task<Void, Never>
     private let filesystemContinuation: AsyncStream<FilesystemEventBatch>.Continuation
     private var retryTask: Task<Void, Never>?
     private let readiness: LibrarySyncReadiness
@@ -175,12 +176,14 @@ public final class AppServices: ObservableObject {
         filesystemContinuation = eventStream.continuation
         let batchHandler = FilesystemSyncBatchHandler(coordinator: filesystemCoordinator, session: session)
         let processor = FilesystemEventProcessor(
+            initiallyPaused: true,
             handler: { batch in try await batchHandler.handle(batch) },
             checkpoint: { eventId in
                 UserPreferences.setLastFSEventId(eventId, forWatchedPath: watchedFolderPath)
             }
         )
         filesystemProcessor = processor
+        filesystemStartupTask = processor.resumeAfterInitialSync(session)
         fsEventsWatcher = FSEventsWatcher(
             watchedPaths: [watchedFolderPath],
             sinceWhen: resumeFromEventId,
@@ -226,6 +229,7 @@ public final class AppServices: ObservableObject {
     deinit {
         readiness.invalidate()
         filesystemEventsTask?.cancel()
+        filesystemStartupTask.cancel()
         filesystemContinuation.finish()
         retryTask?.cancel()
         fsEventsWatcher.stop()

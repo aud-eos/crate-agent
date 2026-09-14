@@ -11,6 +11,18 @@ public actor FilesystemSyncCoordinator {
     private let database: LibraryDatabase
     private let audioExtensions: Set<String>
     private let availabilityResolver = FileAvailabilityResolver()
+    private struct Destination: Sendable {
+        let metadata: FileMetadata
+        let readIdentity: AudioFileReadIdentity
+    }
+
+    private struct PendingMove: Sendable {
+        let original: FileObservationExpectation
+        var destinations: [Destination]
+    }
+
+    // At most two destinations per indexed row: the second records ambiguity.
+    private var pendingMoves: [Int64: PendingMove] = [:]
     public private(set) var requiresReconciliation = false
 
     public init(operationEngine: OperationEngine, database: LibraryDatabase,
@@ -62,6 +74,9 @@ public actor FilesystemSyncCoordinator {
             try FileRecord.filter(Column("path") == observation.path).fetchOne(connection)
         }
         if let knownPath {
+            if try await resolvePendingMove(for: knownPath, batchID: batchID) {
+                return
+            }
             var availability = try inspectKnownIdentity(knownPath)
             // An old-path removal is not evidence that a positively identified Trash item disappeared.
             if availability == .missing, knownPath.fileAvailability == .trashed {
@@ -103,11 +118,107 @@ public actor FilesystemSyncCoordinator {
         let previousAvailability = try inspectKnownIdentity(existing)
         guard previousAvailability == .missing || previousAvailability == .offline else {
             requiresReconciliation = true
+            if previousAvailability == .available {
+                if try FileMetadataCollector.collectVerified(at: existing.path) == existing.identity {
+                    try rememberDestination(at: observation.path, for: existing)
+                } else if let fileID = existing.id {
+                    pendingMoves.removeValue(forKey: fileID)
+                }
+            }
             try await observe(file: existing, availability: previousAvailability, metadata: nil, batchID: batchID)
+            return
+        }
+        if let fileID = existing.id, pendingMoves[fileID] != nil {
+            try rememberDestination(at: observation.path, for: existing)
+            _ = try await resolvePendingMove(for: existing, batchID: batchID)
             return
         }
         let availability = try availabilityResolver.inspect(path: observation.path, volumeID: metadata.volumeUuid)
         try await observe(file: existing, availability: availability, metadata: metadata, batchID: batchID)
+    }
+
+    private func rememberDestination(at path: String, for file: FileRecord) throws {
+        guard let fileID = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
+        let readIdentity = try AudioFileReadIdentity.read(at: path)
+        let metadata = try FileMetadataCollector.collectVerified(at: path)
+        try readIdentity.requireUnchanged(at: path)
+        guard FileIdentityObservationMutation.matchesContent(file, identity: metadata) else { return }
+        var pending = try pendingMoves[fileID] ?? PendingMove(original: FileObservationExpectation(file: file), destinations: [])
+        guard matchesOriginal(file, pending: pending) else {
+            pendingMoves.removeValue(forKey: fileID)
+            requiresReconciliation = true
+            return
+        }
+        let alreadyObserved = pending.destinations.contains { $0.metadata.path == path }
+        pending.destinations = try validDestinations(pending.destinations)
+        if alreadyObserved, !pending.destinations.contains(where: { $0.metadata.path == path }) {
+            pendingMoves[fileID] = pending.destinations.isEmpty ? nil : pending
+            return
+        }
+        if !pending.destinations.contains(where: { $0.metadata.path == path }) {
+            if pending.destinations.count < 2 {
+                pending.destinations.append(Destination(metadata: metadata, readIdentity: readIdentity))
+            }
+        }
+        pendingMoves[fileID] = pending
+        guard pending.destinations.count < 2 else { throw SeratoReconciliationError.ambiguousIdentity(path) }
+    }
+
+    private func matchesOriginal(_ file: FileRecord, pending: PendingMove) -> Bool {
+        let original = pending.original
+        let observedSourceMissing = original.state.membership == .active && original.state.availability == .available
+            && file.libraryState == FileLibraryState(membership: .active, availability: .missing,
+                                                     libraryID: original.state.libraryID, retiredAt: original.state.retiredAt)
+        return file.membershipRevision == original.revision && file.identity == original.identity
+            && (file.libraryState == original.state || observedSourceMissing)
+    }
+
+    private func validDestinations(_ destinations: [Destination]) throws -> [Destination] {
+        var valid: [Destination] = []
+        for destination in destinations {
+            let metadata = destination.metadata
+            let availability = try availabilityResolver.inspect(path: metadata.path, volumeID: metadata.volumeUuid)
+            guard availability == .available else {
+                requiresReconciliation = true
+                if availability == .inaccessible {
+                    throw CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: metadata.path])
+                }
+                continue
+            }
+            guard try FileMetadataCollector.collectVerified(at: metadata.path) == metadata,
+                  try AudioFileReadIdentity.read(at: metadata.path) == destination.readIdentity
+            else {
+                requiresReconciliation = true
+                continue
+            }
+            valid.append(destination)
+        }
+        return valid
+    }
+
+    private func resolvePendingMove(for file: FileRecord, batchID: String) async throws -> Bool {
+        guard let fileID = file.id, var pending = pendingMoves[fileID] else { return false }
+        guard matchesOriginal(file, pending: pending) else {
+            pendingMoves.removeValue(forKey: fileID)
+            requiresReconciliation = true
+            return false
+        }
+        pending.destinations = try validDestinations(pending.destinations)
+        pendingMoves[fileID] = pending.destinations.isEmpty ? nil : pending
+        guard pending.destinations.count < 2 else { throw SeratoReconciliationError.ambiguousIdentity(file.path) }
+        guard let destination = pending.destinations.first else { return false }
+        let sourceAvailability = try inspectKnownIdentity(file)
+        guard sourceAvailability == .missing else {
+            if sourceAvailability != .available {
+                pendingMoves.removeValue(forKey: fileID)
+                requiresReconciliation = true
+            }
+            return false
+        }
+        let expected = try FilesystemMoveExpectation(original: FileObservationExpectation(file: file), destination: destination.metadata, destinationReadIdentity: destination.readIdentity)
+        try await observe(file: file, availability: .available, metadata: destination.metadata, batchID: batchID, moveExpectation: expected)
+        pendingMoves.removeValue(forKey: fileID)
+        return true
     }
 
     private func inspectKnownIdentity(_ file: FileRecord) throws -> FileAvailability {
@@ -122,7 +233,9 @@ public actor FilesystemSyncCoordinator {
         return availability
     }
 
-    private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, batchID: String) async throws {
+    private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, batchID: String,
+                         moveExpectation: FilesystemMoveExpectation? = nil) async throws
+    {
         guard let fileId = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
         var mutations: [TrackMutation] = [.setFileLibraryState(.init(
             fileId: fileId, expectedRevision: file.membershipRevision,
@@ -140,7 +253,27 @@ public actor FilesystemSyncCoordinator {
                                                             path: metadata.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode)))
             }
         }
-        _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID)
+        _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID, moveExpectation: moveExpectation)
+    }
+}
+
+struct FilesystemMoveExpectation: Sendable {
+    let original: FileObservationExpectation
+    let destination: FileMetadata
+    let destinationReadIdentity: AudioFileReadIdentity
+
+    func validate(in database: GRDB.Database) throws {
+        try original.validate(in: database)
+        try validatePhysicalTargets()
+    }
+
+    func validatePhysicalTargets() throws {
+        guard try FileAvailabilityResolver().inspect(path: original.identity.path, volumeID: original.identity.volumeUuid) == .missing,
+              try FileMetadataCollector.collectVerified(at: destination.path) == destination
+        else {
+            throw FileProcessingEligibilityError.superseded(fileId: original.fileId)
+        }
+        try destinationReadIdentity.requireUnchanged(at: destination.path)
     }
 }
 

@@ -359,7 +359,9 @@ public actor OperationEngine {
         try await executeBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens)
     }
 
-    func applyFilesystemObservations(_ mutations: [TrackMutation], batchId: String) async throws -> [Int64] {
+    func applyFilesystemObservations(_ mutations: [TrackMutation], batchId: String,
+                                     moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
+    {
         for mutation in mutations {
             switch mutation {
             case .setFileLibraryState, .observeFileLocation: break
@@ -367,7 +369,7 @@ public actor OperationEngine {
             default: throw LibrarySyncReadinessError.synchronizationRequired
             }
         }
-        return try await executeBatch(mutations, batchId: batchId, filesystemObservation: true)
+        return try await executeBatch(mutations, batchId: batchId, filesystemObservation: true, moveExpectation: moveExpectation)
     }
 
     private func readinessAuthorization(for mutations: [TrackMutation]) throws -> LibrarySyncReadiness.Authorization? {
@@ -382,12 +384,14 @@ public actor OperationEngine {
 
     private func executeBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
-                              filesystemObservation: Bool = false) async throws -> [Int64]
+                              filesystemObservation: Bool = false,
+                              moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
     {
         guard !mutations.isEmpty else { return [] }
         let authorization = filesystemObservation ? nil : try readinessAuthorization(for: mutations)
         let executionResults: [GuardedExecutionResult] = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { db, moves in
             try authorization?.check()
+            try moveExpectation?.validate(in: db)
             let results = try mutations.map { mutation in
                 if let expectedMembershipTokens, let fileID = mutation.tokenFileID {
                     guard let token = expectedMembershipTokens[fileID] else {
@@ -397,6 +401,7 @@ public actor OperationEngine {
                 }
                 return try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db, physicalMoves: moves)
             }
+            try moveExpectation?.validatePhysicalTargets()
             try authorization?.check()
             return results
         }

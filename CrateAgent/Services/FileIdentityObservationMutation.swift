@@ -18,6 +18,13 @@ struct FileObservationExpectation: Sendable {
     }
 }
 
+extension FileObservationExpectation {
+    init(file: FileRecord) throws {
+        guard let fileID = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
+        self.init(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)
+    }
+}
+
 public struct ObserveFileIdentityPayload: Codable, Sendable {
     public let fileId: Int64
     public let expectedRevision: Int64
@@ -94,7 +101,8 @@ enum FileIdentityObservationMutation {
         let moved = SeratoPath.normalized(file.path) != SeratoPath.normalized(identity.path)
         if moved {
             guard matchesContent(file, identity: identity),
-                  try FileAvailabilityResolver().inspect(path: file.path, volumeID: file.volumeUuid) == .missing
+                  try (SeratoPath.isVerifiedCaseAlias(file, identity: identity)
+                      || FileAvailabilityResolver().inspect(path: file.path, volumeID: file.volumeUuid) == .missing)
             else {
                 throw SeratoReconciliationError.ambiguousIdentity(identity.path)
             }

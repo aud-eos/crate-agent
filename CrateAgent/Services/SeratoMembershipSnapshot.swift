@@ -22,13 +22,17 @@ struct SeratoSourceIdentity: Equatable, Sendable {
         guard metadata.st_mode & S_IFMT == S_IFREG else {
             throw SeratoMembershipSnapshotError.unsupportedSource
         }
-        return Self(
-            device: metadata.st_dev, inode: metadata.st_ino, size: metadata.st_size,
-            modifiedSeconds: metadata.st_mtimespec.tv_sec,
-            modifiedNanoseconds: metadata.st_mtimespec.tv_nsec,
-            changedSeconds: metadata.st_ctimespec.tv_sec,
-            changedNanoseconds: metadata.st_ctimespec.tv_nsec
-        )
+        return Self(metadata)
+    }
+
+    init(_ metadata: stat) {
+        device = metadata.st_dev
+        inode = metadata.st_ino
+        size = metadata.st_size
+        modifiedSeconds = metadata.st_mtimespec.tv_sec
+        modifiedNanoseconds = metadata.st_mtimespec.tv_nsec
+        changedSeconds = metadata.st_ctimespec.tv_sec
+        changedNanoseconds = metadata.st_ctimespec.tv_nsec
     }
 }
 
