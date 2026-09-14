@@ -632,6 +632,66 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         )
     }
 
+    /// A CLEAR in Serato (a field going from a value to absent) must also claim
+    /// V2 ownership. `metadataFieldMap` drops nils, so a cleared field is absent
+    /// from the import's `metadata`; comparing over the UNION of old+new keys is
+    /// what lets the value→nil transition supersede the older match — otherwise
+    /// re-syncing the batch restores the value the user deliberately cleared
+    /// (finding #4001407067).
+    func testResyncDoesNotRestoreFieldClearedByLaterSeratoImport() async throws {
+        let tagWriter = ThrowingTagWriter() // never throws
+        let (engine, _, seratoDirectory, fileIds) = try await MainActor.run {
+            try makeEngineWithLibrary(tagWriter: tagWriter)
+        }
+        let file = fileIds[0]
+        let databaseV2Path = seratoDirectory.appendingPathComponent("database V2").path
+
+        // Batch A: a match writes artist "Nas" to V2 (title/album untouched).
+        try await engine.applyBatch(
+            [.applyMusicBrainzMatch(ApplyMusicBrainzMatchPayload(
+                fileID: file, acoustID: "aid", recordingMBID: "recA", releaseMBID: "relA",
+                artistMBID: "art", isrc: "isrc", fingerprintHash: sha256(Data("fp".utf8)),
+                expectedFileSize: 1, expectedMtime: 1,
+                artist: "Nas", title: nil, album: nil, year: nil
+            ))],
+            batchId: "batchA"
+        )
+
+        // The user CLEARS the artist in Serato; the scanner imports the snapshot
+        // (artist now absent). applySetMetadata captures previousMetadata from
+        // the post-match row, so artist transitions "Nas" → nil.
+        try await engine.apply(
+            .setMetadata(SetMetadataPayload(
+                fileId: file,
+                metadata: SeratoMetadata(artist: nil, title: "old", album: "old")
+            )),
+            batchId: "seratoImport"
+        )
+
+        // The clear reaches V2 (artist emptied there too).
+        _ = try batchUpdateDatabaseRecords(
+            databasePath: databaseV2Path,
+            updates: [SeratoTrackMetadataUpdate(
+                trackPath: "Music/A/one.mp3",
+                update: SeratoMetadataUpdate(
+                    artist: "", title: nil, album: nil, genre: nil, bpm: nil,
+                    key: nil, comment: nil, length: nil, label: nil
+                )
+            )]
+        )
+
+        // Re-syncing batch A must NOT restore the cleared artist: the later
+        // import (the clear) owns the field.
+        _ = try await engine.resyncSeratoForBatch("batchA")
+
+        let records = try readDatabaseRecords(databasePath: databaseV2Path)
+        let record = records.first { $0.path == "Music/A/one.mp3" }
+        XCTAssertTrue(
+            record?.artist == "" || record?.artist == nil,
+            "the user's clear must survive as cleared — resync must not restore the match's artist (was \(String(describing: record?.artist)))"
+        )
+    }
+
     // MARK: - Regression: full success
 
     func testFullySuccessfulBatchJournalsOnceAndDoesNotThrow() async throws {

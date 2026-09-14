@@ -504,7 +504,16 @@ public actor OperationEngine {
                    let payload = try? decoder.decode(SetMetadataPayload.self, from: data) {
                     let newFields = Self.metadataFieldMap(payload.metadata)
                     let previousFields = Self.metadataFieldMap(payload.previousMetadata)
-                    for (key, value) in newFields where value != previousFields[key] {
+                    // Union of both key sets so a CLEAR (a field going from a
+                    // value to absent) also claims ownership — otherwise a user
+                    // clearing a field in Serato would leave the older match the
+                    // latest V2 writer and re-sync would restore the value they
+                    // cleared (finding #4001407067). `metadataFieldMap` drops
+                    // nils, so a cleared field is absent from `newFields`;
+                    // comparing the optional values over the union catches the
+                    // value→nil transition too.
+                    for key in Set(newFields.keys).union(previousFields.keys)
+                    where newFields[key] != previousFields[key] {
                         v2[fileId, default: [:]][key] = eventId
                     }
                 }
