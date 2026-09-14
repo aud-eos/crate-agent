@@ -1093,6 +1093,46 @@ final class AutoTaggerServiceTests: XCTestCase {
     /// choice of recording is ambiguous — such a match must never auto-classify
     /// as strong (which "Confirm All Strong" would persist unseen); it is
     /// downgraded to weak for review.
+    func testCompetingStrongResultsRequireReview() async throws {
+        try await assertCompetingResults(topScore: 0.99, otherScore: 0.99, otherRecording: "mb-other", expectWeak: true)
+        try await assertCompetingResults(topScore: 0.99, otherScore: 0.90, otherRecording: "mb-other", expectWeak: true)
+    }
+
+    func testCloseCompetitorBelowStrongThresholdRequiresReview() async throws {
+        try await assertCompetingResults(topScore: 0.91, otherScore: 0.89, otherRecording: "mb-other", expectWeak: true)
+    }
+
+    func testDuplicateRecordingAndDistantWeakResultDoNotDowngrade() async throws {
+        try await assertCompetingResults(topScore: 0.99, otherScore: 0.99, otherRecording: "mb-top", expectWeak: false)
+        try await assertCompetingResults(topScore: 0.99, otherScore: 0.50, otherRecording: "mb-other", expectWeak: false)
+    }
+
+    private func assertCompetingResults(topScore: Double, otherScore: Double, otherRecording: String, expectWeak: Bool) async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/competing.mp3")
+        let recording = makeRecording()
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in [
+                AcoustIDResult(id: "top", score: topScore, recordingIDs: ["mb-top"]),
+                AcoustIDResult(id: "other", score: otherScore, recordingIDs: [otherRecording]),
+            ] },
+            musicBrainzClient: StubMusicBrainzClient { recordingID in
+                XCTAssertEqual(recordingID, "mb-top")
+                return recording
+            },
+            keyStore: StubKeyProvider(),
+            audioTagsReader: stubAudioTagsReader()
+        )
+        await service.run(fileIDs: [fileID])
+        switch service.rows[fileID] {
+        case .weak: XCTAssertTrue(expectWeak)
+        case .strong: XCTAssertFalse(expectWeak)
+        default: XCTFail("expected a classified candidate")
+        }
+        XCTAssertEqual(service.candidate(for: fileID)?.recordingMBID, "mb-top")
+    }
+
     func testMultiRecordingResultDoesNotAutoClassifyStrong() async throws {
         let database = try makeDatabase()
         let hashes: [UInt32] = [1, 2, 3]

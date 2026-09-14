@@ -198,6 +198,10 @@ an earlier query or returning through New Scan waits for fresh results.
 The empty-library state observes the database row count throughout the panel's
 lifetime, including scans after startup. Each lookup pass replaces the service's
 result collection with its selected file IDs, releasing candidates from prior scans.
+Strong classification requires an unambiguous recording: a distinct recording in
+another AcoustID result forces review when that result also scores at least 0.9
+or lies within 0.05 of the selected result. Repeated IDs for the same recording
+do not create ambiguity; distant weak results do not downgrade the winner.
 
 Re-sync decodes all replayable payloads and relevant field-ownership history before
 issuing external writes. An undecodable event fails recovery with its event ID,
@@ -215,6 +219,12 @@ A failed fingerprint recompute clears the stale completed fingerprint only if it
 stored bytes, status, freshness basis, path, and indexed size/mtime still match the
 snapshot that failed. The comparison and update share a transaction, preserving a
 concurrent successful fingerprint. Failure to persist the error is surfaced in the row.
+
+**Open correctness constraint:** freshness snapshots retain only whole-second
+modification times, so same-size edits within one second can evade cached
+fingerprint and apply validation. [#118](https://github.com/aud-eos/crate-agent/issues/118)
+tracks subsecond identity throughout persisted fingerprints and journaled
+candidates, including migration and legacy-data trust rules.
 
 **Open correctness constraint:** queued audio-tag writes capture paths that can
 become stale after Finder renames, blocking the drain or writing to a replacement

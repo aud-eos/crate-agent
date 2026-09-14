@@ -40,6 +40,9 @@ final class AutoTaggerService: ObservableObject {
     /// candidate did in fact resolve and the user can still inspect it.
     private static let strongScoreThreshold = 0.9
 
+    /// Near ties still require review when they straddle the strong cutoff.
+    private static let competingScoreMargin = 0.05
+
     private static let noAPIKeyConfiguredMessage =
         "No AcoustID API key is configured. Add one in Settings to use the auto-tagger."
 
@@ -335,12 +338,14 @@ final class AutoTaggerService: ObservableObject {
             currentFileAlbum: tags.album
         )
 
-        // An AcoustID result carrying MORE THAN ONE recording id is ambiguous:
-        // we take the first, but the result-level score says nothing about
-        // which recording is right. Never let such a match auto-classify as
-        // strong (which "Confirm All Strong Matches" would persist unseen) —
-        // downgrade to weak so the user reviews it (finding #4000668529).
-        let ambiguousRecording = topResult.recordingIDs.count > 1
+        // The score belongs to an AcoustID result, not a unique recording.
+        // Distinct plausible recordings across results need the same review
+        // as multiple recordings attached to the winning result itself.
+        let competingRecordingIDs = Set(acoustIDResults.filter { result in
+            result.score >= Self.strongScoreThreshold
+                || result.score >= topResult.score - Self.competingScoreMargin
+        }.flatMap(\.recordingIDs)).union(topResult.recordingIDs)
+        let ambiguousRecording = competingRecordingIDs.count > 1
         return Self.classify(candidate, ambiguousRecording: ambiguousRecording)
     }
 
