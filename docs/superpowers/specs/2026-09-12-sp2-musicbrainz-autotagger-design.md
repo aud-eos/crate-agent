@@ -226,6 +226,12 @@ fingerprint and apply validation. [#118](https://github.com/aud-eos/crate-agent/
 tracks subsecond identity throughout persisted fingerprints and journaled
 candidates, including migration and legacy-data trust rules.
 
+**Open correctness constraint:** historical re-sync ranks internal journal owners
+but does not compare live embedded tags against external edits. It can overwrite
+newer editor changes even after an originally successful batch.
+[#119](https://github.com/aud-eos/crate-agent/issues/119) tracks conflict-aware
+recovery, durable completion evidence and per-field outcomes across entry points.
+
 **Open correctness constraint:** queued audio-tag writes capture paths that can
 become stale after Finder renames, blocking the drain or writing to a replacement
 file at the old path. [#117](https://github.com/aud-eos/crate-agent/issues/117)
@@ -276,6 +282,9 @@ is routed through the existing `FingerprintWorker` before lookup.
   the same tracks costs zero network. Backed by `URLCache` + a small keyed
   on-disk store.
 - Exponential backoff on `429`/`503`. The pass is cancellable mid-flight.
+  Retry-After accepts delay seconds and all HTTP-date forms; date deadlines are
+  compared against the response-time clock and past deadlines become zero delay.
+  Invalid or unrepresentable delays use the existing exponential schedule.
   Both backoff and proactive rate-limit waits propagate cancellation, so cancelling
   a scan while it waits for a request slot prevents that request from being sent.
 

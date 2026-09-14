@@ -16,6 +16,7 @@ public struct RetryingLookupRequester: Sendable {
     private let sleeper: BackoffSleeping
     private let maxAttempts: Int
     private let baseBackoffSeconds: TimeInterval
+    private let now: @Sendable () -> Date
 
     /// - Parameters:
     ///   - maxAttempts: total attempts (including the first) before a
@@ -28,13 +29,15 @@ public struct RetryingLookupRequester: Sendable {
         limiter: RateLimiter,
         sleeper: BackoffSleeping = SystemBackoffSleeper(),
         maxAttempts: Int = 4,
-        baseBackoffSeconds: TimeInterval = 0.5
+        baseBackoffSeconds: TimeInterval = 0.5,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.loader = loader
         self.limiter = limiter
         self.sleeper = sleeper
         self.maxAttempts = maxAttempts
         self.baseBackoffSeconds = baseBackoffSeconds
+        self.now = now
     }
 
     /// Sends `request`, retrying on 429/503 up to `maxAttempts` times, and
@@ -118,15 +121,49 @@ public struct RetryingLookupRequester: Sendable {
         }
     }
 
-    /// A `Retry-After` header (seconds form) wins when the server sends
-    /// one; otherwise a bounded exponential backoff:
+    /// A valid `Retry-After` delay or HTTP date wins; otherwise use
+    /// bounded exponential backoff:
     /// `baseBackoffSeconds * 2^(attempt-1)`.
     private func retryDelay(forAttempt attempt: Int, response: HTTPURLResponse) -> TimeInterval {
-        if let retryAfterHeader = response.value(forHTTPHeaderField: "Retry-After"),
-           let retryAfterSeconds = TimeInterval(retryAfterHeader)
-        {
-            return retryAfterSeconds
+        if let header = response.value(forHTTPHeaderField: "Retry-After") {
+            let value = header.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let seconds = TimeInterval(value), seconds.isFinite, seconds < Double(Int64.max) {
+                return max(0, seconds)
+            }
+            let receivedAt = now()
+            if let retryAt = Self.httpDate(value, relativeTo: receivedAt) {
+                return max(0, retryAt.timeIntervalSince(receivedAt))
+            }
         }
         return baseBackoffSeconds * pow(2.0, Double(attempt - 1))
+    }
+
+    private static func httpDate(_ value: String, relativeTo referenceDate: Date) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        formatter.calendar = calendar
+        formatter.isLenient = false
+        // RFC 9110's obsolete two-digit year form uses a rolling window,
+        // not DateFormatter's fixed default century.
+        formatter.twoDigitStartDate = calendar.date(byAdding: .year, value: -49, to: referenceDate)
+        let formats = [
+            "EEE, dd MMM yyyy HH:mm:ss 'GMT'",
+            "EEEE, dd-MMM-yy HH:mm:ss 'GMT'",
+            "EEE MMM d HH:mm:ss yyyy",
+        ]
+        for (index, format) in formats.enumerated() {
+            formatter.dateFormat = format
+            guard let date = formatter.date(from: value) else { continue }
+            if index == 1,
+               let futureLimit = calendar.date(byAdding: .year, value: 50, to: referenceDate),
+               date > futureLimit {
+                return calendar.date(byAdding: .year, value: -100, to: date)
+            }
+            return date
+        }
+        return nil
     }
 }

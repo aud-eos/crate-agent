@@ -165,6 +165,57 @@ final class AcoustIDClientTests: XCTestCase {
         XCTAssertEqual(results.count, 2)
     }
 
+    func testRetryAfterAcceptsAllHTTPDateForms() async throws {
+        for header in [
+            "Sun, 06 Nov 1994 08:50:37 GMT",
+            "Sunday, 06-Nov-94 08:50:37 GMT",
+            "Sun Nov  6 08:50:37 1994",
+        ] {
+            for status in [429, 503] {
+                try await assertRetryAfter(header, status: status, expectedDelay: 60)
+            }
+        }
+    }
+
+    func testRetryAfterClampsPastDatesAndNegativeDelay() async throws {
+        try await assertRetryAfter("Sun, 06 Nov 1994 08:48:37 GMT", expectedDelay: 0)
+        try await assertRetryAfter("-2", expectedDelay: 0)
+    }
+
+    func testRetryAfterLegacyYearUsesRollingFiftyYearBoundary() async throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let withinWindow = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2044, month: 11, day: 6, hour: 8, minute: 49, second: 0
+        )))
+        try await assertRetryAfter("Sunday, 06-Nov-44 08:49:00 GMT",
+                                   expectedDelay: withinWindow.timeIntervalSince1970 - 784111777)
+        try await assertRetryAfter("Sunday, 06-Nov-44 08:50:37 GMT", expectedDelay: 0)
+    }
+
+    func testRetryAfterKeepsSecondsAndFallsBackForInvalidValues() async throws {
+        try await assertRetryAfter("120", expectedDelay: 120)
+        for header in ["not a date", "NaN", "inf", "1e300"] {
+            try await assertRetryAfter(header, expectedDelay: 0.5)
+        }
+    }
+
+    private func assertRetryAfter(_ header: String, status: Int = 429, expectedDelay: TimeInterval) async throws {
+        let loader = SequencedStubLoader(responses: [
+            (status: status, body: Data(), headers: ["Retry-After": header]),
+            (status: 200, body: Data("complete".utf8), headers: [:]),
+        ])
+        let sleeper = RecordingSleeper()
+        let requester = RetryingLookupRequester(
+            loader: loader, limiter: .noop, sleeper: sleeper,
+            now: { Date(timeIntervalSince1970: 784111777) }
+        )
+        let body = try await requester.perform(URLRequest(url: URL(string: "https://example.invalid/retry")!))
+        XCTAssertEqual(body, Data("complete".utf8))
+        XCTAssertEqual(loader.callCount, 2)
+        XCTAssertEqual(sleeper.recordedDelays, [expectedDelay], "header: \(header)")
+    }
+
     func testRetryHonorsRetryAfterHeader() async throws {
         let loader = SequencedStubLoader(responses: [
             (status: 429, body: Data(), headers: ["Retry-After": "2"]),
