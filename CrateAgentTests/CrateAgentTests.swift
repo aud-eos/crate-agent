@@ -89,7 +89,7 @@ final class OperationEngineTests: XCTestCase {
         ))
 
         let eventId = try await engine.apply(mutation)
-        XCTAssertGreaterThan(eventId, 0)
+        XCTAssertGreaterThan(try XCTUnwrap(eventId), 0)
 
         try await database.writer.read { db in
             let files = try FileRecord.fetchAll(db)
@@ -113,7 +113,7 @@ final class OperationEngineTests: XCTestCase {
             path: "/Music/A/old.mp3",
             volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1
         )))
-        XCTAssertGreaterThan(indexEventId, 0)
+        XCTAssertGreaterThan(try XCTUnwrap(indexEventId), 0)
 
         let fileId = try await database.writer.read { db in
             try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
@@ -124,7 +124,7 @@ final class OperationEngineTests: XCTestCase {
             fileId: fileId,
             newPath: "/Music/A/new.mp3"
         )))
-        XCTAssertGreaterThan(renameEventId, indexEventId)
+        XCTAssertGreaterThan(try XCTUnwrap(renameEventId), try XCTUnwrap(indexEventId))
 
         try await database.writer.read { db in
             // Path was updated.
@@ -4464,13 +4464,13 @@ final class DuplicateResolverTests: XCTestCase {
             inode: inode,
             fileSize: 1, mtime: 1
         )))
-        return try await engine.apply(.indexNewFile(IndexNewFilePayload(
+        let eventId = try await engine.apply(.indexNewFile(IndexNewFilePayload(
             path: path + ".duplicate-bootstrap-noop",  // workaround
             volumeUuid: "v1",
             inode: inode + 1000,
             fileSize: 1, mtime: 1
         )))
-        // placeholder — replaced below
+        return try XCTUnwrap(eventId)
     }
 
     func testResolveTrashesNonKeepersAndKeepsTheChosenFile() async throws {

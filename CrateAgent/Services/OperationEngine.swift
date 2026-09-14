@@ -122,15 +122,16 @@ public actor OperationEngine {
     /// `apply(_:batchId:)` when grouping multiple mutations into a
     /// single user-initiated operation (so undo can replay them all).
     @discardableResult
-    public func apply(_ mutation: TrackMutation) async throws -> Int64 {
+    public func apply(_ mutation: TrackMutation) async throws -> Int64? {
         try await apply(mutation, batchId: UUID().uuidString)
     }
 
     /// Apply a mutation under a caller-supplied batch identifier. All
     /// mutations sharing a batch_id are treated as a single
     /// transaction for undo purposes.
+    /// Returns nil when an observation confirms an unchanged state.
     @discardableResult
-    public func apply(_ mutation: TrackMutation, batchId: String) async throws -> Int64 {
+    public func apply(_ mutation: TrackMutation, batchId: String) async throws -> Int64? {
         let executionResult: ExecutionResult = try await database.writer.write { db in
             try Self.executeAndLog(mutation: mutation, batchId: batchId, in: db)
         }
@@ -141,6 +142,7 @@ public actor OperationEngine {
     }
 
     /// Apply many mutations under a single batch identifier, atomically.
+    /// Returned event IDs omit unchanged observations and preserve input order.
     ///
     /// One SQLite write transaction covers every mutation's DB-side
     /// work — if any throws, none persist. The `seratoWatchdog`
@@ -166,7 +168,7 @@ public actor OperationEngine {
         let pendingWrites = executionResults.flatMap { $0.seratoWrites }
         try await routeSeratoWrites(pendingWrites, batchId: batchId)
 
-        return executionResults.map(\.eventId)
+        return executionResults.compactMap(\.eventId)
     }
 
     /// Route a committed batch's Serato-side writes: queue them if
@@ -567,7 +569,7 @@ public actor OperationEngine {
             return true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates:
+             .fileRemovedFromCrates, .fileLibraryStateChanged:
             return false
         }
     }
@@ -662,7 +664,7 @@ public actor OperationEngine {
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged:
             return []
         }
     }
@@ -863,6 +865,10 @@ public actor OperationEngine {
             // Reversing this requires a `removeTrackFromSerato` FFI
             // we don't have yet. Document as unsupported rather
             // than half-undo.
+            throw OperationEngineError.undoNotSupported(eventType: event.eventType)
+        case .fileLibraryStateChanged:
+            // Observation inverses preserve audit evidence, not permission to
+            // reverse an external Serato decision or re-add its membership.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
         case .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates:
             // Resolution-flow events are deliberately not undoable.
@@ -1427,7 +1433,7 @@ public actor OperationEngine {
     // MARK: - Synchronous SQL apply
 
     private struct ExecutionResult: Sendable {
-        let eventId: Int64
+        let eventId: Int64?
         /// Serato-gated writes this mutation produced, applied in order.
         /// Most mutations emit zero or one; `applyMusicBrainzMatch`
         /// emits two (a database-V2 metadata update and a file-tag
@@ -1459,6 +1465,9 @@ public actor OperationEngine {
             let eventId = try applyRemoveFile(
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .setFileLibraryState(payload):
+            let eventId = try FileLibraryStateMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case .setMetadata(let payload):
             let eventId = try applySetMetadata(
@@ -2419,7 +2428,7 @@ public actor OperationEngine {
         return writes
     }
 
-    private static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
+    static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
         batchId: String,
         timestamp: Int64,
         fileId: Int64?,
@@ -2496,6 +2505,7 @@ public enum TrackMutation: Sendable {
     case indexNewFile(IndexNewFilePayload)
     case renameFile(RenameFilePayload)
     case removeFile(RemoveFilePayload)
+    case setFileLibraryState(SetFileLibraryStatePayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)
     case addTrackToSerato(AddTrackToSeratoPayload)

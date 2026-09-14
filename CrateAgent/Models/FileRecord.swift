@@ -20,6 +20,16 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         DatabaseColumnEncodingStrategy.convertToSnakeCase
 
     public var id: Int64?
+    public var libraryMembership: LibraryMembership = .legacyUnverified
+    public var fileAvailability: FileAvailability = .unknown
+    public var seratoLibraryId: String?
+    public var retiredAt: Int64?
+    public var membershipRevision: Int64 = 0
+
+    public var libraryState: FileLibraryState {
+        FileLibraryState(membership: libraryMembership, availability: fileAvailability, libraryID: seratoLibraryId, retiredAt: retiredAt)
+    }
+
     public var path: String
     public var volumeUuid: String
     public var inode: Int64
