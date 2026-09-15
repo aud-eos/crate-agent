@@ -6,14 +6,13 @@ import Foundation
 /// `UserPreferences.watchedMusicFolder`) land in `.ready(services)`.
 ///
 /// Why a separate type from AppServices: AppServices's init is heavy
-/// — opens the SQLite database, starts FSEvents, kicks off the
-/// initial scan, registers Combine bridges. Doing that *before* the
+/// — opens the SQLite database, starts FSEvents and background
+/// fingerprinting, and registers Combine bridges. Doing that *before* the
 /// user has picked a folder means watching/scanning the wrong path
 /// and creating throwaway state. The launcher defers construction
 /// until the choice exists.
 @MainActor
 public final class AppLauncher: ObservableObject {
-
     public enum State {
         case needsOnboarding
         case ready(AppServices)

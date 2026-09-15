@@ -4,6 +4,7 @@ import SwiftUI
 struct LibraryBrowserView: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     /// Hard cap on rows the table renders. SwiftUI Table doesn't scale
     /// past ~10k items even with virtualization — diffing + accessibility
@@ -114,11 +115,26 @@ struct LibraryBrowserView: View {
 
     private var statusHeader: some View {
         HStack(spacing: density.spacing) {
-            if let progress = services.scanProgress, !services.initialScanComplete {
+            if let progress = services.scanProgress {
                 ProgressView().controlSize(density.controlSize)
                 Text("Syncing from Serato… \(progress.filesIndexed) new, \(progress.filesMetadataUpdated) updated, of \(progress.seratoReferenceCount)")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
+            } else if isRescanning {
+                ProgressView().controlSize(density.controlSize)
+                Text("Reading saved Serato file info…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else if let fingerprintError = services.fingerprintProgress?.error {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text(fingerprintError)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .lineLimit(1)
+                Button("Retry Fingerprinting") {
+                    services.retryFingerprinting()
+                }
             } else if let fingerprintProgress = services.fingerprintProgress,
                       fingerprintProgress.totalPending > 0
             {
@@ -135,6 +151,22 @@ struct LibraryBrowserView: View {
             }
 
             Spacer()
+
+            if isRescanning {
+                Button("Stop Re-scan", role: .cancel) {
+                    services.stopLibraryRescan()
+                }
+            } else {
+                Button {
+                    services.requestLibraryRescan()
+                } label: {
+                    Label("Re-scan File Info", systemImage: "arrow.clockwise")
+                }
+                .disabled(seratoWatchdog.isSeratoRunning)
+                .help(seratoWatchdog.isSeratoRunning
+                    ? "Close Serato before re-scanning file info."
+                    : "Read Serato's saved library and refresh indexed file information.")
+            }
 
             Text("Watching: \(services.watchedMusicFolder.path)")
                 .font(.callout)
@@ -156,25 +188,32 @@ struct LibraryBrowserView: View {
         .padding(.vertical, density.rowPadding)
     }
 
+    private var isRescanning: Bool {
+        if case .reconciling = services.syncState {
+            return true
+        }
+        return false
+    }
+
     private var tableSection: some View {
         LibraryBrowserTable(rows: rows, selectedFileIds: $selectedFileIds, sortOrder: $sortOrder, showsFilenames: statusFilter != .active)
-        .searchable(text: $searchText, prompt: "Filter by artist, title, album, or path…")
-        .contextMenu(forSelectionType: BrowserRow.ID.self) { selectedIds in
-            if let singleId = selectedIds.first, selectedIds.count == 1,
-               let row = rows.first(where: { $0.id == singleId })
-            {
-                Button("Rename…") {
-                    Task { await openRenameDialog(forRowId: row.id) }
-                }
-                .disabled(!row.canProcess)
-                Button("Show History") { historyTarget = row }
-                Button("Show in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting(
-                        [URL(fileURLWithPath: row.path)]
-                    )
+            .searchable(text: $searchText, prompt: "Filter by artist, title, album, or path…")
+            .contextMenu(forSelectionType: BrowserRow.ID.self) { selectedIds in
+                if let singleId = selectedIds.first, selectedIds.count == 1,
+                   let row = rows.first(where: { $0.id == singleId })
+                {
+                    Button("Rename…") {
+                        Task { await openRenameDialog(forRowId: row.id) }
+                    }
+                    .disabled(!row.canProcess)
+                    Button("Show History") { historyTarget = row }
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: row.path)]
+                        )
+                    }
                 }
             }
-        }
     }
 
     private func openRenameDialog(forRowId rowId: Int64) async {
