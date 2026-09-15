@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 import os.log
 
 /// Orchestrates the drag-drop import flow. The user drops files or
@@ -67,10 +68,10 @@ public actor ImportCoordinator {
     private func importSingleFile(at fileUrl: URL) async -> Bool {
         let absolutePath = fileUrl.path
 
-        guard let fileMetadata = FileMetadataCollector.collect(
-            at: absolutePath,
-            includeLightweightHash: true
-        ) else {
+        let fileMetadata: FileMetadata
+        do {
+            fileMetadata = try FileMetadataCollector.collectVerified(at: SeratoPath.normalized(absolutePath))
+        } catch {
             Self.logger.warning(
                 "could not stat \(absolutePath, privacy: .public); skipping import"
             )
@@ -86,33 +87,46 @@ public actor ImportCoordinator {
 
         let fileId: Int64
         do {
-            _ = try await operationEngine.apply(
-                .indexNewFile(IndexNewFilePayload(
-                    path: fileMetadata.path,
-                    volumeUuid: fileMetadata.volumeUuid,
-                    inode: fileMetadata.inode,
-                    fileSize: fileMetadata.fileSize,
-                    mtime: fileMetadata.mtime,
-                    lightweightHash: fileMetadata.lightweightHash,
-                    bitrateKbps: bitrateKbps,
-                    metadata: seratoMetadata
-                )),
-                batchId: batchId
-            )
-            // Look up the just-inserted file's id for the Serato add.
-            guard let newId = try await database.writer.read({ db in
-                try Int64.fetchOne(
-                    db,
-                    sql: "SELECT id FROM files WHERE path = ?",
-                    arguments: [fileMetadata.path]
-                )
-            }) else {
-                Self.logger.error(
-                    "indexNewFile succeeded but the row at \(fileMetadata.path, privacy: .public) is gone"
-                )
-                return false
+            let existing = try await database.writer.read { database in
+                let candidates = try FileRecord.filter(Column("path") == fileMetadata.path || (Column("inode") == fileMetadata.inode && Column("volume_uuid") == fileMetadata.volumeUuid)).fetchAll(database)
+                    .filter { file in SeratoPath.normalized(file.path) == SeratoPath.normalized(fileMetadata.path) }
+                guard candidates.count <= 1 else { throw SeratoReconciliationError.ambiguousIdentity(fileMetadata.path) }
+                return candidates.first
             }
-            fileId = newId
+            if let existing {
+                guard existing.libraryMembership != .active,
+                      FileImportIdentity.matches(existing, identity: fileMetadata),
+                      let existingID = existing.id else { return false }
+                fileId = existingID
+            } else {
+                _ = try await operationEngine.apply(
+                    .indexNewFile(IndexNewFilePayload(
+                        path: fileMetadata.path,
+                        volumeUuid: fileMetadata.volumeUuid,
+                        inode: fileMetadata.inode,
+                        fileSize: fileMetadata.fileSize,
+                        mtime: fileMetadata.mtime,
+                        lightweightHash: fileMetadata.lightweightHash,
+                        bitrateKbps: bitrateKbps,
+                        metadata: seratoMetadata
+                    )),
+                    batchId: batchId
+                )
+                // Look up the just-inserted file's id for the Serato add.
+                guard let newId = try await database.writer.read({ db in
+                    try Int64.fetchOne(
+                        db,
+                        sql: "SELECT id FROM files WHERE path = ?",
+                        arguments: [fileMetadata.path]
+                    )
+                }) else {
+                    Self.logger.error(
+                        "indexNewFile succeeded but the row at \(fileMetadata.path, privacy: .public) is gone"
+                    )
+                    return false
+                }
+                fileId = newId
+            }
         } catch {
             // Most likely cause: path already in the DB (path is UNIQUE).
             // That's a no-op for the user — they re-dropped a file
@@ -124,20 +138,23 @@ public actor ImportCoordinator {
         }
 
         do {
-            _ = try await operationEngine.apply(
+            let file = try await database.writer.read { database in
+                try FileRecord.fetchOne(database, key: fileId)
+            }
+            guard let file else { throw OperationEngineError.fileNotFound(fileId: fileId) }
+            _ = try await operationEngine.applyBatch([
+                .beginFileImport(BeginFileImportPayload(fileId: fileId, expectedRevision: file.membershipRevision, identity: fileMetadata)),
                 .addTrackToSerato(AddTrackToSeratoPayload(
                     fileId: fileId,
                     metadata: seratoMetadata
                 )),
-                batchId: batchId
-            )
+            ],
+            batchId: batchId)
         } catch {
             Self.logger.error(
                 "addTrackToSerato for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
             )
-            // Continue — the DB row is in place; the user can retry
-            // adding to Serato later, or it'll get caught by the
-            // next Serato-exit reload.
+            return false
         }
 
         return true

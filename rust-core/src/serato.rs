@@ -90,6 +90,12 @@ impl TlvRecord {
             let length = u32::from_be_bytes(length_bytes) as usize;
 
             let offset_after_length = cursor.position();
+            if length as u64 > total_len - offset_after_length {
+                return Err(SeratoError::UnexpectedEof {
+                    offset: offset_after_length,
+                    needed: length,
+                });
+            }
             let mut payload = vec![0u8; length];
             cursor
                 .read_exact(&mut payload)
@@ -177,6 +183,10 @@ fn extract_track_record(otrk_payload: &[u8]) -> Option<SeratoTrackRecord> {
         .find(|record| &record.tag == TAG_PFIL)
         .and_then(|record| decode_utf16be(&record.payload))?;
 
+    Some(decode_track_fields(&nested, path))
+}
+
+fn decode_track_fields(nested: &[TlvRecord], path: String) -> SeratoTrackRecord {
     let mut track = SeratoTrackRecord {
         path,
         artist: None,
@@ -190,7 +200,7 @@ fn extract_track_record(otrk_payload: &[u8]) -> Option<SeratoTrackRecord> {
         label: None,
     };
 
-    for field in &nested {
+    for field in nested {
         match &field.tag {
             b"tart" => track.artist = decode_utf16be(&field.payload),
             b"tsng" => track.title = decode_utf16be(&field.payload),
@@ -205,7 +215,7 @@ fn extract_track_record(otrk_payload: &[u8]) -> Option<SeratoTrackRecord> {
         }
     }
 
-    Some(track)
+    track
 }
 
 /// Full per-track metadata extracted from a Serato `database V2`
@@ -459,6 +469,69 @@ impl DatabaseV2 {
             .filter(|record| &record.tag == TAG_OTRK)
             .filter_map(|record| extract_track_record(&record.payload))
             .collect()
+    }
+
+    pub fn strict_track_records(&self) -> Result<Vec<SeratoTrackRecord>, SeratoError> {
+        let Some(version) = self.records.first() else {
+            return Err(SeratoError::InvalidFile("missing database version".into()));
+        };
+        if version.tag != *b"vrsn"
+            || decode_utf16be(&version.payload).as_deref()
+                != Some("2.0/Serato Scratch LIVE Database")
+        {
+            return Err(SeratoError::InvalidFile(
+                "unsupported database version".into(),
+            ));
+        }
+        let mut tracks = Vec::new();
+        for record in &self.records[1..] {
+            if record.tag == *b"vrsn" {
+                return Err(SeratoError::InvalidFile(
+                    "duplicate database version".into(),
+                ));
+            }
+            if record.tag != *TAG_OTRK {
+                continue;
+            }
+            let nested = TlvRecord::parse_all(&record.payload)?;
+            let mut paths = nested.iter().filter(|field| field.tag == *TAG_PFIL);
+            let path_field = paths
+                .next()
+                .ok_or_else(|| SeratoError::InvalidFile("otrk missing pfil".into()))?;
+            if paths.next().is_some() {
+                return Err(SeratoError::InvalidFile(
+                    "otrk has multiple pfil fields".into(),
+                ));
+            }
+            let path = decode_utf16be(&path_field.payload)
+                .ok_or_else(|| SeratoError::InvalidUtf16 { tag: "pfil".into() })?;
+            if path.is_empty() || path.contains('\0') {
+                return Err(SeratoError::InvalidFile(
+                    "otrk has an empty or NUL-containing path".into(),
+                ));
+            }
+            for field in &nested {
+                if matches!(
+                    &field.tag,
+                    b"tart"
+                        | b"tsng"
+                        | b"talb"
+                        | b"tgen"
+                        | b"tbpm"
+                        | b"tkey"
+                        | b"tcom"
+                        | b"tlen"
+                        | b"tlbl"
+                ) && decode_utf16be(&field.payload).is_none()
+                {
+                    return Err(SeratoError::InvalidUtf16 {
+                        tag: field.tag_str(),
+                    });
+                }
+            }
+            tracks.push(decode_track_fields(&nested, path));
+        }
+        Ok(tracks)
     }
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
@@ -747,6 +820,130 @@ mod tests {
         let mut bytes = Vec::new();
         TlvRecord::write_all(&records, &mut bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn strict_membership_accepts_version_only_empty_library() {
+        let bytes = synthetic_library("2.0/Serato Scratch LIVE Database", TAG_PFIL, &[]);
+        assert!(DatabaseV2::from_bytes(&bytes)
+            .unwrap()
+            .strict_track_records()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn strict_membership_rejects_invalid_versions_and_empty_bytes() {
+        for bytes in [
+            Vec::new(),
+            synthetic_library("", TAG_PFIL, &[]),
+            synthetic_library("nonsense", TAG_PFIL, &[]),
+        ] {
+            assert!(DatabaseV2::from_bytes(&bytes)
+                .unwrap()
+                .strict_track_records()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn strict_membership_rejects_malformed_tracks() {
+        for payload in [
+            Vec::new(),
+            vec![0],
+            b"pfil\0\0\0\0".to_vec(),
+            vec![112, 102, 105, 108, 0, 0, 0, 2, 216, 0],
+        ] {
+            let mut bytes = synthetic_library("2.0/Serato Scratch LIVE Database", TAG_PFIL, &[]);
+            TlvRecord::write_all(
+                &[TlvRecord {
+                    tag: *TAG_OTRK,
+                    payload,
+                }],
+                &mut bytes,
+            )
+            .unwrap();
+            assert!(DatabaseV2::from_bytes(&bytes)
+                .unwrap()
+                .strict_track_records()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn strict_membership_rejects_truncated_and_excessive_lengths() {
+        for bytes in [
+            b"otrk".to_vec(),
+            vec![111, 116, 114, 107, 255, 255, 255, 255],
+        ] {
+            assert!(DatabaseV2::from_bytes(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_membership_preserves_unknown_fields() {
+        let mut bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Music/track.mp3"],
+        );
+        TlvRecord::write_all(
+            &[TlvRecord {
+                tag: *b"zzzz",
+                payload: vec![255],
+            }],
+            &mut bytes,
+        )
+        .unwrap();
+        let database = DatabaseV2::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            database.strict_track_records().unwrap()[0].path,
+            "Music/track.mp3"
+        );
+        assert_eq!(database.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn strict_membership_validates_fields_without_changing_permissive_reader() {
+        for invalid_field in [
+            TlvRecord {
+                tag: *b"tsng",
+                payload: vec![216, 0],
+            },
+            TlvRecord {
+                tag: *TAG_PFIL,
+                payload: encode_utf16be("another.mp3"),
+            },
+        ] {
+            let bytes = synthetic_library(
+                "2.0/Serato Scratch LIVE Database",
+                TAG_PFIL,
+                &["Music/track.mp3"],
+            );
+            let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+            TlvRecord::write_all(&[invalid_field], &mut database.records[1].payload).unwrap();
+            let database = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
+            assert!(database.strict_track_records().is_err());
+            assert_eq!(database.track_records().len(), 1);
+        }
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Music/track.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        TlvRecord::write_all(
+            &[TlvRecord {
+                tag: *b"zzzz",
+                payload: vec![255],
+            }],
+            &mut database.records[1].payload,
+        )
+        .unwrap();
+        let bytes = database.to_bytes().unwrap();
+        let database = DatabaseV2::from_bytes(&bytes).unwrap();
+        assert_eq!(database.strict_track_records().unwrap().len(), 1);
+        assert_eq!(database.to_bytes().unwrap(), bytes);
     }
 
     // ===== CrateFile tests =====

@@ -29,6 +29,15 @@ public actor FingerprintWorker {
         public let totalFailed: Int
         public let totalPending: Int
         public let lastFingerprintedPath: String?
+        public let error: String?
+
+        public init(totalDone: Int, totalFailed: Int, totalPending: Int, lastFingerprintedPath: String?, error: String? = nil) {
+            self.totalDone = totalDone
+            self.totalFailed = totalFailed
+            self.totalPending = totalPending
+            self.lastFingerprintedPath = lastFingerprintedPath
+            self.error = error
+        }
     }
 
     public typealias ProgressHandler = @Sendable (Progress) -> Void
@@ -39,6 +48,7 @@ public actor FingerprintWorker {
         category: "FingerprintWorker"
     )
 
+    private let readiness: LibrarySyncReadiness?
     private let database: LibraryDatabase
     private let concurrency: Int
     private let fingerprintFunction: FingerprintFunction
@@ -47,6 +57,8 @@ public actor FingerprintWorker {
 
     private var progressHandler: ProgressHandler?
     private var workTask: Task<Void, Never>?
+    private var runID: UUID?
+    public private(set) var lastError: String?
     private var totalDone: Int = 0
     private var totalFailed: Int = 0
 
@@ -55,8 +67,10 @@ public actor FingerprintWorker {
         concurrency: Int? = nil,
         fingerprintFunction: @escaping FingerprintFunction = { try fingerprintAudioFile(filePath: $0) },
         pollIntervalSeconds: Double = 5,
-        batchCooldownMillis: UInt64 = 200
+        batchCooldownMillis: UInt64 = 200,
+        readiness: LibrarySyncReadiness? = nil
     ) {
+        self.readiness = readiness
         self.database = database
         // Conservative default: a *quarter* of the cores. Earlier
         // versions used cores - 2 which pegged a real 32k-track
@@ -75,6 +89,9 @@ public actor FingerprintWorker {
     public func start(progress: ProgressHandler? = nil) {
         guard workTask == nil else { return }
         progressHandler = progress
+        let runID = UUID()
+        self.runID = runID
+        lastError = nil
 
         let database = self.database
         let concurrency = self.concurrency
@@ -86,7 +103,8 @@ public actor FingerprintWorker {
                 database: database,
                 concurrency: concurrency,
                 fingerprintFunction: fingerprintFunction,
-                pollIntervalNanos: pollIntervalNanos
+                pollIntervalNanos: pollIntervalNanos,
+                runID: runID
             )
         }
     }
@@ -94,13 +112,14 @@ public actor FingerprintWorker {
     /// Cancel the loop. In-flight fingerprints complete; no new ones
     /// start. Safe to call multiple times.
     public func stop() {
+        runID = nil
         workTask?.cancel()
         workTask = nil
     }
 
     /// Wait for the worker to drain — used by tests so they don't
     /// need to busy-poll. Returns when `runLoop` exits, which only
-    /// happens after `stop()` or task cancellation.
+    /// happens after `stop()`, task cancellation, or a reported infrastructure error.
     public func waitUntilStopped() async {
         await workTask?.value
     }
@@ -114,7 +133,7 @@ public actor FingerprintWorker {
         let pendingCount = try await fetchPendingCount()
         if pendingCount > 0 {
             let batch = try await fetchPendingBatch(limit: max(pendingCount, concurrency * 4))
-            await processBatch(
+            try await processBatch(
                 batch,
                 totalPending: pendingCount,
                 fingerprintFunction: fingerprintFunction
@@ -134,39 +153,38 @@ public actor FingerprintWorker {
         database: LibraryDatabase,
         concurrency: Int,
         fingerprintFunction: @escaping FingerprintFunction,
-        pollIntervalNanos: UInt64
+        pollIntervalNanos: UInt64,
+        runID: UUID
     ) async {
         Self.logger.info("FingerprintWorker started (concurrency=\(concurrency))")
+        defer {
+            if self.runID == runID {
+                workTask = nil
+                self.runID = nil
+            }
+        }
         while !Task.isCancelled {
-            let pendingCount: Int
+            var pendingCount = 0
             do {
                 pendingCount = try await fetchPendingCount()
+                if pendingCount == 0 {
+                    try? await Task.sleep(nanoseconds: pollIntervalNanos)
+                    continue
+                }
+                let batch = try await fetchPendingBatch(limit: concurrency * 4)
+                if batch.isEmpty {
+                    continue
+                }
+                try await processBatch(batch, totalPending: pendingCount, fingerprintFunction: fingerprintFunction)
+            } catch is LibrarySyncReadinessError {
+                return
             } catch {
-                Self.logger.error("Failed to fetch pending count: \(error.localizedDescription, privacy: .public)")
-                try? await Task.sleep(nanoseconds: pollIntervalNanos)
-                continue
+                guard !Task.isCancelled, self.runID == runID else { return }
+                lastError = "Fingerprint processing stopped: \(error.localizedDescription)"
+                progressHandler?(Progress(totalDone: totalDone, totalFailed: totalFailed, totalPending: pendingCount,
+                                          lastFingerprintedPath: nil, error: lastError))
+                return
             }
-
-            if pendingCount == 0 {
-                try? await Task.sleep(nanoseconds: pollIntervalNanos)
-                continue
-            }
-
-            let batch: [FileRecord]
-            do {
-                batch = try await fetchPendingBatch(limit: concurrency * 4)
-            } catch {
-                Self.logger.error("Failed to fetch pending batch: \(error.localizedDescription, privacy: .public)")
-                try? await Task.sleep(nanoseconds: pollIntervalNanos)
-                continue
-            }
-            if batch.isEmpty { continue }
-
-            await processBatch(
-                batch,
-                totalPending: pendingCount,
-                fingerprintFunction: fingerprintFunction
-            )
 
             // Cooperative cooldown so we don't pin CPU continuously
             // across batches. Even at 200ms per batch, this dwarfs
@@ -183,16 +201,19 @@ public actor FingerprintWorker {
         _ batch: [FileRecord],
         totalPending: Int,
         fingerprintFunction: @escaping FingerprintFunction
-    ) async {
+    ) async throws {
+        let authorization = try readiness?.capture()
+        try Task.checkCancellation()
         // Build a dedup plan: copy from already-done byte-twins
         // where possible, fingerprint one representative per
         // (size, hash) group and propagate to siblings.
-        let plan = await planBatch(batch)
+        let plan = try await planBatch(batch)
+        let database = database
 
         var representativeResults: [(BatchPlan.Group, ProcessResult)] = []
         representativeResults.reserveCapacity(plan.toFingerprint.count)
 
-        await withTaskGroup(of: GroupResult.self) { group in
+        try await withThrowingTaskGroup(of: GroupResult.self) { group in
             var iterator = plan.toFingerprint.enumerated().makeIterator()
 
             // Seed `concurrency` representative fingerprint tasks.
@@ -200,21 +221,21 @@ public actor FingerprintWorker {
                 guard let (index, assignment) = iterator.next() else { break }
                 let representative = assignment.representative
                 group.addTask {
-                    let result = await Self.runOne(
-                        file: representative, function: fingerprintFunction
+                    let result = try await Self.runOne(
+                        file: representative, database: database, function: fingerprintFunction, authorization: authorization
                     )
                     return GroupResult(index: index, result: result)
                 }
             }
 
-            while let groupResult = await group.next() {
+            while let groupResult = try await group.next() {
                 let assignment = plan.toFingerprint[groupResult.index]
                 representativeResults.append((assignment, groupResult.result))
                 if !Task.isCancelled, let (index, next) = iterator.next() {
                     let representative = next.representative
                     group.addTask {
-                        let result = await Self.runOne(
-                            file: representative, function: fingerprintFunction
+                        let result = try await Self.runOne(
+                            file: representative, database: database, function: fingerprintFunction, authorization: authorization
                         )
                         return GroupResult(index: index, result: result)
                     }
@@ -224,82 +245,62 @@ public actor FingerprintWorker {
 
         // Flush plan in one transaction: copy-from-existing rows +
         // representative results (propagated to siblings).
-        await flushBatchPlan(
+        try await flushBatchPlan(
             plan: plan,
             representativeResults: representativeResults,
-            totalPending: totalPending
+            totalPending: totalPending, authorization: authorization
         )
     }
 
     private func flushBatchPlan(
         plan: BatchPlan,
         representativeResults: [(BatchPlan.Group, ProcessResult)],
-        totalPending: Int
-    ) async {
+        totalPending: Int,
+        authorization: LibrarySyncReadiness.Authorization?
+    ) async throws {
         let totalFiles = plan.toCopyFromExistingTwin.count
             + representativeResults.reduce(0) { $0 + 1 + $1.0.siblingIds.count }
         guard totalFiles > 0 else { return }
 
-        var doneCount = 0
-        var failedCount = 0
-        var lastPath: String?
-
-        do {
-            try await database.writer.write { db in
-                // Step 1: copy-from-existing — files whose byte-twin
-                // already had a fingerprint in the DB. No decode work
-                // was needed; just write the same hash to this row.
+        let counts = try await database.writer.write { database in
+            try FingerprintPersistence.withAuthorization(authorization) {
+                var completed = 0
+                var failed = 0
                 for entry in plan.toCopyFromExistingTwin {
-                    // requirePendingStatus: don't clobber a newer on-demand
-                    // fingerprint the auto-tagger may have written for this row
-                    // since it was claimed (finding #4000806487).
-                    try FingerprintPersistence.write(
+                    if try FingerprintPersistence.write(
                         fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done,
-                        requirePendingStatus: true, in: db
-                    )
-                }
-
-                // Step 2: representative results — write the outcome
-                // to the representative AND to every sibling. Siblings
-                // share the byte content so they share the outcome
-                // (success or failure).
-                for (assignment, result) in representativeResults {
-                    let (hash, status): (Data?, FingerprintStatus) = {
-                        switch result.outcome {
-                        case .success(let bytes): return (bytes, .done)
-                        case .failure: return (nil, .failed)
-                        }
-                    }()
-                    // Apply to the representative (only while still pending, so a
-                    // newer on-demand fingerprint isn't overwritten — #4000806487).
-                    try FingerprintPersistence.write(
-                        fileID: result.fileId, fingerprint: hash, status: status,
-                        requirePendingStatus: true, in: db
-                    )
-                    // Propagate to siblings.
-                    for siblingId in assignment.siblingIds {
-                        try FingerprintPersistence.write(
-                            fileID: siblingId, fingerprint: hash, status: status,
-                            requirePendingStatus: true, in: db
-                        )
+                        requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[entry.fileId]!, in: database
+                    ) {
+                        completed += 1
                     }
                 }
-            }
-
-            doneCount = plan.toCopyFromExistingTwin.count
-            for (assignment, result) in representativeResults {
-                switch result.outcome {
-                case .success: doneCount += 1 + assignment.siblingIds.count
-                case .failure: failedCount += 1 + assignment.siblingIds.count
+                for (assignment, result) in representativeResults {
+                    let fingerprint: Data?
+                    let status: FingerprintStatus
+                    switch result.outcome {
+                    case let .success(bytes): fingerprint = bytes; status = .done
+                    case .failure: fingerprint = nil; status = .failed
+                    case .notDecoded: continue
+                    }
+                    for fileID in [result.fileId] + assignment.siblingIds {
+                        if try FingerprintPersistence.write(
+                            fileID: fileID, fingerprint: fingerprint, status: status,
+                            requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[fileID]!, in: database
+                        ) {
+                            if status == .done {
+                                completed += 1
+                            } else {
+                                failed += 1
+                            }
+                        }
+                    }
                 }
+                return (completed, failed)
             }
-            lastPath = representativeResults.last?.1.path
-        } catch {
-            Self.logger.error(
-                "Batch persist of \(totalFiles) fingerprints failed: \(error.localizedDescription, privacy: .public)"
-            )
-            failedCount = totalFiles
         }
+        let doneCount = counts.0
+        let failedCount = counts.1
+        let lastPath = representativeResults.last?.1.path
 
         totalDone += doneCount
         totalFailed += failedCount
@@ -328,7 +329,7 @@ public actor FingerprintWorker {
         let hash: Data
     }
 
-    private func planBatch(_ batch: [FileRecord]) async -> BatchPlan {
+    private func planBatch(_ batch: [FileRecord]) async throws -> BatchPlan {
         var groups: [GroupingKey: [FileRecord]] = [:]
         var groupOrder: [GroupingKey] = []
         var standaloneFiles: [FileRecord] = []
@@ -360,7 +361,7 @@ public actor FingerprintWorker {
         // track import (batches of 16, ~2k batches), that compounded
         // to ~32k DB round-trips just for planning.
         let inBatchIds: Set<Int64> = Set(batch.compactMap(\.id))
-        let twins = await lookupExistingDoneFingerprints(
+        let twins = try await lookupExistingDoneFingerprints(
             for: groupOrder,
             excludingFileIds: inBatchIds
         )
@@ -388,6 +389,9 @@ public actor FingerprintWorker {
         }
 
         return BatchPlan(
+            membershipTokens: Dictionary(uniqueKeysWithValues: batch.compactMap { file in
+                file.id.map { fileID in (fileID, FileMembershipToken(fileId: fileID, revision: file.membershipRevision)) }
+            }),
             toCopyFromExistingTwin: copyFromExisting,
             toFingerprint: assignments
         )
@@ -400,7 +404,7 @@ public actor FingerprintWorker {
     private func lookupExistingDoneFingerprints(
         for keys: [GroupingKey],
         excludingFileIds: Set<Int64>
-    ) async -> [GroupingKey: Data] {
+    ) async throws -> [GroupingKey: Data] {
         guard !keys.isEmpty else { return [:] }
 
         // SQLite row-value IN: `(col1, col2) IN (VALUES (?,?), (?,?), ...)`.
@@ -429,39 +433,44 @@ public actor FingerprintWorker {
             static let databaseColumnDecodingStrategy =
                 DatabaseColumnDecodingStrategy.convertFromSnakeCase
         }
-        do {
-            let rows = try await database.writer.read { db -> [TwinRow] in
-                try TwinRow.fetchAll(
-                    db,
-                    sql: sql,
-                    arguments: StatementArguments(arguments)
-                )
-            }
-            // Multiple rows may share the same (size, hash) — pick
-            // the first; any done fingerprint is interchangeable
-            // since the byte twin guarantee asserts they're equal.
-            var twins: [GroupingKey: Data] = [:]
-            for row in rows {
-                let key = GroupingKey(fileSize: row.fileSize, hash: row.lightweightHash)
-                if twins[key] == nil {
-                    twins[key] = row.chromaprintFingerprint
-                }
-            }
-            return twins
-        } catch {
-            Self.logger.error(
-                "Batch twin lookup failed: \(error.localizedDescription, privacy: .public)"
+        let queryArguments = StatementArguments(arguments)!
+        let rows = try await database.writer.read { db -> [TwinRow] in
+            try TwinRow.fetchAll(
+                db,
+                sql: sql,
+                arguments: queryArguments
             )
-            return [:]
         }
+        // Multiple rows may share the same (size, hash) — pick
+        // the first; any done fingerprint is interchangeable
+        // since the byte twin guarantee asserts they're equal.
+        var twins: [GroupingKey: Data] = [:]
+        for row in rows {
+            let key = GroupingKey(fileSize: row.fileSize, hash: row.lightweightHash)
+            if twins[key] == nil {
+                twins[key] = row.chromaprintFingerprint
+            }
+        }
+        return twins
     }
 
     private static func runOne(
         file: FileRecord,
-        function: @escaping FingerprintFunction
-    ) async -> ProcessResult {
+        database: LibraryDatabase,
+        function: @escaping FingerprintFunction,
+        authorization: LibrarySyncReadiness.Authorization?
+    ) async throws -> ProcessResult {
+        try Task.checkCancellation()
+        try authorization?.check()
         guard let fileId = file.id else {
             return ProcessResult(fileId: 0, path: file.path, outcome: .failure)
+        }
+        do {
+            try await database.writer.read { database in
+                try FileProcessingEligibility.requireCurrent(FileMembershipToken(fileId: fileId, revision: file.membershipRevision), in: database)
+            }
+        } catch is FileProcessingEligibilityError {
+            return ProcessResult(fileId: fileId, path: file.path, outcome: .notDecoded)
         }
         do {
             let hashes = try function(file.path)
@@ -490,6 +499,7 @@ public actor FingerprintWorker {
     private func fetchPendingCount() async throws -> Int {
         try await database.writer.read { db in
             try FileRecord
+                .all().processableInLibrary()
                 .filter(Column("fingerprint_status") == FingerprintStatus.pending.rawValue)
                 .fetchCount(db)
         }
@@ -498,6 +508,7 @@ public actor FingerprintWorker {
     private func fetchPendingBatch(limit: Int) async throws -> [FileRecord] {
         try await database.writer.read { db in
             try FileRecord
+                .all().processableInLibrary()
                 .filter(Column("fingerprint_status") == FingerprintStatus.pending.rawValue)
                 .limit(limit)
                 .fetchAll(db)
@@ -513,6 +524,7 @@ private struct ProcessResult: Sendable {
     enum Outcome: Sendable {
         case success(Data)
         case failure
+        case notDecoded
     }
 }
 
@@ -531,6 +543,7 @@ private struct GroupResult: Sendable {
 /// fingerprint copied to siblings, and (c) standalone files with
 /// no hash to dedup against.
 struct BatchPlan: Sendable, Equatable {
+    let membershipTokens: [Int64: FileMembershipToken]
     /// Files that get a fingerprint copied from a DB row whose
     /// (file_size, lightweight_hash) matches. No Chromaprint work
     /// needed at all — these write straight to the DB at flush

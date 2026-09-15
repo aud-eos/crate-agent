@@ -87,6 +87,9 @@ namespace crate_agent_core {
   [Throws=CoreError]
   sequence<SeratoTrackRecord> read_database_records(string database_path);
 
+  [Throws=CoreError]
+  sequence<SeratoTrackRecord> read_database_records_strict(string database_path);
+
   // Update Serato's metadata for a single track inside `database V2`.
   // For each `Some(...)` field in `update`, the corresponding `t*`
   // record in the matching `otrk` is set (creating it if absent);

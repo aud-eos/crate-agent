@@ -61,7 +61,9 @@ pub struct AudioTags {
 
 pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
     let probe = Probe::open(path.as_ref()).map_err(|err| TagError::Probe(err.to_string()))?;
-    let tagged_file = probe.read().map_err(|err| TagError::Read(err.to_string()))?;
+    let tagged_file = probe
+        .read()
+        .map_err(|err| TagError::Read(err.to_string()))?;
 
     let mut tags = AudioTags::default();
 
@@ -73,7 +75,10 @@ pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
     // keeper picker treats `None` as "unknown bitrate" rather than 0.
     tags.bitrate_kbps = properties.audio_bitrate().filter(|kbps| *kbps > 0);
 
-    if let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+    if let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    {
         tags.title = tag.title().map(|cow| cow.into_owned());
         tags.artist = tag.artist().map(|cow| cow.into_owned());
         tags.album = tag.album().map(|cow| cow.into_owned());
@@ -89,7 +94,9 @@ pub fn read_tags(path: impl AsRef<Path>) -> Result<AudioTags, TagError> {
         tags.total_tracks = tag.track_total();
         tags.comment = tag.comment().map(|cow| cow.into_owned());
         tags.album_artist = tag.get_string(ItemKey::AlbumArtist).map(String::from);
-        tags.bpm = tag.get_string(ItemKey::Bpm).and_then(|value| value.parse::<f64>().ok());
+        tags.bpm = tag
+            .get_string(ItemKey::Bpm)
+            .and_then(|value| value.parse::<f64>().ok());
     }
 
     Ok(tags)
@@ -134,7 +141,9 @@ pub struct AudioTagUpdate {
 pub fn write_tags(path: impl AsRef<Path>, update: &AudioTagUpdate) -> Result<(), TagError> {
     let path_ref = path.as_ref();
     let probe = Probe::open(path_ref).map_err(|err| TagError::Probe(err.to_string()))?;
-    let mut tagged_file = probe.read().map_err(|err| TagError::Read(err.to_string()))?;
+    let mut tagged_file = probe
+        .read()
+        .map_err(|err| TagError::Read(err.to_string()))?;
 
     if tagged_file.primary_tag().is_none() {
         let primary_type = tagged_file.primary_tag_type();
@@ -266,7 +275,11 @@ mod tests {
         let tags = read_tags(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(tags.duration_seconds, Some(5), "duration must be populated from properties");
+        assert_eq!(
+            tags.duration_seconds,
+            Some(5),
+            "duration must be populated from properties"
+        );
         assert_eq!(tags.title, None, "no tags written, no title expected");
         assert_eq!(tags.artist, None);
         assert_eq!(tags.album, None);
@@ -300,7 +313,9 @@ mod tests {
         tag.set_track(7);
 
         tagged_file.insert_tag(tag);
-        tagged_file.save_to_path(&path, lofty::config::WriteOptions::default()).unwrap();
+        tagged_file
+            .save_to_path(&path, lofty::config::WriteOptions::default())
+            .unwrap();
 
         let read_back = read_tags(&path).unwrap();
         std::fs::remove_file(&path).ok();
@@ -413,7 +428,10 @@ mod tests {
         let path = tmpdir.join("year.wav");
         write_silent_wav(&path, 2).unwrap();
 
-        let update = AudioTagUpdate { year: Some(1994), ..AudioTagUpdate::default() };
+        let update = AudioTagUpdate {
+            year: Some(1994),
+            ..AudioTagUpdate::default()
+        };
         write_tags(&path, &update).unwrap();
 
         let read_back = read_tags(&path).unwrap();
@@ -504,7 +522,10 @@ mod tests {
         // Forward: apply a different year only.
         apply_update_to_tag(
             &mut tag,
-            &AudioTagUpdate { year: Some(1995), ..Default::default() },
+            &AudioTagUpdate {
+                year: Some(1995),
+                ..Default::default()
+            },
         );
         let edited = tag.date().expect("date frame must survive a year edit");
         assert_eq!(edited.year, 1995, "the year is updated");
@@ -514,7 +535,10 @@ mod tests {
         // Undo: restore the previous year, still preserving month/day.
         apply_update_to_tag(
             &mut tag,
-            &AudioTagUpdate { year: Some(1994), ..Default::default() },
+            &AudioTagUpdate {
+                year: Some(1994),
+                ..Default::default()
+            },
         );
         let restored = tag.date().expect("date frame must survive undo");
         assert_eq!(restored.year, 1994);
@@ -566,7 +590,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(read_tags(&path).unwrap().artist.as_deref(), Some("Seeded Artist"));
+        assert_eq!(
+            read_tags(&path).unwrap().artist.as_deref(),
+            Some("Seeded Artist")
+        );
         assert_eq!(read_tags(&path).unwrap().year, Some(1994));
 
         write_tags(

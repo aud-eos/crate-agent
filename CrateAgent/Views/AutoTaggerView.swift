@@ -70,7 +70,7 @@ struct AutoTaggerView: View {
                 }
             } actions: {
                 Button(session.selectionMode == .browse ? "Select this page" : "Select these results") {
-                    session.selectVisibleFileIDs(visibleFiles.map(\.id))
+                    session.selectVisibleFileIDs(visibleFiles.filter(\.canProcess).map(\.id))
                 }.disabled(visibleFiles.isEmpty || selectionIsLoading || session.isScanning)
                 Button("Clear selection", action: session.clearSelection).disabled(session.selectedFileIDs.isEmpty || session.isScanning)
                 Button("Scan selected (\(session.selectedFileIDs.count))") { Task { await session.startScan() } }
@@ -114,6 +114,7 @@ struct AutoTaggerView: View {
             VStack(spacing: 0) {
                 List(visibleFiles, id: \.id) { file in
                     AutoTagSelectionRow(fileID: file.id, path: file.path, artist: file.artist, title: file.title,
+                                        libraryMembership: file.libraryMembership, fileAvailability: file.fileAvailability,
                                         isSelected: session.selectedFileIDs.contains(file.id),
                                         onToggle: { session.toggleSelection(file.id) })
                         .equatable().disabled(session.isScanning)
@@ -189,7 +190,7 @@ struct AutoTaggerView: View {
                                  model: Binding(get: { session.rowModels[fileID] ?? model }, set: { model in session.updateReviewModel(model, for: fileID) }),
                                  isConfirmed: Binding(get: { session.confirmedFileIDs.contains(fileID) }, set: { approved in session.setApproved(approved, for: fileID) }),
                                  canChooseRecording: hasAlternatives(fileID), onChooseRecording: { chooserFile = ChooserFile(id: fileID) }, isFocused: isFocused,
-                                 isReadOnly: session.appliedFileIDs.contains(fileID) || session.isApplying || session.pendingRecordingFileIDs.contains(fileID),
+                                 isReadOnly: session.processingErrorByFileID[fileID] != nil || session.appliedFileIDs.contains(fileID) || session.isApplying || session.pendingRecordingFileIDs.contains(fileID),
                                  isApplied: session.appliedFileIDs.contains(fileID))
             } else {
                 TrackHeading(artist: file?.artist, title: file?.title, filename: (path as NSString).lastPathComponent, prominent: isFocused)
@@ -201,6 +202,9 @@ struct AutoTaggerView: View {
             }
             if session.pendingRecordingFileIDs.contains(fileID) {
                 ProgressView("Loading replacement recording…")
+            }
+            if let error = session.processingErrorByFileID[fileID] {
+                ActionErrorMessage(message: error)
             }
             if let error = session.selectionErrorByFileID[fileID] {
                 ActionErrorMessage(message: error)

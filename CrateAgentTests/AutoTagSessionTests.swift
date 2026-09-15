@@ -6,6 +6,65 @@ import XCTest
 
 @MainActor
 final class AutoTagSessionTests: XCTestCase {
+    func testApplyKeepsOriginalTokenAcrossFreshnessSuspensionAndReactivation() async throws {
+        let started = expectation(description: "apply freshness suspended")
+        let freshness = SessionFreshnessSuspension(started: started)
+        let fixture = try SessionFixture(fileCount: 1, fileFreshnessReader: { freshness.read($0) })
+        let recorded = SessionTokenRecorder()
+        let engine = OperationEngine(database: fixture.database,
+                                     seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
+                                     fileTagWriter: { _, _ in })
+        let session = AutoTagSession(database: fixture.database, lookupService: fixture.service, applyBatch: { mutations, batchID, tokens in
+            await recorded.record(tokens)
+            _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens)
+        }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: nil)
+        session.selectVisibleFileIDs(fixture.fileIDs)
+        await session.startScan()
+        session.approveAllSuggested()
+        freshness.arm()
+        let apply = Task { await session.applyConfirmed() }
+        await fulfillment(of: [started], timeout: 5)
+        let fileID = fixture.fileIDs[0]
+        _ = try await engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: 0, state: .init(membership: .retired, availability: .available, libraryID: nil, retiredAt: 1))))
+        _ = try await engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: 1, state: .init(membership: .active, availability: .available, libraryID: nil, retiredAt: nil))))
+        freshness.release()
+        await apply.value
+        let tokens = await recorded.tokens
+        XCTAssertEqual(tokens, [fileID: FileMembershipToken(fileId: fileID, revision: 0)])
+        XCTAssertTrue(session.appliedFileIDs.isEmpty)
+        XCTAssertTrue(session.actionError?.contains("superseded") == true)
+        let file = try await fixture.database.writer.read { try XCTUnwrap(FileRecord.fetchOne($0, key: fileID)) }
+        XCTAssertEqual(file.membershipRevision, 2)
+        XCTAssertNil(file.artist)
+        let matchCount = try await fixture.database.writer.read { try EventRecord.filter(Column("event_type") == EventType.musicBrainzMatchApplied.rawValue).fetchCount($0) }
+        XCTAssertEqual(matchCount, 0)
+    }
+
+    func testRetiredChoicesStayInspectableButCannotBeApprovedAfterReactivation() async throws {
+        let fixture = try SessionFixture(fileCount: 2)
+        fixture.session.selectVisibleFileIDs(fixture.fileIDs)
+        await fixture.session.startScan()
+        fixture.session.approveAllSuggested()
+        let retiredID = fixture.fileIDs[0]
+        let original = fixture.session.rowModels[retiredID]
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE files SET library_membership = 'retired', membership_revision = 1 WHERE id = ?", arguments: [retiredID])
+        }
+        fixture.session.approveAllSuggested()
+        XCTAssertFalse(fixture.session.canApprove(fileID: retiredID))
+        XCTAssertEqual(fixture.session.rowModels[retiredID]?.candidate, original?.candidate)
+        XCTAssertNotNil(fixture.session.processingErrorByFileID[retiredID])
+        XCTAssertEqual(fixture.session.confirmedFileIDs, [fixture.fileIDs[1]])
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE files SET library_membership = 'active', membership_revision = 2 WHERE id = ?", arguments: [retiredID])
+        }
+        fixture.session.setApproved(true, for: retiredID)
+        XCTAssertFalse(fixture.session.canApprove(fileID: retiredID))
+        XCTAssertEqual(fixture.session.rowModels[retiredID]?.candidate, original?.candidate)
+        XCTAssertTrue(fixture.session.processingErrorByFileID[retiredID]?.contains("superseded") == true)
+    }
+
     func testSuccessfulResyncWithNoRemainingWritesReleasesRecoveryLock() async throws {
         let noWrites = ResyncOutcome(appliedCount: 0, queuedCount: 0)
         let fixture = try SessionFixture(fileCount: 1, apply: { _, batchID in
@@ -34,12 +93,12 @@ final class AutoTagSessionTests: XCTestCase {
         defer { preferences.removePersistentDomain(forName: suiteName) }
         let fixture = try SessionFixture(fileCount: 1)
         let first = AutoTagSession(database: fixture.database, lookupService: fixture.service,
-                                   applyBatch: { _, _ in }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: preferences)
+                                   applyBatch: { _, _, _ in }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: preferences)
         first.reviewMode = .focus
         first.selectionMode = .search
         first.selectVisibleFileIDs(fixture.fileIDs)
         let recreated = AutoTagSession(database: fixture.database, lookupService: fixture.service,
-                                       applyBatch: { _, _ in }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: preferences)
+                                       applyBatch: { _, _, _ in }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: preferences)
         XCTAssertEqual(recreated.reviewMode, .focus)
         XCTAssertEqual(recreated.selectionMode, .browse)
         XCTAssertTrue(recreated.selectedFileIDs.isEmpty)
@@ -116,7 +175,7 @@ final class AutoTagSessionTests: XCTestCase {
         await fixture.session.applyConfirmed()
         let applied = await recorder.fileIDsByBatch
         XCTAssertEqual(applied, [[fixture.fileIDs[0], fixture.fileIDs[2]]])
-        XCTAssertEqual(fixture.session.confirmedFileIDs, [deletedID])
+        XCTAssertTrue(fixture.session.confirmedFileIDs.isEmpty)
         XCTAssertEqual(fixture.session.appliedFileIDs, [fixture.fileIDs[0], fixture.fileIDs[2]])
         XCTAssertTrue(fixture.session.lastResult?.contains("Skipped 1") == true)
     }
@@ -458,6 +517,7 @@ private struct SessionFixture {
 
     init(fileCount: Int, alternatives: Bool = false, firstLookupHasNoMatch: Bool = false, lowScoreAlternative: Bool = false, blockedRecordingID: String? = nil,
          started: SessionGate = SessionGate(), release: SessionGate = SessionGate(),
+         fileFreshnessReader: @escaping FileFreshnessReading = { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 10) },
          apply: @escaping @Sendable ([TrackMutation], String) async throws -> Void = { _, _ in },
          resync: @escaping @Sendable (String) async throws -> ResyncOutcome = { _ in ResyncOutcome(appliedCount: 1, queuedCount: 0) }) throws
     {
@@ -467,6 +527,8 @@ private struct SessionFixture {
             for index in 1 ... fileCount {
                 var file = FileRecord(path: "/fixture/track-\(index).mp3", volumeUuid: "TEST", inode: Int64(index), fileSize: 1000, mtime: 10,
                                       chromaprintFingerprint: FingerprintEncoder.serialize([UInt32(index)]), fingerprintStatus: .done)
+                file.libraryMembership = .active
+                file.fileAvailability = .available
                 try file.insert(database)
                 try inserted.append(XCTUnwrap(file.id))
             }
@@ -479,8 +541,47 @@ private struct SessionFixture {
                                     keyStore: SessionTestKey(), audioTagsReader: { _ in
                                         AudioTags(bitrateKbps: nil, title: "Current title", artist: "Current artist", album: "Current album", albumArtist: nil,
                                                   genre: nil, year: 1990, trackNumber: nil, totalTracks: nil, bpm: nil, comment: nil, durationSeconds: 200)
-                                    }, fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 10) })
-        session = AutoTagSession(database: database, lookupService: service, applyBatch: apply, resyncBatch: resync, preferences: nil)
+                                    }, fileFreshnessReader: fileFreshnessReader)
+        session = AutoTagSession(database: database, lookupService: service, applyBatch: { mutations, batchID, _ in try await apply(mutations, batchID) }, resyncBatch: resync, preferences: nil)
+    }
+}
+
+private actor SessionTokenRecorder {
+    private(set) var tokens: [Int64: FileMembershipToken]?
+    func record(_ tokens: [Int64: FileMembershipToken]) {
+        self.tokens = tokens
+    }
+}
+
+private final class SessionFreshnessSuspension: @unchecked Sendable {
+    private let lock = NSLock()
+    private let started: XCTestExpectation
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var armed = false
+
+    init(started: XCTestExpectation) {
+        self.started = started
+    }
+
+    func arm() {
+        lock.withLock { armed = true }
+    }
+
+    func release() {
+        semaphore.signal()
+    }
+
+    func read(_: String) -> FileFreshnessSnapshot {
+        let shouldWait = lock.withLock {
+            let shouldWait = armed
+            armed = false
+            return shouldWait
+        }
+        if shouldWait {
+            started.fulfill()
+            semaphore.wait()
+        }
+        return FileFreshnessSnapshot(fileSize: 1000, mtime: 10)
     }
 }
 

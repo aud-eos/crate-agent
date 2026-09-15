@@ -32,6 +32,8 @@ public final class AppServices: ObservableObject {
     public let activityLog: ActivityLog
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
+    let syncSession: SeratoLibrarySyncSession
+    @Published private(set) var syncState: SeratoLibrarySyncSession.State = .reconciling
 
     /// Latest progress from the running initial scan, or nil when no
     /// scan is in flight. Views observe via @Published.
@@ -53,6 +55,13 @@ public final class AppServices: ObservableObject {
 
     private let seratoSyncCoordinator: SeratoSyncCoordinator
     private let fsEventsWatcher: FSEventsWatcher
+    private var filesystemEventsTask: Task<Void, Never>?
+    private let filesystemProcessor: FilesystemEventProcessor
+    private let filesystemStartupTask: Task<Void, Never>
+    private let filesystemContinuation: AsyncStream<FilesystemEventBatch>.Continuation
+    private var retryTask: Task<Void, Never>?
+    private let readiness: LibrarySyncReadiness
+    private var filesystemDeliveryStopped = false
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -84,12 +93,15 @@ public final class AppServices: ObservableObject {
         seratoWatchdog = SeratoWatchdog()
         seratoLocator = try SeratoLibraryLocator.defaultLocation()
         activityLog = ActivityLog()
+        let readiness = LibrarySyncReadiness()
+        self.readiness = readiness
 
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: seratoWatchdog,
             seratoLocator: seratoLocator,
-            activityLog: activityLog
+            activityLog: activityLog,
+            readiness: readiness
         )
         operationEngine = engine
 
@@ -111,7 +123,8 @@ public final class AppServices: ObservableObject {
             database: database
         )
 
-        fingerprintWorker = FingerprintWorker(database: database)
+        let worker = FingerprintWorker(database: database, readiness: readiness)
+        fingerprintWorker = worker
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and
@@ -126,53 +139,70 @@ public final class AppServices: ObservableObject {
         let lookupCache = LookupCache(
             directory: applicationSupportUrl.appendingPathComponent("crate-agent/lookup-cache", isDirectory: true)
         )
-        autoTaggerService = AutoTaggerService(
+        let taggingService = AutoTaggerService(
             database: database,
             acoustIDClient: AcoustIDClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
-            musicBrainzClient: MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache)
+            musicBrainzClient: MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
+            readiness: readiness
         )
+        autoTaggerService = taggingService
         autoTagSession = AutoTagSession(
             database: database, lookupService: autoTaggerService,
-            applyBatch: { mutations, batchID in _ = try await engine.applyBatch(mutations, batchId: batchID) },
+            applyBatch: { mutations, batchID, tokens in _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens) },
             resyncBatch: { batchID in try await engine.resyncSeratoForBatch(batchID) }
         )
 
-        // Coordinator needs the scanner to trigger reload-on-exit;
-        // wire it last so all upstream deps are constructed.
+        let reader = SeratoMembershipSnapshotReader(locator: seratoLocator, watchdog: seratoWatchdog)
+        let session = SeratoLibrarySyncSession(reader: reader,
+                                               reconciler: SeratoMembershipReconciler(database: database, operationEngine: engine, reader: reader),
+                                               scanner: scanner, operationEngine: engine, watchdog: seratoWatchdog, readiness: readiness,
+                                               stopProcessing: { taggingService.cancel() }, worker: worker)
+        syncSession = session
         seratoSyncCoordinator = SeratoSyncCoordinator(
-            operationEngine: engine,
-            libraryScanner: scanner,
+            session: session,
             seratoWatchdog: seratoWatchdog
         )
 
-        // Resume from the last seen event ID if we have one for this
-        // exact watched path — events that happened while crate-agent
-        // was closed get replayed. First launch (no stored ID) starts
-        // from "now."
-        let watchedFolderPath = watchedMusicFolder.path
-        let resumeFromEventId = UserPreferences.lastFSEventId(
-            forWatchedPath: watchedFolderPath
-        ) ?? FSEventsWatcher.sinceNow
+        let watchConfiguration = try FilesystemWatchConfiguration(musicFolder: watchedMusicFolder)
+        let resumeFromEventId = watchConfiguration.resumeEventID {
+            UserPreferences.lastFSEventId(forWatchedPath: $0)
+        }
 
-        // FSEventsWatcher hands the coordinator each batched event
-        // group via a detached Task; the watcher's dispatch queue
-        // stays free for the next callback. The checkpoint callback
-        // persists the highest event ID we've processed so the next
-        // launch's `sinceWhen` picks up exactly where we left off.
-        fsEventsWatcher = FSEventsWatcher(
-            watchedPaths: [watchedFolderPath],
-            sinceWhen: resumeFromEventId,
-            handler: { observations in
-                Task { await filesystemCoordinator.handleObservations(observations) }
-            },
-            onEventIdCheckpoint: { eventId in
-                UserPreferences.setLastFSEventId(eventId, forWatchedPath: watchedFolderPath)
+        let eventStream = AsyncStream<FilesystemEventBatch>.makeStream()
+        filesystemContinuation = eventStream.continuation
+        let batchHandler = FilesystemSyncBatchHandler(coordinator: filesystemCoordinator, session: session)
+        let processor = FilesystemEventProcessor(
+            initiallyPaused: true,
+            handler: { batch in try await batchHandler.handle(batch) },
+            checkpoint: { eventId in
+                UserPreferences.setLastFSEventId(eventId, forWatchedPath: watchConfiguration.checkpointKey)
             }
         )
+        filesystemProcessor = processor
+        let watcher = FSEventsWatcher(
+            watchedPaths: watchConfiguration.watchedPaths,
+            sinceWhen: resumeFromEventId,
+            handler: { batch in eventStream.continuation.yield(batch) }
+        )
+        try watcher.start()
+        fsEventsWatcher = watcher
+        filesystemStartupTask = processor.resumeAfterInitialSync(session)
+        filesystemEventsTask = Task { [weak self] in
+            for await batch in eventStream.stream {
+                if Task.isCancelled {
+                    return
+                }
+                do { try await processor.enqueue(batch) }
+                catch { session.reportFilesystemFailure("Filesystem sync stopped before event \(batch.highestEventID): \(error.localizedDescription)") }
+            }
+            if !Task.isCancelled {
+                self?.filesystemDeliveryStopped = true
+                session.reportFilesystemFailure("Filesystem event delivery stopped. Restart crate-agent to resume watching.")
+            }
+        }
 
         // All stored properties are now assigned; start lifecycle.
         seratoWatchdog.startObservingWorkspace()
-        fsEventsWatcher.start()
 
         // Bridge OperationEngine's queue-depth publisher into the
         // @Published var so SwiftUI views observe it like any other
@@ -181,54 +211,44 @@ public final class AppServices: ObservableObject {
         engine.queueDepthPublisher
             .receive(on: DispatchQueue.main)
             .assign(to: &$pendingSeratoQueueDepth)
+        session.$state.assign(to: &$syncState)
+        session.$initialSyncComplete.assign(to: &$initialScanComplete)
+        session.$scanProgress.assign(to: &$scanProgress)
+        session.$fingerprintProgress.assign(to: &$fingerprintProgress)
 
         Self.logger.info(
             "AppServices ready; watching \(watchedMusicFolder.path, privacy: .public)"
         )
 
-        // Kick off the initial library scan in the background so the
-        // UI shows live progress without blocking app launch. New
-        // files discovered between AppServices.init and scan
-        // completion are also picked up by the FSEvents watcher and
-        // deduplicated by the scanner's path-based skip logic.
-        Task { @MainActor in
-            await runInitialScan()
-        }
-
-        // Start the background fingerprinter. It self-paces against
-        // the `files.fingerprint_status = pending` queue, so it's
-        // safe to start before the initial scan finishes — every
-        // freshly-indexed file will be picked up on the next sweep.
-        let worker = fingerprintWorker
-        Task { @MainActor [weak self] in
-            await worker.start { progressSnapshot in
-                Task { @MainActor in
-                    self?.fingerprintProgress = progressSnapshot
-                }
-            }
-        }
+        session.requestSync()
     }
 
     deinit {
+        readiness.invalidate()
+        filesystemEventsTask?.cancel()
+        filesystemStartupTask.cancel()
+        filesystemContinuation.finish()
+        retryTask?.cancel()
         fsEventsWatcher.stop()
         let worker = fingerprintWorker
         Task { await worker.stop() }
     }
 
-    private func runInitialScan() async {
-        let scanner = libraryScanner
-
-        do {
-            _ = try await scanner.scan { [weak self] progress in
-                Task { @MainActor in
-                    self?.scanProgress = progress
-                }
+    func retrySync() {
+        guard !filesystemDeliveryStopped else { return }
+        guard retryTask == nil else { return }
+        retryTask = Task { [weak self] in
+            guard let self else { return }
+            defer { retryTask = nil }
+            syncSession.beginFilesystemRetry()
+            do {
+                try await filesystemProcessor.retry()
+                syncSession.finishFilesystemRetry(succeeded: true)
+                try await syncSession.synchronize(retryingFailedCleanup: true)
+            } catch {
+                syncSession.finishFilesystemRetry(succeeded: false)
+                syncSession.reportFailure("Sync retry failed: \(error.localizedDescription)")
             }
-        } catch {
-            Self.logger.error(
-                "Initial library scan failed: \(error.localizedDescription, privacy: .public)"
-            )
         }
-        initialScanComplete = true
     }
 }

@@ -92,17 +92,16 @@ enum AutoTagFileSearch {
         // makes a literal "%" or "_" typed by the user match itself
         // instead of being interpreted as a LIKE wildcard.
         let whereClause = """
-        WHERE (COALESCE(artist, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)
+        WHERE \(FileProcessingEligibility.activeSQL) AND ((COALESCE(artist, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)
            OR (COALESCE(title, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)
-           OR (COALESCE(path, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)
+           OR (COALESCE(path, '') LIKE ? ESCAPE '\\' COLLATE NOCASE))
         """
         let pattern = "%\(escapeLikeMetacharacters(trimmedQuery))%"
 
         let matches = try BrowserRow.fetchAll(
             db,
             sql: """
-            SELECT id, path, artist, title, album, bpm, musical_key
-            FROM files
+            \(BrowserRow.browserFetchSQL)
             \(whereClause)
             ORDER BY artist, title
             LIMIT ?

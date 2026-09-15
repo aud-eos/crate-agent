@@ -1,209 +1,323 @@
 import Foundation
 import GRDB
-import os.log
 
-/// Translates `FSEventsObservation` values into `TrackMutation` calls
-/// on the `OperationEngine`. Sits between the raw filesystem watcher
-/// (an event source) and the engine (a mutation sink).
-///
-/// Per the project's "Serato is the source of truth" design, the
-/// coordinator ONLY processes events for files crate-agent already
-/// knows about — i.e., files that the LibraryScanner pulled in from
-/// Serato's library. New files appearing under the watched folder
-/// that aren't in Serato are intentionally ignored. The user adds
-/// new tracks via Serato itself (or, in a future PR, by dragging
-/// onto crate-agent's window).
-///
-/// Behavior:
-/// - `wasRenamed` + file exists + inode matches a known file →
-///   `renameFile` (the file moved; update Serato's pointers)
-/// - `wasRenamed` + file exists + inode does NOT match any known
-///   file + lightweight hash matches a known file →
-///   `renameFile` with cross-volume identity update (the file moved
-///   to a different volume; refresh inode + volume_uuid alongside path)
-/// - `wasRenamed` + file exists + neither inode nor hash matches
-///   anything → ignore (file isn't in Serato; not our concern)
-/// - `wasRenamed` + file doesn't exist → ignore (old-path side of
-///   a rename; the new-path event carries the update)
-/// - `wasCreated` → ignore (new files only enter via Serato or
-///   drag-drop, not auto-indexed)
-/// - `wasRemoved` → deferred until removeFile lands in
-///   OperationEngine.
-///
-/// Audio extension filter prevents OS-side metadata files
-/// (`.DS_Store`, `.localized`, sidecar `*.cue`, etc.) from
-/// triggering needless DB lookups.
+/// Observes known files only. Membership is exclusively determined by Serato reconciliation.
 public actor FilesystemSyncCoordinator {
-
     public static let defaultAudioExtensions: Set<String> = [
-        "mp3", "flac", "wav", "wave", "aif", "aiff",
-        "m4a", "mp4", "alac", "aac",
-        "ogg", "oga", "opus",
+        "mp3", "flac", "wav", "wave", "aif", "aiff", "m4a", "mp4", "alac", "aac", "ogg", "oga", "opus",
     ]
-
-    private static let logger = Logger(
-        subsystem: "com.crateagent.app",
-        category: "FilesystemSyncCoordinator"
-    )
 
     private let operationEngine: OperationEngine
     private let database: LibraryDatabase
     private let audioExtensions: Set<String>
+    private let availabilityResolver = FileAvailabilityResolver()
+    private struct Destination: Sendable {
+        let metadata: FileMetadata
+        let readIdentity: AudioFileReadIdentity
+    }
 
-    public init(
-        operationEngine: OperationEngine,
-        database: LibraryDatabase,
-        audioExtensions: Set<String> = FilesystemSyncCoordinator.defaultAudioExtensions
-    ) {
+    private struct PendingMove: Sendable {
+        let original: FileObservationExpectation
+        let sourceReadIdentity: AudioFileReadIdentity
+        var destinations: [Destination]
+    }
+
+    // At most two destinations per indexed row: the second records ambiguity.
+    private var pendingMoves: [Int64: PendingMove] = [:]
+    private var invalidatedSources: [Int64: AudioFileReadIdentity] = [:]
+    public private(set) var requiresReconciliation = false
+
+    public init(operationEngine: OperationEngine, database: LibraryDatabase,
+                audioExtensions: Set<String> = FilesystemSyncCoordinator.defaultAudioExtensions)
+    {
         self.operationEngine = operationEngine
         self.database = database
         self.audioExtensions = audioExtensions
     }
 
-    public func handleObservations(_ observations: [FSEventsObservation]) async {
+    public func takeReconciliationRequest() -> Bool {
+        let requested = requiresReconciliation
+        requiresReconciliation = false
+        return requested
+    }
+
+    public func restoreReconciliationRequest() {
+        requiresReconciliation = true
+    }
+
+    public func handleBatch(_ batch: FilesystemEventBatch) async throws {
+        requiresReconciliation = requiresReconciliation || batch.requiresReconciliation
+        try await handleObservations(batch.observations)
+    }
+
+    public func handleObservations(_ observations: [FSEventsObservation]) async throws {
         for observation in observations {
-            await handle(observation)
+            if observation.requiresReconciliation || observation.rootChanged || (observation.isDirectory && observation.wasRenamed) {
+                requiresReconciliation = true
+            }
+            guard observation.isFile,
+                  audioExtensions.contains((observation.path as NSString).pathExtension.lowercased()) else { continue }
+            do {
+                let batchID = observation.eventID.map { "filesystem-event-\($0)" } ?? UUID().uuidString
+                let hasPriorWrites = try await database.writer.read { connection in
+                    try EventRecord.filter(Column("batch_id") == batchID).fetchAll(connection)
+                        .contains { $0.eventType.hasReplayableSeratoProjection }
+                }
+                if hasPriorWrites {
+                    _ = try await operationEngine.resyncSeratoForBatch(batchID)
+                }
+                try await handle(observation, batchID: batchID)
+            } catch { throw FilesystemObservationError(path: observation.path, underlying: error) }
         }
     }
 
-    private func handle(_ observation: FSEventsObservation) async {
-        guard observation.isFile else { return }
-
-        let pathExtension = (observation.path as NSString).pathExtension.lowercased()
-        guard audioExtensions.contains(pathExtension) else { return }
-
-        let fileExistsOnDisk = FileManager.default.fileExists(atPath: observation.path)
-        guard observation.wasRenamed && fileExistsOnDisk else {
-            // wasCreated / wasRenamed-old-side / wasRemoved /
-            // wasModified are all no-ops under the Serato-source-of-
-            // truth design. New files come in via the LibraryScanner
-            // (which reads Serato) or via the drag-drop import flow
-            // (future PR); FSEvents is only for tracking existing
-            // file movement.
+    private func handle(_ observation: FSEventsObservation, batchID: String) async throws {
+        let knownPath = try await database.writer.read { connection in
+            try FileRecord.filter(Column("path") == observation.path).fetchOne(connection)
+        }
+        if let knownPath {
+            if try await resolvePendingMove(for: knownPath, batchID: batchID) {
+                return
+            }
+            var availability = try inspectKnownIdentity(knownPath)
+            // An old-path removal is not evidence that a positively identified Trash item disappeared.
+            if availability == .missing, knownPath.fileAvailability == .trashed {
+                availability = .trashed
+            }
+            try await observe(file: knownPath, availability: availability, metadata: nil, batchID: batchID)
             return
         }
-
-        await handleRename(path: observation.path)
+        guard observation.wasRenamed || observation.wasCreated else { return }
+        guard let metadata = FileMetadataCollector.collect(at: observation.path) else {
+            // Unknown old-side events have no tracked row to observe. Never infer deletion from stat failure.
+            return
+        }
+        let inodeMatches = try await database.writer.read { connection in
+            try FileRecord.filter(Column("inode") == metadata.inode)
+                .filter(Column("volume_uuid") == metadata.volumeUuid).fetchAll(connection)
+        }
+        if inodeMatches.count > 1 {
+            requiresReconciliation = true; return
+        }
+        var existing = inodeMatches.first
+        if existing == nil {
+            guard let hash = LightweightHashCalculator.compute(forFileAt: observation.path) else {
+                throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: observation.path])
+            }
+            let candidates = try await database.writer.read { connection in
+                try FileRecord.filter(Column("file_size") == metadata.fileSize)
+                    .filter(Column("lightweight_hash") == hash).fetchAll(connection)
+            }
+            guard candidates.count == 1 else {
+                if candidates.count > 1 {
+                    requiresReconciliation = true
+                }
+                return
+            }
+            existing = candidates.first
+        }
+        guard let existing else { return }
+        if let fileID = existing.id, invalidatedSources[fileID] != nil {
+            requiresReconciliation = true
+            return
+        }
+        let previousAvailability = try inspectKnownIdentity(existing)
+        guard previousAvailability == .missing || previousAvailability == .offline else {
+            requiresReconciliation = true
+            if previousAvailability == .available {
+                try rememberDestination(at: observation.path, for: existing)
+            }
+            try await observe(file: existing, availability: previousAvailability, metadata: nil, batchID: batchID)
+            return
+        }
+        if let fileID = existing.id, pendingMoves[fileID] != nil {
+            try rememberDestination(at: observation.path, for: existing)
+            _ = try await resolvePendingMove(for: existing, batchID: batchID)
+            return
+        }
+        let availability = try availabilityResolver.inspect(path: observation.path, volumeID: metadata.volumeUuid)
+        try await observe(file: existing, availability: availability, metadata: metadata, batchID: batchID)
     }
 
-    private func handleRename(path: String) async {
-        // Stat-only first. Computing the lightweight hash reads up to
-        // 2 MB per file — wasted work for the common case (same-volume
-        // rename, satisfied by the inode lookup below). During a Bulk
-        // Organize of 5k files this avoided ~10 GB of disk I/O.
-        guard let statMetadata = FileMetadataCollector.collect(
-            at: path,
-            includeLightweightHash: false
-        ) else {
-            Self.logger.warning(
-                "could not stat file at \(path, privacy: .public); skipping"
-            )
-            return
-        }
-
-        // First pass: same-volume rename (inode + volume_uuid match).
-        // This is the common case — Finder rename, mv within a volume,
-        // editor "Save As" reusing the inode, etc.
-        let inodeMatch: FileRecord?
-        do {
-            inodeMatch = try await database.writer.read { db in
-                try FileRecord
-                    .filter(Column("inode") == statMetadata.inode)
-                    .filter(Column("volume_uuid") == statMetadata.volumeUuid)
-                    .fetchOne(db)
+    private func rememberDestination(at path: String, for file: FileRecord) throws {
+        guard let fileID = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
+        let readIdentity = try AudioFileReadIdentity.read(at: path)
+        let metadata = try FileMetadataCollector.collectVerified(at: path)
+        try readIdentity.requireUnchanged(at: path)
+        guard FileIdentityObservationMutation.matchesContent(file, identity: metadata) else { return }
+        var pending: PendingMove
+        if let retained = pendingMoves[fileID] {
+            pending = retained
+        } else {
+            let sourceReadIdentity = try AudioFileReadIdentity.read(at: file.path)
+            guard try FileMetadataCollector.collectVerified(at: file.path) == file.identity else {
+                requiresReconciliation = true
+                return
             }
-        } catch {
-            Self.logger.error(
-                "DB lookup for inode \(statMetadata.inode) failed: \(error.localizedDescription, privacy: .public)"
-            )
+            try sourceReadIdentity.requireUnchanged(at: file.path)
+            pending = try PendingMove(original: FileObservationExpectation(file: file), sourceReadIdentity: sourceReadIdentity, destinations: [])
+        }
+        guard matchesOriginal(file, pending: pending) else {
+            pendingMoves.removeValue(forKey: fileID)
+            requiresReconciliation = true
             return
         }
-
-        if let existing = inodeMatch, let fileId = existing.id {
-            if existing.path == path {
-                return  // already up to date; duplicate event
+        if try inspectKnownIdentity(file) == .available, try invalidateChangedSource(pending) {
+            return
+        }
+        let alreadyObserved = pending.destinations.contains { $0.metadata.path == path }
+        pending.destinations = try validDestinations(pending.destinations)
+        if alreadyObserved, !pending.destinations.contains(where: { $0.metadata.path == path }) {
+            pendingMoves[fileID] = pending.destinations.isEmpty ? nil : pending
+            return
+        }
+        if !pending.destinations.contains(where: { $0.metadata.path == path }) {
+            if pending.destinations.count < 2 {
+                pending.destinations.append(Destination(metadata: metadata, readIdentity: readIdentity))
             }
-            await applyRename(
-                fileId: fileId,
-                newPath: path,
-                crossVolumeIdentity: nil
-            )
-            return
         }
-
-        // Second pass: cross-volume move fallback (file_size +
-        // lightweight_hash match an existing row whose inode/volume
-        // didn't). Only now do we read the file content to compute
-        // the hash — same-volume renames never get this far.
-        guard let lightweightHash = LightweightHashCalculator.compute(
-            forFileAt: path
-        ) else {
-            // Hash unreadable: fall back to inode-only behavior,
-            // which we've already exhausted. Not our file.
-            return
-        }
-        // Compose a metadata record carrying the freshly-computed
-        // hash so the rest of the function reads as one logical flow.
-        let metadata = FileMetadata(
-            path: statMetadata.path,
-            volumeUuid: statMetadata.volumeUuid,
-            inode: statMetadata.inode,
-            fileSize: statMetadata.fileSize,
-            mtime: statMetadata.mtime,
-            lightweightHash: lightweightHash
-        )
-
-        let hashMatch: FileRecord?
-        do {
-            hashMatch = try await database.writer.read { db in
-                try FileRecord
-                    .filter(Column("file_size") == metadata.fileSize)
-                    .filter(Column("lightweight_hash") == lightweightHash)
-                    .fetchOne(db)
-            }
-        } catch {
-            Self.logger.error(
-                "DB hash lookup at \(path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
-            )
-            return
-        }
-
-        guard let existing = hashMatch, let fileId = existing.id else {
-            // Not in Serato's library — not our concern.
-            return
-        }
-        if existing.path == path
-            && existing.inode == metadata.inode
-            && existing.volumeUuid == metadata.volumeUuid {
-            return  // already up to date; duplicate event after the row was updated
-        }
-
-        Self.logger.info(
-            "Cross-volume move detected for file \(fileId): \(existing.path, privacy: .public) → \(path, privacy: .public)"
-        )
-        await applyRename(
-            fileId: fileId,
-            newPath: path,
-            crossVolumeIdentity: (volumeUuid: metadata.volumeUuid, inode: metadata.inode)
-        )
+        pendingMoves[fileID] = pending
+        guard pending.destinations.count < 2 else { throw SeratoReconciliationError.ambiguousIdentity(path) }
     }
 
-    private func applyRename(
-        fileId: Int64,
-        newPath: String,
-        crossVolumeIdentity: (volumeUuid: String, inode: Int64)?
-    ) async {
-        do {
-            try await operationEngine.apply(.renameFile(RenameFilePayload(
-                fileId: fileId,
-                newPath: newPath,
-                newVolumeUuid: crossVolumeIdentity?.volumeUuid,
-                newInode: crossVolumeIdentity?.inode
-            )))
-        } catch {
-            Self.logger.error(
-                "rename mutation for file \(fileId) failed: \(error.localizedDescription, privacy: .public)"
-            )
+    private func matchesOriginal(_ file: FileRecord, pending: PendingMove) -> Bool {
+        let original = pending.original
+        let observedSourceMissing = original.state.membership == .active && original.state.availability == .available
+            && file.libraryState == FileLibraryState(membership: .active, availability: .missing,
+                                                     libraryID: original.state.libraryID, retiredAt: original.state.retiredAt)
+        return file.membershipRevision == original.revision && file.identity == original.identity
+            && (file.libraryState == original.state || observedSourceMissing)
+    }
+
+    private func invalidateSource(_ pending: PendingMove) {
+        pendingMoves.removeValue(forKey: pending.original.fileId)
+        invalidatedSources[pending.original.fileId] = pending.sourceReadIdentity
+        requiresReconciliation = true
+    }
+
+    private func invalidateChangedSource(_ pending: PendingMove) throws -> Bool {
+        let original = pending.original
+        var unchanged = false
+        defer {
+            if !unchanged {
+                invalidateSource(pending)
+            }
         }
+        unchanged = try FileMetadataCollector.collectVerified(at: original.identity.path) == original.identity
+            && AudioFileReadIdentity.read(at: original.identity.path) == pending.sourceReadIdentity
+        return !unchanged
+    }
+
+    private func validDestinations(_ destinations: [Destination]) throws -> [Destination] {
+        var valid: [Destination] = []
+        for destination in destinations {
+            let metadata = destination.metadata
+            let availability = try availabilityResolver.inspect(path: metadata.path, volumeID: metadata.volumeUuid)
+            guard availability == .available else {
+                requiresReconciliation = true
+                if availability == .inaccessible {
+                    throw CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: metadata.path])
+                }
+                continue
+            }
+            guard try FileMetadataCollector.collectVerified(at: metadata.path) == metadata,
+                  try AudioFileReadIdentity.read(at: metadata.path) == destination.readIdentity
+            else {
+                requiresReconciliation = true
+                continue
+            }
+            valid.append(destination)
+        }
+        return valid
+    }
+
+    private func resolvePendingMove(for file: FileRecord, batchID: String) async throws -> Bool {
+        guard let fileID = file.id, var pending = pendingMoves[fileID] else { return false }
+        guard matchesOriginal(file, pending: pending) else {
+            pendingMoves.removeValue(forKey: fileID)
+            requiresReconciliation = true
+            return false
+        }
+        let sourceAvailability = try inspectKnownIdentity(file)
+        if sourceAvailability == .available, try invalidateChangedSource(pending) {
+            return false
+        }
+        pending.destinations = try validDestinations(pending.destinations)
+        pendingMoves[fileID] = pending.destinations.isEmpty ? nil : pending
+        guard pending.destinations.count < 2 else { throw SeratoReconciliationError.ambiguousIdentity(file.path) }
+        guard let destination = pending.destinations.first else { return false }
+        guard sourceAvailability == .missing else {
+            if sourceAvailability != .available {
+                invalidateSource(pending)
+            }
+            return false
+        }
+        let expected = try FilesystemMoveExpectation(original: FileObservationExpectation(file: file), destination: destination.metadata, destinationReadIdentity: destination.readIdentity)
+        try await observe(file: file, availability: .available, metadata: destination.metadata, batchID: batchID, moveExpectation: expected)
+        pendingMoves.removeValue(forKey: fileID)
+        return true
+    }
+
+    private func inspectKnownIdentity(_ file: FileRecord) throws -> FileAvailability {
+        let availability = try availabilityResolver.inspect(path: file.path, volumeID: file.volumeUuid)
+        guard availability == .available || availability == .trashed else { return availability }
+        guard let metadata = FileMetadataCollector.collect(at: file.path),
+              metadata.inode == file.inode, metadata.volumeUuid == file.volumeUuid
+        else {
+            requiresReconciliation = true
+            return file.fileAvailability == .missing || file.fileAvailability == .trashed ? file.fileAvailability : .unknown
+        }
+        return availability
+    }
+
+    private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, batchID: String,
+                         moveExpectation: FilesystemMoveExpectation? = nil) async throws
+    {
+        guard let fileId = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
+        var mutations: [TrackMutation] = [.setFileLibraryState(.init(
+            fileId: fileId, expectedRevision: file.membershipRevision,
+            state: FileLibraryState(membership: file.libraryMembership, availability: availability,
+                                    libraryID: file.seratoLibraryId, retiredAt: file.retiredAt)
+        ))]
+        if availability == .available, let metadata,
+           file.path != metadata.path || file.inode != metadata.inode || file.volumeUuid != metadata.volumeUuid
+        {
+            if file.libraryMembership == .active {
+                mutations.append(.renameFile(.init(fileId: fileId, newPath: metadata.path,
+                                                   newVolumeUuid: metadata.volumeUuid, newInode: metadata.inode)))
+            } else {
+                mutations.append(.observeFileLocation(.init(fileId: fileId, expectedRevision: file.membershipRevision,
+                                                            path: metadata.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode)))
+            }
+        }
+        _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID, moveExpectation: moveExpectation)
+    }
+}
+
+struct FilesystemMoveExpectation: Sendable {
+    let original: FileObservationExpectation
+    let destination: FileMetadata
+    let destinationReadIdentity: AudioFileReadIdentity
+
+    func validate(in database: GRDB.Database) throws {
+        try original.validate(in: database)
+        try validatePhysicalTargets()
+    }
+
+    func validatePhysicalTargets() throws {
+        guard try FileAvailabilityResolver().inspect(path: original.identity.path, volumeID: original.identity.volumeUuid) == .missing,
+              try FileMetadataCollector.collectVerified(at: destination.path) == destination
+        else {
+            throw FileProcessingEligibilityError.superseded(fileId: original.fileId)
+        }
+        try destinationReadIdentity.requireUnchanged(at: destination.path)
+    }
+}
+
+public struct FilesystemObservationError: LocalizedError {
+    public let path: String
+    public let underlying: Error
+    public var errorDescription: String? {
+        "Cannot synchronize filesystem observation at \(path): \(underlying.localizedDescription)"
     }
 }

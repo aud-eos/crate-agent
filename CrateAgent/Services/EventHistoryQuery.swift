@@ -40,6 +40,22 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
 
 public enum EventHistoryQuery {
 
+    static func loadFileHistory(fileID: Int64, in database: GRDB.Database, limit: Int = 200, offset: Int = 0) throws -> [EventRecord] {
+        precondition(limit > 0 && offset >= 0)
+        return try EventRecord.filter(Column("file_id") == fileID)
+            .order(Column("timestamp").desc, Column("event_id").desc)
+            .limit(limit, offset: offset)
+            .fetchAll(database)
+    }
+
+    static func fileEventDescription(_ event: EventRecord) throws -> String {
+        if event.eventType == .fileLibraryStateChanged {
+            let payload = try JSONDecoder().decode(SetFileLibraryStatePayload.self, from: Data(event.payloadJson.utf8))
+            return "\(payload.state.membership.displayTitle) · \(payload.state.availability.displayTitle)"
+        }
+        return phrase(for: event.eventType, count: 1)
+    }
+
     /// Read the most-recent `limit` batches from the `events` table,
     /// newest-first by earliest event timestamp.
     ///
@@ -127,6 +143,10 @@ public enum EventHistoryQuery {
         // removeTrackFromSerato FFI we don't have yet).
         let unsupportedRaw: Set<String> = [
             EventType.trackAddedToSerato.rawValue,
+            EventType.fileLocationObserved.rawValue,
+            EventType.fileIdentityObserved.rawValue,
+            EventType.fileLibraryStateChanged.rawValue,
+            EventType.fileImportRequested.rawValue,
             EventType.fileTrashed.rawValue,
             EventType.trackRemovedFromSerato.rawValue,
             EventType.fileRemovedFromCrates.rawValue,
@@ -162,6 +182,14 @@ public enum EventHistoryQuery {
     private static func phrase(for eventType: EventType, count: Int) -> String {
         let pluralS = count == 1 ? "" : "s"
         switch eventType {
+        case .fileLocationObserved:
+            return "Observed location for \(count) file\(pluralS)"
+        case .fileIdentityObserved:
+            return "Observed identity for \(count) file\(pluralS)"
+        case .fileLibraryStateChanged:
+            return "Observed library state for \(count) file\(pluralS)"
+        case .fileImportRequested:
+            return "Requested import for \(count) file\(pluralS)"
         case .trackImported:
             return "Imported \(count) track\(pluralS)"
         case .fileRenamed:

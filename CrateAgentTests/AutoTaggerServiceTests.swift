@@ -4,6 +4,119 @@ import XCTest
 
 @MainActor
 final class AutoTaggerServiceTests: XCTestCase {
+    func testCompletedReviewCanChooseAlternativeAfterSyncButNotAfterRetirement() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("review.mp3")
+        let recording = makeRecording()
+        let service = AutoTaggerService(database: fixture.database,
+                                        acoustIDClient: StubAcoustIDClient { _ in [AcoustIDResult(id: "review", score: 0.99, recordingIDs: ["recording"])] },
+                                        musicBrainzClient: StubMusicBrainzClient { _ in recording }, keyStore: StubKeyProvider(),
+                                        fingerprintFunction: { _ in [1, 2, 3] }, audioTagsReader: stubAudioTagsReader(), readiness: gate)
+        try gate.markReady(gate.prepareDrain())
+        await service.run(fileIDs: [file.id!])
+        XCTAssertNotNil(service.candidate(for: file.id!))
+        gate.invalidate()
+        service.cancel()
+        try gate.markReady(gate.prepareDrain())
+        do {
+            let alternatives = try await service.loadAlternativeDetails(fileID: file.id!, offset: 0)
+            XCTAssertEqual(alternatives.count, 1)
+            let alternative = try await service.resolveAlternative(fileID: file.id!, recordingID: "recording")
+            XCTAssertEqual(alternative.fileID, file.id)
+        } catch { XCTFail("Completed current review was rejected after synchronization: \(error)") }
+        _ = try await fixture.reconcile()
+        do {
+            _ = try await service.resolveAlternative(fileID: file.id!, recordingID: "recording")
+            XCTFail("Retired candidate regained authority")
+        } catch is FileProcessingEligibilityError {}
+    }
+
+    func testSyncGenerationInvalidationStopsDecodeWithoutPersistingFailure() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("lookup.mp3")
+        let started = expectation(description: "Lookup decoder entered")
+        let release = DispatchSemaphore(value: 0)
+        let recording = makeRecording()
+        let service = AutoTaggerService(database: fixture.database,
+                                        acoustIDClient: StubAcoustIDClient { _ in [] },
+                                        musicBrainzClient: StubMusicBrainzClient { _ in recording }, keyStore: StubKeyProvider(),
+                                        fingerprintFunction: { _ in started.fulfill(); release.wait(); return [1, 2, 3] },
+                                        audioTagsReader: stubAudioTagsReader(), readiness: gate)
+        try gate.markReady(gate.prepareDrain())
+        let task = Task { await service.run(fileIDs: [file.id!]) }
+        await fulfillment(of: [started], timeout: 5)
+        gate.invalidate()
+        try gate.markReady(gate.prepareDrain())
+        release.signal()
+        await task.value
+        let current = try await fixture.row(file)
+        XCTAssertNil(current.chromaprintFingerprint)
+        XCTAssertEqual(current.fingerprintStatus, .pending)
+        guard case .stopped = service.rows[file.id!] else { return XCTFail("Expected superseded pass to stop") }
+        XCTAssertNil(service.fatalError)
+    }
+
+    func testThrowingDecoderAfterEpochInvalidationStopsWithoutFailure() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("throwing.mp3")
+        let started = expectation(description: "Throwing decoder entered")
+        let release = DispatchSemaphore(value: 0)
+        let recording = makeRecording()
+        let service = AutoTaggerService(database: fixture.database,
+                                        acoustIDClient: StubAcoustIDClient { _ in [] }, musicBrainzClient: StubMusicBrainzClient { _ in recording }, keyStore: StubKeyProvider(),
+                                        fingerprintFunction: { _ in started.fulfill(); release.wait(); throw NSError(domain: "decode", code: 1) },
+                                        audioTagsReader: stubAudioTagsReader(), readiness: gate)
+        try gate.markReady(gate.prepareDrain())
+        let task = Task { await service.run(fileIDs: [file.id!]) }
+        await fulfillment(of: [started], timeout: 5)
+        gate.invalidate()
+        release.signal()
+        await task.value
+        let current = try await fixture.row(file)
+        XCTAssertEqual(current.fingerprintStatus, .pending)
+        XCTAssertNil(current.chromaprintFingerprint)
+        guard case .stopped = service.rows[file.id!] else { return XCTFail("Superseded decoder failure was not stopped") }
+        XCTAssertNil(service.fatalError)
+    }
+
+    func testAutoTagInvalidationDuringSuccessAndFailureUpdatesRollsBack() async throws {
+        for decodeFails in [false, true] {
+            let gate = LibrarySyncReadiness()
+            let fixture = try SeratoRemovalFixture(readiness: gate)
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("during-write.mp3")
+            let recording = makeRecording()
+            let service = AutoTaggerService(database: fixture.database,
+                                            acoustIDClient: StubAcoustIDClient { _ in [] }, musicBrainzClient: StubMusicBrainzClient { _ in recording }, keyStore: StubKeyProvider(),
+                                            fingerprintFunction: { _ in
+                                                if decodeFails {
+                                                    throw NSError(domain: "decode", code: 1)
+                                                }
+                                                return [1, 2, 3]
+                                            }, audioTagsReader: stubAudioTagsReader(), readiness: gate)
+            try gate.markReady(gate.prepareDrain())
+            try await fixture.database.writer.write { database in
+                database.trace { event in
+                    if event.description.contains("UPDATE files"), event.description.contains("chromaprint_fingerprint") {
+                        gate.invalidate()
+                    }
+                }
+            }
+            await service.run(fileIDs: [file.id!])
+            let current = try await fixture.row(file)
+            XCTAssertEqual(current.fingerprintStatus, .pending)
+            XCTAssertNil(current.chromaprintFingerprint)
+            guard case .stopped = service.rows[file.id!] else { XCTFail("Invalidated persistence was not stopped"); continue }
+            XCTAssertNil(service.fatalError)
+        }
+    }
+
     private var inodeCounter: Int64 = 0
 
     // MARK: - Fixtures
@@ -31,6 +144,8 @@ final class AutoTaggerServiceTests: XCTestCase {
             fingerprintStatus: fingerprintStatus,
             album: album
         )
+        record.libraryMembership = .active
+        record.fileAvailability = .available
         try database.writer.write { db in
             try record.insert(db)
         }
@@ -151,7 +266,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             keyStore: StubKeyProvider(),
             fingerprintFunction: { _ in
                 try database.writer.write { db in
-                    try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
+                    _ = try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
                                                      freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
                 }
                 throw NSError(domain: "decode-test", code: 1)
@@ -567,6 +682,32 @@ final class AutoTaggerServiceTests: XCTestCase {
             return XCTFail("expected .stopped so the row doesn't look permanently pending, got \(String(describing: service.rows[fileID]))")
         }
         XCTAssertEqual(reason, fatalMessage)
+    }
+
+    func testLookupRejectsRetirementAndReactivation() async throws {
+        for reactivate in [false, true] {
+            let database = try makeDatabase()
+            let fileID = try insertFile(in: database, path: "/music/race.mp3")
+            let started = AsyncGate()
+            let release = AsyncGate()
+            let recording = makeRecording()
+            let service = AutoTaggerService(database: database,
+                                            acoustIDClient: SuspendingAcoustIDClient(onStart: {
+                    await started.open()
+                    await release.wait()
+                }, result: [AcoustIDResult(id: "match", score: 0.99, recordingIDs: ["recording"])]),
+                                            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+                                            keyStore: StubKeyProvider(), audioTagsReader: stubAudioTagsReader())
+            let task = Task { await service.run(fileIDs: [fileID]) }
+            await started.wait()
+            try await database.writer.write { database in
+                try database.execute(sql: "UPDATE files SET library_membership = ?, membership_revision = 2 WHERE id = ?", arguments: [reactivate ? "active" : "retired", fileID])
+            }
+            await release.open()
+            await task.value
+            XCTAssertNil(service.candidate(for: fileID))
+            guard case .failed = service.rows[fileID] else { return XCTFail("stale lookup must fail") }
+        }
     }
 
     // MARK: - Cancellation

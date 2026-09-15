@@ -114,6 +114,7 @@ final class WhitespacePreviewTests: XCTestCase {
                 path: "/fixture/missing-artist.mp3", volumeUuid: "fixture", inode: 1, fileSize: 1, mtime: 1,
                 metadata: SeratoMetadata(title: "Keep this title")
             )))
+            try await markProcessingFixturesAvailable(in: database)
             let files = try await database.writer.read { database in try FileRecord.fetchAll(database) }
             let comparison = MissingFieldFillComparison(field: .artist, value: fixture.input).comparison
             let runner = LibraryHygieneRunner(operationEngine: engine)

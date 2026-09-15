@@ -1,6 +1,15 @@
 import Darwin
 import Foundation
 
+enum LegacyFileIdentity {
+    static let unknownVolume = "unknown-volume"
+
+    static func canAdoptVolume(_ file: FileRecord, identity: FileMetadata) -> Bool {
+        file.volumeUuid == unknownVolume && identity.volumeUuid != unknownVolume
+            && FileImportIdentity.matchesAttributes(file, identity: identity)
+    }
+}
+
 /// File-level identity metadata extracted from a path on disk: the
 /// fields needed to populate `FileRecord` plus the inode used by the
 /// FilesystemSyncCoordinator's rename-detection lookups.
@@ -10,7 +19,7 @@ import Foundation
 /// path, what metadata do we record?" Adding a new field here (e.g.,
 /// lightweight content hash for cross-volume move detection) lights
 /// up both call sites at once.
-public struct FileMetadata: Sendable, Equatable {
+public struct FileMetadata: Codable, Sendable, Equatable {
     public let path: String
     public let volumeUuid: String
     public let inode: Int64
@@ -38,7 +47,44 @@ public struct FileMetadata: Sendable, Equatable {
     }
 }
 
+/// Audio paths may be links. Keep both their directory entry and regular target
+/// stable across a read; database V2 deliberately uses the stricter lstat check.
+struct AudioFileReadIdentity: Equatable, Sendable {
+    let entry: SeratoSourceIdentity
+    let target: SeratoSourceIdentity
+    let resolvedPath: String
+
+    static func read(at path: String) throws -> Self {
+        var entry = stat()
+        var target = stat()
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        guard lstat(path, &entry) == 0, stat(path, &target) == 0 else {
+            throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: path])
+        }
+        guard target.st_mode & S_IFMT == S_IFREG else {
+            throw CocoaError(.fileReadUnsupportedScheme, userInfo: [NSFilePathErrorKey: path])
+        }
+        guard resolved == URL(fileURLWithPath: path).resolvingSymlinksInPath().path else {
+            throw SeratoMembershipSnapshotError.sourceChanged
+        }
+        return Self(entry: SeratoSourceIdentity(entry), target: SeratoSourceIdentity(target), resolvedPath: resolved)
+    }
+
+    func requireUnchanged(at path: String) throws {
+        guard try self == Self.read(at: path) else { throw SeratoMembershipSnapshotError.sourceChanged }
+    }
+}
+
 public enum FileMetadataCollector {
+    static func collectVerified(at path: String) throws -> FileMetadata {
+        let before = try AudioFileReadIdentity.read(at: path)
+        guard let metadata = collect(at: path, includeLightweightHash: true), metadata.lightweightHash != nil
+        else {
+            throw SeratoMembershipSnapshotError.sourceChanged
+        }
+        try before.requireUnchanged(at: path)
+        return metadata
+    }
 
     /// Read metadata for the file at `path`. Returns nil when the
     /// file doesn't exist, isn't stat-able (permissions, broken
@@ -56,11 +102,11 @@ public enum FileMetadataCollector {
         includeLightweightHash: Bool = false
     ) -> FileMetadata? {
         var statBuffer = stat()
-        guard stat(path, &statBuffer) == 0 else { return nil }
+        guard stat(path, &statBuffer) == 0, statBuffer.st_mode & S_IFMT == S_IFREG else { return nil }
 
-        let url = URL(fileURLWithPath: path)
-        let volumeUuidString = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?
-            .volumeUUIDString ?? "unknown-volume"
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        guard let volumeUuidString = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?
+            .volumeUUIDString else { return nil }
 
         let hash = includeLightweightHash
             ? LightweightHashCalculator.compute(forFileAt: path)

@@ -1,6 +1,37 @@
 import CoreServices
 import Foundation
 
+struct FilesystemWatchConfiguration: Sendable {
+    let watchedPaths: [String]
+    let checkpointKey: String
+    private let legacyMusicPath: String
+
+    init(musicFolder: URL, trashDirectory: (URL) throws -> URL = { folder in
+        try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: folder, create: true)
+    }) throws {
+        legacyMusicPath = musicFolder.path
+        let trash = try trashDirectory(musicFolder)
+        watchedPaths = Set([musicFolder.path, trash.path].map(SeratoPath.normalized)).sorted()
+        checkpointKey = try "watch-roots:" + String(decoding: JSONEncoder().encode(watchedPaths), as: UTF8.self)
+    }
+
+    func resumeEventID(readCheckpoint: (String) -> UInt64?) -> UInt64 {
+        readCheckpoint(checkpointKey) ?? readCheckpoint(legacyMusicPath) ?? FSEventsWatcher.sinceNow
+    }
+}
+
+enum FilesystemWatcherError: LocalizedError {
+    case creationFailed([String])
+    case startFailed([String])
+
+    var errorDescription: String? {
+        switch self {
+        case let .creationFailed(paths): return "Could not create filesystem observation for \(paths.joined(separator: ", "))."
+        case let .startFailed(paths): return "Could not start filesystem observation for \(paths.joined(separator: ", "))."
+        }
+    }
+}
+
 /// Watches one or more filesystem paths and emits typed observations
 /// for every change. Wraps the C-level FSEvents API.
 ///
@@ -19,8 +50,7 @@ import Foundation
 /// + inode) lands in a follow-up when cross-volume move detection
 /// needs it.
 public final class FSEventsWatcher {
-    public typealias Handler = @Sendable ([FSEventsObservation]) -> Void
-    public typealias EventIdCheckpointHandler = @Sendable (FSEventStreamEventId) -> Void
+    public typealias Handler = @Sendable (FilesystemEventBatch) -> Void
 
     /// Time window in seconds for the kernel to coalesce events
     /// before delivering them to our callback. Higher values smooth
@@ -31,11 +61,10 @@ public final class FSEventsWatcher {
     /// historical events." Equivalent to FSEvents' built-in constant
     /// but with a Swift-friendly name and type.
     public static let sinceNow: FSEventStreamEventId =
-        FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+        .init(kFSEventStreamEventIdSinceNow)
 
     private let watchedPaths: [String]
     private let handler: Handler
-    private let eventIdCheckpointHandler: EventIdCheckpointHandler?
     private let sinceWhen: FSEventStreamEventId
     private let dispatchQueue: DispatchQueue
     private let coalescingLatency: CFTimeInterval
@@ -45,15 +74,13 @@ public final class FSEventsWatcher {
         watchedPaths: [String],
         sinceWhen: FSEventStreamEventId = FSEventsWatcher.sinceNow,
         coalescingLatency: CFTimeInterval = FSEventsWatcher.defaultEventCoalescingLatency,
-        handler: @escaping Handler,
-        onEventIdCheckpoint: EventIdCheckpointHandler? = nil
+        handler: @escaping Handler
     ) {
         self.watchedPaths = watchedPaths
         self.sinceWhen = sinceWhen
         self.coalescingLatency = coalescingLatency
         self.handler = handler
-        self.eventIdCheckpointHandler = onEventIdCheckpoint
-        self.dispatchQueue = DispatchQueue(
+        dispatchQueue = DispatchQueue(
             label: "com.crateagent.fsevents",
             qos: .utility
         )
@@ -66,8 +93,9 @@ public final class FSEventsWatcher {
         FSEventStreamRelease(stream)
     }
 
-    public func start() {
+    public func start() throws {
         guard stream == nil else { return }
+        guard !watchedPaths.isEmpty else { throw FilesystemWatcherError.creationFailed(watchedPaths) }
 
         let context = UnsafeMutablePointer<FSEventStreamContext>.allocate(capacity: 1)
         defer { context.deallocate() }
@@ -94,11 +122,15 @@ public final class FSEventsWatcher {
             coalescingLatency,
             flags
         ) else {
-            return
+            throw FilesystemWatcherError.creationFailed(watchedPaths)
         }
 
         FSEventStreamSetDispatchQueue(createdStream, dispatchQueue)
-        FSEventStreamStart(createdStream)
+        guard FSEventStreamStart(createdStream) else {
+            FSEventStreamInvalidate(createdStream)
+            FSEventStreamRelease(createdStream)
+            throw FilesystemWatcherError.startFailed(watchedPaths)
+        }
         stream = createdStream
     }
 
@@ -141,7 +173,7 @@ public final class FSEventsWatcher {
 
         var observations: [FSEventsObservation] = []
         observations.reserveCapacity(count)
-        for index in 0..<count {
+        for index in 0 ..< count {
             guard let pathPointer = CFArrayGetValueAtIndex(pathsArray, index) else {
                 continue
             }
@@ -151,19 +183,11 @@ public final class FSEventsWatcher {
             let pathString = cfString as String
             observations.append(FSEventsObservation(
                 path: pathString,
-                rawFlags: flagsBuffer[index]
+                rawFlags: flagsBuffer[index], eventID: idsBuffer[index]
             ))
         }
 
-        handler(observations)
-
-        // Checkpoint the highest event ID we just processed so a
-        // restart can resume from this point. The max may be a
-        // historical-replay ID or a live event ID — either is
-        // correct as a "next sinceWhen."
-        if let highestEventId = idsBuffer.max(), highestEventId != 0 {
-            eventIdCheckpointHandler?(highestEventId)
-        }
+        handler(FilesystemEventBatch(observations: observations, highestEventID: idsBuffer.max() ?? 0))
     }
 }
 
@@ -174,6 +198,7 @@ public final class FSEventsWatcher {
 /// Initializer is public so tests can construct observations directly
 /// without spinning up a real FSEvent stream.
 public struct FSEventsObservation: Sendable, Equatable {
+    public let eventID: UInt64?
     public let path: String
     public let isFile: Bool
     public let isDirectory: Bool
@@ -182,19 +207,22 @@ public struct FSEventsObservation: Sendable, Equatable {
     public let wasRemoved: Bool
     public let wasRenamed: Bool
     public let wasModified: Bool
+    public let requiresReconciliation: Bool
     public let rootChanged: Bool
 
-    public init(path: String, rawFlags: FSEventStreamEventFlags) {
+    public init(path: String, rawFlags: FSEventStreamEventFlags, eventID: UInt64? = nil) {
+        self.eventID = eventID
         self.path = path
         let flagsAsInt = Int(rawFlags)
-        self.isFile = (flagsAsInt & kFSEventStreamEventFlagItemIsFile) != 0
-        self.isDirectory = (flagsAsInt & kFSEventStreamEventFlagItemIsDir) != 0
-        self.isSymlink = (flagsAsInt & kFSEventStreamEventFlagItemIsSymlink) != 0
-        self.wasCreated = (flagsAsInt & kFSEventStreamEventFlagItemCreated) != 0
-        self.wasRemoved = (flagsAsInt & kFSEventStreamEventFlagItemRemoved) != 0
-        self.wasRenamed = (flagsAsInt & kFSEventStreamEventFlagItemRenamed) != 0
-        self.wasModified = (flagsAsInt & kFSEventStreamEventFlagItemModified) != 0
-        self.rootChanged = (flagsAsInt & kFSEventStreamEventFlagRootChanged) != 0
+        requiresReconciliation = (flagsAsInt & (kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped)) != 0
+        isFile = (flagsAsInt & kFSEventStreamEventFlagItemIsFile) != 0
+        isDirectory = (flagsAsInt & kFSEventStreamEventFlagItemIsDir) != 0
+        isSymlink = (flagsAsInt & kFSEventStreamEventFlagItemIsSymlink) != 0
+        wasCreated = (flagsAsInt & kFSEventStreamEventFlagItemCreated) != 0
+        wasRemoved = (flagsAsInt & kFSEventStreamEventFlagItemRemoved) != 0
+        wasRenamed = (flagsAsInt & kFSEventStreamEventFlagItemRenamed) != 0
+        wasModified = (flagsAsInt & kFSEventStreamEventFlagItemModified) != 0
+        rootChanged = (flagsAsInt & kFSEventStreamEventFlagRootChanged) != 0
     }
 
     /// Convenience initializer for tests — builds an observation with
@@ -208,8 +236,11 @@ public struct FSEventsObservation: Sendable, Equatable {
         wasRemoved: Bool = false,
         wasRenamed: Bool = false,
         wasModified: Bool = false,
-        rootChanged: Bool = false
+        requiresReconciliation: Bool = false,
+        rootChanged: Bool = false,
+        eventID: UInt64? = nil
     ) {
+        self.eventID = eventID
         self.path = path
         self.isFile = isFile
         self.isDirectory = isDirectory
@@ -218,6 +249,7 @@ public struct FSEventsObservation: Sendable, Equatable {
         self.wasRemoved = wasRemoved
         self.wasRenamed = wasRenamed
         self.wasModified = wasModified
+        self.requiresReconciliation = requiresReconciliation
         self.rootChanged = rootChanged
     }
 }

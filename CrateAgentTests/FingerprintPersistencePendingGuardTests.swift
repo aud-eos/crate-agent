@@ -28,7 +28,7 @@ final class FingerprintPersistencePendingGuardTests: XCTestCase {
 
         // Auto-tagger writes a fresh .done fingerprint (unconditional).
         try await database.writer.write { db in
-            try FingerprintPersistence.write(
+            _ = try FingerprintPersistence.write(
                 fileID: fileID, fingerprint: Data([0xAA]), status: .done,
                 freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 999), in: db
             )
@@ -37,7 +37,7 @@ final class FingerprintPersistencePendingGuardTests: XCTestCase {
         // Worker flush arrives late with older bytes — pending-guarded, so it
         // must NOT overwrite the newer .done result or its basis.
         try await database.writer.write { db in
-            try FingerprintPersistence.write(
+            _ = try FingerprintPersistence.write(
                 fileID: fileID, fingerprint: Data([0xBB]), status: .done,
                 requirePendingStatus: true, in: db
             )
@@ -54,7 +54,7 @@ final class FingerprintPersistencePendingGuardTests: XCTestCase {
 
         // A pending row is still the worker's to fill.
         try await database.writer.write { db in
-            try FingerprintPersistence.write(
+            _ = try FingerprintPersistence.write(
                 fileID: fileID, fingerprint: Data([0xCC]), status: .done,
                 requirePendingStatus: true, in: db
             )

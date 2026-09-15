@@ -26,6 +26,7 @@ public struct HygieneFileRow:
         DatabaseColumnDecodingStrategy.convertFromSnakeCase
 
     public var id: Int64?
+    public var membershipRevision: Int64
     public var path: String
     public var artist: String?
     public var title: String?
@@ -41,8 +42,9 @@ public struct HygieneFileRow:
     /// The column list matches the property names (snake_case in SQL,
     /// camelCase in Swift via the decoding strategy above).
     public static let hygieneFetchSQL = """
-        SELECT id, path, artist, title, album, genre, bpm, musical_key, comment, length, label
+        SELECT id, membership_revision, path, artist, title, album, genre, bpm, musical_key, comment, length, label
         FROM files
+        WHERE \(FileProcessingEligibility.processableSQL)
         """
 
     public init(
@@ -56,9 +58,11 @@ public struct HygieneFileRow:
         musicalKey: String? = nil,
         comment: String? = nil,
         length: String? = nil,
-        label: String? = nil
+        label: String? = nil,
+        membershipRevision: Int64 = 0
     ) {
         self.id = id
+        self.membershipRevision = membershipRevision
         self.path = path
         self.artist = artist
         self.title = title

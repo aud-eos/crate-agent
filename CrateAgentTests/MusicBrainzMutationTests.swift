@@ -10,6 +10,12 @@ import XCTest
 /// library writes on the watchdog (invariant #3), and keys the canonical
 /// `tracks` row by Chromaprint fingerprint hash (invariant #4).
 final class MusicBrainzMutationTests: XCTestCase {
+    private let audioFixture = OwnedProcessingAudioFixture()
+
+    override func tearDownWithError() throws {
+        try audioFixture.remove()
+    }
+    @MainActor private var runningState: ProcessingTestSeratoState?
     func testRedoRejectsMalformedRevertPayloadBeforeClobberingLaterEdit() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, database, fileID) = try await MainActor.run {
@@ -162,9 +168,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         seratoIsRunning: Bool = false
     ) throws -> (OperationEngine, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
+        let state = ProcessingTestSeratoState(isRunning: seratoIsRunning)
+        runningState = state
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: {
-            seratoIsRunning ? ["com.serato.djpro"] : []
+            state.isRunning ? ["com.serato.djpro"] : []
         })
+        state.watchdog = watchdog
         let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
         let engine = OperationEngine(
             database: database,
@@ -190,7 +199,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         )
         let fileId = try database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: path,
+                path: self.audioFixture.path(path),
                 volumeUuid: "v1",
                 inode: inode,
                 fileSize: 1,
@@ -199,6 +208,9 @@ final class MusicBrainzMutationTests: XCTestCase {
                 title: title,
                 album: album
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -519,6 +531,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -598,6 +612,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -658,6 +674,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -936,6 +954,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -990,6 +1010,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -1060,6 +1082,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/b.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a", title: "t", album: "al"
             )
+            sibling.libraryMembership = .active
+            sibling.fileAvailability = .available
             try sibling.insert(db)
             var older = FileRecord(
                 path: "/Music/A/old.mp3", volumeUuid: "v1", inode: 3,
@@ -1326,6 +1350,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -1381,6 +1407,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -1481,6 +1509,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -1540,6 +1570,8 @@ final class MusicBrainzMutationTests: XCTestCase {
                 path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
@@ -1725,6 +1757,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(queueDepth, 2, "Serato-DB update + file-tag write both queued")
         XCTAssertEqual(recorder.calls.count, 0, "file-tag writer must not fire while Serato runs")
 
+        await runningState?.stop()
         try await engine.drainPendingSeratoUpdates()
         let drainedDepth = await engine.pendingSeratoWriteCount
         XCTAssertEqual(drainedDepth, 0, "queue drains on Serato quit")
@@ -1740,12 +1773,16 @@ final class MusicBrainzMutationTests: XCTestCase {
         let fileIdA = try await database.writer.write { db -> Int64 in
             var file = FileRecord(path: "/Music/A/a.mp3", volumeUuid: "v1", inode: 1,
                                   fileSize: 1, mtime: 1, artist: "oldA", title: "oldA", album: "oldA")
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }
         let fileIdB = try await database.writer.write { db -> Int64 in
             var file = FileRecord(path: "/Music/B/b.mp3", volumeUuid: "v1", inode: 2,
                                   fileSize: 1, mtime: 1, artist: "oldB", title: "oldB", album: "oldB")
+            file.libraryMembership = .active
+            file.fileAvailability = .available
             try file.insert(db)
             return file.id!
         }

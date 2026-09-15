@@ -36,6 +36,17 @@ public struct BrowserRow:
     public var album: String?
     public var bpm: String?
     public var musicalKey: String?
+    public var libraryMembership: LibraryMembership
+    public var fileAvailability: FileAvailability
+
+    public var canProcess: Bool {
+        FileProcessingEligibility.isProcessable(membership: libraryMembership, availability: fileAvailability)
+    }
+
+    public var statusText: String {
+        let membership = libraryMembership.displayTitle
+        return fileAvailability == .available ? membership : "\(membership) · \(fileAvailability.displayTitle)"
+    }
 
     // MARK: - Display helpers
 
@@ -63,7 +74,9 @@ public struct BrowserRow:
         title: String? = nil,
         album: String? = nil,
         bpm: String? = nil,
-        musicalKey: String? = nil
+        musicalKey: String? = nil,
+        libraryMembership: LibraryMembership = .legacyUnverified,
+        fileAvailability: FileAvailability = .unknown
     ) {
         self.id = id
         self.path = path
@@ -72,16 +85,44 @@ public struct BrowserRow:
         self.album = album
         self.bpm = bpm
         self.musicalKey = musicalKey
+        self.libraryMembership = libraryMembership
+        self.fileAvailability = fileAvailability
     }
 }
 
 extension BrowserRow {
+    public static let browserColumnsSQL = "files.id, files.path, files.artist, files.title, files.album, files.bpm, files.musical_key, files.library_membership, files.file_availability"
+
     /// Explicit projection query so we never accidentally pull the
     /// BLOB columns. The column list mirrors the struct's properties
     /// (snake_case in SQL, camelCase in Swift via the decoding
     /// strategy above).
     public static let browserFetchSQL = """
-        SELECT id, path, artist, title, album, bpm, musical_key
+        SELECT \(browserColumnsSQL)
         FROM files
         """
+}
+
+extension LibraryMembership {
+    var displayTitle: String {
+        switch self {
+        case .active: "In Serato"
+        case .pendingImport: "Import pending"
+        case .legacyUnverified: "Membership unverified"
+        case .retired: "Removed from Serato"
+        }
+    }
+}
+
+extension FileAvailability {
+    var displayTitle: String {
+        switch self {
+        case .unknown: "Availability unknown"
+        case .available: "Available"
+        case .missing: "File missing"
+        case .trashed: "In Trash"
+        case .offline: "Volume offline"
+        case .inaccessible: "Access denied"
+        }
+    }
 }

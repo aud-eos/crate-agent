@@ -17,6 +17,8 @@ struct AutoTagSelectionRow: View, Equatable {
     let path: String
     let artist: String?
     let title: String?
+    var libraryMembership: LibraryMembership = .legacyUnverified
+    var fileAvailability: FileAvailability = .unknown
     let isSelected: Bool
     let onToggle: () -> Void
 
@@ -25,18 +27,30 @@ struct AutoTagSelectionRow: View, Equatable {
             && lhs.path == rhs.path
             && lhs.artist == rhs.artist
             && lhs.title == rhs.title
+            && lhs.libraryMembership == rhs.libraryMembership
+            && lhs.fileAvailability == rhs.fileAvailability
             && lhs.isSelected == rhs.isSelected
     }
 
     var body: some View {
-        Toggle(isOn: Binding(get: { isSelected }, set: { _ in onToggle() })) {
-            TrackHeading(artist: artist, title: title, filename: (path as NSString).lastPathComponent)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(path)
+        HStack(alignment: .top, spacing: density.detailSpacing) {
+            Toggle("Select \(displayTitle)", isOn: Binding(get: { isSelected }, set: { _ in onToggle() }))
+                .labelsHidden()
+                .toggleStyle(.checkbox)
+                .disabled(!file.canProcess)
+                .accessibilityLabel("Select \(displayTitle)")
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
+                TrackHeading(artist: artist, title: title, filename: (path as NSString).lastPathComponent)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(path)
+                LibraryFileStatusView(file: file)
+            }
         }
-        .toggleStyle(.checkbox)
-        .accessibilityLabel("Select \(displayTitle)")
         .padding(.vertical, density.rowPadding)
+    }
+
+    private var file: BrowserRow {
+        BrowserRow(id: fileID, path: path, artist: artist, title: title, libraryMembership: libraryMembership, fileAvailability: fileAvailability)
     }
 
     private var displayTitle: String {

@@ -18,6 +18,11 @@ Why this exists: without the chokepoint, every feature reinvents (a) the Serato-
 
 How to apply: when adding a new feature that modifies tracks, add a `TrackMutation` case and implement its apply / inverse logic. Do not write a parallel path that goes around `OperationEngine`.
 
+Async validation is not authorization for a later commit: another actor can retire
+the file, replace its identity, or supersede a saved snapshot during suspension.
+Recheck the relevant revision, identity, and snapshot/lifecycle generation inside
+the serialized transaction or external-write boundary (removal-sync Tasks 3 and 5).
+
 ### 2. Every mutation logs an event with an inverse payload
 
 The `events` table is append-only and serves two queries:
@@ -50,6 +55,12 @@ How to apply: anything touching the files above goes through `OperationEngine`, 
 Why this exists: paths change (rename, move, re-encode); fingerprints don't (within Chromaprint's perceptual tolerance). If we used path-as-identity, every feature past sub-project 1 would break the moment a user renamed a track.
 
 How to apply: new features that need to refer to "the same recording" should use `track_id`, not `path` or `file_id`. The `files ←→ tracks` relationship is many-to-one (multiple files can encode the same recording — FLAC and MP3 of the same song); use the right side of that relationship.
+
+Physical I/O must verify that its actual target still matches the original authorized file; a current row or reused path alone is insufficient. `SeratoWriteEligibility` shares this check across queued effects, while destructive move compensation requires `OwnedAudioIdentity`'s complete digest and precise change identity. See [physical effects and cleanup](docs/serato-membership-reconciliation.md#physical-effects-and-duplicate-cleanup).
+
+Successful owned tag-only writes journal a verified physical identity and fingerprint-basis refresh without changing recording association, membership revision, or Serato-mirrored metadata. New writers must use the shared engine path, or the next strict scan will mistake their own edit for replacement. See the [observation consumer contract](docs/serato-membership-reconciliation.md#consumer-contract).
+
+Keep queued local intent separate from the last authorized external metadata baseline, per file revision and write target. Unchanged saved values preserve queued intent; changed or cleared Serato fields supersede only affected V2 ownership, independently of audio tags—even when SQLite already displays the external value. See the [baseline and History contract](docs/serato-membership-reconciliation.md#consumer-contract).
 
 ### 5. The folder layout is artist-first-letter, hardcoded
 

@@ -111,6 +111,7 @@ public final class LibraryDatabase {
         AddMusicBrainzColumnsMigration.register(in: &migrator)
         ResetFingerprintsForAlgorithmTest2Migration.register(in: &migrator)
         AddFingerprintFreshnessBasisMigration.register(in: &migrator)
+        AddFileLibraryStateMigration.register(in: &migrator)
         return migrator
     }
 }

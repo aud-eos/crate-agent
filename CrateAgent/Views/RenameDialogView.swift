@@ -4,11 +4,9 @@ import SwiftUI
 /// library browser's row context menu, edits a Beets-style template,
 /// sees a live preview of the destination path, and confirms.
 ///
-/// Rename flow: validate → move on disk → fire `renameFile` mutation.
-/// We *don't* rely on FSEvents alone — the explicit mutation updates
-/// the UI immediately rather than after FSEvents's ~1s latency. The
-/// FSEvents-driven callback that follows is harmless: it reads the
-/// just-updated DB row, sees `existing.path == newPath`, and no-ops.
+/// The engine validates the captured source and membership revision,
+/// then moves audio and journals its inverse under one compensated
+/// transaction. Later filesystem observations see the updated row.
 ///
 /// The dialog itself doesn't do path computation — that lives in
 /// `RenameDestinationPlanner` as a testable pure function so the
@@ -130,61 +128,18 @@ struct RenameDialogView: View {
             return
         }
 
-        guard FileManager.default.fileExists(atPath: source.path) else {
-            actionError = "Source file no longer exists at \(source.path)"
-            return
-        }
-        if FileManager.default.fileExists(atPath: destination.path) {
-            actionError = "A file already exists at the destination."
-            return
-        }
-
-        let parentDirectory = destination.deletingLastPathComponent()
-        do {
-            try FileManager.default.createDirectory(
-                at: parentDirectory,
-                withIntermediateDirectories: true
-            )
-            try FileManager.default.moveItem(at: source, to: destination)
-        } catch {
-            actionError = "Rename failed: \(error.localizedDescription)"
-            return
-        }
-
-        // FSEvents will see the move within ~1s and might fire its
-        // own renameFile mutation. To avoid a duplicate journal entry,
-        // re-read the row before issuing ours — if FSEvents already
-        // updated it, we're done.
-        let currentPath: String?
-        do {
-            currentPath = try await services.database.writer.read { db in
-                try String.fetchOne(
-                    db,
-                    sql: "SELECT path FROM files WHERE id = ?",
-                    arguments: [fileId]
-                )
-            }
-        } catch {
-            actionError = "Rename succeeded on disk but DB read failed: \(error.localizedDescription)"
-            return
-        }
-
-        if currentPath == destination.path {
-            // FSEvents beat us to it. Nothing else to do.
-            if saveAsDefault {
-                UserPreferences.filenameTemplate = template
-            }
-            dismiss()
-            return
-        }
-
         do {
             _ = try await services.operationEngine.apply(.renameFile(RenameFilePayload(
                 fileId: fileId,
-                newPath: destination.path
-            )))
+                newPath: destination.path,
+                previousPath: source.path,
+                physicalMove: true
+            )), expectedMembershipToken: FileMembershipToken(fileId: fileId, revision: file.membershipRevision))
+        } catch let OperationEngineError.externalSyncIncomplete(batchId, underlying) {
+            actionError = "Rename committed to the library, but cleanup or external updates are incomplete: \(underlying). History can retry external writes for batch \(batchId)."
+            return
         } catch {
-            actionError = "Disk move succeeded but Serato/DB update failed: \(error.localizedDescription)"
+            actionError = "Rename failed: \(error.localizedDescription)"
             return
         }
 

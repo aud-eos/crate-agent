@@ -86,7 +86,7 @@ final class AutoTagSession: ObservableObject {
     }
 
     private let database: LibraryDatabase
-    private let applyBatch: @Sendable ([TrackMutation], String) async throws -> Void
+    private let applyBatch: @Sendable ([TrackMutation], String, [Int64: FileMembershipToken]) async throws -> Void
     private let resyncBatch: @Sendable (String) async throws -> ResyncOutcome
     private let preferences: UserDefaults?
     private var subscriptions: Set<AnyCancellable> = []
@@ -100,9 +100,12 @@ final class AutoTagSession: ObservableObject {
     private var searchTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var hasFocusedEntry = false
+    private var membershipObservation: Task<Void, Never>?
+    private var membershipFiles: [Int64: FileRecord] = [:]
+    @Published private(set) var processingErrorByFileID: [Int64: String] = [:]
 
     init(database: LibraryDatabase, lookupService: AutoTaggerService,
-         applyBatch: @escaping @Sendable ([TrackMutation], String) async throws -> Void,
+         applyBatch: @escaping @Sendable ([TrackMutation], String, [Int64: FileMembershipToken]) async throws -> Void,
          resyncBatch: @escaping @Sendable (String) async throws -> ResyncOutcome,
          preferences: UserDefaults? = .standard)
     {
@@ -128,8 +131,51 @@ final class AutoTagSession: ObservableObject {
             default: break
             }
         }
+        updateProcessingErrors()
         if focusedFileID == nil {
             focusedFileID = scannedFileIDs.first
+        }
+    }
+
+    private func refreshMembership() throws {
+        let fileIDs = scannedFileIDs
+        let files = try database.writer.read { database in
+            try FileRecord.filter(keys: fileIDs).fetchAll(database)
+        }
+        membershipFiles = Dictionary(uniqueKeysWithValues: files.compactMap { file in file.id.map { ($0, file) } })
+        updateProcessingErrors()
+    }
+
+    private func updateProcessingErrors() {
+        let tokens = lookupService.membershipTokens(for: scannedFileIDs)
+        var reasons: [Int64: String] = [:]
+        for fileID in scannedFileIDs {
+            do {
+                guard let file = membershipFiles[fileID] else { throw FileProcessingEligibilityError.superseded(fileId: fileID) }
+                try FileProcessingEligibility.requireProcessable(file)
+                if let token = tokens[fileID], token.revision != file.membershipRevision {
+                    throw FileProcessingEligibilityError.superseded(fileId: fileID)
+                }
+            } catch { reasons[fileID] = error.localizedDescription }
+        }
+        processingErrorByFileID = reasons
+        confirmedFileIDs.subtract(reasons.keys)
+    }
+
+    private func observeMembership(fileIDs: [Int64]) {
+        membershipObservation?.cancel()
+        let database = database
+        membershipObservation = Task { [weak self] in
+            do {
+                let observation = ValueObservation.tracking { database in
+                    try FileRecord.filter(keys: fileIDs).fetchAll(database)
+                }
+                for try await files in observation.values(in: database.writer) {
+                    guard !Task.isCancelled, let self else { return }
+                    self.membershipFiles = Dictionary(uniqueKeysWithValues: files.compactMap { file in file.id.map { ($0, file) } })
+                    self.updateProcessingErrors()
+                }
+            } catch { self?.actionError = "Could not verify library membership: \(error.localizedDescription)" }
         }
     }
 
@@ -163,7 +209,9 @@ final class AutoTagSession: ObservableObject {
                 if reviewMode == .focus {
                     establishFocus()
                 }
+                observeMembership(fileIDs: fileIDs)
                 await lookupService.run(fileIDs: fileIDs)
+                try refreshMembership()
             } catch {
                 guard generation == scanGeneration else { return }
                 actionError = "Could not load the selected files: \(error.localizedDescription)"
@@ -189,6 +237,10 @@ final class AutoTagSession: ObservableObject {
     @discardableResult func reset() -> Bool {
         guard !isApplying, pendingResyncBatchId == nil else { return false }
         stopScan()
+        membershipObservation?.cancel()
+        membershipObservation = nil
+        membershipFiles = [:]
+        processingErrorByFileID = [:]
         browseGeneration += 1
         browseTask?.cancel()
         browseTask = nil
@@ -247,6 +299,7 @@ final class AutoTagSession: ObservableObject {
     }
 
     func setApproved(_ approved: Bool, for fileID: Int64) {
+        do { try refreshMembership() } catch { actionError = error.localizedDescription; return }
         guard canApprove(fileID: fileID) else { return }
         if approved {
             confirmedFileIDs.insert(fileID)
@@ -256,10 +309,11 @@ final class AutoTagSession: ObservableObject {
     }
 
     func canApprove(fileID: Int64) -> Bool {
-        !isApplying && !appliedFileIDs.contains(fileID) && !pendingRecordingFileIDs.contains(fileID) && rowModels[fileID] != nil
+        !isApplying && processingErrorByFileID[fileID] == nil && membershipFiles[fileID] != nil && !appliedFileIDs.contains(fileID) && !pendingRecordingFileIDs.contains(fileID) && rowModels[fileID] != nil
     }
 
     func approveAllSuggested() {
+        do { try refreshMembership() } catch { actionError = error.localizedDescription; return }
         for fileID in scannedFileIDs where canApprove(fileID: fileID) && matchAssessment(for: fileID)?.isBulkApprovalEligible == true {
             confirmedFileIDs.insert(fileID)
         }
@@ -271,6 +325,7 @@ final class AutoTagSession: ObservableObject {
     }
 
     func approveAndAdvance() {
+        do { try refreshMembership() } catch { actionError = error.localizedDescription; return }
         guard let fileID = focusedFileID, canApprove(fileID: fileID), let index = scannedFileIDs.firstIndex(of: fileID) else { return }
         confirmedFileIDs.insert(fileID)
         let ordered = Array(scannedFileIDs.dropFirst(index + 1)) + Array(scannedFileIDs.prefix(index))
@@ -322,7 +377,8 @@ final class AutoTagSession: ObservableObject {
         let task = Task { [self] in
             defer { isApplying = false }
             do {
-                let staleIDs = try await lookupService.staleFileIDs(for: payloads)
+                let tokens = lookupService.membershipTokens(for: payloads.map(\.fileID))
+                let staleIDs = try await lookupService.staleFileIDs(for: payloads).union(payloads.map(\.fileID).filter { tokens[$0] == nil })
                 let freshPayloads = payloads.filter { !staleIDs.contains($0.fileID) }
                 let staleNotice = staleIDs.isEmpty ? "" : " Skipped \(staleIDs.count) file(s) that changed since scanning; scan them again."
                 guard !freshPayloads.isEmpty else {
@@ -331,7 +387,7 @@ final class AutoTagSession: ObservableObject {
                 }
                 let batchID = UUID().uuidString
                 do {
-                    try await applyBatch(freshPayloads.map { .applyMusicBrainzMatch($0) }, batchID)
+                    try await applyBatch(freshPayloads.map { .applyMusicBrainzMatch($0) }, batchID, tokens)
                     markApplied(freshPayloads)
                     lastResult = "Applied \(freshPayloads.count) file(s)." + staleNotice
                 } catch let OperationEngineError.externalSyncIncomplete(failedBatchID, underlying) {

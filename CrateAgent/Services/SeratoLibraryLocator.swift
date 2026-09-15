@@ -36,6 +36,15 @@ public struct SeratoLibraryLocator: Sendable, Equatable {
         seratoDirectory.appendingPathComponent("database V2", isDirectory: false)
     }
 
+    func supportedLibraryIdentity() throws -> String {
+        let directory = seratoDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let volume = try directory.resourceValues(forKeys: [.volumeUUIDStringKey, .volumeIsLocalKey])
+        guard volume.volumeIsLocal == true, let volumeID = volume.volumeUUIDString else {
+            throw SeratoMembershipSnapshotError.unsupportedSource
+        }
+        return "\(volumeID):\(directory.path.precomposedStringWithCanonicalMapping)"
+    }
+
     public var subcratesDirectoryUrl: URL {
         seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
     }

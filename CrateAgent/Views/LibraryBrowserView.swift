@@ -13,6 +13,9 @@ struct LibraryBrowserView: View {
     /// scrolling without losing functionality.
     nonisolated static let visibleRowCap = 1000
 
+    @State private var statusFilter: LibraryStatusFilter = .active
+    @State private var loadError: String?
+    @State private var historyTarget: BrowserRow?
     @State private var rows: [BrowserRow] = []
     @State private var totalRowCount: Int = 0
     @State private var sortOrder: [KeyPathComparator<BrowserRow>] = [
@@ -35,13 +38,16 @@ struct LibraryBrowserView: View {
                 .padding(density.pagePadding)
             statusHeader
             Divider()
+            LibraryStatusFilterBar(selection: $statusFilter)
+            if let loadError {
+                ActionErrorMessage(message: loadError).padding(density.pagePadding)
+            }
             tableSection
             Divider()
             footer
         }
         .frame(minWidth: 920, minHeight: 600)
         .appPresentation()
-        .task { await observeRowCount() }
         // Debounce: 150 ms after typing settles, copy searchText to
         // debouncedSearch which is the actual query input.
         .task(id: searchText) {
@@ -55,9 +61,9 @@ struct LibraryBrowserView: View {
         // sortOrder isn't Hashable; key by its String description.
         .task(id: FetchTrigger(search: debouncedSearch,
                                sortOrderKey: sortOrderKey,
-                               totalRowCount: totalRowCount))
+                               filter: statusFilter))
         {
-            await refetch()
+            await observeRows()
         }
         .alert("Restart required", isPresented: $showRestartAlert) {
             Button("OK", role: .cancel) {}
@@ -80,6 +86,9 @@ struct LibraryBrowserView: View {
             return true
         } isTargeted: { targeted in
             isDropTargeted = targeted
+        }
+        .sheet(item: $historyTarget) { row in
+            FileHistoryView(database: services.database, file: row)
         }
         .sheet(item: $renameTarget) { fileToRename in
             RenameDialogView(file: fileToRename)
@@ -117,7 +126,7 @@ struct LibraryBrowserView: View {
                 Text("Fingerprinting… \(fingerprintProgress.totalDone) done, \(fingerprintProgress.totalPending) pending")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
-            } else if services.initialScanComplete {
+            } else if case .ready = services.syncState {
                 Image(systemName: "checkmark.circle")
                     .foregroundStyle(.green)
                 Text("Library in sync with Serato")
@@ -148,54 +157,7 @@ struct LibraryBrowserView: View {
     }
 
     private var tableSection: some View {
-        Table(rows, selection: $selectedFileIds, sortOrder: $sortOrder) {
-            TableColumn("Artist", value: \.artistOrEmpty) { file in
-                Text(file.artist ?? "—")
-                    .padding(.vertical, density.rowPadding / 2)
-                    .foregroundStyle(file.artist == nil ? .tertiary : .primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            .width(min: 140, ideal: 220)
-
-            TableColumn("Title", value: \.titleOrEmpty) { file in
-                Text(file.title ?? file.filenameOnly)
-                    .foregroundStyle(file.title == nil ? .secondary : .primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            .width(min: 180, ideal: 280)
-
-            TableColumn("BPM", value: \.bpmOrEmpty) { file in
-                Text(file.bpm ?? "")
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 50, ideal: 70)
-
-            TableColumn("Key", value: \.musicalKeyOrEmpty) { file in
-                Text(file.musicalKey ?? "")
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 40, ideal: 50)
-
-            TableColumn("Album", value: \.albumOrEmpty) { file in
-                Text(file.album ?? "")
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 140, ideal: 200)
-
-            TableColumn("Folder", value: \.folderPath) { file in
-                Text(file.folderPath)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .foregroundStyle(.secondary)
-                    .help(file.path)
-            }
-            .width(min: 140, ideal: 240)
-        }
+        LibraryBrowserTable(rows: rows, selectedFileIds: $selectedFileIds, sortOrder: $sortOrder, showsFilenames: statusFilter != .active)
         .searchable(text: $searchText, prompt: "Filter by artist, title, album, or path…")
         .contextMenu(forSelectionType: BrowserRow.ID.self) { selectedIds in
             if let singleId = selectedIds.first, selectedIds.count == 1,
@@ -204,6 +166,8 @@ struct LibraryBrowserView: View {
                 Button("Rename…") {
                     Task { await openRenameDialog(forRowId: row.id) }
                 }
+                .disabled(!row.canProcess)
+                Button("Show History") { historyTarget = row }
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting(
                         [URL(fileURLWithPath: row.path)]
@@ -219,6 +183,7 @@ struct LibraryBrowserView: View {
                 try FileRecord.fetchOne(db, key: rowId)
             }
             if let record {
+                try FileProcessingEligibility.requireProcessable(record)
                 renameTarget = record
             }
             // record == nil is the common case (row vanished
@@ -267,42 +232,22 @@ struct LibraryBrowserView: View {
 
     // MARK: - Data loading
 
-    /// Observe the total row count and tick the FetchTrigger when
-    /// it changes. We trigger refetch on counter changes (rather
-    /// than on every files-table write) because most writes don't
-    /// affect the visible row set under the current search/sort.
-    /// A count change is a strong signal that the visible set
-    /// might have changed; for metadata edits the user can
-    /// refresh by toggling the search (or we add explicit refresh
-    /// in a follow-up).
-    private func observeRowCount() async {
-        let observation = ValueObservation
-            .tracking { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files") ?? 0
-            }
-            .removeDuplicates()
+    private func observeRows() async {
+        let observation = LibraryStatusBrowse.observation(filter: statusFilter, search: debouncedSearch,
+                                                          sortOrder: sortOrder, limit: Self.visibleRowCap)
         do {
-            for try await count in observation.values(in: services.database.writer) {
-                totalRowCount = count
+            for try await result in observation.values(in: services.database.writer) {
+                guard !Task.isCancelled else { return }
+                rows = result.rows
+                totalRowCount = result.totalCount
+                selectedFileIds.formIntersection(rows.map(\.id))
+                loadError = nil
             }
         } catch {
-            // ValueObservation errors are transient; next emission
-            // resumes.
-        }
-    }
-
-    private func refetch() async {
-        let needle = debouncedSearch
-        let order = sortOrder
-        do {
-            let fetched: [BrowserRow] = try await services.database.writer.read { db in
-                try Self.fetchBrowserRows(
-                    db, search: needle, sortOrder: order, limit: Self.visibleRowCap
-                )
-            }
-            rows = fetched
-        } catch {
-            // Defensive — keep showing the previous rows on transient errors.
+            guard !Task.isCancelled else { return }
+            rows = []
+            totalRowCount = 0
+            loadError = "Could not load library: \(error.localizedDescription)"
         }
     }
 
@@ -328,34 +273,7 @@ struct LibraryBrowserView: View {
         sortOrder: [KeyPathComparator<BrowserRow>],
         limit: Int
     ) throws -> [BrowserRow] {
-        var sql = """
-        SELECT id, path, artist, title, album, bpm, musical_key
-        FROM files
-        """
-        var arguments: [DatabaseValueConvertible] = []
-
-        if !search.isEmpty {
-            // SQLite LIKE with `COLLATE NOCASE` does case-insensitive
-            // matching on ASCII. For Unicode case folding, GRDB
-            // supports custom collations — out of scope for this
-            // pass.
-            sql += """
-             WHERE (path LIKE ? COLLATE NOCASE)
-                OR (COALESCE(artist, '') LIKE ? COLLATE NOCASE)
-                OR (COALESCE(title, '') LIKE ? COLLATE NOCASE)
-                OR (COALESCE(album, '') LIKE ? COLLATE NOCASE)
-            """
-            let pattern = "%\(search)%"
-            arguments = [pattern, pattern, pattern, pattern]
-        }
-
-        let orderBy = orderByClause(for: sortOrder.first)
-        sql += " ORDER BY \(orderBy)"
-        sql += " LIMIT \(limit)"
-
-        return try BrowserRow.fetchAll(
-            db, sql: sql, arguments: StatementArguments(arguments)
-        )
+        try LibraryStatusBrowse.fetch(db, search: search, sortOrder: sortOrder, limit: limit).rows
     }
 
     /// Translate the first sort comparator to a SQL ORDER BY clause.
@@ -389,5 +307,106 @@ struct LibraryBrowserView: View {
 private struct FetchTrigger: Hashable {
     let search: String
     let sortOrderKey: String
-    let totalRowCount: Int
+    let filter: LibraryStatusFilter
+}
+
+struct LibraryBrowserTable: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    let rows: [BrowserRow]
+    @Binding var selectedFileIds: Set<BrowserRow.ID>
+    @Binding var sortOrder: [KeyPathComparator<BrowserRow>]
+    var showsFilenames = false
+
+    var body: some View {
+        Table(rows, selection: $selectedFileIds, sortOrder: $sortOrder) {
+            TableColumn("Artist", value: \.artistOrEmpty) { file in
+                Text(file.artist ?? "—")
+                    .padding(.vertical, density.rowPadding / 2)
+                    .foregroundStyle(file.artist == nil ? .tertiary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .width(min: 140, ideal: 220)
+
+            TableColumn("Title", value: \.titleOrEmpty) { file in
+                VStack(alignment: .leading, spacing: density.detailSpacing) {
+                    Text(file.title ?? file.filenameOnly)
+                        .foregroundStyle(file.title == nil ? .secondary : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if showsFilenames, file.title != nil, file.title != file.filenameOnly {
+                        Text(file.filenameOnly)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .help(file.path)
+            }
+            .width(min: 180, ideal: 280)
+
+            TableColumn("BPM", value: \.bpmOrEmpty) { file in
+                Text(file.bpm ?? "")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 50, ideal: 70)
+
+            TableColumn("Key", value: \.musicalKeyOrEmpty) { file in
+                Text(file.musicalKey ?? "")
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 40, ideal: 50)
+
+            TableColumn("Album", value: \.albumOrEmpty) { file in
+                Text(file.album ?? "")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 140, ideal: 200)
+
+            TableColumn("Status") { file in LibraryFileStatusView(file: file) }
+                .width(min: 170, ideal: 240)
+
+            TableColumn("Folder", value: \.folderPath) { file in
+                Text(file.folderPath)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.secondary)
+                    .help(file.path)
+            }
+            .width(min: 140, ideal: 240)
+        }
+        .environment(\.defaultMinListRowHeight, density.minimumRowHeight + (showsFilenames ? 12 : 0))
+    }
+}
+
+struct LibraryStatusFilterBar: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    @Binding var selection: LibraryStatusFilter
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            Picker("Library status", selection: $selection) {
+                ForEach(LibraryStatusFilter.allCases) { filter in Text(filter.title).tag(filter) }
+            }.pickerStyle(.segmented).frame(maxWidth: 480)
+            Text(selection.detail).font(.callout).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, density.pagePadding)
+        .padding(.vertical, density.rowPadding)
+    }
+}
+
+struct LibraryFileStatusView: View {
+    let file: BrowserRow
+    var body: some View {
+        Text(file.statusText)
+            .font(.callout)
+            .foregroundStyle(file.canProcess ? Color.secondary : Color.orange)
+            .lineLimit(2)
+            .help(file.statusText)
+    }
 }

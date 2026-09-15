@@ -33,7 +33,7 @@ final class RecordingAlternativesTests: XCTestCase {
 
     func testInitialMetadataFailureKeepsAlternativesAndAlternateUsesOriginalBaseline() async throws {
         let database = try LibraryDatabase.openInMemory()
-        let fileID = try insertFile(in: database)
+        let fileID = try await insertFile(in: database)
         let loader = MusicBrainzSequenceLoader(bodies: [
             Data(#"{"status":"ok","results":[{"id":"top-source","score":0.99,"recordings":[{"id":"first"}]},{"id":"chosen-source","score":0.4,"recordings":[{"id":"second"}]}]}"#.utf8),
             Data(#"{"id":"first","title":"No release"}"#.utf8),
@@ -82,7 +82,7 @@ final class RecordingAlternativesTests: XCTestCase {
 
     func testDetailPagesAreBoundedAndFailedEntriesRemainRetryable() async throws {
         let database = try LibraryDatabase.openInMemory()
-        let fileID = try insertFile(in: database)
+        let fileID = try await insertFile(in: database)
         let recordings = (0 ..< 12).map { index in ["id": String(format: "recording-%02d", index)] }
         let acoustID = try JSONSerialization.data(withJSONObject: ["status": "ok", "results": [["id": "shared", "score": 0.98, "recordings": recordings]]])
         var responses = [acoustID, Data(#"{"id":"recording-00","title":"Initial","releases":[{"id":"release","title":"Album"}]}"#.utf8)]
@@ -114,7 +114,7 @@ final class RecordingAlternativesTests: XCTestCase {
 
     func testCanonicalSelectionReusesCompleteMetadataAndFailedSwitchPreservesCandidate() async throws {
         let database = try LibraryDatabase.openInMemory()
-        let fileID = try insertFile(in: database)
+        let fileID = try await insertFile(in: database)
         let loader = MusicBrainzSequenceLoader(bodies: [
             Data(#"{"status":"ok","results":[{"id":"top","score":0.99,"recordings":[{"id":"alias"}]},{"id":"lower","score":0.2,"recordings":[{"id":"no-release"}]}]}"#.utf8),
             Data(#"{"id":"canonical","title":"Current proposal","releases":[{"id":"release","title":"Album"}]}"#.utf8),
@@ -138,7 +138,7 @@ final class RecordingAlternativesTests: XCTestCase {
         for loadDetails in [true, false] {
             for resetScan in [true, false] {
                 let database = try LibraryDatabase.openInMemory()
-                let fileID = try insertFile(in: database)
+                let fileID = try await insertFile(in: database)
                 let underlying = MusicBrainzSequenceLoader(bodies: [
                     Data(#"{"status":"ok","results":[{"id":"source","score":0.99,"recordings":[{"id":"first"},{"id":"second"}]}]}"#.utf8),
                     Data(#"{"id":"first","title":"First","releases":[{"id":"release-first","title":"First album"}]}"#.utf8),
@@ -180,7 +180,7 @@ final class RecordingAlternativesTests: XCTestCase {
 
     func testLearningAliasesDoesNotReplaceTheSelectedCandidatesAudioScore() async throws {
         let database = try LibraryDatabase.openInMemory()
-        let fileID = try insertFile(in: database)
+        let fileID = try await insertFile(in: database)
         let loader = MusicBrainzSequenceLoader(bodies: [
             Data(#"{"status":"ok","results":[{"id":"top","score":0.99,"recordings":[{"id":"first"}]},{"id":"other","score":0.95,"recordings":[{"id":"unknown-alias"}]},{"id":"selected","score":0.4,"recordings":[{"id":"second"}]}]}"#.utf8),
             Data(#"{"id":"first","title":"First","releases":[{"id":"release-first","title":"First album"}]}"#.utf8),
@@ -200,7 +200,7 @@ final class RecordingAlternativesTests: XCTestCase {
     func testInitialResolutionPreservesAlternativeDetailsLoadedDuringItsRequest() async throws {
         for loadDetails in [true, false] {
             let database = try LibraryDatabase.openInMemory()
-            let fileID = try insertFile(in: database)
+            let fileID = try await insertFile(in: database)
             let underlying = MusicBrainzSequenceLoader(bodies: [
                 Data(#"{"status":"ok","results":[{"id":"top","score":0.99,"recordings":[{"id":"first"}]},{"id":"alternate","score":0.96,"recordings":[{"id":"second"}]}]}"#.utf8),
                 Data(#"{"id":"canonical","title":"Song","releases":[{"id":"release","title":"Album"}]}"#.utf8),
@@ -238,12 +238,16 @@ final class RecordingAlternativesTests: XCTestCase {
         Data("{\"id\":\"recording-\(String(format: "%02d", index))\",\"title\":\"Title \(index)\"}".utf8)
     }
 
-    private func insertFile(in database: LibraryDatabase) throws -> Int64 {
-        var file = FileRecord(path: "/fixture/alternative.mp3", volumeUuid: "TEST", inode: 1, fileSize: 1000, mtime: 10,
-                              chromaprintFingerprint: FingerprintEncoder.serialize([1, 2, 3]), fingerprintStatus: .done,
-                              album: "Stale library album")
-        try database.writer.write { database in try file.insert(database) }
-        return try XCTUnwrap(file.id)
+    private func insertFile(in database: LibraryDatabase) async throws -> Int64 {
+        let fileID = try await database.writer.write { connection in
+            var file = FileRecord(path: "/fixture/alternative.mp3", volumeUuid: "TEST", inode: 1, fileSize: 1000, mtime: 10,
+                                  chromaprintFingerprint: FingerprintEncoder.serialize([1, 2, 3]), fingerprintStatus: .done,
+                                  album: "Stale library album")
+            try file.insert(connection)
+            return try XCTUnwrap(file.id)
+        }
+        try await markProcessingFixturesAvailable(in: database)
+        return fileID
     }
 
     private func makeService(database: LibraryDatabase, loader: URLLoading, baseline: MutableAlternativeBaseline) -> AutoTaggerService {

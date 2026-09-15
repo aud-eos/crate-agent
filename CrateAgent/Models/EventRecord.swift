@@ -64,6 +64,10 @@ public struct EventRecord: Codable, FetchableRecord, MutablePersistableRecord,
 /// rename a case after it has appeared in a shipped database.
 public enum EventType: String, Codable, DatabaseValueConvertible,
     Hashable, Sendable {
+    case fileLocationObserved = "file_location_observed"
+    case fileIdentityObserved = "file_identity_observed"
+    case fileLibraryStateChanged = "file_library_state_changed"
+    case fileImportRequested = "file_import_requested"
     case trackImported = "track_imported"
     case fileRenamed = "file_renamed"
     case fileRemoved = "file_removed"
@@ -97,7 +101,7 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
             // re-synced (finding #3999974011).
             return true
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
             return false
         }
     }
