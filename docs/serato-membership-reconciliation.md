@@ -112,23 +112,25 @@ same-file rename.
 `reconcileRequestedFilesystemChanges()` supplies one bounded reconciliation pass
 for a coalesced filesystem request. The filesystem consumer owns retaining a
 failed request/batch and advancing its checkpoint only after success. The running
-application routes these requests through the same serialized session as startup
-and Serato exit, including snapshot-authorized scanning and outbound drain. The
+application routes these requests through the same serialized session as the
+user-requested file-info scan, including snapshot-authorized scanning and outbound drain. The
 session never waits on the filesystem processor. A filesystem failure remains
-latched across automatic Serato-exit requests. Retry Sync permits only strict
+latched until an explicit retry. Retry Sync permits only strict
 read/reconcile/scan while the retained processor head is being recovered; it cannot
-drain queued writes, reopen normal readiness, or start the worker in that scope.
-Only successful replay and checkpoint clear the latch. A fresh normal session then
-drains and schedules work, avoiding both a cyclic wait and a premature ready state.
+drain queued writes or reopen normal readiness in that scope. Only successful replay
+and checkpoint clear the latch. A fresh normal session then drains and schedules
+state-changing work, avoiding both a cyclic wait and a premature ready state.
 
-At startup the watcher captures events immediately, but its processor buffers
+At startup the file-info scan is idle. The watcher captures events immediately,
+but its processor buffers
 delivery and checkpoints until `initialSyncComplete` and the session is idle.
 This establishes migrated legacy membership from the saved old V2 paths before
-replaying renames. Waiting for Serato or a failed initial pass leaves the buffer
-paused; a successful retry opens it once. AppServices owns and cancels the startup
-wait task; cancellation is checked again after the session becomes idle, before
-any buffered replay. The processor owns pending delivery,
-so startup does not wait for a filesystem handler that can itself request sync.
+replaying renames. The user's first successful **Re-scan File Info** opens buffered
+delivery once. Waiting for Serato, stopping the scan, or a failed pass leaves the
+buffer paused. AppServices owns and cancels the wait task; cancellation is checked
+again after the session becomes idle, before any buffered replay. The processor
+owns pending delivery, so the manual scan does not wait for a filesystem handler
+that can itself request sync.
 
 Production setup resolves the watched music folder's applicable native Trash
 directory once, creating that directory if necessary, and watches the normalized,
@@ -167,29 +169,30 @@ invalid destinations, but cannot choose between two remaining candidates. This
 observation state is in-process; it does not implement durable queue recovery.
 
 The session installs a closed readiness gate before service startup. It invalidates
-the gate's generation before stopping work or reading a new snapshot. Ordinary
-mutation transactions and fingerprint persistence verify the captured generation
-before and after their transaction work; invalidation during an update rolls back
-the transaction. Decoder failure persistence uses the same guard, and supersession
-remains a stopped result rather than a new row failure. Together these checks mean
-a close/reopen cannot authorize old work. Explicit import intent and verified local
-filesystem observations remain possible, while external writes queue. Only the
-session's scoped drain authorization can write before normal readiness opens.
+the gate's generation before stopping state-changing work or reading a new snapshot.
+Ordinary mutation transactions verify the captured generation before and after their
+transaction work; invalidation during an update rolls back the transaction. Together
+these checks mean a close/reopen cannot authorize old mutations. Explicit import
+intent and verified local filesystem observations remain possible, while external
+writes queue. Only the session's scoped drain authorization can write before normal
+readiness opens. Fingerprinting is an independent background process: it reads only
+active, available rows and checks each row's membership token when persisting, so a
+concurrent retirement or identity change rejects the stale result without coupling
+the worker's lifecycle to the file-info scan.
 Serato launch during a sync cancels it and leaves queued intent intact. After an
 already validated session, Serato being open permits local processing with outbound
-writes queued; initial startup while Serato is open never enables processing.
+writes queued; initial startup while Serato is open never enables state-changing processing.
 
 Main window and menu bar share waiting, reconciliation, result, and failure status
-with Retry Sync. Missing or corrupt source errors retain queued writes. Unexpected
-worker database errors stop processing and publish a monitored failure. Readiness
-supersession is cancellation, not a decoder or database failure. A successful retry
-starts a new worker generation. Initial completion becomes true only after the
-whole sequence succeeds.
+with Retry Sync. Missing or corrupt source errors retain queued writes. Fingerprint
+worker database errors appear in the Library header and activity log without changing
+file-info scan state; **Retry Fingerprinting** restarts only that worker. Initial
+completion becomes true only after the whole scan sequence succeeds.
 
 Synchronization acknowledgements belong to the latest requested generation, not
-an earlier successful pass in a coalesced task. Scheduling must finish with the
-same authorization and no newer request before publishing initial completion or
-ready. A later failed pass cannot acknowledge a required filesystem reconciliation
+an earlier successful pass in a coalesced task. State-changing processing scheduling
+must finish with the same authorization and no newer request before publishing
+initial completion or ready. A later failed pass cannot acknowledge a required filesystem reconciliation
 or advance its checkpoint. Validation-only filesystem retry records its successful
 generation independently of the normal ready state.
 

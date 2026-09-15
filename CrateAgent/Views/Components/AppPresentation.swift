@@ -25,6 +25,7 @@ struct LibrarySyncStatusView: View {
 
     private var message: String {
         switch state {
+        case .idle: "Serato file info has not been re-scanned this session."
         case .waitingForSerato: "Waiting for Serato to close before checking its saved library."
         case .reconciling: "Checking saved Serato membership and synchronizing changes…"
         case let .failed(message): message
@@ -37,6 +38,7 @@ struct LibrarySyncStatusView: View {
 
     private var symbol: String {
         switch state {
+        case .idle: "arrow.triangle.2.circlepath"
         case .failed: "exclamationmark.triangle.fill"
         case .waitingForSerato: "clock"
         case .reconciling: "arrow.triangle.2.circlepath"
@@ -46,6 +48,7 @@ struct LibrarySyncStatusView: View {
 
     private var color: Color {
         switch state {
+        case .idle: .secondary
         case .failed: .red
         case .waitingForSerato: .orange
         case .reconciling: .accentColor

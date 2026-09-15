@@ -33,13 +33,13 @@ public final class AppServices: ObservableObject {
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
-    @Published private(set) var syncState: SeratoLibrarySyncSession.State = .reconciling
+    @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
 
-    /// Latest progress from the running initial scan, or nil when no
+    /// Latest progress from the running file-info scan, or nil when no
     /// scan is in flight. Views observe via @Published.
     @Published public private(set) var scanProgress: LibraryScanner.ScanProgress?
 
-    /// `true` once the initial scan task has completed at least once
+    /// `true` once a file-info scan has completed at least once
     /// since launch. The UI can use this to distinguish "still
     /// scanning" from "library appears empty" states.
     @Published public private(set) var initialScanComplete: Bool = false
@@ -123,7 +123,7 @@ public final class AppServices: ObservableObject {
             database: database
         )
 
-        let worker = FingerprintWorker(database: database, readiness: readiness)
+        let worker = FingerprintWorker(database: database)
         fingerprintWorker = worker
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
@@ -156,7 +156,7 @@ public final class AppServices: ObservableObject {
         let session = SeratoLibrarySyncSession(reader: reader,
                                                reconciler: SeratoMembershipReconciler(database: database, operationEngine: engine, reader: reader),
                                                scanner: scanner, operationEngine: engine, watchdog: seratoWatchdog, readiness: readiness,
-                                               stopProcessing: { taggingService.cancel() }, worker: worker)
+                                               stopProcessing: { taggingService.cancel() })
         syncSession = session
         seratoSyncCoordinator = SeratoSyncCoordinator(
             session: session,
@@ -214,13 +214,12 @@ public final class AppServices: ObservableObject {
         session.$state.assign(to: &$syncState)
         session.$initialSyncComplete.assign(to: &$initialScanComplete)
         session.$scanProgress.assign(to: &$scanProgress)
-        session.$fingerprintProgress.assign(to: &$fingerprintProgress)
 
         Self.logger.info(
             "AppServices ready; watching \(watchedMusicFolder.path, privacy: .public)"
         )
 
-        session.requestSync()
+        startFingerprinting()
     }
 
     deinit {
@@ -248,6 +247,37 @@ public final class AppServices: ObservableObject {
             } catch {
                 syncSession.finishFilesystemRetry(succeeded: false)
                 syncSession.reportFailure("Sync retry failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func requestLibraryRescan() {
+        syncSession.requestSync()
+    }
+
+    func stopLibraryRescan() {
+        syncSession.stopSync()
+    }
+
+    func retryFingerprinting() {
+        fingerprintProgress = nil
+        startFingerprinting(waitingForCurrentRun: true)
+    }
+
+    private func startFingerprinting(waitingForCurrentRun: Bool = false) {
+        let worker = fingerprintWorker
+        Task { [weak self] in
+            if waitingForCurrentRun {
+                await worker.waitUntilStopped()
+            }
+            guard let self else { return }
+            await worker.start { progress in
+                Task { @MainActor [weak self] in
+                    self?.fingerprintProgress = progress
+                    if let error = progress.error {
+                        self?.activityLog.log(error, category: .fingerprint)
+                    }
+                }
             }
         }
     }

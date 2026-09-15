@@ -11,16 +11,16 @@ private struct LibrarySyncFailure: LocalizedError {
 @MainActor
 final class SeratoLibrarySyncSession: ObservableObject {
     enum State: Equatable {
+        case idle
         case waitingForSerato
         case reconciling
         case ready(ReconciliationSummary)
         case failed(String)
     }
 
-    @Published private(set) var state: State = .reconciling
+    @Published private(set) var state: State = .idle
     @Published private(set) var initialSyncComplete = false
     @Published private(set) var scanProgress: LibraryScanner.ScanProgress?
-    @Published private(set) var fingerprintProgress: FingerprintWorker.Progress?
     private let reader: SeratoMembershipSnapshotReader
     private let reconciler: SeratoMembershipReconciler
     private let scanner: LibraryScanner
@@ -29,7 +29,6 @@ final class SeratoLibrarySyncSession: ObservableObject {
     let readiness: LibrarySyncReadiness
     private let stopProcessing: @MainActor () async -> Void
     private let startProcessing: @MainActor () async -> Void
-    private let worker: FingerprintWorker?
     private var task: Task<Void, Never>?
     private var requested = false
     private var filesystemFailure: String?
@@ -41,7 +40,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
     init(reader: SeratoMembershipSnapshotReader, reconciler: SeratoMembershipReconciler,
          scanner: LibraryScanner, operationEngine: OperationEngine, watchdog: SeratoWatchdog,
          readiness: LibrarySyncReadiness, stopProcessing: @escaping @MainActor () async -> Void = {},
-         startProcessing: @escaping @MainActor () async -> Void = {}, worker: FingerprintWorker? = nil)
+         startProcessing: @escaping @MainActor () async -> Void = {})
     {
         self.reader = reader
         self.reconciler = reconciler
@@ -51,7 +50,6 @@ final class SeratoLibrarySyncSession: ObservableObject {
         self.readiness = readiness
         self.stopProcessing = stopProcessing
         self.startProcessing = startProcessing
-        self.worker = worker
     }
 
     func requestSync() {
@@ -71,6 +69,15 @@ final class SeratoLibrarySyncSession: ObservableObject {
         while let task {
             await task.value
         }
+    }
+
+    func stopSync() {
+        successfulGeneration = nil
+        requested = false
+        readiness.invalidate()
+        task?.cancel()
+        scanProgress = nil
+        state = .idle
     }
 
     func synchronize(retryingFailedCleanup: Bool = false) async throws {
@@ -110,7 +117,6 @@ final class SeratoLibrarySyncSession: ObservableObject {
             task = Task { [weak self] in
                 guard let self else { return }
                 await stopProcessing()
-                await worker?.stop()
                 task = nil
                 if requested {
                     requestSync()
@@ -140,11 +146,16 @@ final class SeratoLibrarySyncSession: ObservableObject {
         if isRunning {
             if task != nil {
                 suspend()
-            } else if case .failed = state {} else {
-                state = .waitingForSerato
             }
         } else {
-            requestSync()
+            switch state {
+            case .waitingForSerato, .ready:
+                successfulGeneration = nil
+                readiness.invalidate()
+                state = .idle
+            case .idle, .reconciling, .failed:
+                break
+            }
         }
     }
 
@@ -158,7 +169,6 @@ final class SeratoLibrarySyncSession: ObservableObject {
             }
         }
         await stopProcessing()
-        await worker?.stop()
         do {
             while requested {
                 requested = false
@@ -201,7 +211,6 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     continue
                 }
                 try readiness.markReady(authorization)
-                fingerprintProgress = nil
                 let processingAuthorization = try readiness.capture()
                 await startProcessing()
                 if requested {
@@ -209,19 +218,9 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     continue
                 }
                 try processingAuthorization.check()
-                await worker?.start { [weak self] progress in
-                    Task { @MainActor in
-                        guard let self, (try? processingAuthorization.check()) != nil else { return }
-                        self.fingerprintProgress = progress
-                        if let error = progress.error {
-                            self.reportFailure(error)
-                        }
-                    }
-                }
                 try Task.checkCancellation()
                 if requested {
                     await stopProcessing()
-                    await worker?.stop()
                     continue
                 }
                 try processingAuthorization.check()
@@ -233,7 +232,6 @@ final class SeratoLibrarySyncSession: ObservableObject {
             successfulGeneration = nil
             readiness.invalidate()
             await stopProcessing()
-            await worker?.stop()
             if !Task.isCancelled {
                 state = watchdog.isSeratoRunning ? .waitingForSerato : .failed("Library sync failed: \(error.localizedDescription)")
             }

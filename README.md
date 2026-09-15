@@ -12,8 +12,9 @@ other screens while the app remains open. See the [Auto-Tag guide](docs/auto-tag
 Use the shared Comfortable/Compact density setting to adjust spacing throughout
 the app.
 
-At startup and after Serato closes, crate-agent checks the complete saved library
-before processing tracks or sending queued changes. Removing a track from Serato
+In **Library**, use **Re-scan File Info** to check Serato's complete saved library;
+the scan stays off at startup and can be stopped while it is running. Fingerprinting
+continues as independent background work. Removing a track from Serato
 retires its crate-agent entry while preserving the audio, recording identity, and
 History. Missing audio that Serato still references remains a member but cannot
 be processed. The main window and menu bar show waiting, sync results, or an error

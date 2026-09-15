@@ -6,28 +6,58 @@ import XCTest
 
 @MainActor
 final class SeratoLibrarySyncSessionTests: XCTestCase {
-    func testSupersededFinalSchedulingCannotAcknowledgeFailedFilesystemSync() async throws {
+    func testSessionStartsIdleUntilExplicitlyRequested() throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)
         defer { fixture.cleanup() }
-        let worker = FingerprintWorker(database: fixture.database, readiness: gate)
-        let entered = expectation(description: "Worker actor held during final scheduling")
-        let release = DispatchSemaphore(value: 0)
+
+        let session = makeSession(fixture, gate: gate)
+
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertFalse(session.initialSyncComplete)
+        XCTAssertNil(session.scanProgress)
+    }
+
+    func testStopSyncCancelsTheRealSnapshotBeforeItCanRetireAFile() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("still-active.mp3")
+        try fixture.save(paths: [])
+        let barrier = SessionBarrier()
+        let reader = SeratoMembershipSnapshotReader(
+            locator: fixture.locator,
+            watchdog: fixture.watchdog,
+            afterParsing: { await barrier.pauseFirst() }
+        )
+        let session = makeSession(fixture, gate: gate, reader: reader)
+
+        session.requestSync()
+        await barrier.waitForEntry()
+        session.stopSync()
+        await barrier.release()
+        await session.waitUntilIdle()
+
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertFalse(session.initialSyncComplete)
+        let current = try await fixture.row(file)
+        XCTAssertEqual(current.libraryMembership, .active)
+    }
+
+    func testSupersededProcessingStartCannotAcknowledgeFailedFilesystemSync() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
         var session: SeratoLibrarySyncSession!
         defer { session = nil }
         session = SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler,
                                            scanner: LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator),
                                            operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: gate,
                                            startProcessing: {
-                                               Task { await worker.holdScheduling(entered: entered, release: release) }
-                                               await self.fulfillment(of: [entered], timeout: 5)
-                                               Task { @MainActor in
-                                                   do { try Data([1, 2]).write(to: fixture.locator.databaseV2Url) }
-                                                   catch { XCTFail("Could not corrupt fixture: \(error)") }
-                                                   session.requestSync()
-                                                   release.signal()
-                                               }
-                                           }, worker: worker)
+                                               do { try Data([1, 2]).write(to: fixture.locator.databaseV2Url) }
+                                               catch { XCTFail("Could not corrupt fixture: \(error)") }
+                                               session.requestSync()
+                                           })
         let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
         let handler = FilesystemSyncBatchHandler(coordinator: coordinator, session: session)
         let checkpoints = SessionCheckpoints()
@@ -44,7 +74,6 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         let saved = await checkpoints.values
         XCTAssertEqual(saved, [])
         do { try await processor.enqueue(.init(observations: [], highestEventID: 92)); XCTFail("Failed head was discarded") } catch {}
-        await worker.stop()
     }
 
     func testWorkerInvalidationDuringFingerprintUpdateRollsBackTransaction() async throws {
@@ -244,7 +273,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         do { try await processor.retry(); XCTFail("Corrupt-source retry succeeded") } catch {}
         session.finishFilesystemRetry(succeeded: false)
         try fixture.save(paths: [])
-        session.seratoStateChanged(isRunning: false)
+        session.requestSync()
         await session.waitUntilIdle()
         XCTAssertEqual(session.state, .failed("Retained filesystem batch 41 failed"))
         XCTAssertThrowsError(try gate.capture())
@@ -287,7 +316,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         XCTAssertEqual(after.libraryMembership, .retired)
     }
 
-    func testSeratoLaunchDuringInitialReadCancelsRetirementAndDefersQueuedIntent() async throws {
+    func testSeratoCloseAfterInterruptedManualSyncReturnsIdleWithoutRestarting() async throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)
         defer { fixture.cleanup() }
@@ -316,8 +345,30 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         fixture.watchdog.refresh()
         await session.waitUntilIdle()
         let after = try await fixture.row(removed)
-        XCTAssertEqual(after.libraryMembership, .retired)
-        XCTAssertTrue(session.initialSyncComplete)
+        XCTAssertEqual(after.libraryMembership, .active)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertFalse(session.initialSyncComplete)
+        withExtendedLifetime(coordinator) {}
+    }
+
+    func testSeratoCloseAfterSuccessfulSyncInvalidatesReadinessWithoutRestarting() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let session = makeSession(fixture, gate: gate)
+        let coordinator = SeratoSyncCoordinator(session: session, seratoWatchdog: fixture.watchdog)
+        session.requestSync()
+        await session.waitUntilIdle()
+        XCTAssertNoThrow(try gate.capture())
+
+        fixture.lifecycle.running = true
+        fixture.watchdog.refresh()
+        fixture.lifecycle.running = false
+        fixture.watchdog.refresh()
+        await session.waitUntilIdle()
+
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertThrowsError(try gate.capture())
         withExtendedLifetime(coordinator) {}
     }
 
@@ -346,58 +397,12 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         XCTAssertEqual(current.path, file.path)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
     }
-
-    func testWorkerDatabaseFailureIsVisibleAndRetryStartsNewGeneration() async throws {
-        let gate = LibrarySyncReadiness()
-        let fixture = try SeratoRemovalFixture(readiness: gate)
-        defer { fixture.cleanup() }
-        let worker = FingerprintWorker(database: fixture.database, fingerprintFunction: { _ in [] }, readiness: gate)
-        var injectFailure = true
-        let session = SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler,
-                                               scanner: LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator),
-                                               operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: gate,
-                                               startProcessing: {
-                                                   guard injectFailure else { return }
-                                                   injectFailure = false
-                                                   do { try await fixture.database.writer.write { try $0.execute(sql: "ALTER TABLE files RENAME TO held_files") } }
-                                                   catch { XCTFail("Could not inject database failure: \(error)") }
-                                               }, worker: worker)
-        let failure = expectation(description: "Visible worker database error")
-        let subscription = session.$state.sink { state in
-            if case let .failed(message) = state, message.contains("Fingerprint processing stopped") {
-                failure.fulfill()
-            }
-        }
-        session.requestSync()
-        await fulfillment(of: [failure], timeout: 5)
-        await session.waitUntilIdle()
-        XCTAssertThrowsError(try gate.capture())
-        XCTAssertNotNil(session.fingerprintProgress?.error)
-        let priorError = await worker.lastError
-        XCTAssertNotNil(priorError)
-        try await fixture.database.writer.write { try $0.execute(sql: "ALTER TABLE held_files RENAME TO files") }
-        session.requestSync()
-        await session.waitUntilIdle()
-        guard case .ready = session.state else { return XCTFail("\(session.state)") }
-        let currentError = await worker.lastError
-        XCTAssertNil(currentError)
-        XCTAssertNil(session.fingerprintProgress?.error)
-        await worker.stop()
-        withExtendedLifetime(subscription) {}
-    }
 }
 
 actor SessionCheckpoints {
     private(set) var values: [UInt64] = []
     func append(_ value: UInt64) {
         values.append(value)
-    }
-}
-
-extension FingerprintWorker {
-    func holdScheduling(entered: XCTestExpectation, release: DispatchSemaphore) {
-        entered.fulfill()
-        release.wait()
     }
 }
 

@@ -3,14 +3,17 @@ import GRDB
 import XCTest
 
 final class FileEligibilityIntegrationTests: XCTestCase {
-    func testBackgroundDatabaseFailurePublishesErrorAndStops() async throws {
+    func testBackgroundDatabaseFailurePublishesErrorStopsAndCanRestart() async throws {
         let database = try LibraryDatabase.openInMemory()
-        try await database.writer.write { try $0.execute(sql: "DROP TABLE files") }
+        try await database.writer.write { database in
+            var file = FileRecord(path: "/retry.mp3", volumeUuid: "test", inode: 1, fileSize: 1, mtime: 0)
+            file.libraryMembership = .active
+            file.fileAvailability = .available
+            try file.insert(database)
+            try database.execute(sql: "ALTER TABLE files RENAME TO held_files")
+        }
         let failed = expectation(description: "worker publishes terminal infrastructure failure")
-        let worker = FingerprintWorker(database: database, fingerprintFunction: { _ in
-            XCTFail("no audio should be decoded after database failure")
-            return []
-        })
+        let worker = FingerprintWorker(database: database, fingerprintFunction: { _ in [1, 2, 3] })
         await worker.start { progress in
             if let error = progress.error {
                 XCTAssertTrue(error.contains("files"))
@@ -22,7 +25,18 @@ final class FileEligibilityIntegrationTests: XCTestCase {
         await worker.waitUntilStopped()
         let error = await worker.lastError
         XCTAssertNotNil(error)
+
+        try await database.writer.write { try $0.execute(sql: "ALTER TABLE held_files RENAME TO files") }
+        let recovered = expectation(description: "worker resumes after an independent retry")
+        await worker.start { progress in
+            if progress.totalDone == 1, progress.error == nil {
+                recovered.fulfill()
+            }
+        }
+        await fulfillment(of: [recovered], timeout: 5)
         await worker.stop()
+        let recoveredError = await worker.lastError
+        XCTAssertNil(recoveredError)
     }
 
     func testUnexpectedDatabaseFailureDuringDecodePropagates() async throws {
