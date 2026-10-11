@@ -181,7 +181,7 @@ public enum RenameDestinationPlanner {
             metadata: metadata,
             fileExtension: fileExtension
         )
-        let bucket = String(ArtistLetterNormalizer.bucketLetter(forArtist: file.artist))
+        let bucket = ArtistLetterNormalizer.bucketName(forArtist: file.artist)
         return musicFolder
             .appendingPathComponent(bucket, isDirectory: true)
             .appendingPathComponent(filename, isDirectory: false)

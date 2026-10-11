@@ -11,8 +11,8 @@ import Foundation
 ///    at the format tier (FLAC == WAV == AIFF == ALAC) — comparing
 ///    lossless bitrates is meaningless because lossless encoders
 ///    don't have a fixed bitrate target.
-/// 2. **Bucket match** — a file at `<Music>/<Letter>/...` where
-///    `<Letter>` matches the artist's normalized bucket letter (per
+/// 2. **Bucket match** — a file at `<Music>/<Bucket>/...` where
+///    `<Bucket>` matches the artist's normalized bucket name (per
 ///    Invariant 5) is preferred over copies that drifted out of the
 ///    canonical location.
 /// 3. **Oldest mtime** — interpreting "the original copy" as the
@@ -76,8 +76,8 @@ public enum DuplicateKeeperPicker {
         "ogg", "oga", "opus",
     ]
 
-    /// True when the file lives at `<musicFolder>/<Letter>/...` and
-    /// `<Letter>` matches the normalized bucket letter for the
+    /// True when the file lives at `<musicFolder>/<Bucket>/...` and
+    /// `<Bucket>` matches the normalized bucket name for the
     /// file's artist (per Invariant 5). Files outside the watched
     /// folder, files in deeper nested subdirectories, and files
     /// with no recoverable artist all return false.
@@ -91,10 +91,9 @@ public enum DuplicateKeeperPicker {
         let relative = String(path.dropFirst(musicFolderPath.count + 1))
         let components = relative.split(separator: "/", omittingEmptySubsequences: true)
         guard components.count >= 2,
-              let firstComponent = components.first,
-              firstComponent.count == 1 else { return false }
-        let bucketFromPath = Character(String(firstComponent).uppercased())
-        let bucketFromArtist = ArtistLetterNormalizer.bucketLetter(forArtist: file.artist)
+              let firstComponent = components.first else { return false }
+        let bucketFromPath = firstComponent.uppercased()
+        let bucketFromArtist = ArtistLetterNormalizer.bucketName(forArtist: file.artist)
         return bucketFromPath == bucketFromArtist
     }
 }

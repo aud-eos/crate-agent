@@ -64,7 +64,7 @@ Keep queued local intent separate from the last authorized external metadata bas
 
 ### 5. The folder layout is artist-first-letter, hardcoded
 
-`<MusicFolder>/<Letter>/<filename>.ext` — single-letter buckets by the normalized first letter of the artist. **No configurable folder template in SP-1.** The normalizer (strip articles, normalize numerics, strip symbols) lives in `ArtistLetterNormalizer.swift` and is the single source of truth for the letter assignment.
+`<MusicFolder>/<Bucket>/<filename>.ext` — single-letter buckets by the normalized first letter of the artist, with the hardcoded `_0123456789` bucket for normalized leading ASCII digits (`0`–`9`, #132). **No configurable folder template in SP-1.** The normalizer (strip articles, normalize numerics, strip symbols) lives in `ArtistLetterNormalizer.swift` and is the single source of truth for bucket assignment.
 
 Why this exists: the project owner's personal organizational scheme, and a deliberate YAGNI — building a full folder-template engine is real work, building artist-first-letter bucketing is a 100-line function. Multi-user configurability is a Pillar C concern, not a foundation concern.
 

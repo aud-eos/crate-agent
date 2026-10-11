@@ -2816,7 +2816,6 @@ private final class ConcurrencyCounter: @unchecked Sendable {
 }
 
 final class ArtistLetterNormalizerTests: XCTestCase {
-
     func testStripsLeadingArticleCaseInsensitive() {
         XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "The Beatles"), "Beatles")
         XCTAssertEqual(ArtistLetterNormalizer.stripLeadingArticle(from: "THE Doors"), "Doors")
@@ -2835,46 +2834,48 @@ final class ArtistLetterNormalizerTests: XCTestCase {
     }
 
     func testBucketLetterForPlainAlphabeticArtist() {
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "Aphex Twin"), "A")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "Zomby"), "Z")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "madlib"), "M",
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "Ashanti"), "A")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "Tinashe"), "T")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "Aphex Twin"), "A")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "Zomby"), "Z")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "madlib"), "M",
                        "lowercase input must uppercase to the same bucket")
     }
 
     func testBucketLetterStripsLeadingArticle() {
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "The Beatles"), "B")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "A Tribe Called Quest"), "T")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "The Beatles"), "B")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "A Tribe Called Quest"), "T")
     }
 
-    func testBucketLetterForLeadingDigit() {
-        // From the design plan: 2Pac → T (Two).
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "2Pac"), "T")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "311"), "T",
-                       "leading digit takes priority — '3' → 'Three' → 'T'")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "50 Cent"), "F",
-                       "leading '5' → 'Five' → 'F'")
+    func testBucketForLeadingDigitsUsesNumericFolder() {
+        for leadingDigit in 0 ... 9 {
+            XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "\(leadingDigit) Artist"), "_0123456789")
+        }
+        for artist in ["03 Greedo", "10,000 Maniacs", "2Pac", "311", "50 Cent", " The 1975 ", "...03 Greedo"] {
+            XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: artist), "_0123456789", artist)
+        }
     }
 
     func testBucketLetterForLeadingSymbolLeetspeak() {
         // From the design plan: $uicideboy$ → S.
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "$uicideboy$"), "S")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "@ndrew"), "A",
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "$uicideboy$"), "S")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "@ndrew"), "A",
                        "@ visually substitutes for A")
     }
 
     func testBucketLetterFallsBackToHashWhenNoLetterDerivable() {
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: ""), "#")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "   "), "#")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: nil), "#")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "~~~"), "#",
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: ""), "#")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "   "), "#")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: nil), "#")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "~~~"), "#",
                        "all-symbol artist with no known leetspeak → unknown bucket")
     }
 
     func testBucketLetterSkipsUnknownSymbolsAndFindsFirstLetter() {
         // Underscores, parens, etc. that don't have leetspeak mappings
         // should be skipped so the first real letter wins.
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "(Sandy) Alex G"), "S")
-        XCTAssertEqual(ArtistLetterNormalizer.bucketLetter(forArtist: "...And You Will Know Us"),
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "(Sandy) Alex G"), "S")
+        XCTAssertEqual(ArtistLetterNormalizer.bucketName(forArtist: "...And You Will Know Us"),
                        "A")
     }
 }
@@ -4223,6 +4224,17 @@ final class DuplicateKeeperPickerTests: XCTestCase {
         )
     }
 
+    func testPrefersNumericBucketOverSpelledDigitBucket() {
+        let group = DuplicateFinder.DuplicateGroup(
+            groupKey: "numeric", mode: .perceptual,
+            files: [
+                makeFile(id: 1, path: "/Users/test/Music/O/03 Greedo - Track.mp3", bitrate: 320, artist: "03 Greedo"),
+                makeFile(id: 2, path: "/Users/test/Music/_0123456789/03 Greedo - Track.mp3", bitrate: 320, artist: "03 Greedo"),
+            ]
+        )
+        XCTAssertEqual(DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: musicFolder), 2)
+    }
+
     // MARK: - mtime
 
     func testPicksOlderFileWhenQualityAndBucketBothTie() {
@@ -4579,6 +4591,17 @@ final class LibraryOrganizerPlannerTests: XCTestCase {
 
     private let musicFolder = URL(fileURLWithPath: "/Music")
     private let template = "$artist - $title.$ext"
+
+    func testNumericArtistsKeepTheirExistingBucket() {
+        for artist in ["03 Greedo", "10,000 Maniacs"] {
+            let expectedPath = "/Music/_0123456789/\(artist) - Track.mp3"
+            var file = HygieneFileRow(id: 1, path: expectedPath, artist: artist, title: "Track")
+            XCTAssertTrue(LibraryOrganizer.findMoves(in: [file], musicFolder: musicFolder, template: template).isEmpty)
+            file.path = "/Music/O/\(artist) - Track.mp3"
+            let moves = LibraryOrganizer.findMoves(in: [file], musicFolder: musicFolder, template: template)
+            XCTAssertEqual(moves.map(\.destinationPath), [expectedPath])
+        }
+    }
 
     func testSkipsFilesAlreadyAtCanonicalPath() {
         let file = FileRecord(
