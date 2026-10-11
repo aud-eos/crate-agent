@@ -80,9 +80,16 @@ struct LibraryBrowserView: View {
             let coordinator = services.importCoordinator
             Task { @MainActor in
                 let result = await coordinator.importDroppedItems(droppedUrls)
-                lastImportSummary = result.filesImported == 0
-                    ? "Nothing imported (\(result.filesSkipped) skipped)"
-                    : "Imported \(result.filesImported) track\(result.filesImported == 1 ? "" : "s")"
+                if result.filesPendingSync > 0 {
+                    lastImportSummary = "\(result.filesImported) imported; \(result.filesPendingSync) pending sync; \(result.filesSkipped) skipped"
+                    services.syncSession.reportFailure(
+                        (["Import sync failed. Use Retry Sync to finish pending imports."] + result.syncFailures).joined(separator: "\n")
+                    )
+                } else {
+                    lastImportSummary = result.filesImported == 0
+                        ? "Nothing imported (\(result.filesSkipped) skipped)"
+                        : "Imported \(result.filesImported) track\(result.filesImported == 1 ? "" : "s")"
+                }
             }
             return true
         } isTargeted: { targeted in

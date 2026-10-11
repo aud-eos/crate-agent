@@ -581,7 +581,8 @@ public actor OperationEngine {
     /// never mean "nothing happened." It is surfaced as a DISTINCT typed
     /// error — `.externalSyncIncomplete`, carrying the batchId — so the
     /// caller treats the batch as applied and finishes the external side
-    /// via `resyncSeratoForBatch(batchId)`, NEVER a re-`applyBatch`
+    /// via `resyncSeratoForBatch(batchId)` (or Retry Sync for retained
+    /// import adds), NEVER a re-`applyBatch`
     /// (which would re-journal against the already-mutated rows and
     /// corrupt the undo baseline — invariant #2, issue #836). The queued
     /// (Serato-running) path never throws for external writes; only the
@@ -617,8 +618,8 @@ public actor OperationEngine {
         }
     }
 
-    /// Number of Serato library writes (renames + metadata updates)
-    /// currently queued because Serato was running at apply time.
+    /// Number of deferred Serato writes, including failed import adds
+    /// retained for Retry Sync.
     /// Surfaced for UI ("M changes pending").
     public var pendingSeratoWriteCount: Int {
         pendingSeratoWrites.count
@@ -1511,6 +1512,18 @@ public actor OperationEngine {
                     queueDepthSubject.send(pendingSeratoWrites.count)
                     return ResyncOutcome(appliedCount: applied.count,
                                          queuedCount: Set(remainder.map(\.eventId)).count, supersededCount: superseded.count)
+                } catch {
+                    let unfinished = eligible + groups.dropFirst(index + 1).flatMap { $0 }
+                    var queuedEvents = Set(pendingSeratoWrites.map(\.eventId))
+                    let imports = unfinished.filter { write in
+                        guard case .addTrack = write.write else { return false }
+                        return queuedEvents.insert(write.eventId).inserted
+                    }
+                    if !imports.isEmpty {
+                        pendingSeratoWrites.append(contentsOf: imports)
+                        queueDepthSubject.send(pendingSeratoWrites.count)
+                    }
+                    throw error
                 }
                 applied.formUnion(eligible.map(\.eventId))
                 break

@@ -22,6 +22,10 @@ with **Retry Sync**. A missing or unreadable Serato database stops synchronizati
 it never means that every track was removed. See the
 [reconciliation contract](docs/serato-membership-reconciliation.md).
 
+If an import cannot update Serato, it remains pending and the sync status offers
+**Retry Sync**. Restore access to the Serato library and retry without dropping the
+audio again. Pending retries currently survive only while crate-agent stays open.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing

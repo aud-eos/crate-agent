@@ -17,12 +17,22 @@ import os.log
 /// FilesystemSyncCoordinator). Non-audio files are silently skipped —
 /// this isn't a general-purpose file importer, it's a music importer.
 public actor ImportCoordinator {
-
     public static let defaultAudioExtensions: Set<String> = FilesystemSyncCoordinator.defaultAudioExtensions
 
     public struct ImportResult: Sendable, Equatable {
         public let filesImported: Int
         public let filesSkipped: Int
+        public let syncFailures: [String]
+
+        public var filesPendingSync: Int {
+            syncFailures.count
+        }
+    }
+
+    private enum FileImportOutcome {
+        case imported
+        case skipped
+        case pendingSync(String)
     }
 
     private static let logger = Logger(
@@ -51,21 +61,25 @@ public actor ImportCoordinator {
     public func importDroppedItems(_ urls: [URL]) async -> ImportResult {
         var filesImported = 0
         var filesSkipped = 0
+        var syncFailures: [String] = []
 
         for rootUrl in urls {
             let audioFileUrls = enumerateAudioFiles(at: rootUrl)
             for fileUrl in audioFileUrls {
-                if await importSingleFile(at: fileUrl) {
+                switch await importSingleFile(at: fileUrl) {
+                case .imported:
                     filesImported += 1
-                } else {
+                case .skipped:
                     filesSkipped += 1
+                case let .pendingSync(message):
+                    syncFailures.append(message)
                 }
             }
         }
-        return ImportResult(filesImported: filesImported, filesSkipped: filesSkipped)
+        return ImportResult(filesImported: filesImported, filesSkipped: filesSkipped, syncFailures: syncFailures)
     }
 
-    private func importSingleFile(at fileUrl: URL) async -> Bool {
+    private func importSingleFile(at fileUrl: URL) async -> FileImportOutcome {
         let absolutePath = fileUrl.path
 
         let fileMetadata: FileMetadata
@@ -75,7 +89,7 @@ public actor ImportCoordinator {
             Self.logger.warning(
                 "could not stat \(absolutePath, privacy: .public); skipping import"
             )
-            return false
+            return .skipped
         }
 
         // Read existing audio tags via the FFI; failures fall back to
@@ -96,7 +110,7 @@ public actor ImportCoordinator {
             if let existing {
                 guard existing.libraryMembership != .active,
                       FileImportIdentity.matches(existing, identity: fileMetadata),
-                      let existingID = existing.id else { return false }
+                      let existingID = existing.id else { return .skipped }
                 fileId = existingID
             } else {
                 _ = try await operationEngine.apply(
@@ -123,7 +137,7 @@ public actor ImportCoordinator {
                     Self.logger.error(
                         "indexNewFile succeeded but the row at \(fileMetadata.path, privacy: .public) is gone"
                     )
-                    return false
+                    return .skipped
                 }
                 fileId = newId
             }
@@ -134,7 +148,7 @@ public actor ImportCoordinator {
             Self.logger.info(
                 "indexNewFile rejected (likely duplicate path): \(error.localizedDescription, privacy: .public)"
             )
-            return false
+            return .skipped
         }
 
         do {
@@ -154,10 +168,13 @@ public actor ImportCoordinator {
             Self.logger.error(
                 "addTrackToSerato for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
             )
-            return false
+            if case let OperationEngineError.externalSyncIncomplete(_, underlying) = error {
+                return .pendingSync("\(fileUrl.lastPathComponent): \(underlying)")
+            }
+            return .skipped
         }
 
-        return true
+        return .imported
     }
 
     private func readMetadataAndBitrate(from path: String) -> (SeratoMetadata, Int?) {
@@ -178,7 +195,7 @@ public actor ImportCoordinator {
             genre: tags.genre,
             // BPM in audio tags is a Double; convert to Serato's string format.
             bpm: tags.bpm.map { String(format: "%.3f", $0) },
-            musicalKey: nil,  // not in AudioTags; Serato analysis fills this
+            musicalKey: nil, // not in AudioTags; Serato analysis fills this
             comment: tags.comment,
             length: tags.durationSeconds.map(Self.formatDuration),
             label: nil
