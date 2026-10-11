@@ -37,7 +37,8 @@ audio alone does not re-import it. Reconciliation currently supports the configu
 local Serato library, not independent libraries on external volumes. Offline
 volumes cannot provide evidence for retirement.
 
-**Organize** builds a cancellable preview in the background. Start with no files
+**Organize** builds a cancellable preview in the background. Numeric-leading
+artists use the existing `_0123456789` folder. Start with no files
 selected, review every result using the scrollbar, then choose individual files
 or **Select all eligible matches** in the current filter. Files missing Artist,
 Title or another tag used by the filename template show what they need and stay

@@ -307,7 +307,7 @@ public enum SettingsTemplatePreviewer {
             metadata: sampleMetadata,
             fileExtension: sampleExtension
         )
-        let bucket = String(ArtistLetterNormalizer.bucketLetter(forArtist: sampleMetadata.artist))
+        let bucket = ArtistLetterNormalizer.bucketName(forArtist: sampleMetadata.artist)
         return "<Music>/\(bucket)/\(filename)"
     }
 }

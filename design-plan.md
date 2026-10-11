@@ -70,8 +70,8 @@ These decisions are the load-bearing choices that shape every sub-project. They 
 **Approach 3 was selected:** path + inode + Chromaprint fingerprint computed at index time. Initial scan is parallelized across CPU cores − 2; library browser is usable before scan completes (tracks "promote" from file-identity to track-identity as fingerprints land).
 
 ### Folder organization — hardcoded for v1
-- **Single-letter alphabetical buckets** by first letter of normalized artist name: `<MusicFolder>/<Letter>/<filename>.mp3`
-- Normalization rules: strip leading articles ("The", "A", "An"); normalize numerics ("2Pac" → "T"); strip leading symbols ("$uicideboy$" → "S")
+- **Hardcoded artist buckets**: single-letter alphabetical buckets plus `_0123456789` for normalized leading ASCII digits: `<MusicFolder>/<Bucket>/<filename>.mp3`
+- Normalization rules: strip leading articles ("The", "A", "An"); group numeric-leading names ("2Pac", "03 Greedo", "10,000 Maniacs" → `_0123456789`); strip leading symbols ("$uicideboy$" → "S")
 - User can override the chosen letter per-track via UI
 - **No** configurable folder template in v1 — that's a Pillar C consideration if anyone other than the primary user ever uses this
 - Rationale: tags > folders for library organization (genre crossover makes hierarchical folder structures structurally unsolvable for DJ music); flat alphabetical bucketing is constant-bounded depth and ergonomic

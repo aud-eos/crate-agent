@@ -1,8 +1,15 @@
 # Organize
 
-Organize previews moves into `<MusicFolder>/<ArtistLetter>/<Filename>` using the
+Organize previews moves into `<MusicFolder>/<ArtistBucket>/<Filename>` using the
 filename template in Settings. Opening the screen only reads the library and
 computes proposed paths. It does not move audio or write Serato files.
+
+Alphabetic artists use their normalized letter bucket. Artists whose normalized
+name starts with `0`–`9`, such as 03 Greedo, 10,000 Maniacs and 2Pac, use the fixed
+`_0123456789` folder. Article stripping and symbol normalization apply first;
+The 1975 also belongs there. A file already at its canonical filename in that
+folder produces no move proposal. Rename previews, Settings previews and duplicate
+keeper ranking share the same bucket assignment.
 
 The preview loads in the background. **Cancel scan** or leaving the screen cancels
 that request; an obsolete request cannot replace a newer result. Cancelling a
