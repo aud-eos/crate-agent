@@ -333,8 +333,8 @@ final class OperationEngineTests: XCTestCase {
     /// `applySeratoRename` BEFORE `database V2` got rewritten, so
     /// every organize move ended up with the file moved on disk
     /// but Serato's "All" view still pointing at the old path.
-    /// The fix processes V2 first and tolerates per-crate failures.
-    func testRenameRewritesDatabaseV2EvenWhenCrateFileIsCorrupted() async throws {
+    /// The fix processes V2 first and reports incomplete crate writes.
+    func testRenameReportsCorruptCrateAfterRewritingHealthyStores() async throws {
         // Build a _Serato_ hierarchy with: one good crate, one
         // garbage `.crate`, and a valid `database V2`. The fixture
         // builder handles the directory + bytes — this test only
@@ -364,10 +364,15 @@ final class OperationEngineTests: XCTestCase {
                                arguments: [self.audioFixture.path("/Users/testuser/Music/A/old.mp3")])
         }!
 
-        // The rename must NOT throw despite the corrupted crate.
-        try await engine.apply(.renameFile(RenameFilePayload(
+        let batchID = "rename-with-corrupt-crate"
+        await XCTAssertThrowsErrorAsync(try await engine.apply(.renameFile(RenameFilePayload(
             fileId: fileId, newPath: self.audioFixture.path("/Users/testuser/Music/A/new.mp3"), previousPath: self.audioFixture.path("/Users/testuser/Music/A/old.mp3"), physicalMove: true
-        )))
+        )), batchId: batchID)) { error in
+            guard case let OperationEngineError.externalSyncIncomplete(appliedBatchID, _) = error else {
+                return XCTFail("Expected recoverable partial sync failure, got \(error)")
+            }
+            XCTAssertEqual(appliedBatchID, batchID)
+        }
 
         // Database V2 MUST reflect the new path — this is the
         // bug fix's primary contract.

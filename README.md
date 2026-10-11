@@ -33,6 +33,11 @@ audio alone does not re-import it. Reconciliation currently supports the configu
 local Serato library, not independent libraries on external volumes. Offline
 volumes cannot provide evidence for retirement.
 
+**Move library** validates each previewed file before moving it. Files that changed
+or became unavailable stay in place; successful moves remain undoable together in
+History. Partial migration keeps the current library-folder setting. See the
+[migration and recovery guide](docs/library-migration.md).
+
 ## Why this exists
 
 Serato stores absolute file paths in its binary library files. When you rename a file in Finder, Serato silently loses access to it. Serato has no public API, plugin system, or library-management hooks. Third-party tools that bridge the gap (Lexicon, Rekordbuddy) are excellent but commercial; this project exists to be a small, focused, native alternative that the author can shape to fit their own DJ workflow.

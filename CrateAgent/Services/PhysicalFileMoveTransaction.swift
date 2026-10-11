@@ -39,9 +39,12 @@ final class PhysicalFileMoveTransaction {
         }
     }
 
-    func move(_ payload: RenameFilePayload, file: FileRecord) throws -> FileMetadata {
+    func move(_ payload: RenameFilePayload, file: FileRecord, expectedSource: SeratoSourceIdentity? = nil) throws -> FileMetadata {
         guard file.path == payload.previousPath else { throw FileProcessingEligibilityError.superseded(fileId: payload.fileId) }
         let ownedSource = try OwnedAudioIdentity.read(at: file.path)
+        if let expectedSource, ownedSource.change != expectedSource {
+            throw MoveError.sourceChanged(file.path)
+        }
         let source = ownedSource.metadata
         guard !FileIdentityObservationMutation.isReplacement(file, identity: source),
               source.fileSize == file.fileSize, source.mtime == file.mtime
@@ -177,6 +180,7 @@ final class PhysicalFileMoveTransaction {
     }
 
     private enum MoveError: LocalizedError {
+        case sourceChanged(String)
         case changedDestination(String)
         case compensationFailed(original: String, compensation: String)
         case cleanupFailed(String, String)
@@ -184,6 +188,7 @@ final class PhysicalFileMoveTransaction {
 
         var errorDescription: String? {
             switch self {
+            case let .sourceChanged(path): "Audio at \(path) changed since the preview. Re-scan before moving it."
             case let .changedDestination(path): "Cannot restore moved audio because its destination changed: \(path)."
             case let .compensationFailed(original, compensation): "Move transaction failed: \(original). Restoring audio also failed: \(compensation)"
             case let .cleanupFailed(path, reason): "Audio move committed, but its retained source could not be removed at \(path): \(reason)"

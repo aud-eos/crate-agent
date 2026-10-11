@@ -5,7 +5,7 @@ import os
 /// UniFFI emits only String/Optional<String> value fields, without Sendable conformance.
 extension SeratoTrackRecord: @unchecked Sendable {}
 
-struct SeratoSourceIdentity: Equatable, Sendable {
+struct SeratoSourceIdentity: Hashable, Sendable {
     let device: Int32
     let inode: UInt64
     let size: Int64

@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 
 /// Bulk library-relocation. Rebases every tracked file's path from
 /// one music-folder root to another, preserving the relative
@@ -9,26 +10,50 @@ import Foundation
 /// onboarding default put them there. The migrator moves them
 /// into `~/Music/_DJ_Library_/<Letter>/` in one undoable batch.
 ///
-/// Architecturally identical to `LibraryOrganizer` (file move +
-/// `renameFile` mutation through `OperationEngine` under one
-/// `batch_id`). Difference is the destination calculation: organize
-/// re-renders filenames via the template, migrate just rebases the
-/// prefix.
+/// Migration and Organize share guarded physical moves through
+/// OperationEngine, but calculate their destinations separately.
 ///
 /// Same-volume only for SP-1 (issue #69 tracks cross-volume).
 /// Files not under the old root are skipped — Apple Music library
 /// and other unrelated content in `~/Music/` stays untouched.
 public actor LibraryMigrator {
-
-    public struct Plan: Identifiable, Hashable, Sendable {
+    public struct Destination: Identifiable, Hashable, Sendable {
         public let id: Int64
         public let sourcePath: String
         public let destinationPath: String
+        public let membershipToken: FileMembershipToken
 
-        public init(id: Int64, sourcePath: String, destinationPath: String) {
+        public init(id: Int64, sourcePath: String, destinationPath: String, membershipRevision: Int64) {
             self.id = id
             self.sourcePath = sourcePath
             self.destinationPath = destinationPath
+            membershipToken = FileMembershipToken(fileId: id, revision: membershipRevision)
+        }
+    }
+
+    public struct Plan: Identifiable, Hashable, Sendable {
+        public var id: Int64 {
+            destination.id
+        }
+
+        public var sourcePath: String {
+            destination.sourcePath
+        }
+
+        public var destinationPath: String {
+            destination.destinationPath
+        }
+
+        public var membershipToken: FileMembershipToken {
+            destination.membershipToken
+        }
+
+        private let destination: Destination
+        let sourceIdentity: SeratoSourceIdentity
+
+        fileprivate init(destination: Destination, sourceIdentity: SeratoSourceIdentity) {
+            self.destination = destination
+            self.sourceIdentity = sourceIdentity
         }
     }
 
@@ -45,6 +70,7 @@ public actor LibraryMigrator {
         case crossVolumeUnsupported(reason: String)
         case sourceNoLongerExists(path: String)
         case destinationAlreadyExists(path: String)
+        case cannotInspectSource(path: String)
 
         public var errorDescription: String? {
             switch self {
@@ -52,12 +78,14 @@ public actor LibraryMigrator {
                 return "Nothing to migrate — every tracked file is already under the new root."
             case .sameRoot:
                 return "Source and destination are the same folder."
-            case .crossVolumeUnsupported(let reason):
+            case let .crossVolumeUnsupported(reason):
                 return "Cross-volume migration isn't supported yet (\(reason))."
             case .sourceNoLongerExists:
                 return "Source no longer exists."
             case .destinationAlreadyExists:
                 return "Destination already exists — re-scan and retry."
+            case let .cannotInspectSource(path):
+                return "Cannot inspect \(path). Check that the audio is available, then re-scan."
             }
         }
     }
@@ -87,16 +115,16 @@ public actor LibraryMigrator {
         in files: [F],
         oldRoot: URL,
         newRoot: URL
-    ) -> [Plan] {
+    ) -> [Destination] {
         let oldPrefix = ensureTrailingSlash(oldRoot.path)
         let newPrefix = ensureTrailingSlash(newRoot.path)
         guard oldPrefix != newPrefix else { return [] }
 
-        var plans: [Plan] = []
+        var plans: [Destination] = []
         var claimed: Set<String> = []
         for file in files {
             guard let fileId = file.id else { continue }
-            guard file.path.hasPrefix(oldPrefix) else { continue }
+            guard requiresMove(file.path, oldPrefix: oldPrefix, newPrefix: newPrefix) else { continue }
             let relative = String(file.path.dropFirst(oldPrefix.count))
             // Skip if the file is already at the canonical
             // location under the new root — covers the rerun case.
@@ -106,22 +134,37 @@ public actor LibraryMigrator {
             }
             let resolved = disambiguatedPath(desired: proposed, taken: claimed)
             claimed.insert(resolved)
-            plans.append(Plan(
+            plans.append(Destination(
                 id: fileId,
                 sourcePath: file.path,
-                destinationPath: resolved
+                destinationPath: resolved,
+                membershipRevision: file.membershipRevision
             ))
         }
         return plans
     }
 
-    /// Apply the migration. Two-phase: every file moves on disk
-    /// first, then one `applyBatch` covers every successful move's
-    /// `renameFile` mutation. Single SQLite transaction, single
-    /// batched Serato library rewrite. Per-file move failures
-    /// append to `Outcome.errors` and don't block other files.
-    /// After success the caller updates
-    /// `UserPreferences.watchedMusicFolder` to the new root.
+    public nonisolated static func remainingFileCount(in database: LibraryDatabase, oldRoot: URL, newRoot: URL) async throws -> Int {
+        let oldPrefix = ensureTrailingSlash(oldRoot.path)
+        let newPrefix = ensureTrailingSlash(newRoot.path)
+        return try await database.writer.read { connection in
+            let paths = try String.fetchAll(connection, sql: "SELECT path FROM files WHERE \(FileProcessingEligibility.activeSQL)")
+            return paths.filter { path in requiresMove(path, oldPrefix: oldPrefix, newPrefix: newPrefix) }.count
+        }
+    }
+
+    public nonisolated static func prepareMoves<F: HygieneFileSource>(
+        in files: [F], oldRoot: URL, newRoot: URL
+    ) throws -> [Plan] {
+        try findMoves(in: files, oldRoot: oldRoot, newRoot: newRoot).map { destination in
+            try Task.checkCancellation()
+            let identity: SeratoSourceIdentity
+            do { identity = try SeratoSourceIdentity.read(URL(fileURLWithPath: destination.sourcePath)) }
+            catch { throw MigratorError.cannotInspectSource(path: destination.sourcePath) }
+            return Plan(destination: destination, sourceIdentity: identity)
+        }
+    }
+
     @discardableResult
     public func migrate(
         _ plans: [Plan],
@@ -132,68 +175,22 @@ public actor LibraryMigrator {
         let effectiveBatchId = batchId ?? "migrate-\(UUID().uuidString)"
         await note("Migrating \(plans.count) file\(plans.count == 1 ? "" : "s") to the new library root…")
 
-        var renameMutations: [TrackMutation] = []
-        var failures = 0
-        var errors: [String] = []
-        for plan in plans {
-            do {
-                try await moveFileOnDisk(plan)
-                renameMutations.append(.renameFile(RenameFilePayload(
-                    fileId: plan.id,
-                    newPath: plan.destinationPath
-                )))
-            } catch {
-                failures += 1
-                let filename = (plan.sourcePath as NSString).lastPathComponent
-                errors.append("\(filename): \(error.localizedDescription)")
-                await note("Skipped \(filename) — \(error.localizedDescription)")
-            }
+        let outcome = try await operationEngine.migrateFiles(plans, batchId: effectiveBatchId)
+        for error in outcome.errors {
+            await note(error)
         }
-
-        if !renameMutations.isEmpty {
-            try await operationEngine.applyBatch(
-                renameMutations,
-                batchId: effectiveBatchId
-            )
-        }
-
-        let moved = renameMutations.count
-        await note("Migration complete — moved \(moved), \(failures) skipped")
-        return Outcome(
-            batchId: effectiveBatchId,
-            movedCount: moved,
-            failureCount: failures,
-            errors: errors
-        )
-    }
-
-    // MARK: - Internals
-
-    private func moveFileOnDisk(_ plan: Plan) async throws {
-        let source = URL(fileURLWithPath: plan.sourcePath)
-        let destination = URL(fileURLWithPath: plan.destinationPath)
-        let fileManager = FileManager.default
-
-        guard fileManager.fileExists(atPath: source.path) else {
-            throw MigratorError.sourceNoLongerExists(path: source.path)
-        }
-        if fileManager.fileExists(atPath: destination.path) {
-            throw MigratorError.destinationAlreadyExists(path: destination.path)
-        }
-
-        let parentDirectory = destination.deletingLastPathComponent()
-        try fileManager.createDirectory(
-            at: parentDirectory,
-            withIntermediateDirectories: true
-        )
-
-        await note("Moving \(source.lastPathComponent) → \(destination.path)")
-        try fileManager.moveItem(at: source, to: destination)
+        await note("Migration complete — moved \(outcome.movedCount), \(outcome.failureCount) skipped")
+        return outcome
     }
 
     private func note(_ message: String) async {
         guard let log = activityLog else { return }
         await log.log(message, category: .rename)
+    }
+
+    private nonisolated static func requiresMove(_ path: String, oldPrefix: String, newPrefix: String) -> Bool {
+        oldPrefix != newPrefix && path.hasPrefix(oldPrefix)
+            && !(newPrefix.hasPrefix(oldPrefix) && path.hasPrefix(newPrefix))
     }
 
     /// Ensure the directory path ends with `/` so `hasPrefix`
@@ -207,12 +204,14 @@ public actor LibraryMigrator {
         desired: String,
         taken: Set<String>
     ) -> String {
-        if !taken.contains(desired) { return desired }
+        if !taken.contains(desired) {
+            return desired
+        }
         let url = URL(fileURLWithPath: desired)
         let nameWithoutExt = url.deletingPathExtension().lastPathComponent
         let ext = url.pathExtension
         let parent = url.deletingLastPathComponent()
-        for attempt in 1...1000 {
+        for attempt in 1 ... 1000 {
             let candidateFilename = ext.isEmpty
                 ? "\(nameWithoutExt) (\(attempt))"
                 : "\(nameWithoutExt) (\(attempt)).\(ext)"

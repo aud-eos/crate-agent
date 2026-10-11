@@ -413,6 +413,31 @@ public actor OperationEngine {
     }
 
     func organizeFiles(_ plans: [LibraryOrganizer.Plan], batchId: String) async throws -> LibraryOrganizer.Outcome {
+        let requests = plans.map { plan in
+            PhysicalMoveRequest(token: FileMembershipToken(fileId: plan.id, revision: plan.membershipRevision),
+                                sourcePath: plan.sourcePath, destinationPath: plan.destinationPath, sourceIdentity: nil)
+        }
+        let result = try await moveFiles(requests, batchId: batchId)
+        return LibraryOrganizer.Outcome(batchId: batchId, movedCount: result.movedCount, failureCount: result.errors.count, errors: result.errors)
+    }
+
+    func migrateFiles(_ plans: [LibraryMigrator.Plan], batchId: String) async throws -> LibraryMigrator.Outcome {
+        let requests = plans.map { plan in
+            PhysicalMoveRequest(token: plan.membershipToken, sourcePath: plan.sourcePath,
+                                destinationPath: plan.destinationPath, sourceIdentity: plan.sourceIdentity)
+        }
+        let result = try await moveFiles(requests, batchId: batchId)
+        return LibraryMigrator.Outcome(batchId: batchId, movedCount: result.movedCount, failureCount: result.errors.count, errors: result.errors)
+    }
+
+    private struct PhysicalMoveRequest: Sendable {
+        let token: FileMembershipToken
+        let sourcePath: String
+        let destinationPath: String
+        let sourceIdentity: SeratoSourceIdentity?
+    }
+
+    private func moveFiles(_ plans: [PhysicalMoveRequest], batchId: String) async throws -> (movedCount: Int, errors: [String]) {
         let authorization = try readiness?.capture()
         var results: [GuardedExecutionResult] = []
         var errors: [String] = []
@@ -420,10 +445,10 @@ public actor OperationEngine {
             do {
                 let result = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { database, moves in
                     try authorization?.check()
-                    let token = FileMembershipToken(fileId: plan.id, revision: plan.membershipRevision)
-                    try FileProcessingEligibility.requireCurrent(token, in: database)
-                    let result = try Self.executeAndLog(mutation: .renameFile(.init(fileId: plan.id, newPath: plan.destinationPath,
-                                                                              previousPath: plan.sourcePath, physicalMove: true)), batchId: batchId, in: database, physicalMoves: moves)
+                    try FileProcessingEligibility.requireCurrent(plan.token, in: database)
+                    let result = try Self.executeAndLog(mutation: .renameFile(.init(fileId: plan.token.fileId, newPath: plan.destinationPath,
+                                                                                    previousPath: plan.sourcePath, physicalMove: true)), batchId: batchId, in: database,
+                                                        physicalMoves: moves, expectedPhysicalSource: plan.sourceIdentity)
                     try authorization?.check()
                     return result
                 }
@@ -438,7 +463,7 @@ public actor OperationEngine {
             }
         }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: batchId)
-        return LibraryOrganizer.Outcome(batchId: batchId, movedCount: results.count, failureCount: errors.count, errors: errors)
+        return (results.count, errors)
     }
 
     func applyObservedBatch(_ mutations: [TrackMutation], authorization: SeratoSnapshotAuthorization,
@@ -1831,13 +1856,10 @@ public actor OperationEngine {
             // Enumeration failure is symmetric with the V2 failure
             // — both surface, neither stops the other.
             await note("Failed to enumerate Subcrates directory: \(error.localizedDescription)")
-            if databaseV2Error != nil {
-                throw OperationEngineError.seratoEnumerationFailed(
-                    directory: seratoLocator.subcratesDirectoryUrl.path,
-                    underlying: String(describing: error)
-                )
-            }
-            return
+            throw OperationEngineError.seratoEnumerationFailed(
+                directory: seratoLocator.subcratesDirectoryUrl.path,
+                underlying: String(describing: error)
+            )
         }
 
         var perCrateFailures: [(URL, Error)] = []
@@ -1861,26 +1883,13 @@ public actor OperationEngine {
             }
         }
 
-        // Throw only if both V2 and every crate failed — at that
-        // point we genuinely couldn't sync anything and the caller
-        // (e.g., the organizer) needs to know the file move on
-        // disk has no matching library update.
-        let everyCrateFailed = !crateFiles.isEmpty
-            && perCrateFailures.count == crateFiles.count
-        if databaseV2Error != nil, everyCrateFailed || crateFiles.isEmpty {
-            throw OperationEngineError.seratoRewriteFailed(
-                path: databaseV2Path,
-                underlying: String(describing: databaseV2Error!)
-            )
-        }
+        try requireSuccessfulSeratoRenames(databaseError: databaseV2Error, crateFailures: perCrateFailures)
     }
 
     /// Bulk variant of `applySeratoRename`. One Rust FFI call to
     /// rewrite the `database V2` file for every rename in the batch,
-    /// then one FFI call per crate file. Same failure semantics as
-    /// the single-rename path — V2 errors are recorded but don't
-    /// stop the crate sweep; a final throw only fires if V2 failed
-    /// AND every crate failed (or there were no crates).
+    /// then one FFI call per crate file. Every store is attempted;
+    /// any failure keeps the batch visibly incomplete for re-sync.
     ///
     /// Falls back to the per-rename path for batches of size 1 to
     /// preserve the more granular "⚠️ no entry for X" diagnostic
@@ -1926,13 +1935,10 @@ public actor OperationEngine {
             crateFiles = try seratoLocator.enumerateCrateFiles()
         } catch {
             await note("Failed to enumerate Subcrates directory: \(error.localizedDescription)")
-            if databaseV2Error != nil {
-                throw OperationEngineError.seratoEnumerationFailed(
-                    directory: seratoLocator.subcratesDirectoryUrl.path,
-                    underlying: String(describing: error)
-                )
-            }
-            return
+            throw OperationEngineError.seratoEnumerationFailed(
+                directory: seratoLocator.subcratesDirectoryUrl.path,
+                underlying: String(describing: error)
+            )
         }
 
         var perCrateFailures: [(URL, Error)] = []
@@ -1951,13 +1957,13 @@ public actor OperationEngine {
             }
         }
 
-        let everyCrateFailed = !crateFiles.isEmpty
-            && perCrateFailures.count == crateFiles.count
-        if databaseV2Error != nil, everyCrateFailed || crateFiles.isEmpty {
-            throw OperationEngineError.seratoRewriteFailed(
-                path: databaseV2Path,
-                underlying: String(describing: databaseV2Error!)
-            )
+        try requireSuccessfulSeratoRenames(databaseError: databaseV2Error, crateFailures: perCrateFailures)
+    }
+
+    private func requireSuccessfulSeratoRenames(databaseError: Error?, crateFailures: [(URL, Error)]) throws {
+        let firstFailure = databaseError.map { error in (seratoLocator.databaseV2Url, error) } ?? crateFailures.first
+        if let (url, error) = firstFailure {
+            throw OperationEngineError.seratoRewriteFailed(path: url.path, underlying: String(describing: error))
         }
     }
 
@@ -2081,7 +2087,8 @@ public actor OperationEngine {
         mutation: TrackMutation,
         batchId: String,
         in database: GRDB.Database,
-        physicalMoves: PhysicalFileMoveTransaction? = nil
+        physicalMoves: PhysicalFileMoveTransaction? = nil,
+        expectedPhysicalSource: SeratoSourceIdentity? = nil
     ) throws -> GuardedExecutionResult {
         if let fileID = mutation.processingFileID {
             guard let file = try FileRecord.fetchOne(database, key: fileID) else {
@@ -2100,7 +2107,7 @@ public actor OperationEngine {
             guard let physicalMoves, let file = try FileRecord.fetchOne(database, key: payload.fileId) else {
                 throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
             }
-            let moved = try physicalMoves.move(payload, file: file)
+            let moved = try physicalMoves.move(payload, file: file, expectedSource: expectedPhysicalSource)
             effectiveMutation = .renameFile(RenameFilePayload(fileId: payload.fileId, newPath: payload.newPath,
                                                               previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true))
         }
