@@ -1,43 +1,14 @@
-import GRDB
 import SwiftUI
 
-/// Sidebar tab for bulk file organization. Finds files whose
-/// current path doesn't match their canonical destination
-/// (`<MusicFolder>/<Letter>/<rendered-filename>.<ext>`) and lets
-/// the user bulk-apply the moves. First use case: tracks dropped
-/// into `~/Downloads`, soulseek dirs, etc. — pull them into the
-/// main library folder.
 struct OrganizeView: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
-
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
-
-    @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
-    @State private var plans: [LibraryOrganizer.Plan] = []
-    @State private var selection: Set<Int64> = []
-    @State private var filter: Filter = .outsideOnly
-    @State private var isScanning: Bool = false
-    @State private var isApplying: Bool = false
+    @StateObject private var preview = OrganizePreviewModel()
     @State private var actionError: String?
     @State private var lastResult: String?
-    @State private var pendingConfirm: Bool = false
-
-    private enum Filter: String, CaseIterable, Identifiable {
-        case outsideOnly
-        case all
-
-        var id: String {
-            rawValue
-        }
-
-        var displayName: String {
-            switch self {
-            case .outsideOnly: "Outside music folder"
-            case .all: "All"
-            }
-        }
-    }
+    @State private var pendingConfirm = false
+    @State private var isVisible = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,217 +26,154 @@ struct OrganizeView: View {
         }
         .navigationTitle("Organize")
         .frame(minWidth: 720, minHeight: 480)
-        .task { await rescan() }
-        .alert(
-            "Organize \(selectedPlans.count) file\(selectedPlans.count == 1 ? "" : "s")?",
-            isPresented: $pendingConfirm
-        ) {
-            Button("Move \(selectedPlans.count) file\(selectedPlans.count == 1 ? "" : "s")") {
-                Task { await applySelected() }
-            }
+        .task {
+            isVisible = true
+            await rescan()
+        }
+        .onDisappear {
+            isVisible = false
+            preview.cancelScan()
+        }
+        .alert("Organize \(preview.selection.count) files?", isPresented: $pendingConfirm) {
+            Button("Move \(preview.selection.count) files") { Task { await applySelected() } }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Each selected file moves to its canonical location under \(services.watchedMusicFolder.path). Serato references update in the same batch — one Undo on History reverts every move.")
+            Text("Moves all \(preview.selection.count) selected files, including \(preview.hiddenSelectionCount) outside the current filter, into \(services.watchedMusicFolder.path). Serato references update in one undoable batch.")
         }
     }
 
-    // MARK: - Header
-
     private var header: some View {
         HStack(spacing: density.spacing) {
-            Picker("Filter", selection: $filter) {
-                ForEach(Filter.allCases) { option in
+            Picker("Filter", selection: Binding(get: { preview.filter }, set: preview.setFilter)) {
+                ForEach(OrganizePreviewModel.Filter.allCases) { option in
                     Text(option.displayName).tag(option)
                 }
             }
             .pickerStyle(.segmented)
             .frame(maxWidth: 360)
-            .onChange(of: filter) { _, _ in
-                // Selection only contains visible plans;
-                // re-derive when the filter changes.
-                let visibleIds = Set(visiblePlans.map(\.id))
-                selection = selection.intersection(visibleIds)
-            }
+            .disabled(preview.isBusy)
             Spacer()
             Text("Template: \(UserPreferences.filenameTemplate)")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .help("Filename template applied to every move. Change it in Settings → General.")
+                .help("Change the filename template in Settings → General, then rescan.")
         }
         .padding(.horizontal, density.pagePadding)
         .padding(.vertical, density.spacing)
     }
 
-    // MARK: - Content
-
     @ViewBuilder
     private var content: some View {
-        if isScanning, plans.isEmpty {
-            ProgressView("Scanning library…")
+        if preview.isScanning, preview.snapshot.rows.isEmpty {
+            ProgressView("Planning file moves…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if visiblePlans.isEmpty {
-            emptyState
+        } else if preview.visibleCount == 0 {
+            ContentUnavailableView(
+                preview.error != nil ? "Couldn't load preview" : preview.filter == .outsideOnly ? "No files outside the music folder" : "Every file is at its canonical path",
+                systemImage: preview.error != nil ? "exclamationmark.triangle" : "checkmark.seal",
+                description: Text(preview.error != nil ? "Resolve the error below, then rescan." : "Use All to review other proposed moves, or rescan after importing tracks.")
+            )
         } else {
-            planList
+            OrganizePreviewTable(preview: preview, density: density)
         }
     }
-
-    private var emptyState: some View {
-        VStack(spacing: density.spacing) {
-            Image(systemName: "checkmark.seal")
-                .font(.largeTitle)
-                .foregroundStyle(.green)
-            Text(filter == .outsideOnly
-                ? "No files outside the music folder"
-                : "Every file is at its canonical path")
-                .font(.headline)
-            Text(filter == .outsideOnly
-                ? "Drop tracks here from Finder or import them; they'll land outside the folder and show up for organizing."
-                : "Filenames and letter buckets all match the configured template.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var planList: some View {
-        List {
-            ForEach(visiblePlans) { plan in
-                planRow(plan)
-            }
-        }
-        .listStyle(.inset)
-    }
-
-    private func planRow(_ plan: LibraryOrganizer.Plan) -> some View {
-        HStack(alignment: .top, spacing: density.spacing) {
-            Toggle(isOn: Binding(
-                get: { selection.contains(plan.id) },
-                set: { include in
-                    if include {
-                        selection.insert(plan.id)
-                    } else {
-                        selection.remove(plan.id)
-                    }
-                }
-            )) { EmptyView() }
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-                .accessibilityLabel("Select \((plan.sourcePath as NSString).lastPathComponent)")
-            VStack(alignment: .leading, spacing: density.spacing) {
-                let identity = trackIdentities[plan.sourcePath]
-                TrackHeading(artist: identity?.artist, title: identity?.title, filename: (plan.sourcePath as NSString).lastPathComponent)
-                StatusBadge(title: plan.isOutsideMusicFolder ? "Outside music folder" : "Inside music folder",
-                            systemImage: plan.isOutsideMusicFolder ? "folder.badge.questionmark" : "folder")
-                MetadataComparison(current: plan.sourcePath, proposed: plan.destinationPath, field: "Location")
-            }
-            Spacer()
-        }
-        .padding(.vertical, density.rowPadding)
-    }
-
-    // MARK: - Footer
 
     private var footer: some View {
-        ActionBar {
-            if let actionError {
-                ActionErrorMessage(message: actionError)
-            } else if let lastResult {
-                Label(lastResult, systemImage: "checkmark.circle")
-                    .font(.callout)
-                    .foregroundStyle(.green)
-            } else if !visiblePlans.isEmpty {
-                Text("\(selection.count) of \(visiblePlans.count) selected")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            Text("\(preview.visibleCount) results · \(preview.selection.count) selected · \(preview.hiddenSelectionCount) outside current filter")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, density.pagePadding)
+            ActionBar {
+                if let error = actionError ?? preview.error {
+                    ActionErrorMessage(message: error)
+                } else if let notice = preview.notice {
+                    Text(notice).font(.callout)
+                } else if let lastResult {
+                    Text(lastResult).font(.callout)
+                }
+                if preview.isScanning {
+                    ProgressView("Planning…").controlSize(.small)
+                }
+                if preview.isApplying {
+                    ProgressView("Organizing…").controlSize(.small)
+                }
+            } actions: {
+                if preview.isScanning {
+                    Button("Cancel scan") { preview.cancelScan() }
+                } else {
+                    Button("Rescan") { Task { await rescan() } }
+                        .disabled(preview.isApplying)
+                }
+                BatchSelectionToggle(title: "Select all \(preview.visibleCount) matches", coverage: preview.selection.coverage(in: preview.scope),
+                                     enabled: !preview.isBusy && preview.visibleCount > 0, setSelected: preview.selectScope)
+                    .fixedSize()
+                Button("Clear selection", action: preview.clearSelection)
+                    .disabled(preview.isBusy || preview.selection.count == 0)
+                Button("Move \(preview.selection.count) selected files") { pendingConfirm = true }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(preview.selection.count == 0 || preview.isBusy || seratoWatchdog.isSeratoRunning)
             }
-        } actions: {
-            Button {
-                Task { await rescan() }
-            } label: {
-                Label("Rescan", systemImage: "arrow.clockwise")
-            }
-            .disabled(isScanning || isApplying)
-            Button("Select All") {
-                selection = Set(visiblePlans.map(\.id))
-            }
-            .controlSize(density.controlSize)
-            .disabled(visiblePlans.isEmpty)
-            Button("Move \(selectedPlans.count) selected files") {
-                pendingConfirm = true
-            }
-            .keyboardShortcut(.defaultAction)
-            .disabled(selection.isEmpty || isApplying || seratoWatchdog.isSeratoRunning)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before organizing — renames write to Serato library files and would be clobbered on Serato's next save."
-                : "Move every selected file into its canonical letter bucket and update Serato + DB in one batch.")
         }
+        .padding(.top, density.spacing)
     }
-
-    // MARK: - Derived
-
-    private var visiblePlans: [LibraryOrganizer.Plan] {
-        switch filter {
-        case .outsideOnly:
-            plans.filter(\.isOutsideMusicFolder)
-        case .all:
-            plans
-        }
-    }
-
-    private var selectedPlans: [LibraryOrganizer.Plan] {
-        plans.filter { plan in selection.contains(plan.id) }
-    }
-
-    // MARK: - Actions
 
     private func rescan() async {
-        isScanning = true
-        defer { isScanning = false }
         actionError = nil
-        do {
-            let files = try await services.database.writer.read { db in
-                try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
-            }
-            let computedPlans = LibraryOrganizer.findMoves(
-                in: files,
-                musicFolder: services.watchedMusicFolder,
-                template: UserPreferences.filenameTemplate
-            )
-            trackIdentities = TrackDisplayIdentity.index(files)
-            plans = computedPlans
-            // Default selection: every visible plan. The user can
-            // narrow before applying.
-            selection = Set(visiblePlans.map(\.id))
-        } catch {
-            actionError = "Couldn't scan library: \(error.localizedDescription)"
-        }
+        await preview.rescan(database: services.database, musicFolder: services.watchedMusicFolder, template: UserPreferences.filenameTemplate)
     }
 
     private func applySelected() async {
-        let toApply = selectedPlans
-        guard !toApply.isEmpty else { return }
-        isApplying = true
-        defer { isApplying = false }
+        guard !seratoWatchdog.isSeratoRunning else { return }
+        let plans = await preview.beginApply()
+        guard !plans.isEmpty else { return }
         actionError = nil
         lastResult = nil
-
-        let organizer = LibraryOrganizer(
-            operationEngine: services.operationEngine,
-            activityLog: services.activityLog
-        )
+        let organizer = LibraryOrganizer(operationEngine: services.operationEngine, activityLog: services.activityLog)
         do {
-            let outcome = try await organizer.organize(toApply)
-            if outcome.failureCount == 0 {
-                lastResult = "Organized \(outcome.movedCount) file\(outcome.movedCount == 1 ? "" : "s")"
-            } else {
-                lastResult = "Organized \(outcome.movedCount); \(outcome.failureCount) skipped (see activity log)"
+            let outcome = try await organizer.organize(plans)
+            lastResult = outcome.failureCount == 0
+                ? "Organized \(outcome.movedCount) files"
+                : "Organized \(outcome.movedCount); \(outcome.failureCount) skipped (see activity log)"
+            preview.finishApply()
+            if isVisible {
+                await rescan()
             }
-            await rescan()
         } catch {
+            preview.finishApply()
             actionError = "Organize failed: \(error.localizedDescription)"
         }
+    }
+}
+
+struct OrganizePreviewTable: View {
+    @ObservedObject var preview: OrganizePreviewModel
+    let density: AppDensity
+
+    var body: some View {
+        let snapshot = preview.snapshot
+        let filter = preview.filter
+        VirtualizedPreviewTable(
+            dataID: "\(snapshot.generation):\(filter.rawValue)", accessibilityLabel: "Organize move preview",
+            rowCount: filter == .all ? snapshot.rows.count : snapshot.outsideIndexes.count,
+            row: { index in snapshot.rows[filter == .all ? index : snapshot.outsideIndexes[index]] },
+            columns: [
+                PreviewTableColumn(identifier: "artist", title: "Artist", width: 130, text: { row in row.artist }),
+                PreviewTableColumn(identifier: "title", title: "Title", width: 180, text: { row in row.title }),
+                PreviewTableColumn(identifier: "source", title: "Current path", width: 300, text: { row in row.plan.sourcePath }),
+                PreviewTableColumn(identifier: "destination", title: "Proposed path", width: 300, text: { row in row.plan.destinationPath }),
+                PreviewTableColumn(identifier: "location", title: "Location", width: 160, text: { row in row.plan.isOutsideMusicFolder ? "Outside music folder" : "Inside music folder" }),
+            ],
+            accessibilityName: { row in "\(row.artist) \(row.title)" },
+            isSelected: preview.isSelected,
+            setSelected: { identifier, selected in
+                guard preview.snapshot.generation == snapshot.generation else { return }
+                preview.setSelected(selected, identifier: identifier)
+            },
+            selectAll: {
+                guard preview.snapshot.generation == snapshot.generation else { return }
+                preview.selectScope(true)
+            }, enabled: !preview.isBusy, density: density
+        )
     }
 }

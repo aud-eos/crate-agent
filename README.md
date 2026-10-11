@@ -37,6 +37,12 @@ audio alone does not re-import it. Reconciliation currently supports the configu
 local Serato library, not independent libraries on external volumes. Offline
 volumes cannot provide evidence for retirement.
 
+**Organize** builds a cancellable preview in the background. Start with no files
+selected, review every result using the scrollbar, then choose individual files
+or **Select all matches** in the current filter. Selections survive filter changes;
+the footer and confirmation count hidden selections. See the
+[Organize guide](docs/organize.md).
+
 **Move library** validates each previewed file before moving it. Files that changed
 or became unavailable stay in place; successful moves remain undoable together in
 History. Partial migration keeps the current library-folder setting. See the

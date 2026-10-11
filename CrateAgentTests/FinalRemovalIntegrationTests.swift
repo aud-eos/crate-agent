@@ -666,8 +666,8 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         _ = try batchUpdateDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path, updates: [.init(trackPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: file.path), update: .init(artist: metadata.artist, title: metadata.title, album: metadata.album, genre: metadata.genre, bpm: metadata.bpm, key: metadata.musicalKey, comment: metadata.comment, length: metadata.length, label: metadata.label))])
     }
 
-    static func wav(sample: UInt8 = 0) -> Data {
-        let sampleBytes = Data(repeating: sample, count: 88200)
+    static func wav(sample: UInt8 = 0, durationSeconds: Int = 1) -> Data {
+        let sampleBytes = Data(repeating: sample, count: 88200 * durationSeconds)
         func little<Value: FixedWidthInteger>(_ value: Value) -> Data {
             var encoded = value.littleEndian
             return withUnsafeBytes(of: &encoded) { Data($0) }
