@@ -84,6 +84,11 @@ struct OrganizeView: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, density.pagePadding)
+            if preview.snapshot.blockedCount > 0 {
+                Text("\(preview.snapshot.blockedCount) files need required tags · \(preview.visibleBlockedCount) in this filter. Correct tags in Library Cleanup or Auto-Tag, then rescan.")
+                    .font(.callout)
+                    .padding(.horizontal, density.pagePadding)
+            }
             ActionBar {
                 if let error = actionError ?? preview.error {
                     ActionErrorMessage(message: error)
@@ -105,8 +110,8 @@ struct OrganizeView: View {
                     Button("Rescan") { Task { await rescan() } }
                         .disabled(preview.isApplying)
                 }
-                BatchSelectionToggle(title: "Select all \(preview.visibleCount) matches", coverage: preview.selection.coverage(in: preview.scope),
-                                     enabled: !preview.isBusy && preview.visibleCount > 0, setSelected: preview.selectScope)
+                BatchSelectionToggle(title: "Select all \(preview.scope.count) eligible matches", coverage: preview.selection.coverage(in: preview.scope),
+                                     enabled: !preview.isBusy && !preview.scope.isEmpty, setSelected: preview.selectScope)
                     .fixedSize()
                 Button("Clear selection", action: preview.clearSelection)
                     .disabled(preview.isBusy || preview.selection.count == 0)
@@ -160,9 +165,10 @@ struct OrganizePreviewTable: View {
             columns: [
                 PreviewTableColumn(identifier: "artist", title: "Artist", width: 130, text: { row in row.artist }),
                 PreviewTableColumn(identifier: "title", title: "Title", width: 180, text: { row in row.title }),
-                PreviewTableColumn(identifier: "source", title: "Current path", width: 300, text: { row in row.plan.sourcePath }),
-                PreviewTableColumn(identifier: "destination", title: "Proposed path", width: 300, text: { row in row.plan.destinationPath }),
-                PreviewTableColumn(identifier: "location", title: "Location", width: 160, text: { row in row.plan.isOutsideMusicFolder ? "Outside music folder" : "Inside music folder" }),
+                PreviewTableColumn(identifier: "status", title: "Status", width: 190, text: { row in row.status }),
+                PreviewTableColumn(identifier: "source", title: "Current path", width: 300, text: { row in row.sourcePath }),
+                PreviewTableColumn(identifier: "destination", title: "Proposed path", width: 300, text: { row in row.plan?.destinationPath ?? OrganizeMessages.noValue }),
+                PreviewTableColumn(identifier: "location", title: "Location", width: 160, text: { row in row.isOutsideMusicFolder ? "Outside music folder" : "Inside music folder" }),
             ],
             accessibilityName: { row in "\(row.artist) \(row.title)" },
             isSelected: preview.isSelected,
@@ -173,7 +179,7 @@ struct OrganizePreviewTable: View {
             selectAll: {
                 guard preview.snapshot.generation == snapshot.generation else { return }
                 preview.selectScope(true)
-            }, enabled: !preview.isBusy, density: density
+            }, enabled: !preview.isBusy, density: density, isSelectable: { row in row.plan != nil }
         )
     }
 }

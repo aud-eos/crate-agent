@@ -19,11 +19,28 @@ struct OrganizePlanningCancellation: Sendable {
 
 struct OrganizePreviewSnapshot: Sendable {
     struct Row: Identifiable, Sendable {
-        let plan: LibraryOrganizer.Plan
+        enum Disposition: Sendable {
+            case move(LibraryOrganizer.Plan)
+            case needsMetadata([SeratoMetadataField])
+        }
+
+        let id: Int64
+        let sourcePath: String
+        let isOutsideMusicFolder: Bool
         let artist: String
         let title: String
-        var id: Int64 {
-            plan.id
+        let disposition: Disposition
+
+        var plan: LibraryOrganizer.Plan? {
+            guard case let .move(plan) = disposition else { return nil }
+            return plan
+        }
+
+        var status: String {
+            switch disposition {
+            case .move: return "Ready"
+            case let .needsMetadata(fields): return OrganizeMessages.needsMetadata(fields)
+            }
         }
     }
 
@@ -35,6 +52,10 @@ struct OrganizePreviewSnapshot: Sendable {
     let allScope: IndexSet
     let selection: BatchSelection
     let droppedSelectionCount: Int
+
+    var blockedCount: Int {
+        rows.count - allScope.count
+    }
 
     static let empty = OrganizePreviewSnapshot(rows: [], indexesByID: [:], outsideIndexes: [], outsideScope: [], allScope: [], selection: BatchSelection(), droppedSelectionCount: 0)
 
@@ -51,33 +72,54 @@ struct OrganizePreviewSnapshot: Sendable {
             }
             return files
         }
-        let plans = try LibraryOrganizer.findMoves(in: files, musicFolder: musicFolder, template: template, checkCancellation: cancellation.check)
-        let filesByID = Dictionary(uniqueKeysWithValues: files.compactMap { file in file.id.map { identifier in (identifier, file) } })
+        let preview = try LibraryOrganizer.preview(in: files, musicFolder: musicFolder, template: template, checkCancellation: cancellation.check)
+        let plansByID = Dictionary(uniqueKeysWithValues: preview.plans.map { plan in (plan.id, plan) })
+        let blockedByID = Dictionary(uniqueKeysWithValues: preview.blockedFiles.map { file in (file.id, file) })
         var rows: [Row] = []
         var indexesByID: [Int64: Int] = [:]
         var outsideIndexes: [Int] = []
         var outsideScope = IndexSet()
-        for plan in plans {
+        var allScope = IndexSet()
+        for file in files {
             try cancellation.check()
+            guard let identifier = file.id else { continue }
+            let disposition: Row.Disposition
+            let isOutside: Bool
+            if let plan = plansByID[identifier] {
+                disposition = .move(plan)
+                isOutside = plan.isOutsideMusicFolder
+            } else if let blocked = blockedByID[identifier] {
+                disposition = .needsMetadata(blocked.missingFields)
+                isOutside = blocked.isOutsideMusicFolder
+            } else {
+                continue
+            }
             let index = rows.count
-            indexesByID[plan.id] = index
-            let file = filesByID[plan.id]
-            rows.append(Row(plan: plan, artist: file?.artist ?? "", title: file?.title ?? (plan.sourcePath as NSString).lastPathComponent))
-            if plan.isOutsideMusicFolder {
+            indexesByID[identifier] = index
+            rows.append(Row(id: identifier, sourcePath: file.path, isOutsideMusicFolder: isOutside,
+                            artist: LibraryHygiene.isMissing(file.artist) ? OrganizeMessages.noValue : file.artist ?? "",
+                            title: LibraryHygiene.isMissing(file.title) ? (file.path as NSString).lastPathComponent : file.title ?? "",
+                            disposition: disposition))
+            if isOutside {
                 outsideIndexes.append(index)
-                outsideScope.insert(index)
+            }
+            if case .move = disposition {
+                allScope.insert(index)
+                if isOutside {
+                    outsideScope.insert(index)
+                }
             }
         }
         var reconciled = BatchSelection()
         for oldIndex in selected.indexes {
             try cancellation.check()
-            let oldPlan = previous.rows[oldIndex].plan
+            guard let oldPlan = previous.rows[oldIndex].plan else { preconditionFailure("Blocked rows cannot be selected") }
             if let index = indexesByID[oldPlan.id], rows[index].plan == oldPlan {
                 reconciled.set(true, at: index)
             }
         }
         return OrganizePreviewSnapshot(rows: rows, indexesByID: indexesByID, outsideIndexes: outsideIndexes,
-                                       outsideScope: outsideScope, allScope: IndexSet(integersIn: rows.indices),
+                                       outsideScope: outsideScope, allScope: allScope,
                                        selection: reconciled, droppedSelectionCount: selected.count - reconciled.count)
     }
 }

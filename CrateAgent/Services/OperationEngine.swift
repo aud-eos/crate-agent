@@ -415,7 +415,8 @@ public actor OperationEngine {
     func organizeFiles(_ plans: [LibraryOrganizer.Plan], batchId: String) async throws -> LibraryOrganizer.Outcome {
         let requests = plans.map { plan in
             PhysicalMoveRequest(token: FileMembershipToken(fileId: plan.id, revision: plan.membershipRevision),
-                                sourcePath: plan.sourcePath, destinationPath: plan.destinationPath, sourceIdentity: nil)
+                                sourcePath: plan.sourcePath, destinationPath: plan.destinationPath, sourceIdentity: nil,
+                                organizeRequirements: plan.metadataRequirements)
         }
         let result = try await moveFiles(requests, batchId: batchId)
         return LibraryOrganizer.Outcome(batchId: batchId, movedCount: result.movedCount, failureCount: result.errors.count, errors: result.errors)
@@ -424,7 +425,7 @@ public actor OperationEngine {
     func migrateFiles(_ plans: [LibraryMigrator.Plan], batchId: String) async throws -> LibraryMigrator.Outcome {
         let requests = plans.map { plan in
             PhysicalMoveRequest(token: plan.membershipToken, sourcePath: plan.sourcePath,
-                                destinationPath: plan.destinationPath, sourceIdentity: plan.sourceIdentity)
+                                destinationPath: plan.destinationPath, sourceIdentity: plan.sourceIdentity, organizeRequirements: nil)
         }
         let result = try await moveFiles(requests, batchId: batchId)
         return LibraryMigrator.Outcome(batchId: batchId, movedCount: result.movedCount, failureCount: result.errors.count, errors: result.errors)
@@ -435,6 +436,7 @@ public actor OperationEngine {
         let sourcePath: String
         let destinationPath: String
         let sourceIdentity: SeratoSourceIdentity?
+        let organizeRequirements: OrganizeMetadataRequirements?
     }
 
     private func moveFiles(_ plans: [PhysicalMoveRequest], batchId: String) async throws -> (movedCount: Int, errors: [String]) {
@@ -446,6 +448,12 @@ public actor OperationEngine {
                 let result = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { database, moves in
                     try authorization?.check()
                     try FileProcessingEligibility.requireCurrent(plan.token, in: database)
+                    if let requirements = plan.organizeRequirements {
+                        guard let file = try FileRecord.fetchOne(database, key: plan.token.fileId) else {
+                            throw FileProcessingEligibilityError.superseded(fileId: plan.token.fileId)
+                        }
+                        try requirements.validate(file)
+                    }
                     let result = try Self.executeAndLog(mutation: .renameFile(.init(fileId: plan.token.fileId, newPath: plan.destinationPath,
                                                                                     previousPath: plan.sourcePath, physicalMove: true)), batchId: batchId, in: database,
                                                         physicalMoves: moves, expectedPhysicalSource: plan.sourceIdentity)

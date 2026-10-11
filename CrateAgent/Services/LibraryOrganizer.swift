@@ -26,6 +26,7 @@ public actor LibraryOrganizer {
     /// preview UI; consumed by `organize` at apply time.
     public struct Plan: Identifiable, Hashable, Sendable {
         public let membershipRevision: Int64
+        public let metadataRequirements: OrganizeMetadataRequirements
         public let id: Int64
         public let sourcePath: String
         public let destinationPath: String
@@ -40,14 +41,27 @@ public actor LibraryOrganizer {
             sourcePath: String,
             destinationPath: String,
             isOutsideMusicFolder: Bool,
-            membershipRevision: Int64 = 0
+            membershipRevision: Int64 = 0,
+            metadataRequirements: OrganizeMetadataRequirements = .essential
         ) {
             self.id = id
             self.membershipRevision = membershipRevision
+            self.metadataRequirements = metadataRequirements
             self.sourcePath = sourcePath
             self.destinationPath = destinationPath
             self.isOutsideMusicFolder = isOutsideMusicFolder
         }
+    }
+
+    struct BlockedFile: Sendable {
+        let id: Int64
+        let missingFields: [SeratoMetadataField]
+        let isOutsideMusicFolder: Bool
+    }
+
+    struct Preview: Sendable {
+        let plans: [Plan]
+        let blockedFiles: [BlockedFile]
     }
 
     public struct Outcome: Sendable {
@@ -105,6 +119,15 @@ public actor LibraryOrganizer {
         template: String,
         checkCancellation: () throws -> Void
     ) rethrows -> [Plan] {
+        try preview(in: files, musicFolder: musicFolder, template: template, checkCancellation: checkCancellation).plans
+    }
+
+    nonisolated static func preview<F: HygieneFileSource>(
+        in files: [F], musicFolder: URL, template: String,
+        checkCancellation: () throws -> Void
+    ) rethrows -> Preview {
+        let requirements = OrganizeMetadataRequirements(template: template)
+        var blockedFiles: [BlockedFile] = []
         let musicFolderPath = musicFolder.path
         var plans: [Plan] = []
         var claimedDestinations: Set<String> = []
@@ -113,6 +136,12 @@ public actor LibraryOrganizer {
         for file in files {
             try checkCancellation()
             guard let fileId = file.id else { continue }
+            let isOutside = !file.path.hasPrefix(musicFolderPath + "/") && file.path != musicFolderPath
+            let missing = requirements.missingFields(in: file)
+            guard missing.isEmpty else {
+                blockedFiles.append(BlockedFile(id: fileId, missingFields: missing, isOutsideMusicFolder: isOutside))
+                continue
+            }
             let canonical = RenameDestinationPlanner.destination(
                 forFile: file,
                 musicFolder: musicFolder,
@@ -126,8 +155,6 @@ public actor LibraryOrganizer {
             if file.path == canonical.path {
                 continue
             }
-            let isOutside = !file.path.hasPrefix(musicFolderPath + "/")
-                && file.path != musicFolderPath
             let resolvedDestination = try disambiguatedPath(
                 desired: canonical.path,
                 takenWithinBatch: claimedDestinations,
@@ -140,10 +167,11 @@ public actor LibraryOrganizer {
                 sourcePath: file.path,
                 destinationPath: resolvedDestination,
                 isOutsideMusicFolder: isOutside,
-                membershipRevision: file.membershipRevision
+                membershipRevision: file.membershipRevision,
+                metadataRequirements: requirements
             ))
         }
-        return plans
+        return Preview(plans: plans, blockedFiles: blockedFiles)
     }
 
     /// Per-file compensated transactions preserve partial outcomes;

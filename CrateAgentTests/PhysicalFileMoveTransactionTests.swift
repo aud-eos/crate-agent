@@ -231,7 +231,7 @@ private struct MoveFixture {
         let identity = try FileMetadataCollector.collectVerified(at: source.path)
         database = try LibraryDatabase.openInMemory()
         fileID = try await database.writer.write { database in
-            var file = FileRecord(path: identity.path, volumeUuid: identity.volumeUuid, inode: identity.inode, fileSize: identity.fileSize, mtime: identity.mtime)
+            var file = FileRecord(path: identity.path, volumeUuid: identity.volumeUuid, inode: identity.inode, fileSize: identity.fileSize, mtime: identity.mtime, artist: "Artist", title: "Title")
             file.libraryMembership = .active
             file.fileAvailability = .available
             try file.insert(database)

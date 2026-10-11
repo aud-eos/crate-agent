@@ -17,7 +17,6 @@ import Foundation
 /// metadata field is nil — the engine never throws on missing data,
 /// the caller handles the "empty filename" outcome.
 public enum FilenameTemplateEngine {
-
     /// Filesystem-illegal characters on macOS / common cross-platform
     /// targets. Replaced with `_` in field substitutions so a slash
     /// in `$title` can't escape the intended folder.
@@ -37,6 +36,27 @@ public enum FilenameTemplateEngine {
         metadata: SeratoMetadata,
         fileExtension: String
     ) -> String {
+        substituteFields(in: template) { identifier in
+            substitute(identifier: identifier, metadata: metadata, fileExtension: fileExtension)
+        }
+    }
+
+    static func metadataFields(in template: String) -> Set<SeratoMetadataField> {
+        var fields: Set<SeratoMetadataField> = []
+        _ = substituteFields(in: template) { identifier in
+            if let field = metadataFieldsByIdentifier[identifier] {
+                fields.insert(field)
+            }
+            return ""
+        }
+        return fields
+    }
+
+    private static let metadataFieldsByIdentifier = Dictionary(uniqueKeysWithValues: SeratoMetadataField.allCases.map { field in
+        (field == .musicalKey ? "key" : field.rawValue, field)
+    })
+
+    private static func substituteFields(in template: String, resolve: (String) -> String) -> String {
         var output = ""
         var index = template.startIndex
         while index < template.endIndex {
@@ -50,11 +70,7 @@ public enum FilenameTemplateEngine {
                     continue
                 }
                 let (identifier, advancedIndex) = readIdentifier(in: template, from: after)
-                output.append(substitute(
-                    identifier: identifier,
-                    metadata: metadata,
-                    fileExtension: fileExtension
-                ))
+                output.append(resolve(identifier))
                 index = advancedIndex
                 continue
             }
@@ -78,7 +94,7 @@ public enum FilenameTemplateEngine {
         var identifier = ""
         while index < template.endIndex {
             let char = template[index]
-            if char.isASCII && (char.isLetter || char.isNumber || char == "_") {
+            if char.isASCII, char.isLetter || char.isNumber || char == "_" {
                 identifier.append(char)
                 index = template.index(after: index)
             } else {
@@ -96,19 +112,21 @@ public enum FilenameTemplateEngine {
         metadata: SeratoMetadata,
         fileExtension: String
     ) -> String {
+        if identifier == "ext" {
+            return sanitize(fileExtension)
+        }
+        guard let field = metadataFieldsByIdentifier[identifier] else { return "" }
         let rawValue: String?
-        switch identifier {
-        case "artist": rawValue = metadata.artist
-        case "title": rawValue = metadata.title
-        case "album": rawValue = metadata.album
-        case "genre": rawValue = metadata.genre
-        case "bpm": rawValue = metadata.bpm
-        case "key": rawValue = metadata.musicalKey
-        case "comment": rawValue = metadata.comment
-        case "label": rawValue = metadata.label
-        case "length": rawValue = metadata.length
-        case "ext": rawValue = fileExtension
-        default: rawValue = nil
+        switch field {
+        case .artist: rawValue = metadata.artist
+        case .title: rawValue = metadata.title
+        case .album: rawValue = metadata.album
+        case .genre: rawValue = metadata.genre
+        case .bpm: rawValue = metadata.bpm
+        case .musicalKey: rawValue = metadata.musicalKey
+        case .comment: rawValue = metadata.comment
+        case .label: rawValue = metadata.label
+        case .length: rawValue = metadata.length
         }
         return sanitize(rawValue ?? "")
     }

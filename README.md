@@ -39,8 +39,10 @@ volumes cannot provide evidence for retirement.
 
 **Organize** builds a cancellable preview in the background. Start with no files
 selected, review every result using the scrollbar, then choose individual files
-or **Select all matches** in the current filter. Selections survive filter changes;
-the footer and confirmation count hidden selections. See the
+or **Select all eligible matches** in the current filter. Files missing Artist,
+Title or another tag used by the filename template show what they need and stay
+in place. Selections survive filter changes; the footer and confirmation count
+hidden selections. See the
 [Organize guide](docs/organize.md).
 
 **Move library** validates each previewed file before moving it. Files that changed

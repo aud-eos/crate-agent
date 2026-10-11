@@ -23,7 +23,7 @@ final class OrganizePreviewTests: XCTestCase {
         let model = OrganizePreviewModel()
         try await measureScan(model, database: database, root: root, template: template, label: "idle")
         XCTAssertEqual(model.snapshot.rows.count, 50000)
-        XCTAssertEqual(Set(model.snapshot.rows.map { row in row.plan.destinationPath }).count, 50000)
+        XCTAssertEqual(Set(model.snapshot.rows.compactMap { row in row.plan?.destinationPath }).count, 50000)
         XCTAssertEqual(model.visibleCount, 25000)
         XCTAssertEqual(model.selection.count, 0)
         let initialEvents = try await fixture.events()
@@ -142,7 +142,7 @@ final class OrganizePreviewTests: XCTestCase {
         XCTAssertFalse(model.isScanning)
         XCTAssertNil(model.error)
         XCTAssertEqual(model.selection.count, 0, "Changed proposals must lose selection")
-        XCTAssertTrue(model.snapshot.rows.last!.plan.destinationPath.hasSuffix("/A/New match.mp3"))
+        XCTAssertTrue(model.snapshot.rows.last!.plan!.destinationPath.hasSuffix("/A/New match.mp3"))
     }
 
     private func verifyVirtualizedRendering(_ model: OrganizePreviewModel) throws {

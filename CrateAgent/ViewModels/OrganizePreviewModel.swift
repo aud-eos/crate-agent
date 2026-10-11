@@ -38,6 +38,10 @@ final class OrganizePreviewModel: ObservableObject {
         filter == .all ? snapshot.allScope : snapshot.outsideScope
     }
 
+    var visibleBlockedCount: Int {
+        visibleCount - scope.count
+    }
+
     var hiddenSelectionCount: Int {
         selection.count - selection.count(in: scope)
     }
@@ -53,7 +57,7 @@ final class OrganizePreviewModel: ObservableObject {
     }
 
     func setSelected(_ selected: Bool, identifier: Int64) {
-        guard !isBusy, let index = snapshot.indexesByID[identifier] else { return }
+        guard !isBusy, let index = snapshot.indexesByID[identifier], snapshot.rows[index].plan != nil else { return }
         selection.set(selected, at: index)
     }
 
@@ -133,7 +137,10 @@ final class OrganizePreviewModel: ObservableObject {
         let snapshot = snapshot
         let selected = selection
         return await Task.detached(priority: .userInitiated) {
-            selected.indexes.map { index in snapshot.rows[index].plan }
+            selected.indexes.map { index in
+                guard let plan = snapshot.rows[index].plan else { preconditionFailure("Blocked rows cannot be applied") }
+                return plan
+            }
         }.value
     }
 
