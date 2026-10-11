@@ -68,15 +68,11 @@ public final class AppServices: ObservableObject {
         category: "AppServices"
     )
 
-    /// Convenience bootstrap that reads UserPreferences for the
-    /// watched music folder and opens the on-disk library database.
-    /// Crashes on failure.
-    public static func bootstrap() -> AppServices {
+    public static func bootstrap(watchedMusicFolder: URL) -> AppServices {
         do {
-            let watchedFolder = try UserPreferences.resolveMusicFolder()
             let database = try LibraryDatabase.openDefault()
             return try AppServices(
-                watchedMusicFolder: watchedFolder,
+                watchedMusicFolder: watchedMusicFolder,
                 database: database
             )
         } catch {
@@ -88,6 +84,7 @@ public final class AppServices: ObservableObject {
         watchedMusicFolder: URL,
         database: LibraryDatabase
     ) throws {
+        try ApplicationRuntime.requireLiveResources()
         self.watchedMusicFolder = watchedMusicFolder
         self.database = database
         seratoWatchdog = SeratoWatchdog()

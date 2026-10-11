@@ -1,4 +1,17 @@
 name: CrateAgent
+configs:
+  Debug: debug
+  Release: release
+  Test: debug
+schemes:
+  CrateAgent:
+    build:
+      targets:
+        CrateAgent: all
+    test:
+      config: Test
+      targets:
+        - CrateAgentTests
 options:
   bundleIdPrefix: com.crateagent
   deploymentTarget:
@@ -71,6 +84,10 @@ targets:
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/build-output"
         HEADER_SEARCH_PATHS: "$(SRCROOT)/build-output"
         SWIFT_OBJC_BRIDGING_HEADER: "CrateAgent/Generated/crate_agent_coreFFI.h"
+      configs:
+        Test:
+          PRODUCT_BUNDLE_IDENTIFIER: com.crateagent.CrateAgent.TestHost
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) CRATE_AGENT_TEST_HOST"
 
   CrateAgentTests:
     type: bundle.unit-test

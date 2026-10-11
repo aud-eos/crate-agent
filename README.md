@@ -86,10 +86,14 @@ make test-rust      # Only Rust core
 make test-swift     # Only Swift app
 ```
 
-The hosted Swift test process currently starts normal services when a personal
-library is configured. Run it only in an isolated test account/library until
-[test-host isolation #116](https://github.com/aud-eos/crate-agent/issues/116) is
-implemented; a passing suite does not guarantee that live library state was untouched.
+`make test-swift` uses the **Test** configuration, whose app host has a separate
+bundle identifier and never starts live application services. The generated
+CrateAgent scheme also selects Test for Xcode's Test action. Keep that configuration
+when invoking `xcodebuild` directly; overriding it with Debug or Release loses the
+separate AppKit preferences domain. Live database, Serato-location, and preference
+factories reject calls from XCTest. Launcher tests inject isolated preferences and
+service factories; service integration tests use in-memory databases and temporary
+library fixtures. See [test isolation](docs/testing.md) for the contract.
 
 ### Iterate
 

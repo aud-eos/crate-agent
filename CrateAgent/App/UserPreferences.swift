@@ -1,35 +1,28 @@
 import CoreServices
 import Foundation
 
-/// Thin wrapper over UserDefaults for the small set of preferences
-/// crate-agent persists across launches. Currently just the
-/// user-chosen music folder; expanded over time as Settings UI lands.
-///
-/// Reads are synchronous and cheap; writes flush via UserDefaults's
-/// own coalescing. No abstraction is layered on top because the goal
-/// is exactly "UserDefaults-backed string with a typed accessor" —
-/// the type guards against typos in the key string and the URL/Path
-/// conversion is centralized.
 public enum UserPreferences {
+    private static var store: PreferencesStore {
+        do { return try PreferencesStore.live() }
+        catch { preconditionFailure("Live preferences are unavailable in tests: \(error)") }
+    }
 
-    /// Stored as a path string; converted to URL on read. We don't
-    /// use security-scoped bookmarks because the app is not sandboxed
-    /// at SP-1 — bookmark roundtripping becomes necessary if/when
-    /// App Store distribution lands.
     public static var watchedMusicFolder: URL? {
-        get {
-            guard let path = UserDefaults.standard.string(forKey: Key.watchedMusicFolderPath) else {
-                return nil
-            }
-            return URL(fileURLWithPath: path, isDirectory: true)
-        }
-        set {
-            if let newValue {
-                UserDefaults.standard.set(newValue.path, forKey: Key.watchedMusicFolderPath)
-            } else {
-                UserDefaults.standard.removeObject(forKey: Key.watchedMusicFolderPath)
-            }
-        }
+        get { store.watchedMusicFolder }
+        set { store.watchedMusicFolder = newValue }
+    }
+
+    public static var filenameTemplate: String {
+        get { store.filenameTemplate }
+        set { store.filenameTemplate = newValue }
+    }
+
+    public static func lastFSEventId(forWatchedPath path: String) -> FSEventStreamEventId? {
+        store.lastFSEventId(forWatchedPath: path)
+    }
+
+    public static func setLastFSEventId(_ eventId: FSEventStreamEventId, forWatchedPath path: String) {
+        store.setLastFSEventId(eventId, forWatchedPath: path)
     }
 
     /// Resolve the music folder to watch: stored preference takes
@@ -68,41 +61,76 @@ public enum UserPreferences {
         )
     }
 
+    /// Default template used by the manual rename dialog. Beets-style
+    /// `$field` syntax; see FilenameTemplateEngine. The user-saved
+    /// override (if any) takes precedence; both forms always include
+    /// the extension via `$ext` so renames don't accidentally drop it.
+    public static let defaultFilenameTemplate = "$artist - $title.$ext"
+}
+
+struct PreferencesStore {
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults) {
+        precondition(!ApplicationRuntime.isTesting || defaults !== UserDefaults.standard,
+                     "Tests must inject isolated preferences")
+        self.defaults = defaults
+    }
+
+    static func live() throws -> PreferencesStore {
+        try ApplicationRuntime.requireLiveResources()
+        return PreferencesStore(defaults: .standard)
+    }
+
+    /// Stored as a path string; converted to URL on read. We don't
+    /// use security-scoped bookmarks because the app is not sandboxed
+    /// at SP-1 — bookmark roundtripping becomes necessary if/when
+    /// App Store distribution lands.
+    var watchedMusicFolder: URL? {
+        get {
+            guard let path = defaults.string(forKey: Key.watchedMusicFolderPath) else {
+                return nil
+            }
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        nonmutating set {
+            if let newValue {
+                defaults.set(newValue.path, forKey: Key.watchedMusicFolderPath)
+            } else {
+                defaults.removeObject(forKey: Key.watchedMusicFolderPath)
+            }
+        }
+    }
+
     /// Last FSEvents event ID we successfully processed for the
     /// given watched-folder path. Used as the `sinceWhen` argument on
     /// next launch so events that fire while crate-agent is closed
     /// are replayed rather than silently lost. Keyed by path so that
     /// changing the watched folder doesn't replay events from the
     /// old folder against the new one.
-    public static func lastFSEventId(forWatchedPath path: String) -> FSEventStreamEventId? {
+    func lastFSEventId(forWatchedPath path: String) -> FSEventStreamEventId? {
         let key = Key.lastFSEventIdPrefix + path
-        guard let stored = UserDefaults.standard.object(forKey: key) as? UInt64 else {
+        guard let stored = defaults.object(forKey: key) as? UInt64 else {
             return nil
         }
         return FSEventStreamEventId(stored)
     }
 
-    public static func setLastFSEventId(
+    func setLastFSEventId(
         _ eventId: FSEventStreamEventId,
         forWatchedPath path: String
     ) {
         let key = Key.lastFSEventIdPrefix + path
-        UserDefaults.standard.set(UInt64(eventId), forKey: key)
+        defaults.set(UInt64(eventId), forKey: key)
     }
 
-    /// Default template used by the manual rename dialog. Beets-style
-    /// `$field` syntax; see FilenameTemplateEngine. The user-saved
-    /// override (if any) takes precedence; both forms always include
-    /// the extension via `$ext` so renames don't accidentally drop it.
-    public static let defaultFilenameTemplate = "$artist - $title.$ext"
-
-    public static var filenameTemplate: String {
+    var filenameTemplate: String {
         get {
-            UserDefaults.standard.string(forKey: Key.filenameTemplate)
-                ?? defaultFilenameTemplate
+            defaults.string(forKey: Key.filenameTemplate)
+                ?? UserPreferences.defaultFilenameTemplate
         }
-        set {
-            UserDefaults.standard.set(newValue, forKey: Key.filenameTemplate)
+        nonmutating set {
+            defaults.set(newValue, forKey: Key.filenameTemplate)
         }
     }
 
