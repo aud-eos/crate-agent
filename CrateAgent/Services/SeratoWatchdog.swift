@@ -38,8 +38,14 @@ public final class SeratoWatchdog: ObservableObject {
 
     private let runningBundleIdentifiersProvider: () -> [String]
     private let workspaceNotificationCenter: NotificationCenter
-    private let notificationBundleIdentifierProvider: (Notification) -> String?
+    struct ApplicationIdentity: Hashable {
+        let bundleIdentifier: String
+        let processIdentifier: pid_t
+    }
+
+    private let notificationApplicationProvider: (Notification) -> ApplicationIdentity?
     private var observers: [NSObjectProtocol] = []
+    private var notifiedRunningApplications = Set<ApplicationIdentity>()
 
     /// Pass `nil` (or rely on the default) for production behavior —
     /// reads NSWorkspace.shared.runningApplications. Tests pass a
@@ -55,8 +61,10 @@ public final class SeratoWatchdog: ObservableObject {
     ) {
         self.init(
             workspaceNotificationCenter: NSWorkspace.shared.notificationCenter,
-            notificationBundleIdentifierProvider: { notification in
-                (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+            notificationApplicationProvider: { notification in
+                guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      let bundleIdentifier = application.bundleIdentifier else { return nil }
+                return ApplicationIdentity(bundleIdentifier: bundleIdentifier, processIdentifier: application.processIdentifier)
             },
             runningBundleIdentifiersProvider: customProvider
         )
@@ -64,11 +72,11 @@ public final class SeratoWatchdog: ObservableObject {
 
     init(
         workspaceNotificationCenter: NotificationCenter,
-        notificationBundleIdentifierProvider: @escaping (Notification) -> String?,
+        notificationApplicationProvider: @escaping (Notification) -> ApplicationIdentity?,
         runningBundleIdentifiersProvider customProvider: (() -> [String])? = nil
     ) {
         self.workspaceNotificationCenter = workspaceNotificationCenter
-        self.notificationBundleIdentifierProvider = notificationBundleIdentifierProvider
+        self.notificationApplicationProvider = notificationApplicationProvider
         runningBundleIdentifiersProvider = customProvider ?? {
             NSWorkspace.shared.runningApplications.compactMap { app in
                 app.bundleIdentifier
@@ -104,28 +112,40 @@ public final class SeratoWatchdog: ObservableObject {
     }
 
     private func handleWorkspaceNotification(_ notification: Notification) {
-        guard let bundleIdentifier = notificationBundleIdentifierProvider(notification),
-              bundleIdentifier.hasPrefix(Self.seratoBundleIdentifierPrefix)
+        guard let application = notificationApplicationProvider(notification),
+              application.bundleIdentifier.hasPrefix(Self.seratoBundleIdentifierPrefix)
         else { return }
-        // A queued launch and termination can both arrive after the process has exited.
-        stateRevision += 1
-        let revision = stateRevision
-        externalWriteState.withLock { state in state.revision = revision }
-        refresh()
+        if notification.name == NSWorkspace.didLaunchApplicationNotification {
+            notifiedRunningApplications.insert(application)
+            updateRunningState(true, invalidateSnapshot: true)
+        } else if notification.name == NSWorkspace.didTerminateApplicationNotification {
+            notifiedRunningApplications.remove(application)
+            refresh(invalidateSnapshot: true)
+        }
     }
 
     /// Recompute `isSeratoRunning` from the current running app list.
     /// Exposed for tests; in production this is called automatically
     /// when NSWorkspace notifications fire.
     public func refresh() {
+        refresh(invalidateSnapshot: false)
+    }
+
+    private func refresh(invalidateSnapshot: Bool) {
         let runningIdentifiers = runningBundleIdentifiersProvider()
-        let running = runningIdentifiers.contains { identifier in
+        // Process-list refreshes can lag launch notifications; only termination revokes that evidence.
+        let running = !notifiedRunningApplications.isEmpty || runningIdentifiers.contains { identifier in
             identifier.hasPrefix(Self.seratoBundleIdentifierPrefix)
         }
+        updateRunningState(running, invalidateSnapshot: invalidateSnapshot)
+    }
+
+    private func updateRunningState(_ running: Bool, invalidateSnapshot: Bool) {
+        guard running != isSeratoRunning || invalidateSnapshot else { return }
+        stateRevision += 1
+        let revision = stateRevision
+        externalWriteState.withLock { state in state = (running, revision) }
         if running != isSeratoRunning {
-            stateRevision += 1
-            let revision = stateRevision
-            externalWriteState.withLock { state in state = (running, revision) }
             isSeratoRunning = running
         }
     }
