@@ -212,6 +212,15 @@ review persistence without granting retired or replaced candidates new authority
 Successful explicit adds and snapshots use the same volume UUID plus canonical
 directory ownership identifier. Add confirmation remains the engine's existing
 `import-confirmed:<eventID>` transaction. Failed adds retain pending membership.
+An immediate add failure also retains the original guarded add in the in-memory
+queue and reports a pending-sync import result. The Library drop flow publishes
+the failure through the shared sync status and Retry Sync action. Retry performs
+the external add and normal confirmation without repeating import intent or
+changing the original event payloads/inverses. Failed or unattempted adds are
+retained once per event; already completed adds are not queued again. The normal
+membership, physical-target, and Serato-running checks still apply, so changed,
+retired, or removed audio supersedes the old request. A new explicit drop can
+establish new intent under the existing membership-revision rules.
 This work does not implement the general durable queue (#110) or change shared
 recording ownership rules (#113).
 
