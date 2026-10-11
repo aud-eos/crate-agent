@@ -10,8 +10,9 @@ final class SeratoMembershipSnapshotTests: XCTestCase {
     private func observingWatchdog(_ center: NotificationCenter) -> SeratoWatchdog {
         let watchdog = SeratoWatchdog(
             workspaceNotificationCenter: center,
-            notificationBundleIdentifierProvider: { notification in
-                notification.userInfo?[Self.notificationBundleIdentifierKey] as? String
+            notificationApplicationProvider: { notification in
+                guard let bundleIdentifier = notification.userInfo?[Self.notificationBundleIdentifierKey] as? String else { return nil }
+                return SeratoWatchdog.ApplicationIdentity(bundleIdentifier: bundleIdentifier, processIdentifier: 1)
             },
             runningBundleIdentifiersProvider: { [] }
         )

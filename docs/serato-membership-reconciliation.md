@@ -183,6 +183,13 @@ Serato launch during a sync cancels it and leaves queued intent intact. After an
 already validated session, Serato being open permits local processing with outbound
 writes queued; initial startup while Serato is open never enables state-changing processing.
 
+A Serato launch notification closes the locked external-write gate and advances its
+revision together, before publishing the running state. Launch evidence remains
+until the corresponding process's termination notification, so a lagging process-list
+refresh or another instance sharing its bundle ID cannot reopen the gate.
+Termination refreshes the process list and keeps writes
+blocked while any other notified or observed Serato application remains running.
+
 Main window and menu bar share waiting, reconciliation, result, and failure status
 with Retry Sync. Missing or corrupt source errors retain queued writes. Fingerprint
 worker database errors appear in the Library header and activity log without changing
