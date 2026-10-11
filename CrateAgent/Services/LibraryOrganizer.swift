@@ -22,7 +22,6 @@ import Foundation
 /// `Outcome.errors`. Every successful move shares one `batch_id`
 /// so Undo on History reverts the whole sweep.
 public actor LibraryOrganizer {
-
     /// One proposed move. Returned from `findMoves` for the
     /// preview UI; consumed by `organize` at apply time.
     public struct Plan: Identifiable, Hashable, Sendable {
@@ -95,15 +94,24 @@ public actor LibraryOrganizer {
     /// without round-tripping through the actor — pure computation,
     /// no engine access.
     public nonisolated static func findMoves<F: HygieneFileSource>(
+        in files: [F], musicFolder: URL, template: String
+    ) -> [Plan] {
+        findMoves(in: files, musicFolder: musicFolder, template: template, checkCancellation: {})
+    }
+
+    public nonisolated static func findMoves<F: HygieneFileSource>(
         in files: [F],
         musicFolder: URL,
-        template: String
-    ) -> [Plan] {
+        template: String,
+        checkCancellation: () throws -> Void
+    ) rethrows -> [Plan] {
         let musicFolderPath = musicFolder.path
         var plans: [Plan] = []
         var claimedDestinations: Set<String> = []
+        var nextSuffixByDestination: [String: Int] = [:]
 
         for file in files {
+            try checkCancellation()
             guard let fileId = file.id else { continue }
             let canonical = RenameDestinationPlanner.destination(
                 forFile: file,
@@ -120,9 +128,11 @@ public actor LibraryOrganizer {
             }
             let isOutside = !file.path.hasPrefix(musicFolderPath + "/")
                 && file.path != musicFolderPath
-            let resolvedDestination = disambiguatedPath(
+            let resolvedDestination = try disambiguatedPath(
                 desired: canonical.path,
-                takenWithinBatch: claimedDestinations
+                takenWithinBatch: claimedDestinations,
+                nextSuffixByDestination: &nextSuffixByDestination,
+                checkCancellation: checkCancellation
             )
             claimedDestinations.insert(resolvedDestination)
             plans.append(Plan(
@@ -162,12 +172,14 @@ public actor LibraryOrganizer {
 
     /// If `desired` collides with another path already claimed in
     /// this organize batch, append ` (1)`, ` (2)`, ... before the
-    /// extension until unique. Bounded loop — gives up after 1000
-    /// attempts (extremely unlikely; would indicate a bug).
+    /// extension until unique. Remember the next suffix so a repeated
+    /// destination does not restart the search through earlier claims.
     private nonisolated static func disambiguatedPath(
         desired: String,
-        takenWithinBatch: Set<String>
-    ) -> String {
+        takenWithinBatch: Set<String>,
+        nextSuffixByDestination: inout [String: Int],
+        checkCancellation: () throws -> Void
+    ) rethrows -> String {
         if !takenWithinBatch.contains(desired) {
             return desired
         }
@@ -175,7 +187,9 @@ public actor LibraryOrganizer {
         let nameWithoutExt = url.deletingPathExtension().lastPathComponent
         let ext = url.pathExtension
         let parent = url.deletingLastPathComponent()
-        for attempt in 1...1000 {
+        var attempt = nextSuffixByDestination[desired, default: 1]
+        while true {
+            try checkCancellation()
             let suffix = " (\(attempt))"
             let candidateFilename = ext.isEmpty
                 ? "\(nameWithoutExt)\(suffix)"
@@ -183,10 +197,11 @@ public actor LibraryOrganizer {
             let candidate = parent
                 .appendingPathComponent(candidateFilename)
                 .path
+            attempt += 1
             if !takenWithinBatch.contains(candidate) {
+                nextSuffixByDestination[desired] = attempt
                 return candidate
             }
         }
-        return desired
     }
 }
