@@ -27,6 +27,7 @@ struct MigrateLibrarySheet: View {
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Music/_DJ_Library_")
     @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var plans: [LibraryMigrator.Plan] = []
+    @State private var scanID = UUID()
     @State private var isScanning: Bool = false
     @State private var isApplying: Bool = false
     @State private var actionError: String?
@@ -92,6 +93,7 @@ struct MigrateLibrarySheet: View {
                     (try? UserPreferences.defaultLibraryRoot())?.path == newRoot.path
                 )
             }
+            .disabled(isApplying)
         }
         .padding(.horizontal, density.pagePadding)
         .padding(.vertical, density.spacing)
@@ -167,11 +169,13 @@ struct MigrateLibrarySheet: View {
         } actions: {
             Button("Cancel") { dismiss() }
                 .disabled(isApplying)
+            Button("Re-scan") { Task { await rescan() } }
+                .disabled(isScanning || isApplying)
             Button("Move \(plans.count) files") {
                 pendingConfirm = true
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(plans.isEmpty || isApplying || seratoWatchdog.isSeratoRunning)
+            .disabled(plans.isEmpty || isScanning || isApplying || seratoWatchdog.isSeratoRunning)
             .help(seratoWatchdog.isSeratoRunning
                 ? "Quit Serato before moving — the Serato library writes shouldn't run while Serato is open."
                 : "Move every tracked file to the new root and update Serato + DB in one batch.")
@@ -181,44 +185,40 @@ struct MigrateLibrarySheet: View {
     // MARK: - Actions
 
     private func rescan() async {
+        let requestID = UUID()
+        scanID = requestID
+        let destinationRoot = newRoot
+        let oldRoot = services.watchedMusicFolder
         isScanning = true
-        defer { isScanning = false }
+        plans = []
+        defer {
+            if scanID == requestID {
+                isScanning = false
+            }
+        }
         actionError = nil
         do {
-            let files = try await services.database.writer.read { db in
-                try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL)
+            let preview = try await services.database.writer.read { database in
+                let files = try HygieneFileRow.fetchAll(database, sql: HygieneFileRow.hygieneFetchSQL)
+                let plans = try LibraryMigrator.prepareMoves(in: files, oldRoot: oldRoot, newRoot: destinationRoot)
+                return (files, plans)
             }
-            trackIdentities = TrackDisplayIdentity.index(files)
-            plans = LibraryMigrator.findMoves(
-                in: files,
-                oldRoot: services.watchedMusicFolder,
-                newRoot: newRoot
-            )
+            guard scanID == requestID else { return }
+            trackIdentities = TrackDisplayIdentity.index(preview.0)
+            plans = preview.1
         } catch {
+            guard scanID == requestID else { return }
             actionError = "Couldn't plan move: \(error.localizedDescription)"
         }
     }
 
     private func applyMigration() async {
-        guard !plans.isEmpty else { return }
+        guard !plans.isEmpty, !isScanning, !isApplying else { return }
+        let destinationRoot = newRoot
         isApplying = true
         defer { isApplying = false }
         actionError = nil
         lastResult = nil
-
-        // Make sure the destination root exists. The migrator's
-        // per-file `createDirectory(withIntermediateDirectories:)`
-        // covers letter buckets, but the root itself is needed for
-        // the children to land somewhere.
-        do {
-            try FileManager.default.createDirectory(
-                at: newRoot,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            actionError = "Couldn't create destination: \(error.localizedDescription)"
-            return
-        }
 
         let migrator = LibraryMigrator(
             operationEngine: services.operationEngine,
@@ -229,13 +229,25 @@ struct MigrateLibrarySheet: View {
             if outcome.failureCount == 0 {
                 lastResult = "Moved \(outcome.movedCount) file\(outcome.movedCount == 1 ? "" : "s")"
             } else {
-                lastResult = "Moved \(outcome.movedCount); \(outcome.failureCount) skipped (see activity log)"
+                actionError = (["Moved \(outcome.movedCount); \(outcome.failureCount) skipped. Library folder unchanged."]
+                    + Array(outcome.errors.prefix(3))
+                    + ["See activity log for errors. Re-scan to retry, or undo the completed moves in History."]).joined(separator: "\n")
+                plans = []
+                return
+            }
+            let remaining = try await LibraryMigrator.remainingFileCount(in: services.database,
+                                                                         oldRoot: services.watchedMusicFolder, newRoot: destinationRoot)
+            guard remaining == 0 else {
+                actionError = "Moved \(outcome.movedCount); \(remaining) tracked files still need migration, including unavailable files. Library folder unchanged. Restore availability and re-scan, or undo in History."
+                plans = []
+                return
             }
             // Point the watched-folder preference at the new root
             // so the next launch picks up there.
-            UserPreferences.watchedMusicFolder = newRoot
+            UserPreferences.watchedMusicFolder = destinationRoot
             showRestartAlert = true
         } catch {
+            plans = []
             actionError = "Migration failed: \(error.localizedDescription)"
         }
     }
