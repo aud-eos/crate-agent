@@ -7,7 +7,6 @@ import Foundation
 /// Per-drive `_Serato_/` folders on external volumes (for portable
 /// library workflows) are out of scope until Pillar E lands.
 public struct SeratoLibraryLocator: Sendable, Equatable {
-
     /// Folder containing the `database V2` file and the `Subcrates/`
     /// directory. For a default install this is
     /// `/Users/<user>/Music/_Serato_/`.
@@ -21,6 +20,7 @@ public struct SeratoLibraryLocator: Sendable, Equatable {
     /// the directory exists — callers should handle missing-library
     /// cases (e.g., Serato has never run on this machine).
     public static func defaultLocation() throws -> SeratoLibraryLocator {
+        try ApplicationRuntime.requireLiveResources()
         let musicFolderUrl = try FileManager.default.url(
             for: .musicDirectory,
             in: .userDomainMask,

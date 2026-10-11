@@ -14,7 +14,7 @@ struct CrateAgentApp: App {
             CommandGroup(replacing: .newItem) {}
         }
 
-        MenuBarExtra("crate-agent", systemImage: "music.note.list") {
+        MenuBarExtra("crate-agent", systemImage: "music.note.list", isInserted: .constant(!ApplicationRuntime.isTesting)) {
             menuBarContent
         }
         .menuBarExtraStyle(.window)
@@ -27,11 +27,13 @@ struct CrateAgentApp: App {
     @ViewBuilder
     private var rootView: some View {
         switch launcher.state {
+        case .inactive:
+            EmptyView()
         case .needsOnboarding:
             OnboardingView { pickedFolder in
                 launcher.completeOnboarding(withFolder: pickedFolder)
             }
-        case .ready(let services):
+        case let .ready(services):
             MainWindowView()
                 .environmentObject(services)
                 .environmentObject(services.seratoWatchdog)
@@ -46,6 +48,8 @@ struct CrateAgentApp: App {
     @ViewBuilder
     private var menuBarContent: some View {
         switch launcher.state {
+        case .inactive:
+            EmptyView()
         case .needsOnboarding:
             VStack(alignment: .leading, spacing: 6) {
                 Text("crate-agent")
@@ -56,7 +60,7 @@ struct CrateAgentApp: App {
             }
             .padding(12)
             .frame(width: 220)
-        case .ready(let services):
+        case let .ready(services):
             MenuBarStatusView()
                 .environmentObject(services)
                 .environmentObject(services.seratoWatchdog)
@@ -66,6 +70,8 @@ struct CrateAgentApp: App {
     @ViewBuilder
     private var settingsContent: some View {
         switch launcher.state {
+        case .inactive:
+            EmptyView()
         case .needsOnboarding:
             VStack(spacing: 8) {
                 Image(systemName: "gear.badge.questionmark")
@@ -76,7 +82,7 @@ struct CrateAgentApp: App {
                     .foregroundStyle(.secondary)
             }
             .frame(width: 360, height: 200)
-        case .ready(let services):
+        case let .ready(services):
             SettingsView()
                 .environmentObject(services)
         }

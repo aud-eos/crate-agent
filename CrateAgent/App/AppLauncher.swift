@@ -1,38 +1,54 @@
 import Foundation
 
-/// Two-state launcher that gates AppServices construction on whether
-/// the user has chosen a music folder. First-launch users land in
-/// `.needsOnboarding`; returning users (with a stored
-/// `UserPreferences.watchedMusicFolder`) land in `.ready(services)`.
-///
-/// Why a separate type from AppServices: AppServices's init is heavy
-/// — opens the SQLite database, starts FSEvents and background
-/// fingerprinting, and registers Combine bridges. Doing that *before* the
-/// user has picked a folder means watching/scanning the wrong path
-/// and creating throwaway state. The launcher defers construction
-/// until the choice exists.
+public typealias AppLauncher = ApplicationLauncher<AppServices>
+
 @MainActor
-public final class AppLauncher: ObservableObject {
+public final class ApplicationLauncher<Services>: ObservableObject {
     public enum State {
+        case inactive
         case needsOnboarding
-        case ready(AppServices)
+        case ready(Services)
     }
 
     @Published public private(set) var state: State
+    private let preferences: PreferencesStore?
+    private let makeServices: ((URL) -> Services)?
 
-    public init() {
-        if UserPreferences.watchedMusicFolder != nil {
-            state = .ready(AppServices.bootstrap())
+    fileprivate init(inactive _: Void) {
+        state = .inactive
+        preferences = nil
+        makeServices = nil
+    }
+
+    init(preferences: PreferencesStore, makeServices: @escaping (URL) -> Services) {
+        self.preferences = preferences
+        self.makeServices = makeServices
+        if let folder = preferences.watchedMusicFolder {
+            state = .ready(makeServices(folder))
         } else {
             state = .needsOnboarding
         }
     }
 
-    /// Persist the picked folder and bootstrap services. Transitions
-    /// the launcher into `.ready`, which the view tree observes to
-    /// reveal the library browser.
     public func completeOnboarding(withFolder folder: URL) {
-        UserPreferences.watchedMusicFolder = folder
-        state = .ready(AppServices.bootstrap())
+        guard let preferences, let makeServices else {
+            preconditionFailure("An inactive application cannot complete onboarding")
+        }
+        preferences.watchedMusicFolder = folder
+        state = .ready(makeServices(folder))
+    }
+}
+
+public extension ApplicationLauncher where Services == AppServices {
+    convenience init() {
+        if ApplicationRuntime.isTesting {
+            self.init(inactive: ())
+        } else {
+            do {
+                try self.init(preferences: PreferencesStore.live(), makeServices: AppServices.bootstrap)
+            } catch {
+                fatalError("Application startup failed: \(error)")
+            }
+        }
     }
 }

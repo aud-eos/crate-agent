@@ -115,7 +115,7 @@ test-rust:
 
 test-swift: xcodeproj
 	@echo "==> Running Swift tests..."
-	xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent -configuration Debug test
+	xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent -configuration Test -derivedDataPath "$(DERIVED_DATA_PATH)" test
 
 # ---------------------------------------------------------------------------
 # Format & lint

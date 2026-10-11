@@ -32,6 +32,7 @@ public final class LibraryDatabase {
     /// Open the production database file under Application Support.
     /// Creates the directory and migrates the schema on first launch.
     public static func openDefault() throws -> LibraryDatabase {
+        try ApplicationRuntime.requireLiveResources()
         let applicationSupportUrl = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
