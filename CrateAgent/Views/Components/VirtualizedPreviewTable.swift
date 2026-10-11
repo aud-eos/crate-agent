@@ -20,6 +20,7 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
     let selectAll: () -> Void
     let enabled: Bool
     let density: AppDensity
+    var isSelectable: (Row) -> Bool = { _ in true }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -75,6 +76,7 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
                 guard let self, let table = self.table, self.configuration.enabled,
                       table.selectedRow >= 0, table.selectedRow < self.configuration.rowCount else { return }
                 let row = self.configuration.row(table.selectedRow)
+                guard self.configuration.isSelectable(row) else { return }
                 self.configuration.setSelected(row.id, !self.configuration.isSelected(row.id))
                 self.refreshVisibleCheckboxes()
             }
@@ -134,13 +136,16 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
         private func configure(_ checkbox: PreviewCheckbox, row: Row) {
             checkbox.title = ""
             checkbox.state = configuration.isSelected(row.id) ? .on : .off
-            checkbox.isEnabled = configuration.enabled
+            let selectable = configuration.isSelectable(row)
+            checkbox.isHidden = !selectable
+            checkbox.setAccessibilityElement(selectable)
+            checkbox.isEnabled = configuration.enabled && selectable
             checkbox.controlSize = configuration.density == .compact ? .small : .regular
             checkbox.setAccessibilityLabel("Select \(configuration.accessibilityName(row))")
             let dataID = configuration.dataID
             let identifier = row.id
             checkbox.onPress = { [weak self] in
-                guard let self, self.configuration.enabled, self.configuration.dataID == dataID else { return }
+                guard let self, selectable, self.configuration.enabled, self.configuration.dataID == dataID else { return }
                 self.configuration.setSelected(identifier, !self.configuration.isSelected(identifier))
                 self.refreshVisibleCheckboxes()
             }

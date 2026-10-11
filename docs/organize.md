@@ -8,25 +8,46 @@ The preview loads in the background. **Cancel scan** or leaving the screen cance
 that request; an obsolete request cannot replace a newer result. Cancelling a
 rescan retains the previous preview. Planning errors remain visible beside Rescan.
 
+## Required metadata
+
+Artist and Title must both be present, even when the filename template omits
+one of them. Other supported tags become required when the template references
+them: Album, Genre, BPM, Key, Comment, Label and Length. Nil, empty and
+whitespace-only values are missing. `$ext` comes from the file path, and escaped
+text such as `$$album` is a literal, not a metadata requirement.
+
+Files lacking required tags stay visible with a **Needs Artist**, **Needs Title**,
+or other missing-field status. They have no proposed destination or selection
+checkbox. The footer counts blocked files across the preview and in the current
+filter. Correct their tags in Library Cleanup or Auto-Tag, then rescan. Repaired
+files do not become selected automatically; selected files that become blocked
+are deselected with a notice.
+
+These checks use indexed metadata; opening Organize does not read embedded tags
+or infer artist/title from a filename. The existing filename is only a display
+fallback. Apply checks the plan's required tags again inside the move transaction.
+If a required value became blank, that file stays in place with no move event and
+an explicit failure reason. Other eligible selected files can still move.
+
 ## Review and selection
 
-- The default filter shows proposed moves from outside the music folder. **All**
-  also includes files inside the folder whose paths need changing.
+- The default filter shows files outside the music folder. **All** also includes
+  proposed moves and blocked files inside it.
 - The native table scrolls through every matching proposal. It has no result cap
   or next-page button. Resize columns or hover over a path to read its full value.
   Comfortable and Compact density both apply to the table.
-- Nothing starts selected. Check individual rows, or use **Select all N matches**
-  to select every result in the current filter, including rows outside the viewport.
+- Nothing starts selected. Check individual rows, or use **Select all N eligible matches**
+  to select every eligible result in the current filter, including rows outside the viewport.
   The checkbox shows a mixed state for partial selection; clicking it selects the
   remaining matches. Unchecking it clears only that filter's selection.
 - Arrow keys move row focus. Space toggles the focused row's checkbox; Command-A
-  selects every match in the current filter. Row focus alone does not select a file
+  selects every eligible match in the current filter. Row focus alone does not select a file
   for moving. Checkboxes have accessible track labels.
 - Changing filters preserves selections. The footer shows the total selected and
   how many lie outside the current filter. **Clear selection** clears both visible
   and hidden selections.
 - Rescanning preserves a selected proposal only if its file, membership revision,
-  source and destination still match. Changed or removed proposals are deselected
+  source, destination and required fields still match. Changed or removed proposals are deselected
   with a visible notice. New proposals never become selected automatically.
 
 **Move N selected files** confirms the complete selection, including the hidden
