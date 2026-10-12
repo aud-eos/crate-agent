@@ -11,6 +11,12 @@ not enumerate a music folder or Trash. Ownership mismatches and offline volumes
 cannot retire a row. File availability is recorded independently of membership.
 Retirement retains file ID, recording association, fingerprint, and History.
 
+Availability checks continue past UUID lookup failures for individual mounted
+volumes. A successfully inspected matching volume establishes that the target
+volume is online; no match leaves it offline. Failure to enumerate mounted
+volumes still surfaces as an error, and target-path errors retain their existing
+missing/inaccessible/error classifications.
+
 Pending explicit imports survive absence. A saved old path also protects a
 currently applicable rename when its membership revision still matches, its
 destination is the verified indexed file, and its original location is missing.

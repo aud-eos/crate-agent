@@ -2,16 +2,32 @@ import Darwin
 import Foundation
 
 public struct FileAvailabilityResolver: Sendable {
-    public init() {}
+    private let mountedVolumes: @Sendable () throws -> [URL]
+    private let volumeIdentifier: @Sendable (URL) throws -> String?
+
+    public init() {
+        self.init(mountedVolumes: {
+            guard let volumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeUUIDStringKey]) else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            return volumes
+        }, volumeIdentifier: { volume in
+            try volume.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+        })
+    }
+
+    init(mountedVolumes: @escaping @Sendable () throws -> [URL], volumeIdentifier: @escaping @Sendable (URL) throws -> String?) {
+        self.mountedVolumes = mountedVolumes
+        self.volumeIdentifier = volumeIdentifier
+    }
 
     public func inspect(path: String, volumeID: String) throws -> FileAvailability {
         let manager = FileManager.default
-        guard let volumes = manager.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeUUIDStringKey]) else {
-            throw CocoaError(.fileReadUnknown)
-        }
+        let volumes = try mountedVolumes()
         var volumeIsOnline = false
         for volume in volumes {
-            if try volume.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString == volumeID {
+            guard let candidateIdentifier = try? volumeIdentifier(volume) else { continue }
+            if candidateIdentifier == volumeID {
                 volumeIsOnline = true
                 break
             }
