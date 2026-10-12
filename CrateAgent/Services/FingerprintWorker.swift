@@ -14,7 +14,7 @@ import os.log
 /// Design:
 /// - actor-isolated state (counters, current task) so progress
 ///   reporting and start/stop are race-free
-/// - bounded concurrency: `activeProcessorCount - 2` (min 1) — leaves
+/// - bounded concurrency: `activeProcessorCount / 4` (min 1) — leaves
 ///   headroom for UI + the Serato sync pipeline
 /// - resumable: state lives in the `files` table, so a relaunch picks
 ///   up wherever we stopped
@@ -57,6 +57,8 @@ public actor FingerprintWorker {
     private var progressHandler: ProgressHandler?
     private var workTask: Task<Void, Never>?
     private var runID: UUID?
+    private var restartRequested = false
+    private var restartProgressHandler: ProgressHandler?
     public private(set) var lastError: String?
     private var totalDone: Int = 0
     private var totalFailed: Int = 0
@@ -84,9 +86,15 @@ public actor FingerprintWorker {
         batchCooldownNanos = batchCooldownMillis * 1_000_000
     }
 
-    /// Start the background loop. No-op if already running.
+    /// Start the background loop, or resume after an in-flight stop finishes.
     public func start(progress: ProgressHandler? = nil) {
-        guard workTask == nil else { return }
+        if let workTask {
+            if workTask.isCancelled {
+                restartRequested = true
+                restartProgressHandler = progress
+            }
+            return
+        }
         progressHandler = progress
         let runID = UUID()
         self.runID = runID
@@ -111,9 +119,9 @@ public actor FingerprintWorker {
     /// Cancel the loop. In-flight fingerprints complete; no new ones
     /// start. Safe to call multiple times.
     public func stop() {
-        runID = nil
+        restartRequested = false
+        restartProgressHandler = nil
         workTask?.cancel()
-        workTask = nil
     }
 
     /// Wait for the worker to drain — used by tests so they don't
@@ -160,6 +168,12 @@ public actor FingerprintWorker {
             if self.runID == runID {
                 workTask = nil
                 self.runID = nil
+                if restartRequested {
+                    let progress = restartProgressHandler
+                    restartRequested = false
+                    restartProgressHandler = nil
+                    start(progress: progress)
+                }
             }
         }
         while !Task.isCancelled {

@@ -71,7 +71,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
                                                                   bpm: nil, key: nil, comment: nil, length: nil, label: nil))
         let model = try LibraryBrowserModel(database: fixture.database)
         await model.start()
-        let selection = StartupNavigationSelection()
+        let selection = LibraryNavigationSelection()
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1400, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = NSView(frame: window.contentLayoutRect)
@@ -82,7 +82,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         await barrier.waitForEntry()
         XCTAssertEqual(session.phase, .parsing)
         let renderStart = ContinuousClock.now
-        let host = NSHostingView(rootView: StartupNavigationFixture(selection: selection, model: model, readiness: fixture.readiness))
+        let host = NSHostingView(rootView: LibraryNavigationFixture(selection: selection, model: model, readiness: fixture.readiness))
         window.contentView = host
         host.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
@@ -120,24 +120,5 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         let attachment = XCTAttachment(string: result)
         attachment.lifetime = .keepAlways
         add(attachment)
-    }
-}
-
-@MainActor
-private final class StartupNavigationSelection: ObservableObject {
-    @Published var section = MainWindowView.Section.library
-}
-
-private struct StartupNavigationFixture: View {
-    @ObservedObject var selection: StartupNavigationSelection
-    let model: LibraryBrowserModel
-    let readiness: LibrarySyncReadiness
-    var body: some View {
-        MainWindowNavigation(selection: $selection.section, hasConflicts: false) {
-            VStack {
-                Text(selection.section.displayName)
-                LibraryPagedContent(model: model, density: .comfortable, showsFilenames: false, readiness: readiness, onAction: { _, _ in })
-            }
-        }
     }
 }

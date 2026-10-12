@@ -199,3 +199,49 @@ usable during validation. Define a production-scale fixture and an actual-screen
 smoke checklist before implementation. Small correctness fixtures alone do not
 prove responsiveness; compare baseline and final measurements with the same data
 and build settings. See issues 120 and 129 for the failures this requirement prevents.
+
+## Fingerprint backlog responsiveness
+
+`FingerprintResponsivenessTests` exercises a 30,000-row pending library while the
+real Rust decoder fingerprints 120-second, 44.1 kHz mono WAV audio. Each row has a
+separate temporary symlink to the same generated tone; missing lightweight hashes
+prevent byte-twin reuse from eliminating the decode workload. The database uses
+WAL, and no owner audio, preferences, or live `AppServices` are accessed.
+
+The fixture mounts the production Library content and sidebar, repeatedly scrolls
+to distant rows and switches sidebar selection, and records main-actor scheduling
+gaps. Rendering, scroll completion, sidebar selection, and maximum main-actor gap
+must each stay below 500 ms while the backlog remains active. At least one batch
+must persist successful fingerprints, with no failed decodes. These measurements
+exercise scheduling and database/UI contention on warm, repeated PCM audio; they
+do not establish throughput for a diverse collection or cold external storage.
+The sidebar fixture does not mount the full destination screens.
+
+Use the optimized isolated Test command above with
+`-only-testing:CrateAgentTests/FingerprintResponsivenessTests` and identical build
+settings for baseline and final results. `FINGERPRINT_RESPONSIVENESS` records the
+measurements in the log and an XCTest attachment. The lifecycle regression holds
+one decoder at the audio boundary, requests stop/restart, and verifies the pool
+never exceeds its configured limit and remaining files finish with intact results.
+
+Owner-app smoke checklist: with a substantial fingerprint backlog, browse and
+scroll Library, search, switch to Organize and back, and inspect progress. Repeat a
+file-info rescan or Serato open/close transition while fingerprinting is active;
+processing should resume when authorized without overlapping decoder pools.
+Completed fingerprints should remain available after quitting and reopening.
+
+Reference measurements on 2026-10-12, optimized native arm64 Test build:
+
+| Measurement | Before lifecycle fix | After lifecycle fix |
+| --- | ---: | ---: |
+| Library rendering | 315 ms | 204 ms |
+| Maximum distant-row scroll completion | 169 ms | 339 ms |
+| Maximum sidebar selection | 9 ms | 6 ms |
+| Maximum main-actor scheduling gap | 303 ms | 320 ms |
+
+Both steady-state runs meet the budget; these individual samples do not establish
+a throughput or latency improvement. The lifecycle regression establishes the
+correctness improvement: a stop/restart previously reached two simultaneous
+decoders with a limit of one; the corrected worker stays at one and resumes its
+pending files. Existing background priority, quarter-core concurrency, and batch
+cooldown remain unchanged.
