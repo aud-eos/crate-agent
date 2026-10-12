@@ -10,7 +10,13 @@ final class FileAvailabilityResolverTests: XCTestCase {
         let source = directory.appendingPathComponent("music.mp3")
         try Data([1, 2]).write(to: source)
         let volume = try XCTUnwrap(source.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString)
-        let resolver = FileAvailabilityResolver()
+        let unrelatedVolume = directory.appendingPathComponent("unmounting-volume")
+        let resolver = FileAvailabilityResolver(mountedVolumes: { [unrelatedVolume, directory] }, volumeIdentifier: { candidate in
+            if candidate == unrelatedVolume {
+                throw CocoaError(.fileReadUnknown)
+            }
+            return try candidate.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+        })
         XCTAssertEqual(try resolver.inspect(path: source.path, volumeID: volume), .available)
         let moved = directory.appendingPathComponent("Trash/music.mp3")
         try FileManager.default.moveItem(at: source, to: moved)
@@ -23,6 +29,15 @@ final class FileAvailabilityResolverTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: moved.path)
         try FileManager.default.removeItem(at: moved)
         XCTAssertEqual(try resolver.inspect(path: moved.path, volumeID: volume), .missing)
+    }
+
+    func testMountedVolumeEnumerationFailureRemainsVisible() {
+        let resolver = FileAvailabilityResolver(mountedVolumes: {
+            throw CocoaError(.fileReadUnknown)
+        }, volumeIdentifier: { _ in nil })
+        XCTAssertThrowsError(try resolver.inspect(path: "/unused.mp3", volumeID: "unavailable-volume-list")) { error in
+            XCTAssertEqual((error as? CocoaError)?.code, .fileReadUnknown)
+        }
     }
 
     func testNativeTrashFixture() async throws {
