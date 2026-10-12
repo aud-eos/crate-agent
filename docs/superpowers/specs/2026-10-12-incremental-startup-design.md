@@ -2,9 +2,9 @@
 
 Issue: https://github.com/aud-eos/crate-agent/issues/129
 
-Status: proposed written spec. The owner approved automatic incremental validation
-on launch, keeping full **Re-scan File Info** manual. Written-spec approval and an
-implementation plan are still required before product changes.
+Status: approved by the owner on 2026-10-12. Automatic incremental validation
+on launch is approved, keeping full **Re-scan File Info** manual. The implementation
+plan awaits review before product changes.
 
 ## User outcome
 
