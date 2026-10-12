@@ -289,6 +289,10 @@ final class AutoTaggerService: ObservableObject {
                 fatalError = "Auto-tag pass stopped: \(reason)"
                 stopUnresolvedRows(among: fileIDs, message: reason, generation: generation)
                 return
+            } catch let conflict as SeratoPathConflictError {
+                guard generation == runGeneration else { return }
+                rows[fileID] = .failed(conflict.localizedDescription)
+                continue
             } catch is LibrarySyncReadinessError {
                 stopUnresolvedRows(among: fileIDs, message: "Library synchronization superseded this scan. Scan again after sync finishes.", generation: generation)
                 return
@@ -360,6 +364,7 @@ final class AutoTaggerService: ObservableObject {
             throw AutoTaggerRowFailure("file \(fileID) not found in the library")
         }
         try FileProcessingEligibility.requireProcessable(file)
+        try syncAuthorization?.check(target: .file(file))
         let membershipToken = FileMembershipToken(fileId: fileID, revision: file.membershipRevision)
 
         let (fingerprintBytes, fingerprintBasis) = try await currentFingerprint(for: file)
@@ -559,13 +564,13 @@ final class AutoTaggerService: ObservableObject {
             return (serialized, freshnessBasis)
         } catch {
             let decodeError = error
-            if decodeError is LibrarySyncReadinessError || decodeError is CancellationError {
+            if decodeError is LibrarySyncReadinessError || decodeError is SeratoPathConflictError || decodeError is CancellationError {
                 throw decodeError
             }
             do {
                 try await persistFingerprintFailure(for: file, authorization: authorization)
             } catch {
-                if error is LibrarySyncReadinessError || error is CancellationError {
+                if error is LibrarySyncReadinessError || error is SeratoPathConflictError || error is CancellationError {
                     throw error
                 }
                 throw AutoTaggerRowFailure(
@@ -581,7 +586,11 @@ final class AutoTaggerService: ObservableObject {
 
     private func persistFingerprintFailure(for original: FileRecord, authorization: LibrarySyncReadiness.Authorization?) async throws {
         try await database.writer.write { db in
-            try FingerprintPersistence.withAuthorization(authorization) {
+            var targets: [SeratoConflictTarget] = [.file(original)]
+            if let fileID = original.id, let current = try FileRecord.fetchOne(db, key: fileID) {
+                targets.append(.file(current))
+            }
+            try FingerprintPersistence.withAuthorization(authorization, targets: targets) {
                 guard let fileID = original.id,
                       let current = try FileRecord.fetchOne(db, key: fileID),
                       current.path == original.path,
@@ -707,7 +716,8 @@ final class AutoTaggerService: ObservableObject {
         try authorization?.check()
         try await database.writer.read { database in
             try authorization?.check()
-            try FileProcessingEligibility.requireCurrent(token, in: database)
+            let current = try FileProcessingEligibility.currentFile(token, in: database)
+            try authorization?.check(target: .file(current))
         }
         try authorization?.check()
     }
@@ -728,7 +738,8 @@ final class AutoTaggerService: ObservableObject {
         authorization: LibrarySyncReadiness.Authorization?
     ) async throws {
         try await database.writer.write { db in
-            try FingerprintPersistence.withAuthorization(authorization) {
+            let current = try FileProcessingEligibility.currentFile(expectedMembershipToken, in: db)
+            try FingerprintPersistence.withAuthorization(authorization, targets: [.file(current)]) {
                 try FileProcessingEligibility.requireCurrent(expectedMembershipToken, in: db)
                 try FingerprintPersistence.write(
                     fileID: fileID, fingerprint: bytes, status: status, freshnessBasis: freshnessBasis,

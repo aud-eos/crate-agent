@@ -15,6 +15,10 @@ public struct FilesystemEventBatch: Sendable {
     }
 }
 
+struct FilesystemConflictDeferral: Error {
+    let observations: [FSEventsObservation]
+}
+
 public actor FilesystemEventProcessor {
     private let handler: @Sendable (FilesystemEventBatch) async throws -> Void
     private let checkpoint: @Sendable (UInt64) async throws -> Void
@@ -22,6 +26,7 @@ public actor FilesystemEventProcessor {
     private var draining = false
     private var failure: Error?
     private var paused: Bool
+    private var heldCheckpoint: UInt64 = 0
 
     public init(initiallyPaused: Bool = false, handler: @escaping @Sendable (FilesystemEventBatch) async throws -> Void,
                 checkpoint: @escaping @Sendable (UInt64) async throws -> Void)
@@ -75,13 +80,28 @@ public actor FilesystemEventProcessor {
         guard !paused, !draining else { return }
         draining = true
         defer { draining = false }
+        var cursor = 0
         do {
-            while let batch = pending.first {
-                try await handler(batch)
-                if batch.highestEventID != 0 {
-                    try await checkpoint(batch.highestEventID)
+            while cursor < pending.count {
+                let batch = pending[cursor]
+                do { try await handler(batch) }
+                catch let deferred as FilesystemConflictDeferral {
+                    pending[cursor] = FilesystemEventBatch(observations: deferred.observations, highestEventID: batch.highestEventID)
+                    cursor += 1
+                    continue
                 }
-                pending.removeFirst()
+                if cursor == 0 {
+                    let completedThrough = pending.count == 1 ? max(batch.highestEventID, heldCheckpoint) : batch.highestEventID
+                    if completedThrough != 0 {
+                        try await checkpoint(completedThrough)
+                    }
+                    if pending.count == 1 {
+                        heldCheckpoint = 0
+                    }
+                } else {
+                    heldCheckpoint = max(heldCheckpoint, batch.highestEventID)
+                }
+                pending.remove(at: cursor)
             }
         } catch {
             failure = error

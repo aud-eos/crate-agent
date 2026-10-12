@@ -9,13 +9,20 @@ enum FingerprintPersistence {
     /// Run inside the writer transaction so supersession rolls back every batch row.
     static func withAuthorization<Result>(
         _ authorization: LibrarySyncReadiness.Authorization?,
+        targets: [SeratoConflictTarget] = [],
         perform: () throws -> Result
     ) throws -> Result {
         try Task.checkCancellation()
         try authorization?.check()
+        for target in targets {
+            try authorization?.check(target: target)
+        }
         let result = try perform()
         try Task.checkCancellation()
         try authorization?.check()
+        for target in targets {
+            try authorization?.check(target: target)
+        }
         return result
     }
 

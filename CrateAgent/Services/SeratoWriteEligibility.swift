@@ -16,6 +16,7 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     var write: SeratoPendingWrite
     let eventId: Int64
     let originalIdentity: FileMetadata
+    var originalReferencePaths: [String] = []
     var externalBaseline: SeratoMetadata? = nil
     var requiredKeeper: FileActionAuthority? = nil
     var cleanupReceipt: DuplicateCleanupReceipt? = nil
@@ -24,6 +25,9 @@ struct GuardedSeratoWrite: Sendable, Equatable {
 enum SeratoWriteEligibility {
     static func resolved(_ guarded: GuardedSeratoWrite, file: FileRecord) -> GuardedSeratoWrite {
         var result = guarded
+        for path in guarded.write.referencePaths where !result.originalReferencePaths.contains(path) {
+            result.originalReferencePaths.append(path)
+        }
         switch guarded.write {
         case let .fileTagWrite(write):
             result.write = .fileTagWrite(.init(absolutePath: file.path, metadata: write.metadata, year: write.year, clearYear: write.clearYear))

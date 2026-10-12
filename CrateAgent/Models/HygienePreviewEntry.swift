@@ -2,6 +2,7 @@ import Foundation
 
 protocol HygienePreviewEntry: Identifiable, Equatable {
     var path: String { get }
+    var fileId: Int64 { get }
     var field: SeratoMetadataField { get }
     var currentPreview: String { get }
     var proposedPreview: String { get }

@@ -51,6 +51,7 @@ public actor FilesystemSyncCoordinator {
     }
 
     public func handleObservations(_ observations: [FSEventsObservation]) async throws {
+        var blocked: [FSEventsObservation] = []
         for observation in observations {
             if observation.requiresReconciliation || observation.rootChanged || (observation.isDirectory && observation.wasRenamed) {
                 requiresReconciliation = true
@@ -67,15 +68,23 @@ public actor FilesystemSyncCoordinator {
                     _ = try await operationEngine.resyncSeratoForBatch(batchID)
                 }
                 try await handle(observation, batchID: batchID)
+            } catch is SeratoPathConflictError {
+                blocked.append(observation)
+                requiresReconciliation = true
             } catch { throw FilesystemObservationError(path: observation.path, underlying: error) }
+        }
+        if !blocked.isEmpty {
+            throw FilesystemConflictDeferral(observations: blocked)
         }
     }
 
     private func handle(_ observation: FSEventsObservation, batchID: String) async throws {
+        try await operationEngine.requireUnconflicted(SeratoConflictTarget(paths: [observation.path]))
         let knownPath = try await database.writer.read { connection in
             try FileRecord.filter(Column("path") == observation.path).fetchOne(connection)
         }
         if let knownPath {
+            try await operationEngine.requireUnconflicted(.file(knownPath))
             if try await resolvePendingMove(for: knownPath, batchID: batchID) {
                 return
             }
@@ -92,6 +101,7 @@ public actor FilesystemSyncCoordinator {
             // Unknown old-side events have no tracked row to observe. Never infer deletion from stat failure.
             return
         }
+        try await operationEngine.requireUnconflicted(SeratoConflictTargets.identity(metadata))
         let inodeMatches = try await database.writer.read { connection in
             try FileRecord.filter(Column("inode") == metadata.inode)
                 .filter(Column("volume_uuid") == metadata.volumeUuid).fetchAll(connection)
@@ -117,6 +127,7 @@ public actor FilesystemSyncCoordinator {
             existing = candidates.first
         }
         guard let existing else { return }
+        try await operationEngine.requireUnconflicted(.file(existing))
         if let fileID = existing.id, invalidatedSources[fileID] != nil {
             requiresReconciliation = true
             return

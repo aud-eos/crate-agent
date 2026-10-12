@@ -10,10 +10,15 @@ public enum FileProcessingEligibility {
     }
 
     public static func requireCurrent(_ token: FileMembershipToken, in database: Database) throws {
+        _ = try currentFile(token, in: database)
+    }
+
+    static func currentFile(_ token: FileMembershipToken, in database: Database) throws -> FileRecord {
         guard let file = try FileRecord.fetchOne(database, key: token.fileId), file.membershipRevision == token.revision else {
             throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
         }
         try requireProcessable(file)
+        return file
     }
 
     public static func requireProcessable(_ file: FileRecord) throws {

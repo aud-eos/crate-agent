@@ -6,6 +6,171 @@ import XCTest
 
 @MainActor
 final class SeratoLibrarySyncSessionTests: XCTestCase {
+    func testConflictSyncRetiresOnlyIndependentRowsAndRetainsStaleDetailsUntilValidatedRepair() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let removed = try await fixture.add("removed.mp3")
+        try fixture.save(paths: [protected.path, protected.path.decomposedStringWithCanonicalMapping])
+        let session = makeSession(fixture, gate: gate)
+        try await session.synchronize()
+        guard case let .ready(summary) = session.state else { return XCTFail("\(session.state)") }
+        XCTAssertEqual(summary.pathConflictCount, 1)
+        XCTAssertEqual(summary.retired, 1)
+        let protectedAfter = try await fixture.row(protected)
+        let removedAfter = try await fixture.row(removed)
+        XCTAssertEqual(protectedAfter, protected)
+        XCTAssertEqual(removedAfter.libraryMembership, .retired)
+        let protectedEvents = try await fixture.database.writer.read { connection in try EventRecord.filter(Column("file_id") == protected.id).fetchCount(connection) }
+        XCTAssertEqual(protectedEvents, 0)
+        XCTAssertThrowsError(try gate.capture().check(target: .file(protected)))
+        XCTAssertNoThrow(try gate.capture())
+        XCTAssertFalse(session.conflictsAreStale)
+        fixture.lifecycle.running = true
+        fixture.watchdog.refresh()
+        session.suspend()
+        XCTAssertTrue(session.conflictsAreStale)
+        XCTAssertEqual(session.conflicts.count, 1)
+        XCTAssertThrowsError(try gate.capture())
+        fixture.lifecycle.running = false
+        fixture.watchdog.refresh()
+        try Data([1, 2]).write(to: fixture.locator.databaseV2Url)
+        do { try await session.synchronize(); XCTFail("Corrupt source cleared protection") } catch {}
+        XCTAssertTrue(session.conflictsAreStale)
+        XCTAssertEqual(session.conflicts.count, 1)
+        XCTAssertThrowsError(try gate.requireUnconflicted(.file(protected)))
+        try fixture.save(paths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: protected.path)])
+        try await session.synchronize()
+        XCTAssertTrue(session.conflicts.isEmpty)
+        XCTAssertFalse(session.conflictsAreStale)
+        XCTAssertNoThrow(try gate.capture().check(target: .file(protected)))
+    }
+
+    func testDirectScannerProtectsConflictsAndRejectsMismatchedAnalysis() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("Café.mp3")
+        try fixture.save(paths: [file.path, file.path.decomposedStringWithCanonicalMapping])
+        let scanner = LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator)
+        let snapshot = try await fixture.reader.read()
+        let wrong = SeratoConflictAnalysis(libraryID: snapshot.libraryID, generation: snapshot.generation + 1, conflicts: [], scope: .init())
+        do { _ = try await scanner.scan(snapshot: snapshot, reader: fixture.reader, analysis: wrong); XCTFail("Mismatched analysis accepted") }
+        catch SeratoMembershipSnapshotError.sourceChanged {}
+        _ = try await scanner.scan(snapshot: snapshot, reader: fixture.reader)
+        XCTAssertThrowsError(try gate.capture())
+        XCTAssertThrowsError(try gate.requireUnconflicted(.file(file)))
+        do { _ = try await scanner.scan(); XCTFail("Legacy scan accepted ambiguous saved records") }
+        catch is SeratoPathConflictError {}
+        let row = try await fixture.row(file)
+        let events = try await fixture.events()
+        XCTAssertEqual(row, file)
+        XCTAssertEqual(events, 0)
+    }
+
+    func testConflictQueueRetainsOrderedIntentWhileIndependentWritesDrainAndRepairRevalidates() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let independent = try await fixture.add("independent.mp3")
+        let savedPaths = [protected.path, independent.path].map(SeratoLibraryLocator.seratoRelativePath)
+        try fixture.save(paths: savedPaths)
+        let session = makeSession(fixture, gate: gate)
+        try await session.synchronize()
+        fixture.lifecycle.running = true
+        fixture.watchdog.refresh()
+        for (file, metadata) in [(protected, SeratoMetadata(title: "Queued title")), (protected, SeratoMetadata(artist: "Queued artist")), (independent, SeratoMetadata(title: "Independent"))] {
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(file.id), metadata: metadata, previousMetadata: .empty)))
+        }
+        try fixture.save(paths: savedPaths + [savedPaths[0].decomposedStringWithCanonicalMapping])
+        fixture.lifecycle.running = false
+        fixture.watchdog.refresh()
+        try await session.synchronize()
+        guard case let .ready(summary) = session.state else { return XCTFail("\(session.state)") }
+        XCTAssertEqual(summary.conflictBlockedWriteCount, 2)
+        XCTAssertEqual(summary.supersededWrites, 0)
+        let saved = try readDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path)
+        XCTAssertEqual(saved.first { record in SeratoPath.normalized(record.path) == independent.path }?.title, "Independent")
+        XCTAssertTrue(saved.filter { record in SeratoPath.normalized(record.path) == protected.path }.allSatisfy { record in record.title == nil && record.artist == nil })
+        let repeated = try await fixture.engine.drainPendingSeratoUpdates()
+        XCTAssertEqual(repeated.appliedCount, 0)
+        XCTAssertEqual(repeated.conflictBlockedCount, 2)
+        XCTAssertEqual(repeated.supersededCount, 0)
+        try fixture.save(paths: savedPaths)
+        _ = try updateDatabaseRecord(databasePath: fixture.locator.databaseV2Url.path, trackPath: savedPaths[0], update: SeratoMetadataUpdate(artist: nil, title: "Chosen in Serato", album: nil, genre: nil, bpm: nil, key: nil, comment: nil, length: nil, label: nil))
+        try await session.synchronize()
+        let repaired = try readDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path).first { record in SeratoPath.normalized(record.path) == protected.path }
+        XCTAssertEqual(repaired?.title, "Chosen in Serato")
+        XCTAssertEqual(repaired?.artist, "Queued artist")
+        let pending = await fixture.engine.pendingSeratoWriteCount
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testQueuedDuplicateCleanupRetainsTargetWhenItsKeeperBecomesConflicted() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let keeper = try await fixture.add("Café.mp3")
+        let target = try await fixture.add("copy.mp3")
+        let independent = try await fixture.add("independent.mp3")
+        let paths = [keeper.path, target.path, independent.path].map(SeratoLibraryLocator.seratoRelativePath)
+        try fixture.save(paths: paths)
+        let session = makeSession(fixture, gate: gate)
+        try await session.synchronize()
+        fixture.lifecycle.running = true
+        fixture.watchdog.refresh()
+        _ = try await fixture.engine.resolveDuplicate(target: target, keeper: keeper, batchID: "keeper-conflict")
+        try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(independent.id), metadata: .init(title: "Independent"), previousMetadata: .empty)))
+        try fixture.save(paths: paths + [paths[0].decomposedStringWithCanonicalMapping])
+        fixture.lifecycle.running = false
+        fixture.watchdog.refresh()
+        try await session.synchronize()
+        let first = try await fixture.engine.drainPendingSeratoUpdates()
+        let second = try await fixture.engine.drainPendingSeratoUpdates()
+        XCTAssertEqual(first.conflictBlockedCount, 1)
+        XCTAssertEqual(second.conflictBlockedCount, 1)
+        XCTAssertEqual(second.supersededCount, 0)
+        let failure = await fixture.engine.failedDuplicateCleanupMessage
+        XCTAssertNil(failure)
+        let records = try readDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path)
+        XCTAssertTrue(records.contains { record in SeratoPath.normalized(record.path) == target.path })
+        XCTAssertEqual(records.first { record in SeratoPath.normalized(record.path) == independent.path }?.title, "Independent")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: keeper.path))
+    }
+
+    func testConflictFilesystemEventsRetainCheckpointAndDoNotStarveIndependentObservations() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let independent = try await fixture.add("independent.mp3")
+        try fixture.save(paths: [protected.path, protected.path.decomposedStringWithCanonicalMapping, independent.path])
+        let session = makeSession(fixture, gate: gate)
+        try await session.synchronize()
+        let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        let handler = FilesystemSyncBatchHandler(coordinator: coordinator, session: session)
+        let checkpoints = SessionCheckpoints()
+        let processor = FilesystemEventProcessor(handler: { batch in try await handler.handle(batch) }, checkpoint: { eventID in await checkpoints.append(eventID) })
+        try FileManager.default.removeItem(atPath: protected.path)
+        try FileManager.default.removeItem(atPath: independent.path)
+        try await processor.enqueue(.init(observations: [.init(path: protected.path, isFile: true, wasRemoved: true, eventID: 501)], highestEventID: 501))
+        try await processor.enqueue(.init(observations: [.init(path: independent.path, isFile: true, wasRemoved: true, eventID: 502)], highestEventID: 502))
+        let protectedAfter = try await fixture.row(protected)
+        let independentAfter = try await fixture.row(independent)
+        let heldCheckpoints = await checkpoints.values
+        XCTAssertEqual(protectedAfter, protected)
+        XCTAssertEqual(independentAfter.fileAvailability, .missing)
+        XCTAssertEqual(heldCheckpoints, [])
+        try fixture.save(paths: [protected.path, independent.path])
+        try await session.synchronize()
+        try await processor.retry()
+        let finishedCheckpoints = await checkpoints.values
+        XCTAssertEqual(finishedCheckpoints.last, 502)
+    }
+
     func testSessionStartsIdleUntilExplicitlyRequested() throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)

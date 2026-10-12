@@ -13,14 +13,23 @@ struct SeratoConflictAnalyzer: Sendable {
     }
 
     func analyze(snapshot: SeratoMembershipSnapshot, files: [FileRecord]) async throws -> SeratoConflictAnalysis {
+        var normalizedPaths: [String: String] = [:]
+        func normalized(_ path: String) -> String {
+            if let cached = normalizedPaths[path] {
+                return cached
+            }
+            let result = SeratoPath.normalized(path)
+            normalizedPaths[path] = result
+            return result
+        }
         var occurrencesByPath: [String: [Int]] = [:]
         for (index, record) in snapshot.records.enumerated() {
             if index.isMultiple(of: 256) {
                 try Task.checkCancellation()
             }
-            occurrencesByPath[SeratoPath.normalized(record.path), default: []].append(index)
+            occurrencesByPath[normalized(record.path), default: []].append(index)
         }
-        let duplicatePaths = occurrencesByPath.keys.filter { occurrencesByPath[$0]!.count > 1 }.sorted()
+        let duplicatePaths = occurrencesByPath.keys.filter { path in occurrencesByPath[path]!.count > 1 }.sorted()
         guard !duplicatePaths.isEmpty else {
             return SeratoConflictAnalysis(libraryID: snapshot.libraryID, generation: snapshot.generation, conflicts: [], scope: SeratoConflictScope())
         }
@@ -30,7 +39,7 @@ struct SeratoConflictAnalyzer: Sendable {
             if index.isMultiple(of: 256) {
                 try Task.checkCancellation()
             }
-            filesByPath[SeratoPath.normalized(file.path), default: []].append(index)
+            filesByPath[normalized(file.path), default: []].append(index)
             if file.volumeUuid != LegacyFileIdentity.unknownVolume {
                 filesByIdentity[ConflictPhysicalIdentity(file), default: []].append(index)
             }
@@ -42,7 +51,7 @@ struct SeratoConflictAnalyzer: Sendable {
             try Task.checkCancellation()
             var target = SeratoConflictTarget(paths: [path])
             var occurrences: [SeratoConflictOccurrence] = []
-            let indexedVolumes = Set((filesByPath[path] ?? []).map { files[$0].volumeUuid }.filter { $0 != LegacyFileIdentity.unknownVolume })
+            let indexedVolumes = Set((filesByPath[path] ?? []).map { index in files[index].volumeUuid }.filter { volume in volume != LegacyFileIdentity.unknownVolume })
             for index in occurrencesByPath[path]! {
                 let record = snapshot.records[index]
                 let absolutePath = record.path.hasPrefix("/") ? record.path : "/" + record.path
@@ -83,7 +92,7 @@ struct SeratoConflictAnalyzer: Sendable {
                 if let trackID = file.trackId {
                     target.sharedTrackIDs.insert(trackID)
                 }
-                let normalizedPath = SeratoPath.normalized(file.path)
+                let normalizedPath = normalized(file.path)
                 if expandedPaths.insert(normalizedPath).inserted {
                     candidates += filesByPath[normalizedPath] ?? []
                 }

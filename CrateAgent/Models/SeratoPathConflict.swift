@@ -43,6 +43,10 @@ struct SeratoConflictScope: Sendable {
     var physicalGroups: [ConflictPhysicalIdentity: String] = [:]
     var trackGroups: [Int64: String] = [:]
 
+    var isEmpty: Bool {
+        fileGroups.isEmpty && pathGroups.isEmpty && physicalGroups.isEmpty && trackGroups.isEmpty
+    }
+
     var fileIDs: Set<Int64> {
         Set(fileGroups.keys)
     }
@@ -60,10 +64,10 @@ struct SeratoConflictScope: Sendable {
     }
 
     func conflictingPath(for target: SeratoConflictTarget) -> String? {
-        var matches = target.fileIDs.compactMap { fileGroups[$0] }
-        matches += target.paths.compactMap { pathGroups[SeratoPath.normalized($0)] }
-        matches += target.physicalIdentities.compactMap { physicalGroups[$0] }
-        matches += target.sharedTrackIDs.compactMap { trackGroups[$0] }
+        var matches = target.fileIDs.compactMap { fileID in fileGroups[fileID] }
+        matches += target.paths.compactMap { path in pathGroups[SeratoPath.normalized(path)] }
+        matches += target.physicalIdentities.compactMap { identity in physicalGroups[identity] }
+        matches += target.sharedTrackIDs.compactMap { trackID in trackGroups[trackID] }
         return matches.min()
     }
 

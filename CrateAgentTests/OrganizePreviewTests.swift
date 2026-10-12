@@ -7,6 +7,41 @@ import XCTest
 
 @MainActor
 final class OrganizePreviewTests: XCTestCase {
+    func testConflictPreviewExplainsProtectedSourcesAndDestinations() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let root = fixture.directory.appendingPathComponent("Library")
+        try await fixture.database.writer.write { connection in
+            for identifier in 1 ... 3 {
+                try connection.execute(sql: "INSERT INTO files (id, path, volume_uuid, inode, file_size, mtime, artist, title, library_membership, file_availability) VALUES (?, ?, 'fixture', ?, 1, 1, 'Artist', ?, 'active', 'available')",
+                                       arguments: [identifier, fixture.directory.appendingPathComponent("source-\(identifier).mp3").path, identifier, "Track \(identifier)"])
+            }
+        }
+        let readiness = LibrarySyncReadiness()
+        let authorization = readiness.prepareDrain()
+        var scope = SeratoConflictScope()
+        scope.protect(SeratoConflictTarget(fileIDs: [1]), group: "protected source")
+        scope.protect(SeratoConflictTarget(paths: [root.appendingPathComponent("A/Artist - Track 2.mp3").path]), group: "protected destination")
+        try readiness.install(scope, for: authorization)
+        try readiness.markReady(authorization)
+        let model = OrganizePreviewModel()
+        await model.rescan(database: fixture.database, musicFolder: root, template: "$artist - $title.$ext", readiness: readiness)
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.snapshot.rows.count, 3)
+        XCTAssertEqual(model.snapshot.blockedCount, 2)
+        XCTAssertEqual(model.snapshot.rows.compactMap { row in row.plan?.id }, [3])
+        for row in model.snapshot.rows where row.id != 3 {
+            XCTAssertTrue(row.status.contains("conflict"))
+        }
+        model.setFilter(.all)
+        model.selectScope(true)
+        XCTAssertEqual(model.selection.count, 1)
+        let plans = await model.beginApply()
+        XCTAssertEqual(plans.map(\.id), [3])
+        let events = try await fixture.events()
+        XCTAssertEqual(events, 0)
+    }
+
     func testLargePreviewRemainsResponsiveAndPreservesExplicitTargets() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }

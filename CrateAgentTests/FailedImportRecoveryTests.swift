@@ -4,6 +4,31 @@ import XCTest
 
 @MainActor
 final class FailedImportRecoveryTests: XCTestCase {
+    func testImportIntoProtectedPathIsReportedBeforeAllocatingAnIndexedRow() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let audio = fixture.directory.appendingPathComponent("Café.wav")
+        let bytes = FinalRemovalIntegrationTests.wav()
+        try bytes.write(to: audio)
+        try fixture.save(paths: [audio.path, audio.path.decomposedStringWithCanonicalMapping])
+        let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: fixture.reader.read(), files: [])
+        let authorization = gate.prepareDrain()
+        try gate.install(analysis.scope, for: authorization)
+        try gate.markReady(authorization)
+        let importer = ImportCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        let result = await importer.importDroppedItems([audio])
+        XCTAssertEqual(result.filesImported, 0)
+        XCTAssertEqual(result.filesPendingSync, 0)
+        XCTAssertEqual(result.blockedFiles.count, 1)
+        XCTAssertTrue(result.blockedFiles.first?.localizedCaseInsensitiveContains("conflict") == true)
+        let count = try await fixture.database.writer.read { connection in try FileRecord.fetchCount(connection) }
+        let events = try await fixture.events()
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(events, 0)
+        XCTAssertEqual(try Data(contentsOf: audio), bytes)
+    }
+
     func testRetrySyncRecoversFailedImportsWithoutRepeatingIntentAndRejectsStaleTargets() async throws {
         let readiness = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: readiness)

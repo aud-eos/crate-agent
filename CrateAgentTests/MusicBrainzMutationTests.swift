@@ -10,11 +10,44 @@ import XCTest
 /// library writes on the watchdog (invariant #3), and keys the canonical
 /// `tracks` row by Chromaprint fingerprint hash (invariant #4).
 final class MusicBrainzMutationTests: XCTestCase {
+    @MainActor
+    func testMusicBrainzCannotWriteTrackSharedWithAConflictedFile() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let independent = try await fixture.add("other-encoding.mp3")
+        let fingerprint = sha256(sampleFingerprintBytes)
+        let trackID = try await fixture.database.writer.write { database in
+            var track = TrackRecord(fingerprintHash: fingerprint, artist: "Original")
+            try track.insert(database)
+            try database.execute(sql: "UPDATE files SET track_id = ? WHERE id = ?", arguments: [track.id, protected.id])
+            return try XCTUnwrap(track.id)
+        }
+        let linked = try await fixture.row(protected)
+        try fixture.save(paths: [protected.path, protected.path.decomposedStringWithCanonicalMapping])
+        let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: fixture.reader.read(), files: [linked, independent])
+        let authorization = gate.prepareDrain()
+        try gate.install(analysis.scope, for: authorization)
+        try gate.markReady(authorization)
+        do {
+            try await fixture.engine.apply(.applyMusicBrainzMatch(fullPayload(fileID: XCTUnwrap(independent.id), fingerprintHash: fingerprint)))
+            XCTFail("Shared protected track was changed")
+        } catch is SeratoPathConflictError {}
+        let artist = try await fixture.database.writer.read { connection in try TrackRecord.fetchOne(connection, key: trackID)?.artist }
+        let after = try await fixture.row(independent)
+        let events = try await fixture.events()
+        XCTAssertEqual(artist, "Original")
+        XCTAssertEqual(after, independent)
+        XCTAssertEqual(events, 0)
+    }
+
     private let audioFixture = OwnedProcessingAudioFixture()
 
     override func tearDownWithError() throws {
         try audioFixture.remove()
     }
+
     @MainActor private var runningState: ProcessingTestSeratoState?
     func testRedoRejectsMalformedRevertPayloadBeforeClobberingLaterEdit() async throws {
         let recorder = FileTagWriterRecorder()

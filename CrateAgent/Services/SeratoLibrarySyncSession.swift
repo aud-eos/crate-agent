@@ -20,10 +20,13 @@ final class SeratoLibrarySyncSession: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var initialSyncComplete = false
+    @Published private(set) var conflicts: [SeratoPathConflict] = []
+    @Published private(set) var conflictsAreStale = false
     @Published private(set) var scanProgress: LibraryScanner.ScanProgress?
     private let reader: SeratoMembershipSnapshotReader
     private let reconciler: SeratoMembershipReconciler
     private let scanner: LibraryScanner
+    private let conflictAnalyzer: SeratoConflictAnalyzer
     private let operationEngine: OperationEngine
     private let watchdog: SeratoWatchdog
     let readiness: LibrarySyncReadiness
@@ -40,11 +43,13 @@ final class SeratoLibrarySyncSession: ObservableObject {
     init(reader: SeratoMembershipSnapshotReader, reconciler: SeratoMembershipReconciler,
          scanner: LibraryScanner, operationEngine: OperationEngine, watchdog: SeratoWatchdog,
          readiness: LibrarySyncReadiness, stopProcessing: @escaping @MainActor () async -> Void = {},
-         startProcessing: @escaping @MainActor () async -> Void = {})
+         startProcessing: @escaping @MainActor () async -> Void = {},
+         conflictAnalyzer: SeratoConflictAnalyzer = SeratoConflictAnalyzer())
     {
         self.reader = reader
         self.reconciler = reconciler
         self.scanner = scanner
+        self.conflictAnalyzer = conflictAnalyzer
         self.operationEngine = operationEngine
         self.watchdog = watchdog
         self.readiness = readiness
@@ -61,6 +66,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         }
         requested = true
         readiness.invalidate()
+        conflictsAreStale = !conflicts.isEmpty
         guard task == nil else { return }
         task = Task { [weak self] in await self?.run() }
     }
@@ -75,6 +81,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         successfulGeneration = nil
         requested = false
         readiness.invalidate()
+        conflictsAreStale = !conflicts.isEmpty
         task?.cancel()
         scanProgress = nil
         state = .idle
@@ -103,6 +110,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         successfulGeneration = nil
         requested = false
         readiness.invalidate()
+        conflictsAreStale = !conflicts.isEmpty
         task?.cancel()
         state = .waitingForSerato
     }
@@ -111,6 +119,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         successfulGeneration = nil
         requested = false
         readiness.invalidate()
+        conflictsAreStale = !conflicts.isEmpty
         task?.cancel()
         state = .failed(message)
         if task == nil {
@@ -133,6 +142,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
     func beginFilesystemRetry() {
         filesystemRetryActive = true
         readiness.invalidate()
+        conflictsAreStale = !conflicts.isEmpty
     }
 
     func finishFilesystemRetry(succeeded: Bool) {
@@ -152,6 +162,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
             case .waitingForSerato, .ready:
                 successfulGeneration = nil
                 readiness.invalidate()
+                conflictsAreStale = !conflicts.isEmpty
                 state = .idle
             case .idle, .reconciling, .failed:
                 break
@@ -177,9 +188,12 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 watchdog.refresh()
                 guard !watchdog.isSeratoRunning else { state = .waitingForSerato; return }
                 state = .reconciling
+                let authorization = readiness.prepareDrain()
                 let snapshot = try await reader.read()
-                var summary = try await reconciler.reconcile(snapshot)
-                try await refreshMetadata(snapshot)
+                var validatedSnapshot = snapshot
+                var analysis = try await analyze(snapshot, authorization: authorization)
+                var summary = try await reconciler.reconcile(snapshot, analysis: analysis)
+                try await refreshMetadata(snapshot, analysis: analysis)
                 try await reader.validate(snapshot)
                 try Task.checkCancellation()
                 if requested {
@@ -193,16 +207,18 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     return
                 }
                 let revision = watchdog.stateRevision
-                let authorization = readiness.prepareDrain()
                 let drain = try await LibrarySyncReadiness.$drainAuthorization.withValue(authorization) {
                     try await operationEngine.drainPendingSeratoUpdates(retryingFailedCleanup: retryingFailedCleanup)
                 }
                 retryingFailedCleanup = false
                 summary.supersededWrites = drain.supersededCount
+                summary.conflictBlockedWriteCount = drain.conflictBlockedCount
                 summary.duplicateCleanupMessage = await operationEngine.duplicateCleanupMessage
                 if drain.appliedCount > 0 {
                     let refreshedSnapshot = try await reader.read()
-                    try await refreshMetadata(refreshedSnapshot)
+                    validatedSnapshot = refreshedSnapshot
+                    analysis = try await analyze(refreshedSnapshot, authorization: authorization)
+                    try await refreshMetadata(refreshedSnapshot, analysis: analysis)
                     try await reader.validate(refreshedSnapshot)
                 }
                 try Task.checkCancellation()
@@ -210,6 +226,8 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 if requested {
                     continue
                 }
+                try await reader.validate(validatedSnapshot)
+                try Task.checkCancellation()
                 try readiness.markReady(authorization)
                 let processingAuthorization = try readiness.capture()
                 await startProcessing()
@@ -224,6 +242,9 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     continue
                 }
                 try processingAuthorization.check()
+                summary.pathConflictCount = analysis.conflicts.count
+                conflicts = analysis.conflicts
+                conflictsAreStale = false
                 initialSyncComplete = true
                 successfulGeneration = generation
                 state = .ready(summary)
@@ -231,6 +252,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         } catch {
             successfulGeneration = nil
             readiness.invalidate()
+            conflictsAreStale = !conflicts.isEmpty
             await stopProcessing()
             if !Task.isCancelled {
                 state = watchdog.isSeratoRunning ? .waitingForSerato : .failed("Library sync failed: \(error.localizedDescription)")
@@ -238,7 +260,16 @@ final class SeratoLibrarySyncSession: ObservableObject {
         }
     }
 
-    private func refreshMetadata(_ snapshot: SeratoMembershipSnapshot) async throws {
+    private func analyze(_ snapshot: SeratoMembershipSnapshot, authorization: LibrarySyncReadiness.Authorization) async throws -> SeratoConflictAnalysis {
+        let files = try await scanner.identityProjectionsForConflictAnalysis()
+        let analysis = try await conflictAnalyzer.analyze(snapshot: snapshot, files: files)
+        try await reader.validate(snapshot)
+        try Task.checkCancellation()
+        try readiness.install(analysis.scope, for: authorization)
+        return analysis
+    }
+
+    private func refreshMetadata(_ snapshot: SeratoMembershipSnapshot, analysis: SeratoConflictAnalysis) async throws {
         let progressStream = AsyncStream<LibraryScanner.ScanProgress>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let consumer = Task { [weak self] in
             for await progress in progressStream.stream {
@@ -250,7 +281,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
             progressStream.continuation.finish()
             consumer.cancel()
         }
-        _ = try await scanner.scan(snapshot: snapshot, reader: reader) { progress in
+        _ = try await scanner.scan(snapshot: snapshot, reader: reader, analysis: analysis) { progress in
             progressStream.continuation.yield(progress)
         }
         progressStream.continuation.finish()

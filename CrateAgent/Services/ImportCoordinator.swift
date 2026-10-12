@@ -23,6 +23,14 @@ public actor ImportCoordinator {
         public let filesImported: Int
         public let filesSkipped: Int
         public let syncFailures: [String]
+        public let blockedFiles: [String]
+
+        public init(filesImported: Int, filesSkipped: Int, syncFailures: [String], blockedFiles: [String] = []) {
+            self.filesImported = filesImported
+            self.filesSkipped = filesSkipped
+            self.syncFailures = syncFailures
+            self.blockedFiles = blockedFiles
+        }
 
         public var filesPendingSync: Int {
             syncFailures.count
@@ -33,6 +41,7 @@ public actor ImportCoordinator {
         case imported
         case skipped
         case pendingSync(String)
+        case blocked(String)
     }
 
     private static let logger = Logger(
@@ -62,6 +71,7 @@ public actor ImportCoordinator {
         var filesImported = 0
         var filesSkipped = 0
         var syncFailures: [String] = []
+        var blockedFiles: [String] = []
 
         for rootUrl in urls {
             let audioFileUrls = enumerateAudioFiles(at: rootUrl)
@@ -73,10 +83,12 @@ public actor ImportCoordinator {
                     filesSkipped += 1
                 case let .pendingSync(message):
                     syncFailures.append(message)
+                case let .blocked(message):
+                    blockedFiles.append(message)
                 }
             }
         }
-        return ImportResult(filesImported: filesImported, filesSkipped: filesSkipped, syncFailures: syncFailures)
+        return ImportResult(filesImported: filesImported, filesSkipped: filesSkipped, syncFailures: syncFailures, blockedFiles: blockedFiles)
     }
 
     private func importSingleFile(at fileUrl: URL) async -> FileImportOutcome {
@@ -84,7 +96,11 @@ public actor ImportCoordinator {
 
         let fileMetadata: FileMetadata
         do {
+            try await operationEngine.requireUnconflicted(SeratoConflictTarget(paths: [absolutePath]))
             fileMetadata = try FileMetadataCollector.collectVerified(at: SeratoPath.normalized(absolutePath))
+            try await operationEngine.requireUnconflicted(SeratoConflictTargets.identity(fileMetadata))
+        } catch let conflict as SeratoPathConflictError {
+            return .blocked(conflict.localizedDescription)
         } catch {
             Self.logger.warning(
                 "could not stat \(absolutePath, privacy: .public); skipping import"
@@ -141,6 +157,8 @@ public actor ImportCoordinator {
                 }
                 fileId = newId
             }
+        } catch let conflict as SeratoPathConflictError {
+            return .blocked(conflict.localizedDescription)
         } catch {
             // Most likely cause: path already in the DB (path is UNIQUE).
             // That's a no-op for the user — they re-dropped a file
@@ -164,6 +182,8 @@ public actor ImportCoordinator {
                 )),
             ],
             batchId: batchId)
+        } catch let conflict as SeratoPathConflictError {
+            return .blocked(conflict.localizedDescription)
         } catch {
             Self.logger.error(
                 "addTrackToSerato for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"

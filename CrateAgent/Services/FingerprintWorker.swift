@@ -23,7 +23,6 @@ import os.log
 /// - progress is pushed via a handler closure, mirroring LibraryScanner;
 ///   AppServices bridges it onto a `@Published` for SwiftUI
 public actor FingerprintWorker {
-
     public struct Progress: Sendable, Equatable {
         public let totalDone: Int
         public let totalFailed: Int
@@ -81,8 +80,8 @@ public actor FingerprintWorker {
         let defaultConcurrency = max(1, ProcessInfo.processInfo.activeProcessorCount / 4)
         self.concurrency = max(1, concurrency ?? defaultConcurrency)
         self.fingerprintFunction = fingerprintFunction
-        self.pollIntervalNanos = UInt64(pollIntervalSeconds * 1_000_000_000)
-        self.batchCooldownNanos = batchCooldownMillis * 1_000_000
+        pollIntervalNanos = UInt64(pollIntervalSeconds * 1_000_000_000)
+        batchCooldownNanos = batchCooldownMillis * 1_000_000
     }
 
     /// Start the background loop. No-op if already running.
@@ -139,10 +138,10 @@ public actor FingerprintWorker {
                 fingerprintFunction: fingerprintFunction
             )
         }
-        return Progress(
+        return try Progress(
             totalDone: totalDone,
             totalFailed: totalFailed,
-            totalPending: 0,
+            totalPending: await fetchPendingCount(),
             lastFingerprintedPath: nil
         )
     }
@@ -150,7 +149,7 @@ public actor FingerprintWorker {
     // MARK: - Loop
 
     private func runLoop(
-        database: LibraryDatabase,
+        database _: LibraryDatabase,
         concurrency: Int,
         fingerprintFunction: @escaping FingerprintFunction,
         pollIntervalNanos: UInt64,
@@ -173,6 +172,7 @@ public actor FingerprintWorker {
                 }
                 let batch = try await fetchPendingBatch(limit: concurrency * 4)
                 if batch.isEmpty {
+                    try? await Task.sleep(nanoseconds: pollIntervalNanos)
                     continue
                 }
                 try await processBatch(batch, totalPending: pendingCount, fingerprintFunction: fingerprintFunction)
@@ -207,7 +207,8 @@ public actor FingerprintWorker {
         // Build a dedup plan: copy from already-done byte-twins
         // where possible, fingerprint one representative per
         // (size, hash) group and propagate to siblings.
-        let plan = try await planBatch(batch)
+        let eligibleBatch = batch.filter { file in readiness?.conflictPath(for: .file(file)) == nil }
+        let plan = try await planBatch(eligibleBatch)
         let database = database
 
         var representativeResults: [(BatchPlan.Group, ProcessResult)] = []
@@ -217,7 +218,7 @@ public actor FingerprintWorker {
             var iterator = plan.toFingerprint.enumerated().makeIterator()
 
             // Seed `concurrency` representative fingerprint tasks.
-            for _ in 0..<concurrency {
+            for _ in 0 ..< concurrency {
                 guard let (index, assignment) = iterator.next() else { break }
                 let representative = assignment.representative
                 group.addTask {
@@ -255,7 +256,7 @@ public actor FingerprintWorker {
     private func flushBatchPlan(
         plan: BatchPlan,
         representativeResults: [(BatchPlan.Group, ProcessResult)],
-        totalPending: Int,
+        totalPending _: Int,
         authorization: LibrarySyncReadiness.Authorization?
     ) async throws {
         let totalFiles = plan.toCopyFromExistingTwin.count
@@ -263,10 +264,13 @@ public actor FingerprintWorker {
         guard totalFiles > 0 else { return }
 
         let counts = try await database.writer.write { database in
-            try FingerprintPersistence.withAuthorization(authorization) {
+            let files = try FileRecord.filter(Array(plan.membershipTokens.keys).contains(Column("id"))).fetchAll(database)
+                .filter { file in authorization?.gate.conflictPath(for: .file(file)) == nil }
+            let permittedIDs = Set(files.compactMap(\.id))
+            return try FingerprintPersistence.withAuthorization(authorization, targets: files.map(SeratoConflictTarget.file)) {
                 var completed = 0
                 var failed = 0
-                for entry in plan.toCopyFromExistingTwin {
+                for entry in plan.toCopyFromExistingTwin where permittedIDs.contains(entry.fileId) {
                     if try FingerprintPersistence.write(
                         fileID: entry.fileId, fingerprint: entry.fingerprint, status: .done,
                         requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[entry.fileId]!, in: database
@@ -282,7 +286,7 @@ public actor FingerprintWorker {
                     case .failure: fingerprint = nil; status = .failed
                     case .notDecoded: continue
                     }
-                    for fileID in [result.fileId] + assignment.siblingIds {
+                    for fileID in [result.fileId] + assignment.siblingIds where permittedIDs.contains(fileID) {
                         if try FingerprintPersistence.write(
                             fileID: fileID, fingerprint: fingerprint, status: status,
                             requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[fileID]!, in: database
@@ -305,9 +309,9 @@ public actor FingerprintWorker {
         totalDone += doneCount
         totalFailed += failedCount
 
-        emitProgress(
+        try emitProgress(
             lastPath: lastPath,
-            pending: max(0, totalPending - totalFiles)
+            pending: await fetchPendingCount()
         )
     }
 
@@ -339,7 +343,9 @@ public actor FingerprintWorker {
                 continue
             }
             let key = GroupingKey(fileSize: file.fileSize, hash: hash)
-            if groups[key] == nil { groupOrder.append(key) }
+            if groups[key] == nil {
+                groupOrder.append(key)
+            }
             groups[key, default: []].append(file)
         }
 
@@ -413,13 +419,13 @@ public actor FingerprintWorker {
         let excludeList = excludingFileIds.map(String.init).joined(separator: ",")
         let excludeClause = excludeList.isEmpty ? "" : " AND id NOT IN (\(excludeList))"
         let sql = """
-            SELECT file_size, lightweight_hash, chromaprint_fingerprint
-            FROM files
-            WHERE fingerprint_status = 'done'
-              AND chromaprint_fingerprint IS NOT NULL
-              AND (file_size, lightweight_hash) IN (VALUES \(placeholders))
-            \(excludeClause)
-            """
+        SELECT file_size, lightweight_hash, chromaprint_fingerprint
+        FROM files
+        WHERE fingerprint_status = 'done'
+          AND chromaprint_fingerprint IS NOT NULL
+          AND (file_size, lightweight_hash) IN (VALUES \(placeholders))
+        \(excludeClause)
+        """
         var arguments: [DatabaseValueConvertible] = []
         for key in keys {
             arguments.append(key.fileSize)
@@ -467,9 +473,12 @@ public actor FingerprintWorker {
         }
         do {
             try await database.writer.read { database in
-                try FileProcessingEligibility.requireCurrent(FileMembershipToken(fileId: fileId, revision: file.membershipRevision), in: database)
+                let current = try FileProcessingEligibility.currentFile(FileMembershipToken(fileId: fileId, revision: file.membershipRevision), in: database)
+                try authorization?.check(target: .file(current))
             }
         } catch is FileProcessingEligibilityError {
+            return ProcessResult(fileId: fileId, path: file.path, outcome: .notDecoded)
+        } catch is SeratoPathConflictError {
             return ProcessResult(fileId: fileId, path: file.path, outcome: .notDecoded)
         }
         do {
@@ -506,12 +515,26 @@ public actor FingerprintWorker {
     }
 
     private func fetchPendingBatch(limit: Int) async throws -> [FileRecord] {
-        try await database.writer.read { db in
-            try FileRecord
-                .all().processableInLibrary()
-                .filter(Column("fingerprint_status") == FingerprintStatus.pending.rawValue)
-                .limit(limit)
-                .fetchAll(db)
+        let readiness = readiness
+        return try await database.writer.read { database in
+            var result: [FileRecord] = []
+            var cursor: Int64 = 0
+            let pageSize = min(max(limit, 32), 256)
+            while result.count < limit {
+                try Task.checkCancellation()
+                let page = try FileRecord.all().processableInLibrary()
+                    .filter(Column("fingerprint_status") == FingerprintStatus.pending.rawValue)
+                    .filter(Column("id") > cursor).order(Column("id")).limit(pageSize).fetchAll(database)
+                guard let lastID = page.last?.id else { break }
+                cursor = lastID
+                for file in page where readiness?.conflictPath(for: .file(file)) == nil {
+                    result.append(file)
+                    if result.count == limit {
+                        break
+                    }
+                }
+            }
+            return result
         }
     }
 }

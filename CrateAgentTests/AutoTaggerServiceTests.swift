@@ -4,6 +4,31 @@ import XCTest
 
 @MainActor
 final class AutoTaggerServiceTests: XCTestCase {
+    func testAutoTagReportsPerFileConflictAndContinuesIndependentLookup() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let independent = try await fixture.add("independent.mp3")
+        var scope = SeratoConflictScope()
+        scope.protect(.file(protected), group: protected.path)
+        let authorization = gate.prepareDrain()
+        try gate.install(scope, for: authorization)
+        try gate.markReady(authorization)
+        let recording = makeRecording()
+        let service = AutoTaggerService(database: fixture.database,
+                                        acoustIDClient: StubAcoustIDClient { _ in [] }, musicBrainzClient: StubMusicBrainzClient { _ in recording }, keyStore: StubKeyProvider(),
+                                        fingerprintFunction: { path in XCTAssertEqual(path, independent.path); return [1, 2, 3] },
+                                        audioTagsReader: stubAudioTagsReader(), readiness: gate)
+        try await service.run(fileIDs: [XCTUnwrap(protected.id), XCTUnwrap(independent.id)])
+        guard case let .failed(message) = try service.rows[XCTUnwrap(protected.id)] else { return XCTFail("Conflict reason is missing") }
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("conflict"))
+        XCTAssertEqual(try service.rows[XCTUnwrap(independent.id)], .noMatch)
+        XCTAssertNil(service.fatalError)
+        let unchanged = try await fixture.row(protected)
+        XCTAssertEqual(unchanged, protected)
+    }
+
     func testCompletedReviewCanChooseAlternativeAfterSyncButNotAfterRetirement() async throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)
@@ -15,20 +40,20 @@ final class AutoTaggerServiceTests: XCTestCase {
                                         musicBrainzClient: StubMusicBrainzClient { _ in recording }, keyStore: StubKeyProvider(),
                                         fingerprintFunction: { _ in [1, 2, 3] }, audioTagsReader: stubAudioTagsReader(), readiness: gate)
         try gate.markReady(gate.prepareDrain())
-        await service.run(fileIDs: [file.id!])
-        XCTAssertNotNil(service.candidate(for: file.id!))
+        try await service.run(fileIDs: [XCTUnwrap(file.id)])
+        XCTAssertNotNil(try service.candidate(for: XCTUnwrap(file.id)))
         gate.invalidate()
         service.cancel()
         try gate.markReady(gate.prepareDrain())
         do {
-            let alternatives = try await service.loadAlternativeDetails(fileID: file.id!, offset: 0)
+            let alternatives = try await service.loadAlternativeDetails(fileID: XCTUnwrap(file.id), offset: 0)
             XCTAssertEqual(alternatives.count, 1)
-            let alternative = try await service.resolveAlternative(fileID: file.id!, recordingID: "recording")
+            let alternative = try await service.resolveAlternative(fileID: XCTUnwrap(file.id), recordingID: "recording")
             XCTAssertEqual(alternative.fileID, file.id)
         } catch { XCTFail("Completed current review was rejected after synchronization: \(error)") }
         _ = try await fixture.reconcile()
         do {
-            _ = try await service.resolveAlternative(fileID: file.id!, recordingID: "recording")
+            _ = try await service.resolveAlternative(fileID: XCTUnwrap(file.id), recordingID: "recording")
             XCTFail("Retired candidate regained authority")
         } catch is FileProcessingEligibilityError {}
     }
@@ -50,13 +75,17 @@ final class AutoTaggerServiceTests: XCTestCase {
         let task = Task { await service.run(fileIDs: [file.id!]) }
         await fulfillment(of: [started], timeout: 5)
         gate.invalidate()
-        try gate.markReady(gate.prepareDrain())
+        var scope = SeratoConflictScope()
+        scope.protect(.file(file), group: file.path)
+        let authorization = gate.prepareDrain()
+        try gate.install(scope, for: authorization)
+        try gate.markReady(authorization)
         release.signal()
         await task.value
         let current = try await fixture.row(file)
         XCTAssertNil(current.chromaprintFingerprint)
         XCTAssertEqual(current.fingerprintStatus, .pending)
-        guard case .stopped = service.rows[file.id!] else { return XCTFail("Expected superseded pass to stop") }
+        guard case .stopped = try service.rows[XCTUnwrap(file.id)] else { return XCTFail("Expected superseded pass to stop") }
         XCTAssertNil(service.fatalError)
     }
 
@@ -81,7 +110,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         let current = try await fixture.row(file)
         XCTAssertEqual(current.fingerprintStatus, .pending)
         XCTAssertNil(current.chromaprintFingerprint)
-        guard case .stopped = service.rows[file.id!] else { return XCTFail("Superseded decoder failure was not stopped") }
+        guard case .stopped = try service.rows[XCTUnwrap(file.id)] else { return XCTFail("Superseded decoder failure was not stopped") }
         XCTAssertNil(service.fatalError)
     }
 
@@ -108,11 +137,11 @@ final class AutoTaggerServiceTests: XCTestCase {
                     }
                 }
             }
-            await service.run(fileIDs: [file.id!])
+            try await service.run(fileIDs: [XCTUnwrap(file.id)])
             let current = try await fixture.row(file)
             XCTAssertEqual(current.fingerprintStatus, .pending)
             XCTAssertNil(current.chromaprintFingerprint)
-            guard case .stopped = service.rows[file.id!] else { XCTFail("Invalidated persistence was not stopped"); continue }
+            guard case .stopped = try service.rows[XCTUnwrap(file.id)] else { XCTFail("Invalidated persistence was not stopped"); continue }
             XCTAssertNil(service.fatalError)
         }
     }
@@ -267,7 +296,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             fingerprintFunction: { _ in
                 try database.writer.write { db in
                     _ = try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
-                                                     freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
+                                                         freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
                 }
                 throw NSError(domain: "decode-test", code: 1)
             }
@@ -693,9 +722,9 @@ final class AutoTaggerServiceTests: XCTestCase {
             let recording = makeRecording()
             let service = AutoTaggerService(database: database,
                                             acoustIDClient: SuspendingAcoustIDClient(onStart: {
-                    await started.open()
-                    await release.wait()
-                }, result: [AcoustIDResult(id: "match", score: 0.99, recordingIDs: ["recording"])]),
+                                                await started.open()
+                                                await release.wait()
+                                            }, result: [AcoustIDResult(id: "match", score: 0.99, recordingIDs: ["recording"])]),
                                             musicBrainzClient: StubMusicBrainzClient { _ in recording },
                                             keyStore: StubKeyProvider(), audioTagsReader: stubAudioTagsReader())
             let task = Task { await service.run(fileIDs: [fileID]) }
