@@ -69,6 +69,7 @@ enum SeratoMembershipSnapshotError: LocalizedError, Equatable {
 final class SeratoMembershipSnapshotReader {
     private let locator: SeratoLibraryLocator
     private let watchdog: SeratoWatchdog
+    private let parse: @Sendable (String) throws -> [SeratoTrackRecord]
     private let afterParsing: @Sendable () async throws -> Void
     private var generation: UInt64 = 0
     private var acceptedSnapshot: SeratoMembershipSnapshot?
@@ -78,11 +79,13 @@ final class SeratoMembershipSnapshotReader {
     init(
         locator: SeratoLibraryLocator,
         watchdog: SeratoWatchdog,
-        afterParsing: @escaping @Sendable () async throws -> Void = {}
+        afterParsing: @escaping @Sendable () async throws -> Void = {},
+        parse: @escaping @Sendable (String) throws -> [SeratoTrackRecord] = { path in try readDatabaseRecordsStrict(databasePath: path) }
     ) {
         self.locator = locator
         self.watchdog = watchdog
         self.afterParsing = afterParsing
+        self.parse = parse
     }
 
     func read() async throws -> SeratoMembershipSnapshot {
@@ -96,6 +99,7 @@ final class SeratoMembershipSnapshotReader {
         currentGeneration.withLock { value in value = requestedGeneration }
         let locator = locator
         let afterParsing = afterParsing
+        let parse = parse
         let task = Task.detached {
             try Task.checkCancellation()
             let directory = locator.seratoDirectory.resolvingSymlinksInPath().standardizedFileURL
@@ -114,7 +118,7 @@ final class SeratoMembershipSnapshotReader {
             }
             let records: [SeratoTrackRecord]
             do {
-                records = try readDatabaseRecordsStrict(databasePath: sourceURL.path)
+                records = try parse(sourceURL.path)
             } catch CoreError.IoError {
                 throw SeratoMembershipSnapshotError.sourceUnavailable
             } catch {
@@ -153,6 +157,37 @@ final class SeratoMembershipSnapshotReader {
         return snapshot
     }
 
+    func authorizeCachedSource(libraryID: String, source: SeratoSourceIdentity) async throws -> SeratoSnapshotAuthorization {
+        watchdog.refresh()
+        guard !watchdog.isSeratoRunning else { throw SeratoMembershipSnapshotError.seratoRunning }
+        let revision = watchdog.stateRevision
+        generation += 1
+        let requestedGeneration = generation
+        currentGeneration.withLock { value in value = requestedGeneration }
+        let locator = locator
+        try await Task.detached {
+            guard try SeratoSourceIdentity.read(locator.databaseV2Url) == source,
+                  try locator.supportedLibraryIdentity() == libraryID,
+                  try SeratoSourceIdentity.read(locator.databaseV2Url) == source
+            else {
+                throw SeratoMembershipSnapshotError.sourceChanged
+            }
+        }.value
+        try Task.checkCancellation()
+        watchdog.refresh()
+        guard watchdog.isClosed(atRevision: revision) else { throw SeratoMembershipSnapshotError.seratoRunning }
+        guard generation == requestedGeneration else { throw SeratoMembershipSnapshotError.sourceChanged }
+        let snapshot = SeratoMembershipSnapshot(libraryID: libraryID, records: [], source: source, generation: requestedGeneration)
+        acceptedSnapshot = snapshot
+        acceptedWatchdogRevision = revision
+        return try await authorization(for: snapshot)
+    }
+
+    func cachedSnapshot(records: [SeratoTrackRecord]) throws -> SeratoMembershipSnapshot {
+        guard let acceptedSnapshot, acceptedSnapshot.generation == generation else { throw SeratoMembershipSnapshotError.sourceChanged }
+        return SeratoMembershipSnapshot(libraryID: acceptedSnapshot.libraryID, records: records, source: acceptedSnapshot.source, generation: generation)
+    }
+
     func validate(_ snapshot: SeratoMembershipSnapshot) async throws {
         watchdog.refresh()
         guard !watchdog.isSeratoRunning, watchdog.stateRevision == acceptedWatchdogRevision else {
@@ -182,6 +217,7 @@ final class SeratoMembershipSnapshotReader {
         let currentGeneration = currentGeneration
         let watchdog = watchdog
         let sourceURL = locator.databaseV2Url
+        let locator = locator
         return SeratoSnapshotAuthorization {
             try Task.checkCancellation()
             guard currentGeneration.withLock({ value in value == snapshot.generation }) else {
@@ -190,7 +226,9 @@ final class SeratoMembershipSnapshotReader {
             guard watchdog.isClosed(atRevision: revision) else {
                 throw SeratoMembershipSnapshotError.seratoRunning
             }
-            guard try SeratoSourceIdentity.read(sourceURL) == snapshot.source else {
+            guard try SeratoSourceIdentity.read(sourceURL) == snapshot.source,
+                  try locator.supportedLibraryIdentity() == snapshot.libraryID
+            else {
                 throw SeratoMembershipSnapshotError.sourceChanged
             }
         }

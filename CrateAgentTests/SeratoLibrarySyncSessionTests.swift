@@ -55,7 +55,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         try fixture.save(paths: [file.path, file.path.decomposedStringWithCanonicalMapping])
         let scanner = LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator)
         let snapshot = try await fixture.reader.read()
-        let wrong = SeratoConflictAnalysis(libraryID: snapshot.libraryID, generation: snapshot.generation + 1, conflicts: [], scope: .init())
+        let wrong = SeratoConflictAnalysis(source: snapshot.source, libraryID: snapshot.libraryID, generation: snapshot.generation + 1, conflicts: [], scope: .init())
         do { _ = try await scanner.scan(snapshot: snapshot, reader: fixture.reader, analysis: wrong); XCTFail("Mismatched analysis accepted") }
         catch SeratoMembershipSnapshotError.sourceChanged {}
         _ = try await scanner.scan(snapshot: snapshot, reader: fixture.reader)

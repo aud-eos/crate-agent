@@ -31,7 +31,7 @@ struct SeratoConflictAnalyzer: Sendable {
         }
         let duplicatePaths = occurrencesByPath.keys.filter { path in occurrencesByPath[path]!.count > 1 }.sorted()
         guard !duplicatePaths.isEmpty else {
-            return SeratoConflictAnalysis(libraryID: snapshot.libraryID, generation: snapshot.generation, conflicts: [], scope: SeratoConflictScope())
+            return SeratoConflictAnalysis(source: snapshot.source, libraryID: snapshot.libraryID, generation: snapshot.generation, conflicts: [], scope: SeratoConflictScope())
         }
         var filesByPath: [String: [Int]] = [:]
         var filesByIdentity: [ConflictPhysicalIdentity: [Int]] = [:]
@@ -104,7 +104,7 @@ struct SeratoConflictAnalyzer: Sendable {
             scope.protect(target, group: path)
             conflicts.append(SeratoPathConflict(id: path, occurrences: occurrences, fileIDs: target.fileIDs))
         }
-        return SeratoConflictAnalysis(libraryID: snapshot.libraryID, generation: snapshot.generation, conflicts: conflicts, scope: scope)
+        return SeratoConflictAnalysis(source: snapshot.source, libraryID: snapshot.libraryID, generation: snapshot.generation, conflicts: conflicts, scope: scope)
     }
 
     static func inspectPath(_ path: String, volumeID: String? = nil) throws -> ConflictPathObservation {
