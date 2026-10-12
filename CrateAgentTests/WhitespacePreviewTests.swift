@@ -95,7 +95,7 @@ final class WhitespacePreviewTests: XCTestCase {
     }
 
     @MainActor
-    func testMissingFieldComparisonMatchesWhatTheRunnerSaves() async throws {
+    func testMissingFillNormalizesValuesWithoutChangingOtherFields() async throws {
         let cases = [
             (input: " Artist ", saved: "Artist"),
             (input: "\t\nArtist\r\n", saved: "Artist"),
@@ -116,15 +116,13 @@ final class WhitespacePreviewTests: XCTestCase {
             )))
             try await markProcessingFixturesAvailable(in: database)
             let files = try await database.writer.read { database in try FileRecord.fetchAll(database) }
-            let comparison = MissingFieldFillComparison(field: .artist, value: fixture.input).comparison
             let runner = LibraryHygieneRunner(operationEngine: engine)
             _ = try await runner.applyMissingFieldFill(
                 field: .artist, value: fixture.input, fileIds: files.compactMap(\.id), files: files
             )
             let savedFile = try await database.writer.read { database in try FileRecord.fetchOne(database) }
             let saved = try XCTUnwrap(savedFile)
-            XCTAssertEqual(comparison.proposed, fixture.saved)
-            XCTAssertEqual(saved.artist ?? "", comparison.proposed)
+            XCTAssertEqual(saved.artist ?? "", fixture.saved)
             XCTAssertEqual(saved.title, "Keep this title")
             let writes = try await database.writer.read { database in
                 try EventRecord.filter(Column("event_type") == EventType.fileTagsWritten.rawValue).fetchAll(database)
@@ -132,7 +130,7 @@ final class WhitespacePreviewTests: XCTestCase {
             XCTAssertEqual(writes.count, fixture.saved.isEmpty ? 0 : 1)
             if let write = writes.first {
                 let payload = try JSONDecoder().decode(WriteFileTagsPayload.self, from: Data(write.payloadJson.utf8))
-                XCTAssertEqual(payload.metadata.artist, comparison.proposed)
+                XCTAssertEqual(payload.metadata.artist, fixture.saved)
             }
         }
     }

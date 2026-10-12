@@ -12,6 +12,11 @@ other screens while the app remains open. See the [Auto-Tag guide](docs/auto-tag
 Use the shared Comfortable/Compact density setting to adjust spacing throughout
 the app.
 
+Track lists share search and explicit batch selection. Cleanup and Organize start
+with nothing selected; filtered selections remain visible in the counts. See the
+[list-control contract](docs/list-controls.md) for scopes, keyboard controls, and
+screen-specific exceptions.
+
 In **Library**, use **Re-scan File Info** to check Serato's complete saved library;
 the scan stays off at startup and can be stopped while it is running. Fingerprinting
 continues as independent background work. Removing a track from Serato

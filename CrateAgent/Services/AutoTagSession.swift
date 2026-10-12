@@ -51,6 +51,8 @@ final class AutoTagSession: ObservableObject {
     @Published private(set) var appliedFileIDs: Set<Int64> = []
     @Published private(set) var searchState = AutoTagSearchState()
     @Published private(set) var browseResults = AutoTagFileBrowse.Results.empty
+    @Published private(set) var browseQuery = ""
+    @Published private(set) var selectionNotice: String?
     @Published private(set) var browseFilter = AutoTagBrowseFilter.either
     @Published private(set) var isBrowsing = false
     @Published private(set) var browseError: String?
@@ -99,6 +101,7 @@ final class AutoTagSession: ObservableObject {
     private var browseLoaded = false
     private var searchTask: Task<Void, Never>?
     private var searchGeneration = 0
+    private var selectedSnapshots: [Int64: BrowserRow] = [:]
     private var hasFocusedEntry = false
     private var membershipObservation: Task<Void, Never>?
     private var membershipFiles: [Int64: FileRecord] = [:]
@@ -181,6 +184,11 @@ final class AutoTagSession: ObservableObject {
 
     func startScan() async {
         guard !isApplying, !isScanning, pendingResyncBatchId == nil, !selectedFileIDs.isEmpty else { return }
+        do { try reconcileSelection() } catch {
+            actionError = "Could not verify selection: \(error.localizedDescription)"
+            return
+        }
+        guard !selectedFileIDs.isEmpty else { return }
         scanGeneration += 1
         let generation = scanGeneration
         let fileIDs = selectedFileIDs.sorted()
@@ -246,6 +254,8 @@ final class AutoTagSession: ObservableObject {
         browseTask = nil
         browseLoaded = false
         browseResults = .empty
+        browseQuery = ""
+        selectionNotice = nil
         isBrowsing = false
         browseError = nil
         searchGeneration += 1
@@ -257,6 +267,7 @@ final class AutoTagSession: ObservableObject {
         rows = [:]
         rowModels = [:]
         selectedFileIDs = []
+        selectedSnapshots = [:]
         confirmedFileIDs = []
         appliedFileIDs = []
         filesByID = [:]
@@ -270,20 +281,60 @@ final class AutoTagSession: ObservableObject {
     }
 
     func selectVisibleFileIDs(_ fileIDs: [Int64]) {
+        setVisibleFileIDs(fileIDs, selected: true)
+    }
+
+    func setVisibleFileIDs(_ fileIDs: [Int64], selected: Bool) {
         guard !isScanning, !isApplying, scannedFileIDs.isEmpty else { return }
-        selectedFileIDs.formUnion(fileIDs)
+        if selected {
+            do {
+                let visible = selectionMode == .browse ? browseResults.matches : searchState.results.matches
+                let displayed = Dictionary(uniqueKeysWithValues: visible.map { file in (file.id, file) })
+                let newIDs = Set(fileIDs).subtracting(selectedFileIDs)
+                let missingIDs = newIDs.subtracting(displayed.keys)
+                let loaded = try selectionRows(missingIDs)
+                let available = displayed.merging(Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, $0) }), uniquingKeysWith: { current, _ in current })
+                for identifier in newIDs {
+                    guard let file = available[identifier], file.canProcess else { continue }
+                    selectedSnapshots[identifier] = file
+                    selectedFileIDs.insert(identifier)
+                }
+            } catch { actionError = "Could not select files: \(error.localizedDescription)" }
+        } else {
+            selectedFileIDs.subtract(fileIDs)
+            for identifier in fileIDs {
+                selectedSnapshots[identifier] = nil
+            }
+        }
+    }
+
+    private func selectionRows(_ identifiers: Set<Int64>) throws -> [BrowserRow] {
+        guard !identifiers.isEmpty else { return [] }
+        return try database.writer.read { connection in
+            try BrowserRow.fetchAll(connection, sql: BrowserRow.browserFetchSQL + " WHERE id IN (" + identifiers.map { _ in "?" }.joined(separator: ",") + ")", arguments: StatementArguments(identifiers))
+        }
+    }
+
+    private func reconcileSelection() throws {
+        guard !selectedFileIDs.isEmpty, !isScanning, !isApplying else { return }
+        let current = try selectionRows(selectedFileIDs)
+        let retained = Set(current.filter { file in file.canProcess && selectedSnapshots[file.id] == file }.map(\.id))
+        let removed = selectedFileIDs.subtracting(retained)
+        setVisibleFileIDs(Array(removed), selected: false)
+        if !removed.isEmpty {
+            selectionNotice = "\(removed.count) selected files changed or became unavailable and were deselected."
+        }
     }
 
     func toggleSelection(_ fileID: Int64) {
-        guard !isScanning, !isApplying, scannedFileIDs.isEmpty else { return }
-        if !selectedFileIDs.insert(fileID).inserted {
-            selectedFileIDs.remove(fileID)
-        }
+        setVisibleFileIDs([fileID], selected: !selectedFileIDs.contains(fileID))
     }
 
     func clearSelection() {
         guard !isScanning, !isApplying, scannedFileIDs.isEmpty else { return }
         selectedFileIDs = []
+        selectedSnapshots = [:]
+        selectionNotice = nil
     }
 
     func updateReviewModel(_ model: AutoTagRowModel, for fileID: Int64) {
@@ -502,17 +553,29 @@ final class AutoTagSession: ObservableObject {
         }
     }
 
+    func loadSelectionPage(_ page: Int) async {
+        if selectionMode == .browse {
+            await loadBrowsePage(page)
+        } else {
+            await performSearch(page: page)
+        }
+    }
+
     func loadBrowsePage(_ page: Int? = nil) async {
+        guard !isScanning, !isApplying else { return }
         browseTask?.cancel()
         browseGeneration += 1
         let generation = browseGeneration
         let requestedPage = page ?? browsePage
         let filter = browseFilter
+        let query = browseQuery
         isBrowsing = true
         browseError = nil
         let task = Task { [self] in
             do {
-                let result = try await database.writer.read { database in try AutoTagFileBrowse.browse(filter: filter, page: requestedPage, in: database) }
+                let result = try await database.writer.read { database in try AutoTagFileBrowse.browse(filter: filter, page: requestedPage, query: query, in: database) }
+                guard generation == browseGeneration, !Task.isCancelled else { return }
+                try reconcileSelection()
                 guard generation == browseGeneration, !Task.isCancelled else { return }
                 browseResults = result
                 browseLoaded = true
@@ -528,8 +591,22 @@ final class AutoTagSession: ObservableObject {
         await task.value
     }
 
+    func updateBrowseQuery(_ query: String) {
+        guard !isScanning, !isApplying else { return }
+        browseQuery = query
+        browseTask?.cancel()
+        browseGeneration += 1
+        let generation = browseGeneration
+        isBrowsing = true
+        browseTask = Task {
+            do { try await Task.sleep(nanoseconds: 150_000_000) } catch { return }
+            guard generation == browseGeneration else { return }
+            await loadBrowsePage(0)
+        }
+    }
+
     func setBrowseFilter(_ filter: AutoTagBrowseFilter) {
-        guard filter != browseFilter else { return }
+        guard !isScanning, !isApplying, filter != browseFilter else { return }
         browseGeneration += 1
         browseTask?.cancel()
         browseFilter = filter
@@ -543,7 +620,7 @@ final class AutoTagSession: ObservableObject {
     }
 
     func updateSearchQuery(_ query: String) {
-        guard query != searchState.query else { return }
+        guard !isScanning, !isApplying, query != searchState.query else { return }
         searchState.query = query
         searchTask?.cancel()
         searchGeneration += 1
@@ -555,18 +632,23 @@ final class AutoTagSession: ObservableObject {
         }
     }
 
-    func performSearch() async {
+    func performSearch(page: Int = 0) async {
+        guard !isScanning, !isApplying else { return }
         searchTask?.cancel()
         searchGeneration += 1
         let generation = searchGeneration
         let query = searchState.query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
+        searchState.beginSearch()
         let task = Task { [self] in
             let outcome: Result<AutoTagFileSearch.Results, Error>
-            do { outcome = try await .success(database.writer.read { database in try AutoTagFileSearch.search(query: query, in: database) }) }
+            do { outcome = try await .success(database.writer.read { database in try AutoTagFileSearch.search(query: query, page: page, in: database) }) }
             catch { outcome = .failure(error) }
             guard generation == searchGeneration,
                   Self.shouldPublishSearchResult(queryTaskRanFor: query, currentQuery: searchState.query, isCancelled: Task.isCancelled) else { return }
+            do { try reconcileSelection() }
+            catch { actionError = "Could not refresh selection: \(error.localizedDescription)" }
+            guard generation == searchGeneration, !Task.isCancelled else { return }
             searchState.publish(outcome, for: query)
             searchTask = nil
         }

@@ -34,7 +34,7 @@ enum AutoTagFileBrowse {
         static let empty = Results(matches: [], totalMatchCount: 0, page: 0)
     }
 
-    static func browse(filter: AutoTagBrowseFilter = .either, page: Int = 0, in db: GRDB.Database) throws -> Results {
+    static func browse(filter: AutoTagBrowseFilter = .either, page: Int = 0, query: String = "", in db: GRDB.Database) throws -> Results {
         let (offset, overflow) = page.multipliedReportingOverflow(by: pageSize)
         guard page >= 0, !overflow else { throw BrowseError.invalidPage }
         let missingFields = ["files.artist", "files.title", "files.album"]
@@ -50,8 +50,9 @@ enum AutoTagFileBrowse {
         let source = """
         FROM files LEFT JOIN tracks ON tracks.id = files.track_id
         WHERE \(FileProcessingEligibility.activeSQL) AND (\(predicate))
+          AND (:query = '' OR \(ListSearch.predicate(prefix: "files.", parameter: ":query")))
         """
-        let countArguments: StatementArguments = ["whitespace": whitespaceCharacters]
+        let countArguments: StatementArguments = ["whitespace": whitespaceCharacters, "query": query.trimmingCharacters(in: .whitespacesAndNewlines)]
         guard let total = try Int.fetchOne(db, sql: "SELECT COUNT(*) \(source)", arguments: countArguments) else {
             throw BrowseError.missingCount
         }
@@ -63,7 +64,7 @@ enum AutoTagFileBrowse {
             ORDER BY files.artist, files.title, files.id
             LIMIT :limit OFFSET :offset
             """,
-            arguments: ["whitespace": whitespaceCharacters, "limit": pageSize, "offset": offset]
+            arguments: ["whitespace": whitespaceCharacters, "query": query.trimmingCharacters(in: .whitespacesAndNewlines), "limit": pageSize, "offset": offset]
         )
         return Results(matches: matches, totalMatchCount: total, page: page)
     }

@@ -29,6 +29,7 @@ struct OrganizePreviewSnapshot: Sendable {
         let isOutsideMusicFolder: Bool
         let artist: String
         let title: String
+        let searchText: String
         let disposition: Disposition
 
         var plan: LibraryOrganizer.Plan? {
@@ -99,6 +100,7 @@ struct OrganizePreviewSnapshot: Sendable {
             rows.append(Row(id: identifier, sourcePath: file.path, isOutsideMusicFolder: isOutside,
                             artist: LibraryHygiene.isMissing(file.artist) ? OrganizeMessages.noValue : file.artist ?? "",
                             title: LibraryHygiene.isMissing(file.title) ? (file.path as NSString).lastPathComponent : file.title ?? "",
+                            searchText: ListSearch.normalized(ListSearch.text(artist: file.artist, title: file.title, album: file.album, path: file.path)),
                             disposition: disposition))
             if isOutside {
                 outsideIndexes.append(index)

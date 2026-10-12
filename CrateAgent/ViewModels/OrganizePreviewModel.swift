@@ -22,6 +22,53 @@ final class OrganizePreviewModel: ObservableObject {
     @Published private(set) var error: String?
     @Published private(set) var notice: String?
 
+    @Published private(set) var query = ""
+    @Published private(set) var visibleIndexes: [Int] = []
+    private var sortColumn = ""
+    private var sortAscending = true
+    private var filteredScope = IndexSet()
+
+    func setQuery(_ query: String) {
+        guard !isBusy else { return }
+        self.query = query
+        refilter()
+    }
+
+    func sort(column: String, ascending: Bool) {
+        guard !isBusy else { return }
+        sortColumn = column
+        sortAscending = ascending
+        refilter()
+    }
+
+    private func sortText(_ row: OrganizePreviewSnapshot.Row) -> String {
+        switch sortColumn {
+        case "artist": row.artist
+        case "title": row.title
+        case "status": row.status
+        case "source": row.sourcePath
+        case "destination": row.plan?.destinationPath ?? ""
+        case "location": row.isOutsideMusicFolder ? "Outside music folder" : "Inside music folder"
+        default: preconditionFailure("Unknown Organize column")
+        }
+    }
+
+    @Published private(set) var displayGeneration = UUID()
+
+    private func refilter() {
+        let needle = ListSearch.normalized(query.trimmingCharacters(in: .whitespacesAndNewlines))
+        let candidates = filter == .all ? Array(snapshot.rows.indices) : snapshot.outsideIndexes
+        visibleIndexes = needle.isEmpty ? candidates : candidates.filter { index in snapshot.rows[index].searchText.contains(needle) }
+        if !sortColumn.isEmpty {
+            visibleIndexes.sort { first, second in
+                let order = sortText(snapshot.rows[first]).localizedStandardCompare(sortText(snapshot.rows[second]))
+                return sortAscending ? order == .orderedAscending : order == .orderedDescending
+            }
+        }
+        displayGeneration = UUID()
+        filteredScope = IndexSet(visibleIndexes).intersection(snapshot.allScope)
+    }
+
     private var requestID = UUID()
     private var worker: Task<OrganizePreviewSnapshot, Error>?
     private var cancellation: OrganizePlanningCancellation?
@@ -31,11 +78,11 @@ final class OrganizePreviewModel: ObservableObject {
     }
 
     var visibleCount: Int {
-        filter == .all ? snapshot.rows.count : snapshot.outsideIndexes.count
+        visibleIndexes.count
     }
 
     var scope: IndexSet {
-        filter == .all ? snapshot.allScope : snapshot.outsideScope
+        filteredScope
     }
 
     var visibleBlockedCount: Int {
@@ -49,6 +96,7 @@ final class OrganizePreviewModel: ObservableObject {
     func setFilter(_ filter: Filter) {
         guard !isBusy else { return }
         self.filter = filter
+        refilter()
     }
 
     func isSelected(_ identifier: Int64) -> Bool {
@@ -116,6 +164,7 @@ final class OrganizePreviewModel: ObservableObject {
             try Task.checkCancellation()
             guard requestID == currentRequest else { return }
             snapshot = loaded
+            refilter()
             selection = loaded.selection
             if loaded.droppedSelectionCount > 0 {
                 notice = "\(loaded.droppedSelectionCount) selected proposals changed or disappeared and were deselected. Review the updated preview."

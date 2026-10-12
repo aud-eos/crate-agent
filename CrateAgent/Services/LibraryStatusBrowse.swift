@@ -46,9 +46,9 @@ enum LibraryStatusBrowse {
         var predicate = filter.predicate
         var arguments: [DatabaseValueConvertible] = []
         if !search.isEmpty {
-            predicate += " AND ((path LIKE ? COLLATE NOCASE) OR (COALESCE(artist, '') LIKE ? COLLATE NOCASE) OR (COALESCE(title, '') LIKE ? COLLATE NOCASE) OR (COALESCE(album, '') LIKE ? COLLATE NOCASE))"
-            let pattern = "%\(search)%"
-            arguments = [pattern, pattern, pattern, pattern]
+            predicate += " AND \(ListSearch.trackPredicate)"
+            let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+            arguments = [query, query, query, query]
         }
         guard let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files WHERE \(predicate)", arguments: StatementArguments(arguments)) else {
             throw BrowseError.missingCount

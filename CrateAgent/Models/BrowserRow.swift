@@ -24,7 +24,6 @@ import GRDB
 public struct BrowserRow:
     Codable, FetchableRecord, Hashable, Identifiable, Sendable
 {
-
     public static let databaseTableName = "files"
     public static let databaseColumnDecodingStrategy =
         DatabaseColumnDecodingStrategy.convertFromSnakeCase
@@ -37,6 +36,7 @@ public struct BrowserRow:
     public var bpm: String?
     public var musicalKey: String?
     public var libraryMembership: LibraryMembership
+    public var membershipRevision: Int64
     public var fileAvailability: FileAvailability
 
     public var canProcess: Bool {
@@ -61,11 +61,25 @@ public struct BrowserRow:
     /// SwiftUI's `KeyPathComparator` needs a `Comparable` value;
     /// Optional<String> isn't Comparable. These projections return
     /// "" for nil so nil sorts first alphabetically.
-    public var artistOrEmpty: String { artist ?? "" }
-    public var titleOrEmpty: String { title ?? "" }
-    public var albumOrEmpty: String { album ?? "" }
-    public var bpmOrEmpty: String { bpm ?? "" }
-    public var musicalKeyOrEmpty: String { musicalKey ?? "" }
+    public var artistOrEmpty: String {
+        artist ?? ""
+    }
+
+    public var titleOrEmpty: String {
+        title ?? ""
+    }
+
+    public var albumOrEmpty: String {
+        album ?? ""
+    }
+
+    public var bpmOrEmpty: String {
+        bpm ?? ""
+    }
+
+    public var musicalKeyOrEmpty: String {
+        musicalKey ?? ""
+    }
 
     public init(
         id: Int64,
@@ -76,8 +90,10 @@ public struct BrowserRow:
         bpm: String? = nil,
         musicalKey: String? = nil,
         libraryMembership: LibraryMembership = .legacyUnverified,
-        fileAvailability: FileAvailability = .unknown
+        fileAvailability: FileAvailability = .unknown,
+        membershipRevision: Int64 = 0
     ) {
+        self.membershipRevision = membershipRevision
         self.id = id
         self.path = path
         self.artist = artist
@@ -90,17 +106,17 @@ public struct BrowserRow:
     }
 }
 
-extension BrowserRow {
-    public static let browserColumnsSQL = "files.id, files.path, files.artist, files.title, files.album, files.bpm, files.musical_key, files.library_membership, files.file_availability"
+public extension BrowserRow {
+    static let browserColumnsSQL = "files.id, files.path, files.artist, files.title, files.album, files.bpm, files.musical_key, files.library_membership, files.file_availability, files.membership_revision"
 
     /// Explicit projection query so we never accidentally pull the
     /// BLOB columns. The column list mirrors the struct's properties
     /// (snake_case in SQL, camelCase in Swift via the decoding
     /// strategy above).
-    public static let browserFetchSQL = """
-        SELECT \(browserColumnsSQL)
-        FROM files
-        """
+    static let browserFetchSQL = """
+    SELECT \(browserColumnsSQL)
+    FROM files
+    """
 }
 
 extension LibraryMembership {

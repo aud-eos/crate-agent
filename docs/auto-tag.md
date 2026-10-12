@@ -11,7 +11,7 @@ recording has no MusicBrainz ID. You can filter either condition separately.
 The missing-fields filter describes the indexed Serato metadata; scanning reads
 the actual embedded tags for the review comparison.
 
-Browse one page at a time or use **Search** to find a specific artist, title, or
+Browse one page at a time or use **Search** to find a specific artist, title, album, or
 filename. Selections stay selected when you change pages or searches. Selecting
 a page selects only its displayed tracks. **Scan selected (N)** starts the audio
 lookup for those tracks; opening the browser does not start a scan.
@@ -100,3 +100,11 @@ are outside the supported scope. See the
 The app-wide density control adjusts spacing throughout the app. Comfortable is
 the default; Compact fits more rows. This preference is shared with General
 settings and does not change selections or metadata decisions.
+
+## Shared list controls
+
+Browse and Search support artist, title, album, and path matching, with Previous
+and Next page controls. Select page is reversible; Clear selection also clears
+hidden pages and searches. Review List search leaves approvals intact and reports
+hidden approvals. Bulk approval actions apply across the entire scan. See the
+[shared list-control contract](list-controls.md).

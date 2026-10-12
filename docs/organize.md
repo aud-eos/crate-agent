@@ -108,3 +108,7 @@ The full immutable plan remains in memory because collision allocation needs the
 complete candidate set. Only visible rows become AppKit views. SQL-backed paging
 for other screens remains tracked separately in #134; shared selection adoption
 outside Organize remains in #146.
+
+Search artist, title, album, or path to narrow the location filter. Click a native
+column header to sort. Search and sort preserve explicit selections, including
+hidden targets. See the [shared list-control contract](list-controls.md).

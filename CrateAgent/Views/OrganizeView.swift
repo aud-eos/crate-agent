@@ -19,6 +19,8 @@ struct OrganizeView: View {
             PageHeading("Organize", subtitle: "Review track locations, then move selected files into your artist letter folders.")
                 .padding(density.pagePadding)
             header
+            ListSearchField(text: Binding(get: { preview.query }, set: preview.setQuery))
+                .padding(.horizontal, density.pagePadding).padding(.bottom, density.spacing).disabled(preview.isBusy)
             Divider()
             content
             Divider()
@@ -69,7 +71,7 @@ struct OrganizeView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if preview.visibleCount == 0 {
             ContentUnavailableView(
-                preview.error != nil ? "Couldn't load preview" : preview.filter == .outsideOnly ? "No files outside the music folder" : "Every file is at its canonical path",
+                preview.error != nil ? "Couldn't load preview" : !preview.query.isEmpty ? ListControlLabels.noMatches : preview.filter == .outsideOnly ? "No files outside the music folder" : "Every file is at its canonical path",
                 systemImage: preview.error != nil ? "exclamationmark.triangle" : "checkmark.seal",
                 description: Text(preview.error != nil ? "Resolve the error below, then rescan." : "Use All to review other proposed moves, or rescan after importing tracks.")
             )
@@ -80,9 +82,7 @@ struct OrganizeView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: density.detailSpacing) {
-            Text("\(preview.visibleCount) results · \(preview.selection.count) selected · \(preview.hiddenSelectionCount) outside current filter")
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(.secondary)
+            ListResultSummary(results: preview.visibleCount, selected: preview.selection.count, hidden: preview.hiddenSelectionCount)
                 .padding(.horizontal, density.pagePadding)
             if preview.snapshot.blockedCount > 0 {
                 Text("\(preview.snapshot.blockedCount) files need required tags · \(preview.visibleBlockedCount) in this filter. Correct tags in Library Cleanup or Auto-Tag, then rescan.")
@@ -110,11 +110,8 @@ struct OrganizeView: View {
                     Button("Rescan") { Task { await rescan() } }
                         .disabled(preview.isApplying)
                 }
-                BatchSelectionToggle(title: "Select all \(preview.scope.count) eligible matches", coverage: preview.selection.coverage(in: preview.scope),
-                                     enabled: !preview.isBusy && !preview.scope.isEmpty, setSelected: preview.selectScope)
-                    .fixedSize()
-                Button("Clear selection", action: preview.clearSelection)
-                    .disabled(preview.isBusy || preview.selection.count == 0)
+                BatchSelectionControls(count: preview.selection.count, scopeCount: preview.scope.count, coverage: preview.selection.coverage(in: preview.scope),
+                                       enabled: !preview.isBusy, setSelected: preview.selectScope, clear: preview.clearSelection)
                 Button("Move \(preview.selection.count) selected files") { pendingConfirm = true }
                     .keyboardShortcut(.defaultAction)
                     .disabled(preview.selection.count == 0 || preview.isBusy || seratoWatchdog.isSeratoRunning)
@@ -157,11 +154,11 @@ struct OrganizePreviewTable: View {
 
     var body: some View {
         let snapshot = preview.snapshot
-        let filter = preview.filter
+        let indexes = preview.visibleIndexes
         VirtualizedPreviewTable(
-            dataID: "\(snapshot.generation):\(filter.rawValue)", accessibilityLabel: "Organize move preview",
-            rowCount: filter == .all ? snapshot.rows.count : snapshot.outsideIndexes.count,
-            row: { index in snapshot.rows[filter == .all ? index : snapshot.outsideIndexes[index]] },
+            dataID: preview.displayGeneration.uuidString, accessibilityLabel: "Organize move preview",
+            rowCount: indexes.count,
+            row: { index in snapshot.rows[indexes[index]] },
             columns: [
                 PreviewTableColumn(identifier: "artist", title: "Artist", width: 130, text: { row in row.artist }),
                 PreviewTableColumn(identifier: "title", title: "Title", width: 180, text: { row in row.title }),
@@ -179,7 +176,7 @@ struct OrganizePreviewTable: View {
             selectAll: {
                 guard preview.snapshot.generation == snapshot.generation else { return }
                 preview.selectScope(true)
-            }, enabled: !preview.isBusy, density: density, isSelectable: { row in row.plan != nil }
+            }, enabled: !preview.isBusy, density: density, sort: preview.sort, isSelectable: { row in row.plan != nil }
         )
     }
 }
