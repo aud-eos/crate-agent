@@ -1,6 +1,19 @@
 import AppKit
 
 final class PagedNSTableView: NSTableView {
+    var contentVisibleRect: NSRect {
+        var visible = visibleRect
+        if let headerView {
+            let header = convert(headerView.bounds, from: headerView)
+            if visible.intersects(header) {
+                let lower = min(visible.maxY, header.maxY)
+                visible.size.height = visible.maxY - lower
+                visible.origin.y = lower
+            }
+        }
+        return visible
+    }
+
     var selectionIntent: ((Int, NSEvent.ModifierFlags) -> Void)?
     var selectMatchingRows: (() -> Void)?
     var menuAtRow: ((Int) -> NSMenu?)?

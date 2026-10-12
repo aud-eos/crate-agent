@@ -3,6 +3,7 @@ import Foundation
 
 @MainActor
 final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObject {
+    let pageUpdates = PassthroughSubject<IndexSet, Never>()
     @Published private(set) var totalCount = 0
     @Published private(set) var generation: UInt64 = 0
     @Published private(set) var updateID: UInt64 = 0
@@ -14,6 +15,7 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
     private(set) var decodedRowCount = 0
     private(set) var changedRows = IndexSet()
     private(set) var viewportAnchor: Int?
+    private(set) var focusAnchor: Int?
     private(set) var viewport = 0 ..< 0
     var cacheLimit: Int {
         effectivePageSize * 5
@@ -24,7 +26,7 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
     }
 
     var cachedRows: [Snapshot.Row] {
-        pages.values.flatMap { $0 }
+        pages.values.flatMap { rows in rows }
     }
 
     private var pages: [Int: [Snapshot.Row]] = [:]
@@ -40,8 +42,8 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
 
     private var requests: [UUID: Request] = [:]
 
-    func open(_ snapshot: Snapshot, anchorID: Snapshot.Row.ID? = nil, fallbackIndex: Int = 0) async {
-        invalidate()
+    func open(_ snapshot: Snapshot, anchorID: Snapshot.Row.ID? = nil, fallbackIndex: Int = 0, focusID: Snapshot.Row.ID? = nil, focusFallback: Int? = nil) async {
+        invalidate(resetCount: false)
         self.snapshot = snapshot
         let requestedGeneration = generation
         isLoading = true
@@ -50,8 +52,10 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         do {
             let count = try await snapshot.count()
             guard count >= 0 else { throw PagingError.invalidRange }
-            let anchor = try await anchorID.asyncFlatMap { try await snapshot.index(of: $0) }
+            let anchor = try await anchorID.asyncFlatMap { identifier in try await snapshot.index(of: identifier) }
+            let focused = try await focusID.asyncFlatMap { identifier in try await snapshot.index(of: identifier) }
             guard generation == requestedGeneration, !Task.isCancelled else { return }
+            focusAnchor = min(max(0, focused ?? focusFallback ?? anchor ?? fallbackIndex), max(0, count - 1))
             totalCount = count
             viewportAnchor = min(max(0, anchor ?? fallbackIndex), max(0, count - 1))
             isLoading = false
@@ -61,6 +65,7 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
             }
         } catch {
             guard generation == requestedGeneration, !Task.isCancelled else { return }
+            totalCount = 0
             countFailed = true
             isLoading = false
             self.error = error.localizedDescription
@@ -71,6 +76,7 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         guard !isLoading, !countFailed, totalCount > 0 else { return }
         let lower = min(max(0, range.lowerBound), totalCount - 1)
         let upper = min(max(lower + 1, range.upperBound), totalCount)
+        guard viewport != lower ..< upper || desiredPages.isEmpty else { return }
         viewport = lower ..< upper
         let size = max(200, (viewport.count + 3) / 4)
         if size != effectivePageSize {
@@ -96,8 +102,8 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
             distance += 1
         }
         desiredPages = desired
-        pages = pages.filter { desired.contains($0.key) }
-        failures = failures.filter { desired.contains($0.key) }
+        pages = pages.filter { entry in desired.contains(entry.key) }
+        failures = failures.filter { entry in desired.contains(entry.key) }
         error = failures.values.first
         for request in requests.values where !desired.contains(request.page) || request.size != size {
             request.task.cancel()
@@ -131,7 +137,7 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         updateID &+= 1
     }
 
-    private func invalidate() {
+    private func invalidate(resetCount: Bool = true) {
         generation &+= 1
         for request in requests.values {
             request.task.cancel()
@@ -141,8 +147,11 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         failures.removeAll()
         desiredPages.removeAll()
         changedRows.removeAll()
-        totalCount = 0
+        if resetCount {
+            totalCount = 0
+        }
         viewportAnchor = nil
+        focusAnchor = nil
         viewport = 0 ..< 0
     }
 
@@ -189,6 +198,7 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         }
         error = failures.values.first
         changedRows = IndexSet(integersIn: range)
+        pageUpdates.send(changedRows)
         updateID &+= 1
     }
 }

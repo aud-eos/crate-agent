@@ -31,6 +31,12 @@ If an import cannot update Serato, it remains pending and the sync status offers
 **Retry Sync**. Restore access to the Serato library and retry without dropping the
 audio again. Pending retries currently survive only while crate-agent stays open.
 
+Library shows every matching file through one continuous scrollbar, loading rows
+as needed. **Select all matches** includes unloaded files; selections survive
+search and filter changes, and the count shows selected files outside the filter.
+New matches never join an earlier selection automatically. Right-click actions
+still operate on the clicked file.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing

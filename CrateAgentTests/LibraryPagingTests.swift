@@ -1,5 +1,7 @@
+import AppKit
 @testable import CrateAgent
 import GRDB
+import SwiftUI
 import XCTest
 
 final class LibraryPagingTests: XCTestCase {
@@ -26,7 +28,7 @@ final class LibraryPagingTests: XCTestCase {
     func testSnapshotCountPagesAndFullQuerySearchRemainConsistentAcrossWrites() async throws {
         let fixture = try fixture
         let snapshot = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: fixture.query)
-        let count = try await snapshot.count()
+        let count = await snapshot.count()
         XCTAssertEqual(count, 30000)
         try await fixture.pool.write { connection in
             var added = PagedLibraryFixture.file(30001)
@@ -36,10 +38,10 @@ final class LibraryPagingTests: XCTestCase {
         let oldLast = try await snapshot.rows(in: 29800 ..< 30000)
         XCTAssertEqual(oldLast.last?.title, "Final Needle")
         XCTAssertEqual(oldLast.last?.id, 30000)
-        let oldCount = try await snapshot.count()
+        let oldCount = await snapshot.count()
         XCTAssertEqual(oldCount, 30000)
         let current = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: fixture.query)
-        let newCount = try await current.count()
+        let newCount = await current.count()
         XCTAssertEqual(newCount, 30001)
         let search = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: .init(search: "Changed"))
         let found = try await search.rows(in: 0 ..< 1)
@@ -121,6 +123,110 @@ final class LibraryPagingTests: XCTestCase {
         XCTAssertEqual(summary.total, 1)
         try await store.clear()
         await store.close()
+    }
+
+    @MainActor
+    func testNativeLibraryPerformanceAndSelectionWithThirtyThousandFiles() async throws {
+        let fixture = try fixture
+        let model = try LibraryBrowserModel(database: fixture.database)
+        let windowStart = CFAbsoluteTimeGetCurrent()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1400, height: 650), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSView(frame: window.contentLayoutRect)
+        window.orderFront(nil)
+        window.displayIfNeeded()
+        let windowMilliseconds = (CFAbsoluteTimeGetCurrent() - windowStart) * 1000
+        defer { window.close() }
+        var maximumDelay = 0.0
+        let heartbeat = Task { @MainActor in
+            var previous = CFAbsoluteTimeGetCurrent()
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(5)) } catch { return }
+                let now = CFAbsoluteTimeGetCurrent()
+                maximumDelay = max(maximumDelay, (now - previous) * 1000 - 5)
+                previous = now
+            }
+        }
+        defer { heartbeat.cancel(); model.stop() }
+        let loadingStart = CFAbsoluteTimeGetCurrent()
+        await model.start()
+        await pagingEventually { model.results.totalCount == 30000 }
+        let configuration = PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: false, density: .comfortable),
+                                       accessibilityLabel: "Library", rowHeight: 28,
+                                       isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
+                                       onSelect: { _, _ in }, onSelectRange: { _, _ in }, onSelectAll: {}, onClear: {}, onSort: { _, _ in }, contextMenu: { _ in nil })
+        let renderStart = CFAbsoluteTimeGetCurrent()
+        let coordinator = configuration.makeCoordinator()
+        let scroll = coordinator.makeScrollView()
+        window.contentView = scroll
+        scroll.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        let renderMilliseconds = (CFAbsoluteTimeGetCurrent() - renderStart) * 1000
+        defer { coordinator.stop() }
+        let table = try XCTUnwrap(scroll.documentView as? NSTableView)
+        XCTAssertEqual(table.numberOfRows, 30000)
+        await pagingEventually { model.results.row(at: 0) != nil }
+        let initialDecoded = model.results.decodedRowCount
+        XCTAssertLessThanOrEqual(initialDecoded, 1000)
+        let initialLatency = (CFAbsoluteTimeGetCurrent() - loadingStart) * 1000
+        let jumpStart = CFAbsoluteTimeGetCurrent()
+        table.scrollRowToVisible(29999)
+        scroll.layoutSubtreeIfNeeded()
+        let jumpMilliseconds = (CFAbsoluteTimeGetCurrent() - jumpStart) * 1000
+        await pagingEventually { model.results.row(at: 29999) != nil }
+        let pageLatency = (CFAbsoluteTimeGetCurrent() - jumpStart) * 1000
+        table.scrollRowToVisible(0)
+        await pagingEventually { model.results.row(at: 0) != nil }
+        let snapshot = try XCTUnwrap(model.results.snapshot)
+        model.selection.setScope(snapshot, selected: true)
+        await pagingEventually { model.selection.summary?.total == 30000 && !model.selection.isBusy }
+        XCTAssertLessThanOrEqual(model.results.peakCachedRowCount, 1000)
+        model.setQuery(.init(search: "Final Needle"))
+        await pagingEventually { model.results.totalCount == 1 && model.selection.summary?.hidden == 29999 }
+        let file = try await model.resolveFile(id: 30000)
+        XCTAssertEqual(file.title, "Final Needle")
+        let metrics = "window_setup_ms=\(windowMilliseconds) render_ms=\(renderMilliseconds) jump_ms=\(jumpMilliseconds) initial_async_ms=\(initialLatency) distant_async_ms=\(pageLatency) main_delay_ms=\(maximumDelay) initial_decoded=\(initialDecoded) total_decoded=\(model.results.decodedRowCount) cache_peak=\(model.results.peakCachedRowCount)"
+        print("PAGED_LIBRARY_METRICS \(metrics)")
+        let attachment = XCTAttachment(string: metrics)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor
+    func testMetadataRefreshKeepsMountedTableAndDistantScrollAnchor() async throws {
+        let fixture = try fixture
+        let model = try LibraryBrowserModel(database: fixture.database)
+        await model.start()
+        let host = NSHostingView(rootView: LibraryPagedContent(model: model, density: .comfortable, showsFilenames: false, onAction: { _, _ in }))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1400, height: 650), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.orderFront(nil)
+        defer { model.stop(); window.close() }
+        func findTable(_ view: NSView) -> PagedNSTableView? {
+            if let table = view as? PagedNSTableView {
+                return table
+            }
+            for child in view.subviews {
+                if let table = findTable(child) {
+                    return table
+                }
+            }
+            return nil
+        }
+        await pagingEventually { findTable(host) != nil }
+        let table = try XCTUnwrap(findTable(host))
+        table.scrollRowToVisible(29999)
+        await pagingEventually { model.results.row(at: 29999) != nil && !model.selection.isBusy }
+        let firstVisible = table.rows(in: table.contentVisibleRect).location
+        let anchor = try XCTUnwrap(model.results.row(at: firstVisible)?.id)
+        let generation = model.results.generation
+        try await fixture.pool.write { connection in try connection.execute(sql: "UPDATE files SET title = 'Updated' WHERE id = 30000") }
+        await pagingEventually { model.results.generation > generation && !model.isRefreshing && model.results.row(at: 29999)?.title == "Updated" }
+        let refreshed = try XCTUnwrap(findTable(host))
+        XCTAssertTrue(refreshed === table, "Refresh must keep the native table mounted")
+        let newFirstVisible = refreshed.rows(in: refreshed.contentVisibleRect).location
+        XCTAssertEqual(model.results.row(at: newFirstVisible)?.id, anchor)
     }
 
     func testObservationIncludesOffscreenMetadataAndAvailabilityButNotFingerprintWrites() async throws {

@@ -16,7 +16,7 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
     static func open(pool: DatabasePool, query: LibraryBrowseQuery) async throws -> LibraryPagedSnapshot {
         try Task.checkCancellation()
         let reader = try pool.makeSnapshot()
-        let total = try reader.read { try query.count(in: $0) }
+        let total = try reader.read { database in try query.count(in: database) }
         try Task.checkCancellation()
         return LibraryPagedSnapshot(reader: reader, query: query, total: total)
     }
@@ -28,7 +28,7 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
     func rows(in range: Range<Int>) throws -> [BrowserRow] {
         try Task.checkCancellation()
         guard range.lowerBound >= 0, range.upperBound <= total else { throw PagingError.invalidRange }
-        return try reader.read { try signature.rows(in: $0, range: range) }
+        return try reader.read { database in try signature.rows(in: database, range: range) }
     }
 
     func index(of id: Int64) throws -> Int? {

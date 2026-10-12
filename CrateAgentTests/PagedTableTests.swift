@@ -58,6 +58,10 @@ final class PagedTableTests: XCTestCase {
         let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: location, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
         XCTAssertNotNil(table.menu(for: event))
         XCTAssertEqual(contextID, 5)
+        table.focusRow(1, modifiers: [], selecting: false)
+        await controller.open(PagedQueryFixture(rowCount: 5, signature: "refreshed"), anchorID: 1, focusID: 5, focusFallback: 4)
+        await pagingEventually { table.selectedRow == 4 }
+        XCTAssertEqual(selected, [3])
         await controller.open(PagedQueryFixture(rowCount: 2, signature: "deleted"), anchorID: 5, fallbackIndex: 4)
         await pagingEventually { table.numberOfRows == 2 }
         XCTAssertEqual(selected, [3])

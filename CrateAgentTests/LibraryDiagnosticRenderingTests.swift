@@ -34,7 +34,7 @@ final class LibraryDiagnosticRenderingTests: XCTestCase {
                     try await render(VStack(spacing: 0) {
                         PageHeading("Library", subtitle: "Synthetic diagnostic fixture").padding()
                         LibraryStatusFilterBar(selection: .constant(filter))
-                        LibraryBrowserTable(rows: filtered, selectedFileIds: .constant([]), sortOrder: .constant([]), showsFilenames: filter != .active)
+                        DiagnosticPagedLibraryTable(rows: filtered, showsFilenames: filter != .active, density: density)
                     }.appPresentation(), name: "library-\(filter.rawValue)-\(suffix)", density: density, scheme: scheme, width: 1500, height: 530)
                 }
                 try await render(FileHistoryContent(file: rows[5], entries: [FileHistoryEntry(event: event)]),
@@ -76,6 +76,10 @@ final class LibraryDiagnosticRenderingTests: XCTestCase {
             XCTAssertTrue(tables.contains { $0.numberOfRows > 0 }, "Native table must have rendered fixture rows: \(name)")
             if name.hasPrefix("library-removedFromSerato-") || name.hasPrefix("library-missing-") {
                 let table = try XCTUnwrap(tables.first { $0.numberOfRows > 0 })
+                let header = try XCTUnwrap(table.headerView)
+                let firstFrame = host.convert(table.rect(ofRow: 0), from: table)
+                let headerFrame = host.convert(header.bounds, from: header)
+                XCTAssertLessThanOrEqual(firstFrame.intersection(headerFrame).height, 1, "First row must be below the native header")
                 XCTAssertGreaterThanOrEqual(table.rect(ofRow: 0).height, density.minimumRowHeight + 12,
                                             "Diagnostic rows must accommodate a visible filename: \(name)")
             }
@@ -95,5 +99,46 @@ final class LibraryDiagnosticRenderingTests: XCTestCase {
 
     private func descendants(of view: NSView) -> [NSView] {
         view.subviews.flatMap { child in [child] + descendants(of: child) }
+    }
+}
+
+private struct DiagnosticLibrarySnapshot: PagedQuerySnapshot {
+    let rows: [BrowserRow]
+    var signature: String {
+        "diagnostic"
+    }
+
+    func count() async throws -> Int {
+        rows.count
+    }
+
+    func rows(in range: Range<Int>) async throws -> [BrowserRow] {
+        Array(rows[range])
+    }
+
+    func index(of id: Int64) async throws -> Int? {
+        rows.firstIndex { row in row.id == id }
+    }
+
+    func identities(after id: Int64?, limit: Int) async throws -> [PagedIdentity<Int64>] {
+        rows.filter { row in row.id > (id ?? 0) }.prefix(limit).map { row in identity(for: row) }
+    }
+
+    func identity(for row: BrowserRow) -> PagedIdentity<Int64> {
+        .init(id: row.id, revision: row.membershipRevision)
+    }
+}
+
+private struct DiagnosticPagedLibraryTable: View {
+    let rows: [BrowserRow]
+    let showsFilenames: Bool
+    let density: AppDensity
+    @StateObject private var controller = PagedResultsController<DiagnosticLibrarySnapshot>()
+    var body: some View {
+        PagedTable(controller: controller, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density),
+                   accessibilityLabel: "Library", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
+                   isSelected: { _ in false }, onSelect: { _, _ in }, onSelectRange: { _, _ in }, onSelectAll: {}, onClear: {},
+                   onSort: { _, _ in }, contextMenu: { _ in nil })
+            .task { await controller.open(DiagnosticLibrarySnapshot(rows: rows)) }
     }
 }

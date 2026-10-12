@@ -88,7 +88,8 @@ actor LibrarySelectionStore: PagedSelectionProvider {
     func summary(in snapshot: Snapshot) async throws -> PagedSelectionSummary {
         let requestedEpoch = epoch
         let total = try await requireStorage().read { database in
-            try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM selected_identity WHERE included = 1") ?? 0
+            guard let count = try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM selected_identity WHERE included = 1") else { throw PagingError.incompletePage }
+            return count
         }
         let count = await snapshot.count()
         var inScope = 0
@@ -118,7 +119,7 @@ actor LibrarySelectionStore: PagedSelectionProvider {
             while true {
                 try Task.checkCancellation()
                 let predicate = lastID == nil ? "" : " AND id > ?"
-                let arguments: StatementArguments = lastID.map { [$0] } ?? []
+                let arguments: StatementArguments = lastID.map { identifier in [identifier] } ?? []
                 let batch = try Row.fetchAll(database, sql: "SELECT id, revision FROM selected_identity WHERE included = 1\(predicate) ORDER BY id LIMIT 200", arguments: arguments)
                     .map { row in Identity(id: row["id"], revision: row["revision"]) }
                 if batch.isEmpty {
