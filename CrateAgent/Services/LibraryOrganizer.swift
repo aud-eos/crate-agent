@@ -57,6 +57,7 @@ public actor LibraryOrganizer {
         let id: Int64
         let missingFields: [SeratoMetadataField]
         let isOutsideMusicFolder: Bool
+        var conflictReason: String? = nil
     }
 
     struct Preview: Sendable {
@@ -124,6 +125,7 @@ public actor LibraryOrganizer {
 
     nonisolated static func preview<F: HygieneFileSource>(
         in files: [F], musicFolder: URL, template: String,
+        readiness: LibrarySyncReadiness? = nil,
         checkCancellation: () throws -> Void
     ) rethrows -> Preview {
         let requirements = OrganizeMetadataRequirements(template: template)
@@ -137,6 +139,10 @@ public actor LibraryOrganizer {
             try checkCancellation()
             guard let fileId = file.id else { continue }
             let isOutside = !file.path.hasPrefix(musicFolderPath + "/") && file.path != musicFolderPath
+            if let conflict = readiness?.conflictPath(for: SeratoConflictTarget(fileIDs: [fileId], paths: [file.path])) {
+                blockedFiles.append(BlockedFile(id: fileId, missingFields: [], isOutsideMusicFolder: isOutside, conflictReason: SeratoConflictMessages.blocked(conflict)))
+                continue
+            }
             let missing = requirements.missingFields(in: file)
             guard missing.isEmpty else {
                 blockedFiles.append(BlockedFile(id: fileId, missingFields: missing, isOutsideMusicFolder: isOutside))
@@ -161,6 +167,10 @@ public actor LibraryOrganizer {
                 nextSuffixByDestination: &nextSuffixByDestination,
                 checkCancellation: checkCancellation
             )
+            if let conflict = readiness?.conflictPath(for: SeratoConflictTarget(fileIDs: [fileId], paths: [file.path, resolvedDestination])) {
+                blockedFiles.append(BlockedFile(id: fileId, missingFields: [], isOutsideMusicFolder: isOutside, conflictReason: SeratoConflictMessages.blocked(conflict)))
+                continue
+            }
             claimedDestinations.insert(resolvedDestination)
             plans.append(Plan(
                 id: fileId,

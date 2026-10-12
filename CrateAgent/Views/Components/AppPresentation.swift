@@ -3,6 +3,8 @@ import SwiftUI
 struct LibrarySyncStatusView: View {
     let state: SeratoLibrarySyncSession.State
     let retry: () -> Void
+    var hasConflicts = false
+    var review: (() -> Void)? = nil
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
 
     var body: some View {
@@ -14,6 +16,9 @@ struct LibrarySyncStatusView: View {
             }
             Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: density.spacing)
+            if hasConflicts, let review {
+                Button(SeratoConflictMessages.review, action: review)
+            }
             if case .failed = state {
                 Button("Retry Sync", action: retry)
             }
@@ -31,6 +36,7 @@ struct LibrarySyncStatusView: View {
         case let .failed(message): message
         case let .ready(summary):
             "Library synced · \(summary.retired) removed from Serato · \(summary.reactivated) activated · \(summary.unavailable) unavailable"
+                + (summary.pathConflictCount > 0 ? " · \(summary.pathConflictCount) path conflicts · \(summary.conflictBlockedWriteCount) changes waiting for repair" : "")
                 + (summary.supersededWrites > 0 ? " · \(summary.supersededWrites) queued changes superseded" : "")
                 + (summary.duplicateCleanupMessage.map { " · " + $0 } ?? "")
         }
@@ -42,7 +48,7 @@ struct LibrarySyncStatusView: View {
         case .failed: "exclamationmark.triangle.fill"
         case .waitingForSerato: "clock"
         case .reconciling: "arrow.triangle.2.circlepath"
-        case .ready: "checkmark.circle"
+        case let .ready(summary): summary.pathConflictCount > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle"
         }
     }
 
@@ -52,7 +58,7 @@ struct LibrarySyncStatusView: View {
         case .failed: .red
         case .waitingForSerato: .orange
         case .reconciling: .accentColor
-        case .ready: .secondary
+        case let .ready(summary): summary.pathConflictCount > 0 ? .orange : .secondary
         }
     }
 }
@@ -95,6 +101,7 @@ enum AppDensity: String, CaseIterable, Identifiable {
 }
 
 enum AppPresentation {
+    static let mainWindowID = "main"
     static let densityPreference = "appearance.density"
 }
 

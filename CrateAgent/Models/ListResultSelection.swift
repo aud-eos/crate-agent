@@ -13,6 +13,17 @@ struct ListResultSelection<Row: Identifiable & Equatable> {
     private var searchIndex: [Row.ID: String] = [:]
     private var revisions: [Row.ID: String] = [:]
     private var visibleIDs: Set<Row.ID> = []
+    private var blockedIDs: Set<Row.ID> = []
+
+    var selectableVisibleCount: Int {
+        visibleIDs.subtracting(blockedIDs).count
+    }
+
+    mutating func setBlockedIDs(_ identifiers: Set<Row.ID>) {
+        blockedIDs = identifiers
+        selectedIDs.subtract(identifiers)
+        generation = UUID()
+    }
 
     var selectedRows: [Row] {
         rows.filter { row in selectedIDs.contains(row.id) }
@@ -23,7 +34,7 @@ struct ListResultSelection<Row: Identifiable & Equatable> {
     }
 
     var coverage: BatchSelection.Coverage {
-        ListSelectionCoverage.coverage(selected: selectedIDs, scope: visibleIDs)
+        ListSelectionCoverage.coverage(selected: selectedIDs, scope: visibleIDs.subtracting(blockedIDs))
     }
 
     mutating func replace(_ rows: [Row], context: String,
@@ -54,7 +65,7 @@ struct ListResultSelection<Row: Identifiable & Equatable> {
     }
 
     mutating func setSelected(_ selected: Bool, id: Row.ID) {
-        guard searchIndex[id] != nil else { return }
+        guard searchIndex[id] != nil, !selected || !blockedIDs.contains(id) else { return }
         if selected {
             selectedIDs.insert(id)
         } else {
@@ -64,7 +75,7 @@ struct ListResultSelection<Row: Identifiable & Equatable> {
 
     mutating func selectVisible(_ selected: Bool) {
         if selected {
-            selectedIDs.formUnion(visibleIDs)
+            selectedIDs.formUnion(visibleIDs.subtracting(blockedIDs))
         } else {
             selectedIDs.subtract(visibleIDs)
         }
@@ -116,6 +127,7 @@ extension ListResultSelection where Row: HygienePreviewEntry {
                 case "current": row.currentPreview
                 case "proposed": row is LibraryHygiene.MissingFieldEntry ? proposalRevision : row.proposedPreview
                 case "path": row.path
+                case "status": ""
                 default: preconditionFailure("Unknown Cleanup column")
                 }
             }

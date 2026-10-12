@@ -3,6 +3,95 @@ import GRDB
 import XCTest
 
 final class FileEligibilityIntegrationTests: XCTestCase {
+    func testWorkerSkipsConflictedLeadingPageAndKeepsProtectedRowsPending() async throws {
+        let database = try LibraryDatabase.openInMemory()
+        let gate = LibrarySyncReadiness()
+        let files = try await database.writer.write { database in
+            try (0 ..< 6).map { index in
+                var file = FileRecord(path: "/conflict-page-\(index).mp3", volumeUuid: "test", inode: Int64(index + 1), fileSize: 1, mtime: 0)
+                file.libraryMembership = .active
+                file.fileAvailability = .available
+                try file.insert(database)
+                return file
+            }
+        }
+        var scope = SeratoConflictScope()
+        for file in files.prefix(5) {
+            scope.protect(.file(file), group: file.path)
+        }
+        let authorization = gate.prepareDrain()
+        try gate.install(scope, for: authorization)
+        let completed = expectation(description: "eligible file beyond the first page finishes")
+        let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { path in
+            XCTAssertEqual(path, files[5].path)
+            return [1, 2, 3]
+        }, pollIntervalSeconds: 0.01, readiness: gate)
+        await worker.start { progress in
+            if progress.totalDone == 1 {
+                completed.fulfill()
+            }
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try gate.markReady(authorization)
+        await fulfillment(of: [completed], timeout: 5)
+        await worker.stop()
+        let remaining = try await database.writer.read { connection in try FileRecord.order(Column("id")).fetchAll(connection) }
+        XCTAssertTrue(remaining.prefix(5).allSatisfy { file in file.fingerprintStatus == .pending && file.chromaprintFingerprint == nil })
+        XCTAssertEqual(remaining.last?.fingerprintStatus, .done)
+        let progress = try await worker.processAllPendingOnce()
+        XCTAssertEqual(progress.totalPending, 5)
+        XCTAssertEqual(progress.totalFailed, 0)
+    }
+
+    func testConflictRefreshRejectsSuspendedRepresentativeAndTwinResultsThenResumesIndependentWork() async throws {
+        let database = try LibraryDatabase.openInMemory()
+        let gate = LibrarySyncReadiness()
+        let files = try await database.writer.write { database in
+            try (0 ..< 5).map { index in
+                var file = FileRecord(path: "/conflict-twin-\(index).mp3", volumeUuid: "test", inode: Int64(index + 1), fileSize: 1, mtime: 0,
+                                      lightweightHash: Data([index < 2 ? 1 : (index == 2 ? 2 : 3)]))
+                file.libraryMembership = .active
+                file.fileAvailability = .available
+                if index == 4 {
+                    file.chromaprintFingerprint = FingerprintEncoder.serialize([4, 5, 6])
+                    file.fingerprintStatus = .done
+                }
+                try file.insert(database)
+                return file
+            }
+        }
+        let started = expectation(description: "representative decode suspended")
+        let release = DispatchSemaphore(value: 0)
+        let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { path in
+            if path == files[0].path {
+                started.fulfill(); release.wait()
+            }
+            return [1, 2, 3]
+        }, readiness: gate)
+        try gate.markReady(gate.prepareDrain())
+        let work = Task { try await worker.processAllPendingOnce() }
+        await fulfillment(of: [started], timeout: 5)
+        gate.invalidate()
+        var scope = SeratoConflictScope()
+        for index in [0, 1, 3] {
+            scope.protect(.file(files[index]), group: files[index].path)
+        }
+        let authorization = gate.prepareDrain()
+        try gate.install(scope, for: authorization)
+        try gate.markReady(authorization)
+        release.signal()
+        do { _ = try await work.value; XCTFail("Old decode generation committed") } catch is LibrarySyncReadinessError {}
+        _ = try await worker.processAllPendingOnce()
+        let after = try await database.writer.read { connection in try FileRecord.order(Column("id")).fetchAll(connection) }
+        for index in [0, 1, 3] {
+            XCTAssertEqual(after[index].fingerprintStatus, .pending)
+            XCTAssertNil(after[index].chromaprintFingerprint)
+            XCTAssertNil(after[index].fingerprintedSize)
+        }
+        XCTAssertEqual(after[2].fingerprintStatus, .done)
+        XCTAssertEqual(after[4].chromaprintFingerprint, files[4].chromaprintFingerprint)
+    }
+
     func testBackgroundDatabaseFailurePublishesErrorStopsAndCanRestart() async throws {
         let database = try LibraryDatabase.openInMemory()
         try await database.writer.write { database in
@@ -218,7 +307,7 @@ final class FileEligibilityIntegrationTests: XCTestCase {
         release.signal()
         let progress = try await task.value
         XCTAssertEqual(progress.totalDone, 1)
-        let files = try await database.writer.read { try FileRecord.order(Column("id")).fetchAll($0) }
+        let files = try await database.writer.read { connection in try FileRecord.order(Column("id")).fetchAll(connection) }
         for index in [0, 1, 3] {
             XCTAssertNil(files[index].chromaprintFingerprint)
             XCTAssertEqual(files[index].fingerprintStatus, .pending)

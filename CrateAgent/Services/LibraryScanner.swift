@@ -18,7 +18,6 @@ import os.log
 /// Used by AppServices on launch and by SeratoSyncCoordinator when
 /// Serato quits — same operation in both contexts.
 public actor LibraryScanner {
-
     public struct ScanProgress: Sendable, Equatable {
         public let seratoReferenceCount: Int
         public let filesIndexed: Int
@@ -59,7 +58,13 @@ public actor LibraryScanner {
     public func scan(progress: ProgressHandler? = nil) async throws -> ScanResult {
         Self.logger.info("Starting Serato library scan")
 
+        let scopeAuthorization = await operationEngine.captureConflictScope()
         let seratoRecords = try await loadSeratoRecords()
+        var seenPaths = Set<String>()
+        for (path, _) in seratoRecords {
+            guard seenPaths.insert(SeratoPath.normalized(path)).inserted else { throw SeratoPathConflictError(path: path) }
+            try await operationEngine.requireUnconflicted(SeratoConflictTarget(paths: [path]))
+        }
         Self.logger.info(
             "Serato references \(seratoRecords.count, privacy: .public) tracks"
         )
@@ -82,14 +87,17 @@ public actor LibraryScanner {
 
         for (absolutePath, record) in seratoRecords {
             if let existingFile = knownFilesByPath[absolutePath],
-               let fileId = existingFile.id {
+               let fileId = existingFile.id
+            {
+                try await operationEngine.requireUnconflicted(.file(existingFile))
                 // Backfill lightweightHash for rows that pre-date the
                 // cross-volume-move feature. Idempotent: skipped when
                 // the hash is already present. Direct DB write rather
                 // than a mutation — the hash is a derived value, not
                 // a user action, so it doesn't belong in the event log.
                 if existingFile.lightweightHash == nil,
-                   let hash = LightweightHashCalculator.compute(forFileAt: absolutePath) {
+                   let hash = LightweightHashCalculator.compute(forFileAt: absolutePath)
+                {
                     hashBackfills.append((fileId: fileId, hash: hash))
                 }
 
@@ -97,7 +105,8 @@ public actor LibraryScanner {
                 // migration #004). Same direct-write rationale: bitrate
                 // is a derived property of the file, not a user action.
                 if existingFile.bitrateKbps == nil,
-                   let bitrate = readBitrateKbps(forPathAt: absolutePath) {
+                   let bitrate = readBitrateKbps(forPathAt: absolutePath)
+                {
                     bitrateBackfills.append((fileId: fileId, bitrate: bitrate))
                 }
 
@@ -177,6 +186,7 @@ public actor LibraryScanner {
         if !hashBackfills.isEmpty || !bitrateBackfills.isEmpty {
             do {
                 try await database.writer.write { db in
+                    try scopeAuthorization?.check()
                     for entry in hashBackfills {
                         try db.execute(
                             sql: "UPDATE files SET lightweight_hash = ? WHERE id = ?",
@@ -189,11 +199,10 @@ public actor LibraryScanner {
                             arguments: [entry.bitrate, entry.fileId]
                         )
                     }
+                    try scopeAuthorization?.check()
                 }
             } catch {
-                Self.logger.error(
-                    "Backfill flush failed: \(error.localizedDescription, privacy: .public)"
-                )
+                throw error
             }
         }
 
@@ -221,17 +230,34 @@ public actor LibraryScanner {
     /// Consumes exactly the saved generation reconciled by the caller. Run before
     /// queue drain; draining changes V2 and requires a newly read snapshot.
     @discardableResult
-    func scan(snapshot: SeratoMembershipSnapshot, reader: SeratoMembershipSnapshotReader, progress: ProgressHandler? = nil) async throws -> ScanResult {
+    func identityProjectionsForConflictAnalysis() async throws -> [FileRecord] {
+        try await FileRecord.loadIdentityProjections(database: database)
+    }
+
+    func scan(snapshot: SeratoMembershipSnapshot, reader: SeratoMembershipSnapshotReader, analysis suppliedAnalysis: SeratoConflictAnalysis? = nil, progress: ProgressHandler? = nil) async throws -> ScanResult {
         try await reader.validate(snapshot)
+        let directAuthorization = suppliedAnalysis == nil ? await operationEngine.captureConflictScope() : nil
         let files = try await FileRecord.loadIdentityProjections(database: database)
+        let analysis: SeratoConflictAnalysis
+        if let suppliedAnalysis {
+            analysis = suppliedAnalysis
+        } else {
+            analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+        }
+        try analysis.validate(snapshot)
+        try await reader.validate(snapshot)
+        if suppliedAnalysis == nil {
+            try await operationEngine.installDirectConflictAnalysis(analysis, authorization: directAuthorization)
+        }
         var byPath: [String: FileRecord] = [:]
-        for file in files {
+        for file in files where analysis.scope.conflictingPath(for: .file(file)) == nil {
             let path = SeratoPath.normalized(file.path)
             guard byPath.updateValue(file, forKey: path) == nil else { throw SeratoReconciliationError.ambiguousIdentity(path) }
         }
         var records: [String: SeratoTrackRecord] = [:]
         for record in snapshot.records {
             let path = SeratoPath.normalized(record.path)
+            guard analysis.scope.conflictingPath(for: SeratoConflictTarget(paths: [path])) == nil else { continue }
             guard records.updateValue(record, forKey: path) == nil else { throw SeratoReconciliationError.ambiguousIdentity(path) }
         }
         var indexed = 0
@@ -258,6 +284,10 @@ public actor LibraryScanner {
                 continue
             }
             let identity = try FileMetadataCollector.collectVerified(at: path)
+            guard analysis.scope.conflictingPath(for: SeratoConflictTargets.identity(identity)) == nil else {
+                skipped += 1
+                continue
+            }
             let metadata = makeSeratoMetadata(fromRecord: record)
             let authorization = try await reader.authorization(for: snapshot)
             if let existing, let fileID = existing.id {
@@ -266,7 +296,7 @@ public actor LibraryScanner {
                     throw SeratoReconciliationError.ambiguousIdentity(path)
                 }
                 let events = try await operationEngine.observeSnapshotMetadata(.init(fileId: fileID, expectedRevision: existing.membershipRevision,
-                                                                                                      previousIdentity: existing.identity, identity: identity, metadata: metadata,
+                                                                                     previousIdentity: existing.identity, identity: identity, metadata: metadata,
                                                                                      bitrateKbps: readBitrateKbps(forPathAt: path), expectedState: existing.libraryState), authorization: authorization)
                 if !events.isEmpty {
                     updated += 1
@@ -324,9 +354,7 @@ public actor LibraryScanner {
         }
         let indexed = Self.buildPathIndex(allFiles)
         if indexed.duplicatePathCount > 0 {
-            Self.logger.warning(
-                "loadKnownFilesByPath: \(indexed.duplicatePathCount, privacy: .public) duplicate path(s) in files table (likely Unicode normalization or symlink-resolution mismatches). Last-seen wins. Investigate via #35 if this recurs."
-            )
+            throw SeratoReconciliationError.ambiguousIdentity("Multiple indexed rows share a path")
         }
         return indexed.byPath
     }
@@ -347,7 +375,9 @@ public actor LibraryScanner {
         byPath.reserveCapacity(files.count)
         var duplicatePathCount = 0
         for file in files {
-            if byPath[file.path] != nil { duplicatePathCount += 1 }
+            if byPath[file.path] != nil {
+                duplicatePathCount += 1
+            }
             byPath[file.path] = file
         }
         return (byPath, duplicatePathCount)

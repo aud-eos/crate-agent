@@ -2,7 +2,7 @@ import AppKit
 
 enum LibraryBrowserColumns {
     private static let statusIdentifier = "status"
-    static func make(showsFilenames: Bool, density: AppDensity) -> [PagedTableColumn<BrowserRow>] {
+    static func make(showsFilenames: Bool, density: AppDensity, readiness: LibrarySyncReadiness? = nil) -> [PagedTableColumn<BrowserRow>] {
         let definitions: [(LibraryBrowseSort.Column?, String, CGFloat)] = [
             (.artist, "Artist", 220), (.title, "Title", 280), (.bpm, "BPM", 70),
             (.musicalKey, "Key", 50), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
@@ -11,7 +11,7 @@ enum LibraryBrowserColumns {
             let identifier = column?.rawValue ?? statusIdentifier
             return PagedTableColumn(identifier: identifier, title: title, width: width, makeCell: { LibraryBrowserCell() }, updateCell: { view, row in
                 guard let cell = view as? LibraryBrowserCell else { preconditionFailure("Unexpected Library cell") }
-                cell.update(row: row, column: column, title: title, showsFilenames: showsFilenames, density: density)
+                cell.update(row: row?.applyingConflictScope(readiness), column: column, title: title, showsFilenames: showsFilenames, density: density)
             }, sortable: column != nil)
         }
     }

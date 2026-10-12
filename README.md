@@ -27,6 +27,14 @@ with **Retry Sync**. A missing or unreadable Serato database stops synchronizati
 it never means that every track was removed. See the
 [reconciliation contract](docs/serato-membership-reconciliation.md).
 
+An amber **path conflicts** status means unrelated tracks remain usable. Choose
+**Review conflicts** in the main window or menu bar to compare saved spellings,
+Unicode bytes, metadata, and file availability. Repair unwanted references in
+Serato without deleting audio, save and close Serato, then **Retry Sync**. Waiting
+changes retain their intent and are revalidated against the repaired library;
+crate-agent never chooses a duplicate automatically.
+
+
 If an import cannot update Serato, it remains pending and the sync status offers
 **Retry Sync**. Restore access to the Serato library and retry without dropping the
 audio again. Pending retries currently survive only while crate-agent stays open.

@@ -6,7 +6,7 @@ struct CrateAgentApp: App {
     @StateObject private var launcher = AppLauncher()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: AppPresentation.mainWindowID) {
             rootView
         }
         .windowResizability(.contentSize)

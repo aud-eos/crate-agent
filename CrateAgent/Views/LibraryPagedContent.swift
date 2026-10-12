@@ -11,6 +11,7 @@ struct LibraryPagedContent: View {
     @ObservedObject var model: LibraryBrowserModel
     let density: AppDensity
     let showsFilenames: Bool
+    var readiness: LibrarySyncReadiness? = nil
     let onAction: (Int64, LibraryBrowserAction) -> Void
 
     private var enabled: Bool {
@@ -68,7 +69,7 @@ struct LibraryPagedContent: View {
     }
 
     private var table: some View {
-        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density),
+        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness),
                    accessibilityLabel: "Library files", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
                    isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
                    onSelect: { rows, selected in
@@ -87,7 +88,7 @@ struct LibraryPagedContent: View {
                        var query = model.query
                        query.sort = .init(column: column, ascending: ascending)
                        model.setQuery(query)
-                   }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, onFocus: { identifier, index in model.focus(id: identifier, index: index) })
+                   }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, contentRevision: readiness?.scopeRevision ?? 0, onFocus: { identifier, index in model.focus(id: identifier, index: index) })
     }
 
     private func menu(for identifier: Int64) -> NSMenu? {
@@ -97,7 +98,8 @@ struct LibraryPagedContent: View {
         for action in LibraryBrowserAction.allCases {
             let item = LibraryActionMenuItem(title: action.rawValue) { onAction(identifier, action) }
             if action == .rename {
-                item.isEnabled = model.results.cachedRows.first { row in row.id == identifier }?.canProcess == true
+                item.isEnabled = model.results.cachedRows.first { row in row.id == identifier }?.applyingConflictScope(readiness).canProcess == true
+                item.toolTip = model.results.cachedRows.first { row in row.id == identifier }?.applyingConflictScope(readiness).processingBlockReason
             }
             menu.addItem(item)
         }

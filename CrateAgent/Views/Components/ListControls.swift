@@ -52,7 +52,7 @@ struct ResultListControls<Row: Identifiable & Equatable>: View {
     var enabled = true
 
     var body: some View {
-        BatchSelectionControls(count: results.selectedIDs.count, scopeCount: results.visibleRows.count,
+        BatchSelectionControls(count: results.selectedIDs.count, scopeCount: results.selectableVisibleCount,
                                coverage: results.coverage, enabled: enabled,
                                setSelected: { selected in results.selectVisible(selected) }, clear: { results.clearSelection() })
     }

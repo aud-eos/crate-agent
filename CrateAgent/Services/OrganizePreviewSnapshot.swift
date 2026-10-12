@@ -22,6 +22,7 @@ struct OrganizePreviewSnapshot: Sendable {
         enum Disposition: Sendable {
             case move(LibraryOrganizer.Plan)
             case needsMetadata([SeratoMetadataField])
+            case pathConflict(String)
         }
 
         let id: Int64
@@ -40,6 +41,7 @@ struct OrganizePreviewSnapshot: Sendable {
         var status: String {
             switch disposition {
             case .move: return "Ready"
+            case let .pathConflict(reason): return reason
             case let .needsMetadata(fields): return OrganizeMessages.needsMetadata(fields)
             }
         }
@@ -62,7 +64,7 @@ struct OrganizePreviewSnapshot: Sendable {
 
     static func load(database: LibraryDatabase, musicFolder: URL, template: String,
                      previous: OrganizePreviewSnapshot, selected: BatchSelection,
-                     cancellation: OrganizePlanningCancellation) async throws -> OrganizePreviewSnapshot
+                     cancellation: OrganizePlanningCancellation, readiness: LibrarySyncReadiness? = nil) async throws -> OrganizePreviewSnapshot
     {
         let files = try await database.writer.read { connection in
             var files: [HygieneFileRow] = []
@@ -73,7 +75,7 @@ struct OrganizePreviewSnapshot: Sendable {
             }
             return files
         }
-        let preview = try LibraryOrganizer.preview(in: files, musicFolder: musicFolder, template: template, checkCancellation: cancellation.check)
+        let preview = try LibraryOrganizer.preview(in: files, musicFolder: musicFolder, template: template, readiness: readiness, checkCancellation: cancellation.check)
         let plansByID = Dictionary(uniqueKeysWithValues: preview.plans.map { plan in (plan.id, plan) })
         let blockedByID = Dictionary(uniqueKeysWithValues: preview.blockedFiles.map { file in (file.id, file) })
         var rows: [Row] = []
@@ -90,7 +92,7 @@ struct OrganizePreviewSnapshot: Sendable {
                 disposition = .move(plan)
                 isOutside = plan.isOutsideMusicFolder
             } else if let blocked = blockedByID[identifier] {
-                disposition = .needsMetadata(blocked.missingFields)
+                disposition = blocked.conflictReason.map(Row.Disposition.pathConflict) ?? .needsMetadata(blocked.missingFields)
                 isOutside = blocked.isOutsideMusicFolder
             } else {
                 continue

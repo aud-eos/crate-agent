@@ -85,7 +85,7 @@ struct OrganizeView: View {
             ListResultSummary(results: preview.visibleCount, selected: preview.selection.count, hidden: preview.hiddenSelectionCount)
                 .padding(.horizontal, density.pagePadding)
             if preview.snapshot.blockedCount > 0 {
-                Text("\(preview.snapshot.blockedCount) files need required tags · \(preview.visibleBlockedCount) in this filter. Correct tags in Library Cleanup or Auto-Tag, then rescan.")
+                Text("\(preview.snapshot.blockedCount) files blocked · \(preview.visibleBlockedCount) in this filter. Resolve each row’s missing tags or path conflict, then rescan.")
                     .font(.callout)
                     .padding(.horizontal, density.pagePadding)
             }
@@ -122,7 +122,7 @@ struct OrganizeView: View {
 
     private func rescan() async {
         actionError = nil
-        await preview.rescan(database: services.database, musicFolder: services.watchedMusicFolder, template: UserPreferences.filenameTemplate)
+        await preview.rescan(database: services.database, musicFolder: services.watchedMusicFolder, template: UserPreferences.filenameTemplate, readiness: services.readiness)
     }
 
     private func applySelected() async {

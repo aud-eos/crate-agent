@@ -38,6 +38,28 @@ final class ListControlsTests: XCTestCase {
         XCTAssertTrue(results.selectedRows.isEmpty)
     }
 
+    func testRepairBlockedRowsRemainVisibleButCannotJoinCleanupSelection() {
+        let files = [HygieneFileRow(id: 1, path: "/Music/conflict.mp3"), HygieneFileRow(id: 2, path: "/Music/independent.mp3")]
+        let entries = LibraryHygiene.missingFieldEntries(forField: .artist, in: files)
+        var results = ListResultSelection<LibraryHygiene.MissingFieldEntry>()
+        results.replace(entries, context: "artist", searchText: { entry in entry.path })
+        results.selectVisible(true)
+        results.setBlockedIDs([entries[0].id])
+        XCTAssertEqual(results.visibleRows.count, 2)
+        XCTAssertEqual(results.selectedRows.map(\.fileId), [2])
+        results.setSelected(true, id: entries[0].id)
+        results.selectVisible(true)
+        XCTAssertEqual(results.selectedRows.map(\.fileId), [2])
+        XCTAssertEqual(results.coverage, .all)
+        results.setQuery("conflict")
+        XCTAssertEqual(results.selectableVisibleCount, 0)
+        XCTAssertEqual(results.coverage, .none)
+        results.setBlockedIDs([])
+        XCTAssertEqual(results.selectedRows.map(\.fileId), [2], "Repair must not silently select a previously blocked proposal")
+        results.selectVisible(true)
+        XCTAssertEqual(Set(results.selectedRows.map(\.fileId)), [1, 2])
+    }
+
     func testChangedReplacementIsDeselectedAndReported() {
         let files = [HygieneFileRow(id: 1, path: "/Music/song.mp3", artist: "Old Artist")]
         var results = ListResultSelection<LibraryHygiene.FindAndReplaceMatch>()

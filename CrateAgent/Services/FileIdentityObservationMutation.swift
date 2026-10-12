@@ -44,8 +44,9 @@ extension FileRecord {
         SeratoMetadata(artist: artist, title: title, album: album, genre: genre, bpm: bpm,
                        musicalKey: musicalKey, comment: comment, length: length, label: label)
     }
+
     static func loadIdentityProjections(database: LibraryDatabase) async throws -> [FileRecord] {
-        let columns = "id, path, volume_uuid, inode, file_size, mtime, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision"
+        let columns = "id, track_id, path, volume_uuid, inode, file_size, mtime, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision"
         var result: [FileRecord] = []
         var cursor: Int64 = 0
         while true {

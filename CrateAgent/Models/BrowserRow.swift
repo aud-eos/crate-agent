@@ -38,12 +38,16 @@ public struct BrowserRow:
     public var libraryMembership: LibraryMembership
     public var membershipRevision: Int64
     public var fileAvailability: FileAvailability
+    public var processingBlockReason: String? = nil
 
     public var canProcess: Bool {
-        FileProcessingEligibility.isProcessable(membership: libraryMembership, availability: fileAvailability)
+        processingBlockReason == nil && FileProcessingEligibility.isProcessable(membership: libraryMembership, availability: fileAvailability)
     }
 
     public var statusText: String {
+        if let processingBlockReason {
+            return processingBlockReason
+        }
         let membership = libraryMembership.displayTitle
         return fileAvailability == .available ? membership : "\(membership) · \(fileAvailability.displayTitle)"
     }
@@ -140,5 +144,13 @@ extension FileAvailability {
         case .offline: "Volume offline"
         case .inaccessible: "Access denied"
         }
+    }
+}
+
+extension BrowserRow {
+    func applyingConflictScope(_ readiness: LibrarySyncReadiness?) -> Self {
+        var row = self
+        row.processingBlockReason = readiness?.conflictPath(for: SeratoConflictTarget(fileIDs: [id], paths: [path])).map(SeratoConflictMessages.blocked)
+        return row
     }
 }

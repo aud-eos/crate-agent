@@ -308,3 +308,139 @@ pub fn write_audio_tags(file_path: String, update: AudioTagUpdate) -> Result<(),
     tags::write_tags(&path, &update)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod conflict_round_trip_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn raw_record(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = tag.to_vec();
+        bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn raw_text(tag: &[u8; 4], text: &str) -> Vec<u8> {
+        let payload: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        raw_record(tag, &payload)
+    }
+
+    fn raw_track(path_tag: &[u8; 4], path: &str, artist: &str, opaque: &[u8]) -> Vec<u8> {
+        let mut payload = raw_text(path_tag, path);
+        payload.extend(raw_text(b"tart", artist));
+        payload.extend(raw_record(b"zzzz", opaque));
+        raw_record(b"otrk", &payload)
+    }
+
+    fn metadata(artist: &str) -> SeratoMetadataUpdate {
+        SeratoMetadataUpdate {
+            artist: Some(artist.to_owned()),
+            title: None,
+            album: None,
+            genre: None,
+            bpm: None,
+            key: None,
+            comment: None,
+            length: None,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn unrelated_ffi_writes_preserve_unicode_conflict_records_byte_for_byte() {
+        let directory = std::env::temp_dir().join(format!(
+            "crate-conflict-round-trip-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let composed = "Music/Caf\u{e9}.mp3";
+        let decomposed = "Music/Cafe\u{301}.mp3";
+        assert_ne!(composed.as_bytes(), decomposed.as_bytes());
+        for (name, path_tag, version) in [
+            ("database V2", b"pfil", "2.0/Serato Scratch LIVE Database"),
+            ("test.crate", b"ptrk", "1.0/Serato ScratchLive Crate"),
+            ("test.scrate", b"ptrk", "1.0/Serato ScratchLive Crate"),
+        ] {
+            let path = directory.join(name).to_str().unwrap().to_owned();
+            let first = raw_track(path_tag, composed, "First artist", &[0, 255, 7, 3]);
+            let mut protected = raw_text(b"vrsn", version);
+            protected.extend_from_slice(&first);
+            protected.extend(raw_track(path_tag, decomposed, "Second artist", &[3, 2, 1]));
+            protected.extend_from_slice(&first);
+            let mut original = protected.clone();
+            original.extend(raw_track(path_tag, "Music/Other.mp3", "Original", &[42]));
+            fs::write(&path, &original).unwrap();
+            if name == "database V2" {
+                assert_eq!(
+                    update_database_record(
+                        path.clone(),
+                        "Music/Other.mp3".into(),
+                        metadata("Updated")
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert!(fs::read(&path).unwrap().starts_with(&protected));
+                assert_eq!(
+                    read_database_records(path.clone())
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .artist
+                        .as_deref(),
+                    Some("Updated")
+                );
+                assert_eq!(
+                    rewrite_database_path(
+                        path.clone(),
+                        "Music/Other.mp3".into(),
+                        "Music/Renamed.mp3".into()
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert!(fs::read(&path).unwrap().starts_with(&protected));
+                assert_eq!(
+                    remove_track_from_database(path.clone(), "Music/Renamed.mp3".into()).unwrap(),
+                    1
+                );
+                assert_eq!(fs::read(&path).unwrap(), protected);
+                assert_eq!(
+                    add_track_to_database(path.clone(), "Music/New.mp3".into(), metadata("New"))
+                        .unwrap(),
+                    1
+                );
+                assert!(fs::read(&path).unwrap().starts_with(&protected));
+                let records = read_database_records(path.clone()).unwrap();
+                assert_eq!(records.len(), 4);
+                assert_eq!(records.last().unwrap().path, "Music/New.mp3");
+            } else {
+                assert_eq!(
+                    rewrite_crate_path(
+                        path.clone(),
+                        "Music/Other.mp3".into(),
+                        "Music/Renamed.mp3".into()
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert!(fs::read(&path).unwrap().starts_with(&protected));
+                let paths = read_crate_paths(path.clone()).unwrap();
+                assert_eq!(paths.len(), 4);
+                assert_eq!(paths.last().unwrap(), "Music/Renamed.mp3");
+                assert_eq!(
+                    remove_path_from_crate(path.clone(), "Music/Renamed.mp3".into()).unwrap(),
+                    1
+                );
+                assert_eq!(fs::read(&path).unwrap(), protected);
+            }
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+}

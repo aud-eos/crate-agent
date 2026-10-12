@@ -130,7 +130,7 @@ final class OrganizePreviewModel: ObservableObject {
         notice = OrganizeMessages.scanCancelled
     }
 
-    func rescan(database: LibraryDatabase, musicFolder: URL, template: String) async {
+    func rescan(database: LibraryDatabase, musicFolder: URL, template: String, readiness: LibrarySyncReadiness? = nil) async {
         guard !isApplying else { return }
         cancelScan()
         let currentRequest = UUID()
@@ -144,7 +144,7 @@ final class OrganizePreviewModel: ObservableObject {
         notice = nil
         let worker = Task.detached(priority: .userInitiated) {
             try await OrganizePreviewSnapshot.load(database: database, musicFolder: musicFolder, template: template,
-                                                   previous: previous, selected: selected, cancellation: cancellation)
+                                                   previous: previous, selected: selected, cancellation: cancellation, readiness: readiness)
         }
         self.worker = worker
         defer {

@@ -25,6 +25,7 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
     let contextMenu: (Snapshot.Row.ID) -> NSMenu?
     var selectionVersion: () -> UInt64 = { 0 }
     var enabled = true
+    var contentRevision: UInt64 = 0
     var onFocus: (Snapshot.Row.ID?, Int) -> Void = { _, _ in }
 
     func makeCoordinator() -> Coordinator {
@@ -114,12 +115,13 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
 
         func update(_ configuration: PagedTable) {
             let geometryChanged = self.configuration.rowHeight != configuration.rowHeight
+            let contentChanged = self.configuration.contentRevision != configuration.contentRevision
             self.configuration = configuration
             if geometryChanged {
                 table?.rowHeight = configuration.rowHeight
                 table?.reloadData()
             }
-            refreshVisibleRows(reloadCells: false)
+            refreshVisibleRows(reloadCells: contentChanged)
             reportViewport()
         }
 

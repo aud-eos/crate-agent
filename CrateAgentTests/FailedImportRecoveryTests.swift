@@ -4,6 +4,76 @@ import XCTest
 
 @MainActor
 final class FailedImportRecoveryTests: XCTestCase {
+    func testConflictDuringImportConfirmationRollsBackAndRetainsRetry() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let pending = try await fixture.add("pending.wav", membership: .pendingImport)
+        try fixture.save(paths: [])
+        try gate.markReady(gate.prepareDrain())
+        var preparedScope = SeratoConflictScope()
+        preparedScope.protect(.file(pending), group: pending.path)
+        let scope = preparedScope
+        try await fixture.database.writer.write { database in
+            database.trace { event in
+                if event.description.contains("UPDATE files") || event.description.contains("UPDATE \"files\"") {
+                    gate.invalidate()
+                    do { try gate.install(scope, for: gate.prepareDrain()) }
+                    catch { XCTFail("Cannot install controlled conflict: \(error)") }
+                }
+            }
+        }
+        do {
+            try await fixture.engine.apply(.addTrackToSerato(.init(fileId: XCTUnwrap(pending.id), metadata: .empty)), batchId: "late-import")
+        } catch let OperationEngineError.externalSyncIncomplete(batchId, underlying) {
+            XCTAssertEqual(batchId, "late-import")
+            XCTAssertTrue(underlying.contains("synchronizationRequired") || underlying.contains("SeratoPathConflictError"))
+        }
+        try await fixture.database.writer.write { database in database.trace(nil) }
+        let after = try await fixture.row(pending)
+        XCTAssertEqual(after, pending)
+        let confirmations = try await fixture.database.writer.read { database in
+            try EventRecord.filter(Column("batch_id").like("import-confirmed:%")).fetchCount(database)
+        }
+        XCTAssertEqual(confirmations, 0)
+        let retained = await fixture.engine.pendingSeratoWriteCount
+        XCTAssertEqual(retained, 1)
+        gate.invalidate()
+        let authorization = gate.prepareDrain()
+        try gate.install(.init(), for: authorization)
+        try gate.markReady(authorization)
+        try await fixture.engine.drainPendingSeratoUpdates()
+        let repaired = try await fixture.row(pending)
+        XCTAssertEqual(repaired.libraryMembership, .active)
+        let remaining = await fixture.engine.pendingSeratoWriteCount
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testImportIntoProtectedPathIsReportedBeforeAllocatingAnIndexedRow() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let audio = fixture.directory.appendingPathComponent("Café.wav")
+        let bytes = FinalRemovalIntegrationTests.wav()
+        try bytes.write(to: audio)
+        try fixture.save(paths: [audio.path, audio.path.decomposedStringWithCanonicalMapping])
+        let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: fixture.reader.read(), files: [])
+        let authorization = gate.prepareDrain()
+        try gate.install(analysis.scope, for: authorization)
+        try gate.markReady(authorization)
+        let importer = ImportCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        let result = await importer.importDroppedItems([audio])
+        XCTAssertEqual(result.filesImported, 0)
+        XCTAssertEqual(result.filesPendingSync, 0)
+        XCTAssertEqual(result.blockedFiles.count, 1)
+        XCTAssertTrue(result.blockedFiles.first?.localizedCaseInsensitiveContains("conflict") == true)
+        let count = try await fixture.database.writer.read { connection in try FileRecord.fetchCount(connection) }
+        let events = try await fixture.events()
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(events, 0)
+        XCTAssertEqual(try Data(contentsOf: audio), bytes)
+    }
+
     func testRetrySyncRecoversFailedImportsWithoutRepeatingIntentAndRejectsStaleTargets() async throws {
         let readiness = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: readiness)

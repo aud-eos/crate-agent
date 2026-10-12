@@ -181,10 +181,12 @@ transaction work; invalidation during an update rolls back the transaction. Toge
 these checks mean a close/reopen cannot authorize old mutations. Explicit import
 intent and verified local filesystem observations remain possible, while external
 writes queue. Only the session's scoped drain authorization can write before normal
-readiness opens. Fingerprinting is an independent background process: it reads only
-active, available rows and checks each row's membership token when persisting, so a
-concurrent retirement or identity change rejects the stale result without coupling
-the worker's lifecycle to the file-info scan.
+readiness opens. Fingerprinting starts as an independent background task, waits
+while source validation keeps readiness closed, and resumes automatically when the
+gate opens. It reads only active, available, unconflicted rows and checks both the
+sync generation and each row's membership token when persisting. A concurrent
+conflict, retirement or identity change rejects stale results; a sync pause does
+not terminate the worker or require a manual fingerprint retry.
 Serato launch during a sync cancels it and leaves queued intent intact. After an
 already validated session, Serato being open permits local processing with outbound
 writes queued; initial startup while Serato is open never enables state-changing processing.
@@ -272,3 +274,49 @@ destination. Changed or unowned files are retained with an error, including midd
 edits within the same timestamp second. Digest reads use bounded memory on the
 writer's execution context and only touch files participating in a move; browse
 and full-library snapshots do not hash every audio byte.
+
+
+## Unicode path conflicts and guided repair
+
+A strict saved snapshot is analyzed before reconciliation, scanning, or queue
+drain. Every occurrence is retained, including byte-identical repeated records.
+Canonical path comparison groups Unicode-equivalent spellings, while diagnostics
+preserve original UTF-8 bytes, metadata, and physical-file observations. Only
+conflicted spellings are inspected for diagnostics; analysis does not decode audio
+or fingerprint the library.
+
+The conflict scope protects indexed file IDs, normalized source/destination and
+historical reference paths, and volume/inode aliases. Operations writing a shared
+recording row also check its track ID. Presence evidence still includes every
+saved record, so excluded files are not falsely retired. Mutation transactions
+check scope before and after work; queued physical effects check again immediately
+before I/O. The global epoch still stops all processing for an invalid source,
+cancellation, or Serato launch.
+
+A ready session can contain conflicts. Fingerprinting and Auto-Tag skip protected
+files without marking their audio failed; late results cannot commit. Import
+reports blocked files separately from infrastructure failures. Previews retain
+blocked rows with an explanation and exclude them from mutation selection.
+Filesystem delivery retains blocked observations and holds its checkpoint while
+later independent observations proceed. Repair retry replays retained observations
+through current identity checks.
+
+Queue draining makes a bounded pass. Protected entries and later dependent entries
+remain in order; independent writes can proceed. A blocked entry is not superseded.
+After repair, normal membership revision, physical identity, and external metadata
+baseline rules determine which retained intent is still applicable. Unrelated V2,
+Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.
+
+**Review conflicts** opens a dedicated list and detail screen. Details remain
+visible while another sync is pending or fails. **Copy conflict details** exports
+only on click. **Show in Finder** rechecks the selected occurrence's physical
+identity; **Open Serato** is also explicit. Guidance distinguishes no verified
+live file, aliases of one physical file, distinct files, and inaccessible or
+unknown locations. Restore access before declaring a reference stale; preserve
+intended audio, metadata, and crate membership. Remove only verified unwanted
+library references without deleting audio, save and close Serato, then retry.
+Counts clear only after a current validated snapshot proves repair.
+
+Direct strict scanner/reconciler callers derive and install protection but cannot
+open global readiness. The legacy scanner rejects ambiguous records rather than
+choosing a winner; use the strict session for partial synchronization.

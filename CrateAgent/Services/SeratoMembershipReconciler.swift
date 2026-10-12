@@ -7,6 +7,8 @@ struct ReconciliationSummary: Sendable, Equatable {
     var unavailable: Int = 0
     var skippedUnsupported: Int = 0
     var supersededWrites: Int = 0
+    var pathConflictCount: Int = 0
+    var conflictBlockedWriteCount: Int = 0
     var duplicateCleanupMessage: String? = nil
 }
 
@@ -61,22 +63,36 @@ actor SeratoMembershipReconciler {
         self.beforeCommit = beforeCommit
     }
 
-    func reconcile(_ snapshot: SeratoMembershipSnapshot) async throws -> ReconciliationSummary {
+    func reconcile(_ snapshot: SeratoMembershipSnapshot, analysis suppliedAnalysis: SeratoConflictAnalysis? = nil) async throws -> ReconciliationSummary {
         guard !running else { throw SeratoReconciliationError.alreadyReconciling }
         running = true
         defer { running = false }
         try await reader.validate(snapshot)
         let savedPaths = Set(snapshot.records.map { record in SeratoPath.normalized(record.path) })
+        let directAuthorization = suppliedAnalysis == nil ? await operationEngine.captureConflictScope() : nil
         let files = try await FileRecord.loadIdentityProjections(database: database)
+        let analysis: SeratoConflictAnalysis
+        if let suppliedAnalysis {
+            analysis = suppliedAnalysis
+        } else {
+            analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+        }
+        try analysis.validate(snapshot)
+        try await reader.validate(snapshot)
+        if suppliedAnalysis == nil {
+            try await operationEngine.installDirectConflictAnalysis(analysis, authorization: directAuthorization)
+        }
+        let eligibleFiles = files.filter { file in analysis.scope.conflictingPath(for: .file(file)) == nil }
         var byPath: [String: FileRecord] = [:]
-        for file in files {
+        for file in eligibleFiles {
             let path = SeratoPath.normalized(file.path)
             guard byPath.updateValue(file, forKey: path) == nil else { throw SeratoReconciliationError.ambiguousIdentity(path) }
         }
-        let moves = try resolveSavedMoves(paths: savedPaths, files: files, byPath: byPath)
+        let moves = try resolveSavedMoves(paths: savedPaths, files: files, byPath: byPath, scope: analysis.scope)
         var summary = ReconciliationSummary()
+        summary.pathConflictCount = analysis.conflicts.count
         let batchID = UUID().uuidString
-        for file in files {
+        for file in eligibleFiles {
             try Task.checkCancellation()
             guard let fileID = file.id else { continue }
             guard file.seratoLibraryId == nil || file.seratoLibraryId == snapshot.libraryID else {
@@ -143,6 +159,7 @@ actor SeratoMembershipReconciler {
                 summary.unavailable += 1
             }
         }
+        try await reader.validate(snapshot)
         return summary
     }
 
@@ -157,7 +174,7 @@ actor SeratoMembershipReconciler {
         return identity
     }
 
-    private func resolveSavedMoves(paths: Set<String>, files: [FileRecord], byPath: [String: FileRecord]) throws -> [Int64: FileMetadata] {
+    private func resolveSavedMoves(paths: Set<String>, files: [FileRecord], byPath: [String: FileRecord], scope: SeratoConflictScope) throws -> [Int64: FileMetadata] {
         struct PhysicalIdentity: Hashable {
             let volume: String
             let inode: Int64
@@ -172,12 +189,17 @@ actor SeratoMembershipReconciler {
         var moves: [Int64: FileMetadata] = [:]
         for path in paths.sorted() where byPath[path] == nil {
             try Task.checkCancellation()
+            guard scope.conflictingPath(for: SeratoConflictTarget(paths: [path])) == nil else { continue }
             guard let basic = FileMetadataCollector.collect(at: path),
                   try availability.inspect(path: path, volumeID: basic.volumeUuid) == .available else { continue }
             let identity = try FileMetadataCollector.collectVerified(at: path)
+            guard scope.conflictingPath(for: SeratoConflictTargets.identity(identity)) == nil else { continue }
             let inodeCandidates = byPhysicalIdentity[PhysicalIdentity(volume: identity.volumeUuid, inode: identity.inode)] ?? []
             let hashCandidates = identity.lightweightHash.flatMap { hash in byHash[hash] } ?? []
             let candidates = inodeCandidates.isEmpty ? hashCandidates : inodeCandidates
+            guard !candidates.contains(where: { file in scope.conflictingPath(for: .file(file)) != nil }) else {
+                throw SeratoReconciliationError.ambiguousIdentity(path)
+            }
             guard !candidates.isEmpty else { continue }
             guard candidates.count == 1, let candidate = candidates.first, let fileID = candidate.id,
                   moves[fileID] == nil,

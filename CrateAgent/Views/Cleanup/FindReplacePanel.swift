@@ -27,6 +27,7 @@ struct FindReplacePanel: View {
         get { results.rows }
         nonmutating set {
             results.replaceHygiene(newValue, files: files, context: "replace:\(caseSensitive):\(selectedFields.map(\.rawValue).sorted().joined(separator: ","))", fileID: { $0.fileId })
+            refreshConflictSelection()
         }
     }
 
@@ -63,6 +64,7 @@ struct FindReplacePanel: View {
             footer
         }
         .task { await loadFiles() }
+        .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
         // Debounce: every keystroke / field-toggle restarts this
         // task; the 150 ms sleep + cancellation check coalesces a
         // burst of typing into one recompute. Without this, every
@@ -142,7 +144,7 @@ struct FindReplacePanel: View {
             )
         } else {
             HygieneSelectionTable(results: $results, identities: trackIdentities, enabled: !isApplying && !isLoading && previewIsCurrent,
-                                  path: { $0.path }, field: { $0.field.displayName }, oldValue: { $0.oldValue }, newValue: { $0.newValue })
+                                  blockReason: { row in conflictReason(row) }, path: { $0.path }, field: { $0.field.displayName }, oldValue: { $0.oldValue }, newValue: { $0.newValue })
         }
     }
 
@@ -215,5 +217,13 @@ struct FindReplacePanel: View {
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
         }
+    }
+
+    private func conflictReason(_ row: some HygienePreviewEntry) -> String? {
+        services.readiness.conflictPath(for: SeratoConflictTarget(fileIDs: [row.fileId], paths: [row.path])).map(SeratoConflictMessages.blocked)
+    }
+
+    private func refreshConflictSelection() {
+        results.setBlockedIDs(Set(results.rows.filter { row in conflictReason(row) != nil }.map(\.id)))
     }
 }

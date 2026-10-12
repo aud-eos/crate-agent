@@ -15,6 +15,7 @@ struct DuplicatesPanel: View {
             results.replace(newValue, context: mode.rawValue, searchText: { group in
                 group.files.map { ListSearch.text(artist: $0.artist, title: $0.title, album: $0.album, path: $0.path) }.joined(separator: "\n")
             })
+            refreshConflictSelection()
         }
     }
 
@@ -82,6 +83,7 @@ struct DuplicatesPanel: View {
             }
         }
         .task { await rescan() }
+        .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
         // Cache invalidation: when the group set changes (after a
         // rescan, or after a resolve removed files) or the user
         // taps a different keeper radio, rebuild every group's
@@ -215,11 +217,20 @@ struct DuplicatesPanel: View {
         }
     }
 
+    private func conflictReason(_ group: DuplicateFinder.DuplicateGroup) -> String? {
+        group.files.compactMap { file in services.readiness.conflictPath(for: .file(file)) }.first.map(SeratoConflictMessages.blocked)
+    }
+
+    private func refreshConflictSelection() {
+        results.setBlockedIDs(Set(groups.filter { group in conflictReason(group) != nil }.map(\.id)))
+    }
+
     private func groupCard(_ group: DuplicateFinder.DuplicateGroup) -> some View {
         VStack(alignment: .leading, spacing: density.spacing) {
             HStack(spacing: density.spacing) {
                 Toggle("Select group", isOn: Binding(get: { results.selectedIDs.contains(group.id) }, set: { results.setSelected($0, id: group.id) }))
                     .toggleStyle(.checkbox)
+                    .disabled(conflictReason(group) != nil)
                 Text("\(group.size) copies · \(modeHeader(for: group))")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -231,10 +242,13 @@ struct DuplicatesPanel: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .controlSize(density.controlSize)
-                .disabled(isResolving || seratoWatchdog.isSeratoRunning)
+                .disabled(isResolving || seratoWatchdog.isSeratoRunning || conflictReason(group) != nil)
                 .help(seratoWatchdog.isSeratoRunning
                     ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
                     : "Move non-keepers in this group to Trash and remove their Serato references in one batch.")
+            }
+            if let reason = conflictReason(group) {
+                Text(reason).font(.callout).foregroundStyle(.orange)
             }
             VStack(spacing: density.detailSpacing) {
                 ForEach(group.files, id: \.id) { file in

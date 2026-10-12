@@ -16,6 +16,7 @@ struct CaseConsistencyPanel: View {
             results.replace(newValue, context: "case", revision: { group in group.variants.flatMap(\.fileIds).map { revisions[$0] ?? "" }.joined(separator: ",") }, searchText: { group in
                 group.variants.flatMap(\.fileIds).compactMap { index[$0] }.joined(separator: "\n")
             })
+            refreshConflictSelection()
         }
     }
 
@@ -43,6 +44,7 @@ struct CaseConsistencyPanel: View {
             footer
         }
         .task { await rescan() }
+        .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
     }
 
     @ViewBuilder
@@ -67,17 +69,29 @@ struct CaseConsistencyPanel: View {
         }
     }
 
+    private func conflictReason(_ group: LibraryHygiene.CaseInconsistencyGroup) -> String? {
+        services.readiness.conflictPath(for: SeratoConflictTarget(fileIDs: Set(group.variants.flatMap(\.fileIds)))).map(SeratoConflictMessages.blocked)
+    }
+
+    private func refreshConflictSelection() {
+        results.setBlockedIDs(Set(groups.filter { group in conflictReason(group) != nil }.map(\.id)))
+    }
+
     private func groupRow(_ group: LibraryHygiene.CaseInconsistencyGroup) -> some View {
         VStack(alignment: .leading, spacing: density.spacing) {
             HStack(spacing: density.spacing) {
                 Toggle("Select group", isOn: Binding(get: { results.selectedIDs.contains(group.id) }, set: { results.setSelected($0, id: group.id) }))
                     .toggleStyle(.checkbox)
+                    .disabled(conflictReason(group) != nil)
                 Text(group.field.displayName)
                     .font(.callout)
                     .foregroundStyle(.tint)
                 Text("\(group.totalFiles) file\(group.totalFiles == 1 ? "" : "s")")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
+            }
+            if let reason = conflictReason(group) {
+                Text(reason).font(.callout).foregroundStyle(.orange)
             }
             ForEach(group.variants, id: \.value) { variant in
                 let isChosen = resolvedCanonical(for: group) == variant.value
