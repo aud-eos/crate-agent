@@ -67,6 +67,62 @@ final class LibraryPagingTests: XCTestCase {
         }
     }
 
+    func testCapturedSelectionExcludesNewMatchesAndReconcilesChangedIdentities() async throws {
+        let fixture = try fixture
+        let store = try LibrarySelectionStore(database: fixture.database)
+        let scope = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: .init(search: "Artist A"))
+        try await store.setScope(scope, selected: true)
+        try await store.set([.init(id: 1, revision: 0)], selected: false)
+        let outside = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: .init(search: "Artist B"))
+        let hidden = try await store.summary(in: outside)
+        XCTAssertEqual(hidden.total, 14999)
+        XCTAssertEqual(hidden.hidden, 14999)
+        try await fixture.pool.write { connection in
+            var added = PagedLibraryFixture.file(30001)
+            added.artist = "Artist A"
+            try added.insert(connection)
+            try connection.execute(sql: "UPDATE files SET artist = 'Artist A' WHERE id = 15001")
+            try connection.execute(sql: "UPDATE files SET membership_revision = 1 WHERE id = 2")
+            try connection.execute(sql: "DELETE FROM files WHERE id = 3")
+        }
+        let removed = try await store.reconcile()
+        XCTAssertEqual(removed, 2)
+        let current = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: .init(search: "Artist A"))
+        let summary = try await store.summary(in: current)
+        XCTAssertEqual(summary.total, 14997)
+        XCTAssertEqual(summary.inScope, 14997)
+        let newIDs = try await store.selectedIDs(in: [.init(id: 15001, revision: 0), .init(id: 30001, revision: 0)])
+        XCTAssertTrue(newIDs.isEmpty)
+        try await store.setRange(0 ..< 3, in: outside, selected: true)
+        try await store.setScope(current, selected: false)
+        let remaining = try await store.summary(in: outside)
+        XCTAssertEqual(remaining.total, 2)
+        try await store.clear()
+        let cleared = try await store.summary(in: current)
+        XCTAssertEqual(cleared.total, 0)
+        await store.close()
+    }
+
+    func testPartialCaptureFailureRollsBackWithoutChangingCommittedSelection() async throws {
+        let fixture = try fixture
+        let store = try LibrarySelectionStore(database: fixture.database, readIdentities: { snapshot, after, limit in
+            if after != nil {
+                throw PagingFixtureError.unavailable
+            }
+            return try await snapshot.identities(after: after, limit: limit)
+        })
+        try await store.set([.init(id: 1, revision: 0)], selected: true)
+        let snapshot = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: fixture.query)
+        do {
+            try await store.setScope(snapshot, selected: true)
+            XCTFail("Capture must surface the read failure")
+        } catch PagingFixtureError.unavailable {}
+        let summary = try await store.summary(in: snapshot)
+        XCTAssertEqual(summary.total, 1)
+        try await store.clear()
+        await store.close()
+    }
+
     func testObservationIncludesOffscreenMetadataAndAvailabilityButNotFingerprintWrites() async throws {
         let fixture = try fixture
         let changes = expectation(description: "metadata and availability changes")
