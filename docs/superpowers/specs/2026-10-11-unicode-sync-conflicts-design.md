@@ -2,8 +2,8 @@
 
 Issue: https://github.com/aud-eos/crate-agent/issues/130
 
-Status: proposed specification for owner review. The owner approved guided repair
-in Serato as the first-release direction; implementation has not started.
+Status: approved by the owner on 2026-10-11. Guided repair in Serato is the
+first-release direction; implementation has not started.
 
 ## Outcome and scope
 
@@ -216,6 +216,5 @@ dev server. Update README usage and the reconciliation guide with the final flow
 
 ## Review handoff
 
-This spec is ready for owner review. After approval, write the implementation plan
-with an explicit guard/caller audit, staged checks and production-size fixture,
-then obtain the owner's execution-method choice before implementing.
+This spec is approved. Review the implementation plan and confirm its execution
+method before implementing.
