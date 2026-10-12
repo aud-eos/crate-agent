@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-enum LibraryStatusFilter: String, CaseIterable, Identifiable {
+enum LibraryStatusFilter: String, CaseIterable, Identifiable, Sendable {
     case active, removedFromSerato, missing
     var id: String {
         rawValue
@@ -43,20 +43,8 @@ enum LibraryStatusBrowse {
                       limit: Int = 1000, offset: Int = 0) throws -> Results
     {
         guard limit > 0, offset >= 0 else { throw BrowseError.invalidBounds }
-        var predicate = filter.predicate
-        var arguments: [DatabaseValueConvertible] = []
-        if !search.isEmpty {
-            predicate += " AND \(ListSearch.trackPredicate)"
-            let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-            arguments = [query, query, query, query]
-        }
-        guard let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM files WHERE \(predicate)", arguments: StatementArguments(arguments)) else {
-            throw BrowseError.missingCount
-        }
-        let order = LibraryBrowserView.orderByClause(for: sortOrder.first)
-        arguments.append(contentsOf: [limit, offset])
-        let rows = try BrowserRow.fetchAll(db, sql: BrowserRow.browserFetchSQL + " WHERE \(predicate) ORDER BY \(order), id ASC LIMIT ? OFFSET ?", arguments: StatementArguments(arguments))
-        return Results(rows: rows, totalCount: count)
+        let query = LibraryBrowseQuery(filter: filter, search: search, sort: .init(comparator: sortOrder.first))
+        return try Results(rows: query.rows(in: db, range: offset ..< (offset + limit)), totalCount: query.count(in: db))
     }
 
     static func observation(filter: LibraryStatusFilter, search: String, sortOrder: [KeyPathComparator<BrowserRow>], limit: Int) -> ValueObservation<ValueReducers.RemoveDuplicates<ValueReducers.Fetch<Results>>> {

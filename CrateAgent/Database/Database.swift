@@ -48,7 +48,11 @@ public final class LibraryDatabase {
             withIntermediateDirectories: true
         )
         let databaseUrl = crateAgentDirectory.appendingPathComponent("library.sqlite")
-        let pool = try DatabasePool(path: databaseUrl.path, configuration: makeConfiguration())
+        return try openWAL(at: databaseUrl)
+    }
+
+    static func openWAL(at url: URL) throws -> LibraryDatabase {
+        let pool = try DatabasePool(path: url.path, configuration: makeConfiguration())
         return try LibraryDatabase(writer: pool)
     }
 

@@ -314,7 +314,7 @@ struct LibraryBrowserView: View {
     /// the SortOrder for a stable key.
     private var sortOrderKey: String {
         sortOrder.map { comparator in
-            let column = Self.sqlColumn(for: comparator.keyPath)
+            let column = LibraryBrowseSort(comparator: comparator).column.sql
             let direction = comparator.order == .forward ? "asc" : "desc"
             return "\(column):\(direction)"
         }.joined(separator: "|")
@@ -334,30 +334,6 @@ struct LibraryBrowserView: View {
         try LibraryStatusBrowse.fetch(db, search: search, sortOrder: sortOrder, limit: limit).rows
     }
 
-    /// Translate the first sort comparator to a SQL ORDER BY clause.
-    nonisolated static func orderByClause(for comparator: KeyPathComparator<BrowserRow>?) -> String {
-        let direction = (comparator?.order ?? .forward) == .forward ? "ASC" : "DESC"
-        let column = sqlColumn(for: comparator?.keyPath)
-        return "\(column) \(direction)"
-    }
-
-    /// Map a `BrowserRow` keypath (used by SwiftUI Table's sort) to
-    /// the matching SQL column expression. The empty-string
-    /// projections (artistOrEmpty, etc.) map to `COALESCE(col, '')`
-    /// so null values sort consistently regardless of SQLite's
-    /// default null ordering.
-    nonisolated static func sqlColumn(for keyPath: PartialKeyPath<BrowserRow>?) -> String {
-        switch keyPath {
-        case \BrowserRow.path: "path"
-        case \BrowserRow.artistOrEmpty: "COALESCE(artist, '')"
-        case \BrowserRow.titleOrEmpty: "COALESCE(title, '')"
-        case \BrowserRow.albumOrEmpty: "COALESCE(album, '')"
-        case \BrowserRow.bpmOrEmpty: "COALESCE(bpm, '')"
-        case \BrowserRow.musicalKeyOrEmpty: "COALESCE(musical_key, '')"
-        case \BrowserRow.folderPath: "path"
-        default: "path"
-        }
-    }
 }
 
 /// Composite trigger for refetch — `.task(id:)` runs when any of
