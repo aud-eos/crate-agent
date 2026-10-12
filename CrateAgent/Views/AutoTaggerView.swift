@@ -2,6 +2,8 @@ import SwiftUI
 
 struct AutoTaggerView: View {
     @ObservedObject var session: AutoTagSession
+    var readiness: LibrarySyncReadiness? = nil
+    var conflictRevision: UInt64 = 0
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @State private var showResetConfirmation = false
@@ -106,7 +108,8 @@ struct AutoTaggerView: View {
     }
 
     private var visibleFiles: [BrowserRow] {
-        session.selectionMode == .browse ? session.browseResults.matches : session.searchState.results.matches
+        let rows = session.selectionMode == .browse ? session.browseResults.matches : session.searchState.results.matches
+        return rows.map { row in row.applyingConflictScope(readiness) }
     }
 
     private var selectionIsLoading: Bool {
@@ -139,6 +142,7 @@ struct AutoTaggerView: View {
                 List(visibleFiles, id: \.id) { file in
                     AutoTagSelectionRow(fileID: file.id, path: file.path, artist: file.artist, title: file.title,
                                         libraryMembership: file.libraryMembership, fileAvailability: file.fileAvailability,
+                                        processingBlockReason: file.processingBlockReason,
                                         isSelected: session.selectedFileIDs.contains(file.id),
                                         onToggle: { session.toggleSelection(file.id) })
                         .equatable().disabled(session.isScanning)

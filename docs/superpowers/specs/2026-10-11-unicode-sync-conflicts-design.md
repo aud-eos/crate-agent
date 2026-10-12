@@ -3,7 +3,7 @@
 Issue: https://github.com/aud-eos/crate-agent/issues/130
 
 Status: approved by the owner on 2026-10-11. Guided repair in Serato is the
-first-release direction; implementation has not started.
+first-release direction. Implementation is complete; final review and PR verification are in progress.
 
 ## Outcome and scope
 

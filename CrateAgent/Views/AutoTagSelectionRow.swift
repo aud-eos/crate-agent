@@ -19,6 +19,7 @@ struct AutoTagSelectionRow: View, Equatable {
     let title: String?
     var libraryMembership: LibraryMembership = .legacyUnverified
     var fileAvailability: FileAvailability = .unknown
+    var processingBlockReason: String? = nil
     let isSelected: Bool
     let onToggle: () -> Void
 
@@ -29,6 +30,7 @@ struct AutoTagSelectionRow: View, Equatable {
             && lhs.title == rhs.title
             && lhs.libraryMembership == rhs.libraryMembership
             && lhs.fileAvailability == rhs.fileAvailability
+            && lhs.processingBlockReason == rhs.processingBlockReason
             && lhs.isSelected == rhs.isSelected
     }
 
@@ -50,7 +52,9 @@ struct AutoTagSelectionRow: View, Equatable {
     }
 
     private var file: BrowserRow {
-        BrowserRow(id: fileID, path: path, artist: artist, title: title, libraryMembership: libraryMembership, fileAvailability: fileAvailability)
+        var row = BrowserRow(id: fileID, path: path, artist: artist, title: title, libraryMembership: libraryMembership, fileAvailability: fileAvailability)
+        row.processingBlockReason = processingBlockReason
+        return row
     }
 
     private var displayTitle: String {

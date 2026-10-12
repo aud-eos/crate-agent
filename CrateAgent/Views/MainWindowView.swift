@@ -12,6 +12,7 @@ struct MainWindowView: View {
         case cleanup
         case autoTag
         case history
+        case conflicts
 
         var id: String {
             rawValue
@@ -24,6 +25,7 @@ struct MainWindowView: View {
             case .cleanup: "Library Cleanup"
             case .autoTag: "Auto-Tag"
             case .history: "History"
+            case .conflicts: SeratoConflictMessages.review
             }
         }
 
@@ -34,6 +36,7 @@ struct MainWindowView: View {
             case .cleanup: "sparkles"
             case .autoTag: "wand.and.stars"
             case .history: "clock.arrow.circlepath"
+            case .conflicts: "exclamationmark.triangle"
             }
         }
     }
@@ -44,10 +47,10 @@ struct MainWindowView: View {
     var body: some View {
         VStack(spacing: 0) {
             if services.syncState != .idle {
-                LibrarySyncStatusView(state: services.syncState, retry: services.retrySync)
+                LibrarySyncStatusView(state: services.syncState, retry: services.retrySync, hasConflicts: !services.syncSession.conflicts.isEmpty, review: services.reviewConflicts)
             }
             NavigationSplitView {
-                List(Section.allCases, selection: $selection) { section in
+                List(Section.allCases.filter { section in section != .conflicts || !services.syncSession.conflicts.isEmpty || selection == .conflicts }, selection: $selection) { section in
                     Label(section.displayName, systemImage: section.iconName)
                         .tag(section)
                 }
@@ -66,6 +69,8 @@ struct MainWindowView: View {
         // safety margin so the browser table never compresses.
         .frame(minWidth: 1120, minHeight: 640)
         .appPresentation()
+        .onAppear { handleConflictNavigation() }
+        .onChange(of: services.conflictNavigationRequest) { _, _ in handleConflictNavigation() }
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 DensityPicker()
@@ -73,6 +78,12 @@ struct MainWindowView: View {
                     .frame(width: 170)
             }
         }
+    }
+
+    private func handleConflictNavigation() {
+        guard services.conflictNavigationRequest != nil else { return }
+        selection = .conflicts
+        services.consumeConflictNavigation()
     }
 
     @ViewBuilder
@@ -85,9 +96,11 @@ struct MainWindowView: View {
         case .cleanup:
             LibraryHygieneView()
         case .autoTag:
-            AutoTaggerView(session: services.autoTagSession)
+            AutoTaggerView(session: services.autoTagSession, readiness: services.readiness, conflictRevision: services.readiness.scopeRevision)
         case .history:
             HistoryView()
+        case .conflicts:
+            SeratoConflictReviewView(model: services.conflictReviewModel)
         }
     }
 }

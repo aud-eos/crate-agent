@@ -32,7 +32,7 @@ struct LibraryBrowserView: View {
             }
             ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
             if let model {
-                LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active) { identifier, action in
+                LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness) { identifier, action in
                     Task { await perform(action, for: identifier) }
                 }
             } else if loadError == nil {
@@ -73,6 +73,7 @@ struct LibraryBrowserView: View {
             let coordinator = services.importCoordinator
             Task { @MainActor in
                 let result = await coordinator.importDroppedItems(droppedUrls)
+                loadError = result.blockedFiles.isEmpty ? nil : result.blockedFiles.joined(separator: "\n")
                 if result.filesPendingSync > 0 {
                     lastImportSummary = "\(result.filesImported) imported; \(result.filesPendingSync) pending sync; \(result.filesSkipped) skipped"
                     services.syncSession.reportFailure(
@@ -221,6 +222,7 @@ struct LibraryBrowserView: View {
             switch action {
             case .rename:
                 try FileProcessingEligibility.requireProcessable(record)
+                try services.readiness.requireUnconflicted(.file(record))
                 renameTarget = record
             case .history:
                 historyTarget = BrowserRow(id: identifier, path: record.path, artist: record.artist, title: record.title,

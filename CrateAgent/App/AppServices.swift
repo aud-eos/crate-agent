@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import os.log
@@ -34,6 +35,33 @@ public final class AppServices: ObservableObject {
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
     @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
+    @Published private(set) var conflictNavigationRequest: UUID?
+    lazy var conflictReviewModel = SeratoConflictReviewModel(session: syncSession, copyDetails: { text in
+        NSPasteboard.general.clearContents()
+        guard NSPasteboard.general.setString(text, forType: .string) else {
+            throw SeratoConflictActionError(message: "Could not copy the conflict details to the clipboard.")
+        }
+    }, revealFile: { path in
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }, openSerato: {
+        let identifiers = ["com.serato.dj", "com.serato.djpro", "com.serato.djlite"]
+        guard let application = identifiers.lazy.compactMap({ identifier in NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) }).first else {
+            throw SeratoConflictActionError(message: "Serato DJ could not be found. Open your installed Serato application, save and close its library, then retry sync.")
+        }
+        _ = try await NSWorkspace.shared.openApplication(at: application, configuration: NSWorkspace.OpenConfiguration())
+    }, retrySync: { [weak self] in self?.retrySync() })
+
+    func consumeConflictNavigation() {
+        conflictNavigationRequest = nil
+    }
+
+    func reviewConflicts() {
+        conflictNavigationRequest = UUID()
+        NSApp.activate(ignoringOtherApps: true)
+        for window in NSApp.windows where window.canBecomeKey {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
 
     /// Latest progress from the running file-info scan, or nil when no
     /// scan is in flight. Views observe via @Published.
@@ -60,7 +88,7 @@ public final class AppServices: ObservableObject {
     private let filesystemStartupTask: Task<Void, Never>
     private let filesystemContinuation: AsyncStream<FilesystemEventBatch>.Continuation
     private var retryTask: Task<Void, Never>?
-    private let readiness: LibrarySyncReadiness
+    let readiness: LibrarySyncReadiness
     private var filesystemDeliveryStopped = false
 
     private static let logger = Logger(
@@ -241,6 +269,7 @@ public final class AppServices: ObservableObject {
                 try await filesystemProcessor.retry()
                 syncSession.finishFilesystemRetry(succeeded: true)
                 try await syncSession.synchronize(retryingFailedCleanup: true)
+                try await filesystemProcessor.retry()
             } catch {
                 syncSession.finishFilesystemRetry(succeeded: false)
                 syncSession.reportFailure("Sync retry failed: \(error.localizedDescription)")

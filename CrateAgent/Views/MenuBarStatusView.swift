@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MenuBarStatusView: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
     @State private var indexedFileCount: Int = 0
@@ -11,7 +12,10 @@ struct MenuBarStatusView: View {
         VStack(alignment: .leading, spacing: density.spacing) {
             PageHeading("crate-agent", subtitle: "Library status")
 
-            LibrarySyncStatusView(state: services.syncState, retry: services.retrySync)
+            LibrarySyncStatusView(state: services.syncState, retry: services.retrySync, hasConflicts: !services.syncSession.conflicts.isEmpty, review: {
+                openWindow(id: AppPresentation.mainWindowID)
+                services.reviewConflicts()
+            })
 
             Text("\(indexedFileCount) files indexed")
                 .font(.callout.monospacedDigit())

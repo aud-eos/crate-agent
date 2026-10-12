@@ -13,6 +13,7 @@ struct WhitespacePanel: View {
         get { results.rows }
         nonmutating set {
             results.replaceHygiene(newValue, files: files, context: "whitespace", fileID: { $0.fileId })
+            refreshConflictSelection()
         }
     }
 
@@ -41,6 +42,7 @@ struct WhitespacePanel: View {
             footer
         }
         .task { await rescan() }
+        .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
     }
 
     @ViewBuilder
@@ -59,7 +61,7 @@ struct WhitespacePanel: View {
             )
         } else {
             HygieneSelectionTable(results: $results, identities: trackIdentities, enabled: !isScanning && !isFixing,
-                                  path: { $0.path }, field: { $0.field.displayName },
+                                  blockReason: { row in conflictReason(row) }, path: { $0.path }, field: { $0.field.displayName },
                                   oldValue: { WhitespacePreview(current: $0.oldValue, proposed: $0.newValue).visibleCurrent }, newValue: { WhitespacePreview(current: $0.oldValue, proposed: $0.newValue).visibleProposed })
         }
     }
@@ -126,5 +128,13 @@ struct WhitespacePanel: View {
         } catch {
             actionError = "Fix failed: \(error.localizedDescription)"
         }
+    }
+
+    private func conflictReason(_ row: some HygienePreviewEntry) -> String? {
+        services.readiness.conflictPath(for: SeratoConflictTarget(fileIDs: [row.fileId], paths: [row.path])).map(SeratoConflictMessages.blocked)
+    }
+
+    private func refreshConflictSelection() {
+        results.setBlockedIDs(Set(results.rows.filter { row in conflictReason(row) != nil }.map(\.id)))
     }
 }

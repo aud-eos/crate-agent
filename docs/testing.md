@@ -68,3 +68,63 @@ size while retaining the five-page bound. Memory and identity assertions are
 hard requirements. Generic controller tests cover controlled stale completions
 and error/retry races, and native table tests cover deferred selection and context
 IDs independently of Library's row type.
+
+
+## Local builds while using the Mac
+
+Use one native build at a time, keep the same DerivedData location between runs,
+and avoid routine clean builds. For lower contention on an Apple Silicon Mac:
+
+```sh
+nice -n 10 xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent \
+  -configuration Test -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath build-output/DerivedData -jobs 1 \
+  -parallel-testing-enabled NO ONLY_ACTIVE_ARCH=YES \
+  SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO test
+```
+
+This reduces concurrency and scheduling priority; it is not a hard CPU cap.
+Xcode's integrated scheduler owns individual compiler tasks, and Xcode can append
+its own Swift `-j` argument after `OTHER_SWIFT_FLAGS`. Do not assume adding `-j1`
+there controls the effective compiler invocation. Retain architecture coverage in
+release/CI checks. Avoid running Rust and Swift builds simultaneously; use `cargo
+-j 1` for the corresponding Rust command. Focused XCTest selectors reduce executed
+tests but still compile the test target; run the full suite before opening a PR.
+
+## Serato conflict fixtures
+
+`SeratoConflictAnalysisTests` includes a temporary WAL database with 30,000 indexed
+rows and 30,002 saved occurrences. It measures analysis separately from startup
+scanning, verifies two diagnostic probes for two raw conflicting spellings, and
+samples main-actor responsiveness. The analysis target is 100 ms; the main-actor
+gap assertion is 50 ms. Timing output is attached as `CONFLICT_PERF` evidence.
+The test does not open production data or synthesize 30,000 audio files.
+
+`SeratoConflictPresentationTests` mounts the actual repair view, routes explicit
+native actions through injected boundaries, retains stale/error evidence, and
+exports light/dark Comfortable/Compact renders to `/tmp/crate-130-conflict-renders`.
+`CONFLICT_NAV` records hosted navigation time against a 500 ms assertion. These
+figures describe the new conflict work, not overall incremental-startup performance.
+
+Run these suites with `-only-testing:CrateAgentTests/SeratoConflictAnalysisTests`
+and `-only-testing:CrateAgentTests/SeratoConflictPresentationTests` added before
+`test` in the isolated native command above. Session, mutation, worker, import,
+selection, and Rust FFI tests cover safety at their existing public boundaries.
+
+Owner-app smoke check: open **Review conflicts**, compare both saved spellings and
+metadata, copy the details, reveal a verified file, and explicitly open Serato.
+Preserve the intended audio and crate references, save and close Serato, retry,
+and confirm conflict counts clear. Automated fixtures never perform this repair
+against the owner's library.
+
+
+On the reference Mac with serial, lower-priority Test builds, observed analysis
+wall times ranged from 233–560 ms. The final formatted-tree run measured
+557 ms, 3.7 ms maximum main-actor gap, and 66–108 ms hosted navigation; the
+preceding full run measured 233 ms, about 2 ms, and 34–56 ms respectively.
+The 100 ms analysis target remains unmet in this unoptimized configuration.
+Correctness, two-probe scaling, main-actor responsiveness, and navigation limits
+passed. These measurements were not rerun to select a favorable sample.
+VoiceOver navigation remains part of the owner-app smoke check: the in-process
+AppKit accessibility tree exposes selectable text but not all SwiftUI controls,
+so it is not used as an oracle for the screen's buttons.

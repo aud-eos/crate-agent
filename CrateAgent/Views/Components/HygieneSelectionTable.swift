@@ -5,6 +5,7 @@ struct HygieneSelectionTable<Row: Identifiable & Equatable>: View {
     let identities: [String: TrackDisplayIdentity]
     let enabled: Bool
     var contentRevision = ""
+    var blockReason: (Row) -> String? = { _ in nil }
     let path: (Row) -> String
     let field: (Row) -> String
     let oldValue: (Row) -> String
@@ -21,6 +22,7 @@ struct HygieneSelectionTable<Row: Identifiable & Equatable>: View {
                 PreviewTableColumn(identifier: "field", title: "Field", width: 90, text: field),
                 PreviewTableColumn(identifier: "current", title: "Current", width: 180, text: oldValue),
                 PreviewTableColumn(identifier: "proposed", title: "Proposed", width: 180, text: newValue),
+                PreviewTableColumn(identifier: "status", title: "Status", width: 280, text: { row in blockReason(row) ?? "Ready" }),
                 PreviewTableColumn(identifier: "path", title: "Path", width: 260, text: path),
             ], accessibilityName: { row in "\(field(row)) for \(path(row))" },
             isSelected: { identifier in results.selectedIDs.contains(identifier) }, setSelected: { identifier, selected in results.setSelected(selected, id: identifier) },
@@ -29,7 +31,7 @@ struct HygieneSelectionTable<Row: Identifiable & Equatable>: View {
                     let order = sortText(first, column: column).localizedStandardCompare(sortText(second, column: column))
                     return ascending ? order == .orderedAscending : order == .orderedDescending
                 }
-            }
+            }, isSelectable: { row in blockReason(row) == nil }
         )
     }
 
@@ -41,6 +43,7 @@ struct HygieneSelectionTable<Row: Identifiable & Equatable>: View {
         case "current": oldValue(row)
         case "proposed": newValue(row)
         case "path": path(row)
+        case "status": blockReason(row) ?? "Ready"
         default: preconditionFailure("Unknown Cleanup column")
         }
     }

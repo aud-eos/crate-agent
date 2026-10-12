@@ -16,6 +16,7 @@ struct MissingFieldsPanel: View {
         get { results.rows }
         nonmutating set {
             results.replaceHygiene(newValue, files: files, context: selectedField.rawValue, proposalRevision: LibraryHygiene.normalizedMissingFieldValue(fillValue), fileID: { $0.fileId })
+            refreshConflictSelection()
         }
     }
 
@@ -46,6 +47,7 @@ struct MissingFieldsPanel: View {
             footer
         }
         .task { await rescan() }
+        .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
     }
 
     @ViewBuilder
@@ -138,7 +140,7 @@ struct MissingFieldsPanel: View {
             )
         } else {
             HygieneSelectionTable(results: $results, identities: trackIdentities, enabled: !isScanning && !isApplying,
-                                  contentRevision: fillValue, path: { $0.path }, field: { $0.field.displayName },
+                                  contentRevision: fillValue, blockReason: { row in conflictReason(row) }, path: { $0.path }, field: { $0.field.displayName },
                                   oldValue: { _ in "Not set" }, newValue: { _ in LibraryHygiene.normalizedMissingFieldValue(fillValue) })
         }
     }
@@ -219,5 +221,13 @@ struct MissingFieldsPanel: View {
         } catch {
             actionError = "Apply failed: \(error.localizedDescription)"
         }
+    }
+
+    private func conflictReason(_ row: some HygienePreviewEntry) -> String? {
+        services.readiness.conflictPath(for: SeratoConflictTarget(fileIDs: [row.fileId], paths: [row.path])).map(SeratoConflictMessages.blocked)
+    }
+
+    private func refreshConflictSelection() {
+        results.setBlockedIDs(Set(results.rows.filter { row in conflictReason(row) != nil }.map(\.id)))
     }
 }
