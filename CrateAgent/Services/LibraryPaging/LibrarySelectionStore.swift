@@ -1,0 +1,204 @@
+import Foundation
+import GRDB
+
+actor LibrarySelectionStore: PagedSelectionProvider {
+    typealias Snapshot = LibraryPagedSnapshot
+    typealias Identity = PagedIdentity<Int64>
+    typealias IdentityReader = @Sendable (Snapshot, Int64?, Int) async throws -> [Identity]
+    private let pool: DatabasePool
+    private var storage: DatabaseQueue?
+    private let readIdentities: IdentityReader
+    private var epoch: UInt64 = 0
+
+    init(database: LibraryDatabase,
+         readIdentities: @escaping IdentityReader = { snapshot, after, limit in try await snapshot.identities(after: after, limit: limit) }) throws
+    {
+        guard let pool = database.writer as? DatabasePool else { throw PagingError.unavailableDatabase }
+        self.pool = pool
+        self.readIdentities = readIdentities
+        let storage = try DatabaseQueue(path: "")
+        try storage.write { database in
+            try database.execute(sql: """
+            CREATE TABLE selected_identity (
+                id INTEGER PRIMARY KEY, revision INTEGER NOT NULL,
+                included INTEGER NOT NULL, capture TEXT
+            );
+            CREATE TABLE staged_identity (
+                operation TEXT NOT NULL, id INTEGER NOT NULL, revision INTEGER NOT NULL,
+                PRIMARY KEY (operation, id)
+            );
+            """)
+        }
+        self.storage = storage
+    }
+
+    func set(_ identities: [Identity], selected: Bool) throws {
+        try Task.checkCancellation()
+        try requireStorage().write { database in
+            for identity in identities {
+                if selected {
+                    try database.execute(sql: """
+                    INSERT INTO selected_identity(id, revision, included) VALUES (?, ?, 1)
+                    ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, included = 1
+                    """, arguments: [identity.id, identity.revision])
+                } else {
+                    try database.execute(sql: "UPDATE selected_identity SET included = 0 WHERE id = ? AND revision = ?", arguments: [identity.id, identity.revision])
+                }
+            }
+        }
+    }
+
+    func setScope(_ snapshot: Snapshot, selected: Bool) async throws {
+        var lastID: Int64?
+        try await capture(selected: selected) { [readIdentities] in
+            let batch = try await readIdentities(snapshot, lastID, 200)
+            lastID = batch.last?.id
+            return batch
+        }
+    }
+
+    func setRange(_ range: Range<Int>, in snapshot: Snapshot, selected: Bool) async throws {
+        let count = await snapshot.count()
+        guard range.lowerBound >= 0, range.upperBound <= count else { throw PagingError.invalidRange }
+        var offset = range.lowerBound
+        try await capture(selected: selected) {
+            guard offset < range.upperBound else { return [] }
+            let end = min(range.upperBound, offset + 200)
+            let batch = try await snapshot.identities(in: offset ..< end)
+            offset = end
+            return batch
+        }
+    }
+
+    func selectedIDs(in identities: [Identity]) throws -> Set<Int64> {
+        try Task.checkCancellation()
+        guard !identities.isEmpty else { return [] }
+        return try requireStorage().read { database in
+            let arguments = StatementArguments(identities.map(\.id))
+            let placeholders = Array(repeating: "?", count: identities.count).joined(separator: ",")
+            let expected = Set(identities)
+            let rows = try Row.fetchAll(database, sql: "SELECT id, revision FROM selected_identity WHERE included = 1 AND id IN (\(placeholders))", arguments: arguments)
+            return Set(rows.compactMap { row in
+                let identity = Identity(id: row["id"], revision: row["revision"])
+                return expected.contains(identity) ? identity.id : nil
+            })
+        }
+    }
+
+    func summary(in snapshot: Snapshot) async throws -> PagedSelectionSummary {
+        let requestedEpoch = epoch
+        let total = try await requireStorage().read { database in
+            guard let count = try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM selected_identity WHERE included = 1") else { throw PagingError.incompletePage }
+            return count
+        }
+        let count = await snapshot.count()
+        var inScope = 0
+        if total > 0 {
+            var lastID: Int64?
+            while true {
+                try Task.checkCancellation()
+                let batch = try await snapshot.identities(after: lastID, limit: 200)
+                guard requestedEpoch == epoch else { throw CancellationError() }
+                if batch.isEmpty {
+                    break
+                }
+                inScope += try selectedIDs(in: batch).count
+                lastID = batch.last?.id
+            }
+        }
+        return .init(total: total, inScope: inScope, scopeCount: count, removed: 0)
+    }
+
+    func reconcile() throws -> Int {
+        try Task.checkCancellation()
+        let storage = try requireStorage()
+        let reader = try pool.makeSnapshot()
+        return try storage.write { database in
+            var lastID: Int64?
+            var removed = 0
+            while true {
+                try Task.checkCancellation()
+                let predicate = lastID == nil ? "" : " AND id > ?"
+                let arguments: StatementArguments = lastID.map { identifier in [identifier] } ?? []
+                let batch = try Row.fetchAll(database, sql: "SELECT id, revision FROM selected_identity WHERE included = 1\(predicate) ORDER BY id LIMIT 200", arguments: arguments)
+                    .map { row in Identity(id: row["id"], revision: row["revision"]) }
+                if batch.isEmpty {
+                    break
+                }
+                let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                let current = try reader.read { library in
+                    try Set(Row.fetchAll(library, sql: "SELECT id, membership_revision FROM files WHERE id IN (\(placeholders))", arguments: StatementArguments(batch.map(\.id)))
+                        .map { row in Identity(id: row["id"], revision: row["membership_revision"]) })
+                }
+                for identity in batch where !current.contains(identity) {
+                    try database.execute(sql: "DELETE FROM selected_identity WHERE id = ?", arguments: [identity.id])
+                    removed += 1
+                }
+                lastID = batch.last?.id
+            }
+            return removed
+        }
+    }
+
+    func clear() throws {
+        epoch &+= 1
+        try requireStorage().write { database in
+            try database.execute(sql: "DELETE FROM selected_identity; DELETE FROM staged_identity")
+        }
+    }
+
+    func close() {
+        epoch &+= 1
+        storage = nil
+    }
+
+    private func requireStorage() throws -> DatabaseQueue {
+        guard let storage else { throw CancellationError() }
+        return storage
+    }
+
+    private func capture(selected: Bool, nextBatch: () async throws -> [Identity]) async throws {
+        let requestedEpoch = epoch
+        let operation = UUID().uuidString
+        let storage = try requireStorage()
+        do {
+            while true {
+                try Task.checkCancellation()
+                let batch = try await nextBatch()
+                guard requestedEpoch == epoch else { throw CancellationError() }
+                if batch.isEmpty {
+                    break
+                }
+                try await storage.write { database in
+                    for identity in batch {
+                        try database.execute(sql: "INSERT INTO staged_identity(operation, id, revision) VALUES (?, ?, ?)", arguments: [operation, identity.id, identity.revision])
+                    }
+                }
+            }
+            try Task.checkCancellation()
+            guard requestedEpoch == epoch else { throw CancellationError() }
+            try await storage.write { database in
+                if selected {
+                    try database.execute(sql: """
+                    INSERT INTO selected_identity(id, revision, included, capture)
+                    SELECT id, revision, 1, operation FROM staged_identity WHERE operation = ?
+                    ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, included = 1, capture = excluded.capture
+                    """, arguments: [operation])
+                } else {
+                    try database.execute(sql: """
+                    UPDATE selected_identity SET included = 0 WHERE EXISTS (
+                        SELECT 1 FROM staged_identity WHERE operation = ?
+                        AND staged_identity.id = selected_identity.id AND staged_identity.revision = selected_identity.revision
+                    )
+                    """, arguments: [operation])
+                }
+                try database.execute(sql: "DELETE FROM staged_identity WHERE operation = ?", arguments: [operation])
+            }
+        } catch {
+            try await storage.write { database in
+                try database.execute(sql: "DELETE FROM staged_identity WHERE operation = ?", arguments: [operation])
+            }
+            throw error
+        }
+    }
+}

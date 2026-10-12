@@ -149,8 +149,8 @@ final class FileEligibilityIntegrationTests: XCTestCase {
             let search = try AutoTagFileSearch.search(query: "needle", in: database)
             XCTAssertEqual(search.totalMatchCount, 4)
             XCTAssertEqual(search.matches.count, 4)
-            XCTAssertEqual(try LibraryBrowserView.fetchBrowserRows(database, search: "needle", sortOrder: [], limit: 200).count, 4)
-            XCTAssertEqual(try LibraryBrowserView.fetchBrowserRows(database, search: "", sortOrder: [], limit: 200).count, 4)
+            XCTAssertEqual(try LibraryStatusBrowse.fetch(database, search: "needle", sortOrder: [], limit: 200).rows.count, 4)
+            XCTAssertEqual(try LibraryStatusBrowse.fetch(database, search: "", sortOrder: [], limit: 200).rows.count, 4)
             XCTAssertEqual(try HygieneFileRow.fetchAll(database, sql: HygieneFileRow.hygieneFetchSQL).count, 1)
         }
     }

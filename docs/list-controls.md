@@ -32,7 +32,7 @@ rows does not approve a tag proposal or start an operation.
 | Organize | Select eligible move proposals. Missing required metadata stays visible but unselectable. Search combines with the location filter. |
 | Auto-Tag selection | Both browse and search are paged. **Select page** affects the current page's eligible files; selections survive page and query changes. The count outside this page includes selections hidden by search. |
 | Auto-Tag review | List search filters display only. Approvals remain separate, with total and hidden approval counts. Explicit bulk approval controls and Apply approved tracks cover the entire scan; Focus mode navigates the whole scan. |
-| Library | Native row selection supplies single-row context actions, not a batch mutation. Highlights are limited to the displayed result set and reset when filtered out; they do not persist as hidden batch targets. Existing sortable columns remain. The current 1,000-row display cap is labeled; broader virtualization is tracked in #134. |
+| Library | Continuous scrolling covers every match. Select all matches and Command-A capture the full query, including unloaded rows. Selection survives search, sort and status changes; total and outside-filter counts stay visible. Changed membership revisions and deleted files are deselected with a notice. Right-click Rename, History and Finder resolve the clicked file afresh; selection does not introduce a bulk mutation. |
 | Move library | A whole-library operation that changes the watched root after successful completion. Search filters its preview only; confirmation always states the complete move count. Partial selection would violate that operation's contract. |
 
 Flat Cleanup and Organize previews use native reusable rows and continuous
@@ -49,6 +49,12 @@ in-memory lists and the registered SQLite function. `ListSearchField`,
 `ListResultSummary`, and `BatchSelectionControls` share presentation, while each
 screen owns its scan, domain eligibility, approval, and apply orchestration.
 Organize retains its indexed immutable snapshot for its larger planning workload.
+Library uses `PagedResultsController` with a GRDB read snapshot and a bounded
+five-page cache. `PagedTable` renders native reusable rows and loading placeholders;
+`PagedSelectionController` delegates captured IDs/revisions to ephemeral SQLite
+storage. Count, page and selection errors remain visible with Retry. Selection
+capture completes atomically before dependent controls become available. Clear
+selection cancels unfinished capture as well as clearing hidden selections.
 Never interpret a viewport, page, or current filter as the complete selection.
 
 Future artist, crate, version, and playlist lists should adopt these mechanics

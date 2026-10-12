@@ -42,3 +42,29 @@ This is an application startup boundary, not an operating-system sandbox. Tests
 that bypass these factories and explicitly open arbitrary paths still need
 isolated fixtures. A green suite alone is not evidence that new test code respects
 that contract.
+
+
+## Paged Library fixture
+
+`LibraryPagingTests` creates one temporary WAL database with 30,000 synthetic
+files. It never opens the owner's library or creates audio. Run it in the isolated
+Test host:
+
+```sh
+xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent -configuration Test \
+  -derivedDataPath build-output/DerivedData \
+  -only-testing:CrateAgentTests/LibraryPagingTests test
+```
+
+The `PAGED_LIBRARY_METRICS` log and XCTest attachment report Library rendering
+inside an existing window, distant scrollbar work, initial/distant asynchronous
+load latency, maximum main-actor heartbeat delay, decoded row totals, and peak
+cached rows. Rendering and scroll gestures run in separate main-actor turns,
+with a short idle interval between interactions. OS window setup is reported separately. Targets are below 100 ms for
+rendering and below 50 ms for main-thread work; timings are measured evidence,
+not machine-dependent pass/fail thresholds. The normal cache bound is 1,000 rows
+(200 per page, five pages); oversized viewports declare a larger effective page
+size while retaining the five-page bound. Memory and identity assertions are
+hard requirements. Generic controller tests cover controlled stale completions
+and error/retry races, and native table tests cover deferred selection and context
+IDs independently of Library's row type.
