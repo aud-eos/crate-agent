@@ -1685,6 +1685,7 @@ public actor OperationEngine {
         case let .metadataUpdate(update):
             try await applySeratoMetadataUpdate(update, guardedWrites: guardedWrites)
         case let .addTrack(add):
+            let scopeAuthorization = readiness?.captureScope()
             try await applySeratoAddTrack(add, guardedWrites: guardedWrites)
             guard let guardedWrite = guardedWrites.first else {
                 throw OperationEngineError.insertDidNotReturnRowId
@@ -1696,11 +1697,14 @@ public actor OperationEngine {
                 else {
                     throw FileProcessingEligibilityError.superseded(fileId: guardedWrite.token.fileId)
                 }
-                _ = try FileLibraryStateMutation.apply(
-                    SetFileLibraryStatePayload(fileId: guardedWrite.token.fileId, expectedRevision: guardedWrite.token.revision,
-                                               state: FileLibraryState(membership: .active, availability: file.fileAvailability, libraryID: libraryID, retiredAt: nil)),
-                    batchId: "import-confirmed:\(guardedWrite.eventId)", timestamp: Int64(Date().timeIntervalSince1970 * 1000), in: database
+                try scopeAuthorization?.check()
+                _ = try Self.executeAndLog(
+                    readiness: self.readiness,
+                    mutation: .setFileLibraryState(.init(fileId: guardedWrite.token.fileId, expectedRevision: guardedWrite.token.revision,
+                                                         state: FileLibraryState(membership: .active, availability: file.fileAvailability, libraryID: libraryID, retiredAt: nil))),
+                    batchId: "import-confirmed:\(guardedWrite.eventId)", in: database
                 )
+                try scopeAuthorization?.check()
             }
         case let .fileTagWrite(write):
             try await applyFileTagWrite(write, guardedWrites: guardedWrites)

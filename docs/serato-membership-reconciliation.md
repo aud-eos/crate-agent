@@ -181,10 +181,12 @@ transaction work; invalidation during an update rolls back the transaction. Toge
 these checks mean a close/reopen cannot authorize old mutations. Explicit import
 intent and verified local filesystem observations remain possible, while external
 writes queue. Only the session's scoped drain authorization can write before normal
-readiness opens. Fingerprinting is an independent background process: it reads only
-active, available rows and checks each row's membership token when persisting, so a
-concurrent retirement or identity change rejects the stale result without coupling
-the worker's lifecycle to the file-info scan.
+readiness opens. Fingerprinting starts as an independent background task, waits
+while source validation keeps readiness closed, and resumes automatically when the
+gate opens. It reads only active, available, unconflicted rows and checks both the
+sync generation and each row's membership token when persisting. A concurrent
+conflict, retirement or identity change rejects stale results; a sync pause does
+not terminate the worker or require a manual fingerprint retry.
 Serato launch during a sync cancels it and leaves queued intent intact. After an
 already validated session, Serato being open permits local processing with outbound
 writes queued; initial startup while Serato is open never enables state-changing processing.

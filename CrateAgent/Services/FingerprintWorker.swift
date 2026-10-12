@@ -177,7 +177,11 @@ public actor FingerprintWorker {
                 }
                 try await processBatch(batch, totalPending: pendingCount, fingerprintFunction: fingerprintFunction)
             } catch is LibrarySyncReadinessError {
-                return
+                try? await Task.sleep(nanoseconds: pollIntervalNanos)
+                continue
+            } catch is SeratoPathConflictError {
+                try? await Task.sleep(nanoseconds: pollIntervalNanos)
+                continue
             } catch {
                 guard !Task.isCancelled, self.runID == runID else { return }
                 lastError = "Fingerprint processing stopped: \(error.localizedDescription)"

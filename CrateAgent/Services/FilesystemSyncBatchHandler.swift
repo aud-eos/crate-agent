@@ -10,12 +10,18 @@ actor FilesystemSyncBatchHandler {
     }
 
     func handle(_ batch: FilesystemEventBatch) async throws {
-        try await coordinator.handleBatch(batch)
-        guard await coordinator.takeReconciliationRequest() else { return }
-        do { try await session.synchronize() }
-        catch {
-            await coordinator.restoreReconciliationRequest()
-            throw error
+        var retainedConflict: FilesystemConflictDeferral?
+        do { try await coordinator.handleBatch(batch) }
+        catch let deferred as FilesystemConflictDeferral { retainedConflict = deferred }
+        if await coordinator.takeReconciliationRequest() {
+            do { try await session.synchronize() }
+            catch {
+                await coordinator.restoreReconciliationRequest()
+                throw error
+            }
+        }
+        if let retainedConflict {
+            throw retainedConflict
         }
     }
 }

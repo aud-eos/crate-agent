@@ -148,7 +148,7 @@ public final class AppServices: ObservableObject {
             database: database
         )
 
-        let worker = FingerprintWorker(database: database)
+        let worker = FingerprintWorker(database: database, readiness: readiness)
         fingerprintWorker = worker
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the

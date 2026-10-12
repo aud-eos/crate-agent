@@ -3,7 +3,9 @@
 Issue: https://github.com/aud-eos/crate-agent/issues/130
 
 Status: approved by the owner on 2026-10-11. Guided repair in Serato is the
-first-release direction. Implementation is complete; final review and PR verification are in progress.
+first-release direction. Implementation and final review fixes are complete. Native verification passed;
+the analysis latency target and owner-app accessibility smoke check remain open
+validation limitations, documented in the PR.
 
 ## Outcome and scope
 

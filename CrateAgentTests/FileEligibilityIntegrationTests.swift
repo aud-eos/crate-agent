@@ -21,17 +21,18 @@ final class FileEligibilityIntegrationTests: XCTestCase {
         }
         let authorization = gate.prepareDrain()
         try gate.install(scope, for: authorization)
-        try gate.markReady(authorization)
         let completed = expectation(description: "eligible file beyond the first page finishes")
         let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { path in
             XCTAssertEqual(path, files[5].path)
             return [1, 2, 3]
-        }, readiness: gate)
+        }, pollIntervalSeconds: 0.01, readiness: gate)
         await worker.start { progress in
             if progress.totalDone == 1 {
                 completed.fulfill()
             }
         }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try gate.markReady(authorization)
         await fulfillment(of: [completed], timeout: 5)
         await worker.stop()
         let remaining = try await database.writer.read { connection in try FileRecord.order(Column("id")).fetchAll(connection) }

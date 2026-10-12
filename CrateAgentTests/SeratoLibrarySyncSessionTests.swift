@@ -171,6 +171,39 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         XCTAssertEqual(finishedCheckpoints.last, 502)
     }
 
+    func testMixedConflictBatchStillValidatesRequiredReconciliation() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let independent = try await fixture.add("retired.mp3")
+        try fixture.save(paths: [protected.path, protected.path.decomposedStringWithCanonicalMapping, independent.path])
+        let session = makeSession(fixture, gate: gate)
+        try await session.synchronize()
+        let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        let handler = FilesystemSyncBatchHandler(coordinator: coordinator, session: session)
+        let checkpoints = SessionCheckpoints()
+        let processor = FilesystemEventProcessor(handler: { batch in try await handler.handle(batch) }, checkpoint: { eventID in await checkpoints.append(eventID) })
+        let batch = FilesystemEventBatch(observations: [
+            .init(path: protected.path, isFile: true, wasRemoved: true, eventID: 601),
+            .init(path: fixture.directory.path, isDirectory: true, rootChanged: true, eventID: 602),
+        ], highestEventID: 602)
+        try Data("invalid source".utf8).write(to: fixture.locator.databaseV2Url)
+        do { try await processor.enqueue(batch); XCTFail("Conflict deferral hid source validation failure") } catch {}
+        XCTAssertThrowsError(try gate.capture())
+        try fixture.save(paths: [protected.path, protected.path.decomposedStringWithCanonicalMapping])
+        try await processor.retry()
+        let retired = try await fixture.row(independent)
+        XCTAssertEqual(retired.libraryMembership, .retired)
+        let held = await checkpoints.values
+        XCTAssertEqual(held, [])
+        try fixture.save(paths: [protected.path])
+        try await session.synchronize()
+        try await processor.retry()
+        let finished = await checkpoints.values
+        XCTAssertEqual(finished.last, 602)
+    }
+
     func testSessionStartsIdleUntilExplicitlyRequested() throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)
