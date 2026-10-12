@@ -80,6 +80,20 @@ Backup (Flavor 1) and sidecar-DB sync (Flavor 3) are in scope. **Cross-machine l
 
 Why this exists: a path-translation layer is a major engineering effort that would bloat the foundation. The project owner is one person on one main Mac with an external backup. Solve the actual problem, not the abstract one.
 
+### 8. Large-library plans include interaction budgets and measured fixtures
+
+For startup, navigation, scans, and bulk operations, define the user journey,
+expected library size, readiness/interaction budgets, and what remains usable
+before implementation. Use a production-scale fixture, compare baseline and final
+results with identical data/build settings, and include an actual-screen smoke
+checklist. Keep committed browsing available while processing authorization is
+closed; never weaken identity or write guards to improve a timing result.
+
+Evidence: [Organize responsiveness](https://github.com/aud-eos/crate-agent/pull/151)
+and [incremental startup](https://github.com/aud-eos/crate-agent/issues/129).
+See [testing guidance](docs/testing.md#planning-large-library-work) and
+`LibraryStartupPerformanceTests` for the 30,000-file fixture and hard budgets.
+
 ## Conventions
 
 Universal rules (descriptive variable names, no lint-suppression comments, strict env vars with module-level asserts, no silent failures, etc.) live in `~/.claude/CLAUDE.md` and are hook-enforced. The bullets below are crate-agent-specific only.

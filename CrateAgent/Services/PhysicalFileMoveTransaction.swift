@@ -15,7 +15,12 @@ final class PhysicalFileMoveTransaction {
                                         afterTransfer: @escaping @Sendable (URL) throws -> Void = { _ in },
                                         _ body: @escaping @Sendable (Database, PhysicalFileMoveTransaction) throws -> Result) async throws -> Result
     {
-        try await writer.writeWithoutTransaction { database in
+        let accounting = SyncRevisionAccounting.current
+        return try await writer.writeWithoutTransaction { database in
+            let revisionBefore = try SyncCheckpointStore.revision(in: database)
+            try accounting?.validate(revisionBefore)
+            let fence = "physical:\(batchId)"
+            try SyncCheckpointStore.beginEffect(batchID: fence, in: database)
             let transaction = PhysicalFileMoveTransaction(afterTransfer: afterTransfer)
             var result: Result?
             do {
@@ -31,10 +36,14 @@ final class PhysicalFileMoveTransaction {
                     throw MoveError.compensationFailed(original: failure.localizedDescription,
                                                        compensation: "\(error.localizedDescription) Retained audio paths: \(retainedPaths)")
                 }
+                try SyncCheckpointStore.finishEffect(batchID: fence, in: database)
                 throw failure
             }
             do { try transaction.finish() }
             catch { throw OperationEngineError.externalSyncIncomplete(batchId: batchId, underlying: error.localizedDescription) }
+            try SyncCheckpointStore.finishEffect(batchID: fence, in: database)
+            let revisionAfter = try SyncCheckpointStore.revision(in: database)
+            accounting?.record(revisionAfter - revisionBefore)
             return result!
         }
     }

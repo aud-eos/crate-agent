@@ -12,7 +12,7 @@ struct MenuBarStatusView: View {
         VStack(alignment: .leading, spacing: density.spacing) {
             PageHeading("crate-agent", subtitle: "Library status")
 
-            LibrarySyncStatusView(state: services.syncState, retry: services.retrySync, hasConflicts: !services.syncSession.conflicts.isEmpty, review: {
+            LibrarySyncStatusView(state: services.syncState, retry: services.retrySync, phase: services.syncPhase, fileInfoFailures: services.syncFileInfoFailures, progress: services.scanProgress, hasConflicts: !services.syncSession.conflicts.isEmpty, review: {
                 openWindow(id: AppPresentation.mainWindowID)
                 services.reviewConflicts()
             })

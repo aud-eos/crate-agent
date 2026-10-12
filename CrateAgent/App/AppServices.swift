@@ -35,6 +35,8 @@ public final class AppServices: ObservableObject {
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
     @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
+    @Published private(set) var syncPhase: SeratoLibrarySyncSession.SyncPhase?
+    @Published private(set) var syncFileInfoFailures: [String] = []
     @Published private(set) var conflictNavigationRequest: UUID?
     lazy var conflictReviewModel = SeratoConflictReviewModel(session: syncSession, copyDetails: { text in
         NSPasteboard.general.clearContents()
@@ -85,7 +87,7 @@ public final class AppServices: ObservableObject {
     private let fsEventsWatcher: FSEventsWatcher
     private var filesystemEventsTask: Task<Void, Never>?
     private let filesystemProcessor: FilesystemEventProcessor
-    private let filesystemStartupTask: Task<Void, Never>
+    private let startupCoordinator: LibraryStartupCoordinator
     private let filesystemContinuation: AsyncStream<FilesystemEventBatch>.Continuation
     private var retryTask: Task<Void, Never>?
     let readiness: LibrarySyncReadiness
@@ -177,18 +179,14 @@ public final class AppServices: ObservableObject {
             resyncBatch: { batchID in try await engine.resyncSeratoForBatch(batchID) }
         )
 
+        let watchConfiguration = try FilesystemWatchConfiguration(musicFolder: watchedMusicFolder)
         let reader = SeratoMembershipSnapshotReader(locator: seratoLocator, watchdog: seratoWatchdog)
         let session = SeratoLibrarySyncSession(reader: reader,
                                                reconciler: SeratoMembershipReconciler(database: database, operationEngine: engine, reader: reader),
                                                scanner: scanner, operationEngine: engine, watchdog: seratoWatchdog, readiness: readiness,
-                                               stopProcessing: { taggingService.cancel() })
+                                               stopProcessing: { taggingService.cancel() },
+                                               checkpointStore: SyncCheckpointStore(database: database), watchRoots: watchConfiguration.watchedPaths)
         syncSession = session
-        seratoSyncCoordinator = SeratoSyncCoordinator(
-            session: session,
-            seratoWatchdog: seratoWatchdog
-        )
-
-        let watchConfiguration = try FilesystemWatchConfiguration(musicFolder: watchedMusicFolder)
         let resumeFromEventId = watchConfiguration.resumeEventID {
             UserPreferences.lastFSEventId(forWatchedPath: $0)
         }
@@ -211,7 +209,14 @@ public final class AppServices: ObservableObject {
         )
         try watcher.start()
         fsEventsWatcher = watcher
-        filesystemStartupTask = processor.resumeAfterInitialSync(session)
+        let startup = LibraryStartupCoordinator(session: session, processor: processor,
+                                                captureBoundary: { try await watcher.captureReplayBoundary() },
+                                                replay: { batch in
+                                                    try await filesystemCoordinator.handleBatch(batch)
+                                                    _ = await filesystemCoordinator.takeReconciliationRequest()
+                                                })
+        startupCoordinator = startup
+        seratoSyncCoordinator = SeratoSyncCoordinator(session: session, seratoWatchdog: seratoWatchdog, startup: startup)
         filesystemEventsTask = Task { [weak self] in
             for await batch in eventStream.stream {
                 if Task.isCancelled {
@@ -239,18 +244,20 @@ public final class AppServices: ObservableObject {
         session.$state.assign(to: &$syncState)
         session.$initialSyncComplete.assign(to: &$initialScanComplete)
         session.$scanProgress.assign(to: &$scanProgress)
+        session.$phase.assign(to: &$syncPhase)
+        session.$fileInfoFailures.assign(to: &$syncFileInfoFailures)
 
         Self.logger.info(
             "AppServices ready; watching \(watchedMusicFolder.path, privacy: .public)"
         )
 
         startFingerprinting()
+        startup.start()
     }
 
     deinit {
         readiness.invalidate()
         filesystemEventsTask?.cancel()
-        filesystemStartupTask.cancel()
         filesystemContinuation.finish()
         retryTask?.cancel()
         fsEventsWatcher.stop()
@@ -261,6 +268,9 @@ public final class AppServices: ObservableObject {
     func retrySync() {
         guard !filesystemDeliveryStopped else { return }
         guard retryTask == nil else { return }
+        if !startupCoordinator.completed {
+            startupCoordinator.start(retryingFailedCleanup: true); return
+        }
         retryTask = Task { [weak self] in
             guard let self else { return }
             defer { retryTask = nil }
@@ -268,7 +278,7 @@ public final class AppServices: ObservableObject {
             do {
                 try await filesystemProcessor.retry()
                 syncSession.finishFilesystemRetry(succeeded: true)
-                try await syncSession.synchronize(retryingFailedCleanup: true)
+                try await syncSession.synchronize(syncSession.retryRequest(), retryingFailedCleanup: true)
                 try await filesystemProcessor.retry()
             } catch {
                 syncSession.finishFilesystemRetry(succeeded: false)
@@ -278,11 +288,11 @@ public final class AppServices: ObservableObject {
     }
 
     func requestLibraryRescan() {
-        syncSession.requestSync()
+        startupCoordinator.requestRescan()
     }
 
     func stopLibraryRescan() {
-        syncSession.stopSync()
+        startupCoordinator.stop()
     }
 
     func retryFingerprinting() {

@@ -127,16 +127,17 @@ drain queued writes or reopen normal readiness in that scope. Only successful re
 and checkpoint clear the latch. A fresh normal session then drains and schedules
 state-changing work, avoiding both a cyclic wait and a premature ready state.
 
-At startup the file-info scan is idle. The watcher captures events immediately,
-but its processor buffers
-delivery and checkpoints until `initialSyncComplete` and the session is idle.
-This establishes migrated legacy membership from the saved old V2 paths before
-replaying renames. The user's first successful **Re-scan File Info** opens buffered
-delivery once. Waiting for Serato, stopping the scan, or a failed pass leaves the
-buffer paused. AppServices owns and cancels the wait task; cancellation is checked
-again after the session becomes idle, before any buffered replay. The processor
-owns pending delivery, so the manual scan does not wait for a filesystem handler
-that can itself request sync.
+Startup automatically validates the saved library while browsing stays available.
+The watcher starts immediately; its processor buffers delivery and cursor updates.
+A native boundary orders callbacks that have actually arrived. Native tests showed
+that a flush can finish before a file change is delivered, so boundary completion
+alone is never physical evidence: cached files also pass precise stat and volume
+validation. Later delivered events invalidate an in-progress startup candidate.
+The startup coordinator handles captured observations without recursively invoking
+the session, then releases normal delivery only after successful validation.
+Conflict-blocked observations retain their cursor dependency. Serato closing starts
+another incremental pass. **Re-scan File Info** forces file-info reads; Retry retains
+the failed request mode. Stop leaves the last committed browsing state available.
 
 Production setup resolves the watched music folder's applicable native Trash
 directory once, creating that directory if necessary, and watches the normalized,
@@ -320,3 +321,34 @@ Counts clear only after a current validated snapshot proves repair.
 Direct strict scanner/reconciler callers derive and install protection but cannot
 open global readiness. The legacy scanner rejects ambiguous records rather than
 choosing a winner; use the strict session for partial synchronization.
+
+
+## Incremental checkpoint
+
+Schema-only migrations add versioned saved occurrences, file evidence, a slim stat
+projection, dirty-row tracking, and durable external-effect fences. Raw path bytes
+and occurrence multiplicity are preserved. SQLite triggers advance a revision for
+relevant file changes; fingerprint progress alone does not invalidate the cache.
+
+An unchanged pass reads the header and slim stat projection, validates entry/target
+identity and volume UUID, checks source identity and the database revision, and
+opens readiness under the serialized writer. It does not parse V2 or reread audio.
+Symlink targets are checked even outside watched roots. Uncertain files use strict
+verification. Prior conflicts always receive fresh analysis.
+
+Changed sources are compared with the last external metadata projection, separate
+from local metadata. Metadata-only observations use the mutation/event/inverse
+chokepoint with precise file evidence and a commit-time metadata check. Unchanged
+external fields preserve local edits, including during forced refresh. Audio-derived
+values record their evidence basis; a successful absent bitrate is distinct from a
+failed probe. Probe failures remain visible and are retried instead of being cached
+as success. A later local Serato write loads its original baseline by file token
+without loading the complete metadata cache. Unknown interrupted-write baselines
+remain unknown.
+
+Publication checks the expected local revision, current source authorization, and
+unfinished effect fences. Per-session accounting identifies its own observation
+writes; unrelated concurrent changes invalidate the candidate. Unresolved durable
+fences surface an explicit Retry Sync / History recovery error and are never cleared
+merely because a read succeeded. The checkpoint is derived evidence, not a durable
+queue for lost in-memory intent.

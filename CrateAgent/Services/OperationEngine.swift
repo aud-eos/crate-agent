@@ -506,31 +506,65 @@ public actor OperationEngine {
                             expectedFiles: [FileObservationExpectation] = [], batchId: String = UUID().uuidString) async throws -> [Int64]
     {
         let scopeAuthorization = readiness?.captureScope()
+        let metrics = LibrarySyncMetrics.current
+        let accounting = SyncRevisionAccounting.current
         return try await database.writer.write { connection in
-            try authorization.check()
-            try scopeAuthorization?.check()
-            for expected in expectedFiles {
-                try expected.validate(in: connection)
+            try LibrarySyncMetrics.$current.withValue(metrics) {
+                try authorization.check()
+                try scopeAuthorization?.check()
+                for expected in expectedFiles {
+                    try expected.validate(in: connection)
+                }
+                let revisionBefore = try SyncCheckpointStore.revision(in: connection)
+                try accounting?.validate(revisionBefore)
+                let results = try mutations.map { mutation in
+                    try Self.validateObservedIdentity(mutation, in: connection)
+                    let result = try Self.executeAndLog(readiness: self.readiness, mutation: mutation, batchId: batchId, in: connection)
+                    guard result.seratoWrites.isEmpty else { throw SeratoMembershipSnapshotError.unsupportedSource }
+                    return result
+                }
+                try authorization.check()
+                try scopeAuthorization?.check()
+                let revisionAfter = try SyncCheckpointStore.revision(in: connection)
+                accounting?.record(revisionAfter - revisionBefore)
+                metrics?.record(.rowWrite, count: Int(revisionAfter - revisionBefore))
+                return results.compactMap(\.eventId)
             }
-            let results = try mutations.map { mutation in
-                try Self.validateObservedIdentity(mutation, in: connection)
-                let result = try Self.executeAndLog(readiness: self.readiness, mutation: mutation, batchId: batchId, in: connection)
-                guard result.seratoWrites.isEmpty else { throw SeratoMembershipSnapshotError.unsupportedSource }
-                return result
-            }
-            try authorization.check()
-            try scopeAuthorization?.check()
-            return results.compactMap(\.eventId)
         }
     }
 
-    func observeSnapshotMetadata(_ payload: ObserveFileIdentityPayload, authorization: SeratoSnapshotAuthorization) async throws -> [Int64] {
+    func restoreObservedSeratoMetadata(_ records: [FileMembershipToken: SeratoMetadata], authorization: SeratoSnapshotAuthorization) throws {
+        try authorization.check()
+        for (token, metadata) in records where observedSeratoMetadata[token] == nil {
+            observedSeratoMetadata[token] = metadata
+        }
+        try authorization.check()
+    }
+
+    func observeSnapshotMetadata(_ payload: ObserveFileIdentityPayload, authorization: SeratoSnapshotAuthorization,
+                                 metadataEvidence: AudioFileReadIdentity? = nil, expectedMetadata: SeratoMetadata? = nil) async throws -> [Int64]
+    {
         guard let observed = payload.metadata else { throw SeratoMembershipSnapshotError.unsupportedSource }
         let token = FileMembershipToken(fileId: payload.fileId, revision: payload.expectedRevision)
+        guard let current = try await database.writer.read({ connection in try FileRecord.fetchOne(connection, key: payload.fileId) }) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
         let currentFields = Self.metadataFieldMap(observed)
         let captured = pendingSeratoWrites.filter { $0.token == token }
         var replacements: [(GuardedSeratoWrite, GuardedSeratoWrite?)] = []
         var overlay = observed
+        if let baseline = observedSeratoMetadata[token] {
+            let local = current.seratoMetadata
+            overlay = SeratoMetadata(artist: observed.artist == baseline.artist ? local.artist : observed.artist,
+                                     title: observed.title == baseline.title ? local.title : observed.title,
+                                     album: observed.album == baseline.album ? local.album : observed.album,
+                                     genre: observed.genre == baseline.genre ? local.genre : observed.genre,
+                                     bpm: observed.bpm == baseline.bpm ? local.bpm : observed.bpm,
+                                     musicalKey: observed.musicalKey == baseline.musicalKey ? local.musicalKey : observed.musicalKey,
+                                     comment: observed.comment == baseline.comment ? local.comment : observed.comment,
+                                     length: observed.length == baseline.length ? local.length : observed.length,
+                                     label: observed.label == baseline.label ? local.label : observed.label)
+        }
         var conflicts = Set<Int64>()
         var uncertainFields = Set<String>()
         for guarded in captured {
@@ -560,7 +594,14 @@ public actor OperationEngine {
         observation.observedMetadata = observed
         observation.previousObservedMetadata = observedSeratoMetadata[token]
         observation.uncertainV2Fields = uncertainFields.isEmpty ? nil : uncertainFields.sorted()
-        let events = try await applyObservedBatch([.observeFileIdentity(observation)], authorization: authorization)
+        let mutation: TrackMutation
+        if let metadataEvidence {
+            guard let expectedMetadata else { throw SyncCheckpointError.malformed }
+            mutation = .observeFileMetadata(.init(observation: observation, evidence: metadataEvidence, expectedMetadata: expectedMetadata))
+        } else {
+            mutation = .observeFileIdentity(observation)
+        }
+        let events = try await applyObservedBatch([mutation], authorization: authorization, expectedFiles: [FileObservationExpectation(file: current)])
         observedSeratoMetadata[token] = observed
         pendingSeratoWrites = pendingSeratoWrites.compactMap { current in
             if let replacement = replacements.first(where: { $0.0 == current }) {
@@ -569,6 +610,7 @@ public actor OperationEngine {
             return current
         }
         pendingFieldConflicts.formUnion(conflicts)
+        try await finishResolvedEffectFences(Set(captured.map(\.eventId)))
         queueDepthSubject.send(pendingSeratoWrites.count)
         if !conflicts.isEmpty {
             await note("Queued metadata for \((payload.identity.path as NSString).lastPathComponent) was superseded in \(conflicts.count) change(s): saved Serato fields changed or their original external baseline is unknown. Other fields remain queued.")
@@ -631,11 +673,21 @@ public actor OperationEngine {
         _ writes: [GuardedSeratoWrite],
         batchId: String
     ) async throws -> ResyncOutcome {
-        let writes = writes.map { write in
+        var capturedWrites: [GuardedSeratoWrite] = []
+        for write in writes {
             var captured = write
+            if observedSeratoMetadata[write.token] == nil {
+                do {
+                    observedSeratoMetadata[write.token] = try await SyncCheckpointStore(database: database)
+                        .cachedBaseline(token: write.token, identity: write.originalIdentity, locator: seratoLocator)
+                } catch {
+                    throw OperationEngineError.externalSyncIncomplete(batchId: batchId, underlying: error.localizedDescription)
+                }
+            }
             captured.externalBaseline = observedSeratoMetadata[write.token]
-            return captured
+            capturedWrites.append(captured)
         }
+        let writes = capturedWrites
         guard !writes.isEmpty else { return ResyncOutcome(appliedCount: 0, queuedCount: 0) }
         let isSeratoRunning = await seratoWatchdog.isSeratoRunning
         if isSeratoRunning || readiness?.permitsExternalWrites == false {
@@ -660,6 +712,15 @@ public actor OperationEngine {
     /// Number of deferred Serato writes, including failed import adds
     /// retained for Retry Sync.
     /// Surfaced for UI ("M changes pending").
+    var hasPendingSynchronizationWork: Bool {
+        !pendingSeratoWrites.isEmpty || !pendingDuplicateCleanups.isEmpty
+            || !pendingFieldConflicts.isEmpty || failedDuplicateCleanupMessage != nil
+    }
+
+    var pendingEffectFenceIDs: Set<String> {
+        Set(pendingSeratoWrites.map { write in SyncCheckpointStore.eventFence(write.eventId) })
+    }
+
     public var pendingSeratoWriteCount: Int {
         pendingSeratoWrites.count
     }
@@ -1486,6 +1547,7 @@ public actor OperationEngine {
                 pendingSeratoWrites.remove(at: index)
             }
             queueDepthSubject.send(pendingSeratoWrites.count)
+            try await finishResolvedEffectFences([next.eventId])
             try await finishQueuedDuplicateStep(eventID: next.eventId, succeeded: applied.contains(next.eventId))
         }
         let outcome = ResyncOutcome(appliedCount: applied.count,
@@ -1598,7 +1660,55 @@ public actor OperationEngine {
         }
     }
 
+    private var activeEffectEvents: [Int64: Int] = [:]
+
+    private func finishActiveEffect(_ eventID: Int64) {
+        guard let count = activeEffectEvents[eventID], count > 0 else { preconditionFailure("Unbalanced external effect") }
+        if count == 1 {
+            activeEffectEvents.removeValue(forKey: eventID)
+        } else {
+            activeEffectEvents[eventID] = count - 1
+        }
+    }
+
+    private func finishResolvedEffectFences(_ eventIDs: Set<Int64>) async throws {
+        let pending = Set(pendingSeratoWrites.map(\.eventId))
+        let resolved = eventIDs.subtracting(pending).filter { eventID in activeEffectEvents[eventID, default: 0] == 0 }
+        guard !resolved.isEmpty else { return }
+        try await database.writer.write { connection in
+            for eventID in resolved {
+                try SyncCheckpointStore.finishEffect(batchID: SyncCheckpointStore.eventFence(eventID), in: connection)
+            }
+        }
+    }
+
     private func applyGuardedSeratoWrites(_ writes: [GuardedSeratoWrite]) async throws -> ResyncOutcome {
+        let eventIDs = Set(writes.map(\.eventId))
+        for eventID in eventIDs {
+            activeEffectEvents[eventID, default: 0] += 1
+        }
+        let outcome: ResyncOutcome
+        do {
+            try await database.writer.write { connection in
+                for eventID in eventIDs {
+                    try SyncCheckpointStore.beginEffect(batchID: SyncCheckpointStore.eventFence(eventID), in: connection)
+                }
+            }
+            outcome = try await applyGuardedSeratoWritesUnchecked(writes)
+        } catch {
+            for eventID in eventIDs {
+                finishActiveEffect(eventID)
+            }
+            throw error
+        }
+        for eventID in eventIDs {
+            finishActiveEffect(eventID)
+        }
+        try await finishResolvedEffectFences(eventIDs)
+        return outcome
+    }
+
+    private func applyGuardedSeratoWritesUnchecked(_ writes: [GuardedSeratoWrite]) async throws -> ResyncOutcome {
         let partition = try await partitionConflictWrites(writes)
         enqueueConflictWrites(partition.blocked)
         let blockedEvents = Set(partition.blocked.map(\.eventId))
@@ -2262,6 +2372,9 @@ public actor OperationEngine {
             try readiness?.requireUnconflicted(target)
         }
         try scopeAuthorization?.check()
+        for write in result.seratoWrites {
+            try SyncCheckpointStore.beginEffect(batchID: SyncCheckpointStore.eventFence(write.eventId), in: database)
+        }
         return result
     }
 
@@ -2345,6 +2458,10 @@ public actor OperationEngine {
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .observeFileIdentity(payload):
             let eventId = try FileIdentityObservationMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .observeFileMetadata(payload):
+            let eventId = try FileIdentityObservationMutation.apply(payload.observation, batchId: batchId, timestamp: timestampMillis, in: db,
+                                                                    metadataEvidence: payload.evidence, expectedMetadata: payload.expectedMetadata)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .setFileLibraryState(payload):
             let eventId = try FileLibraryStateMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
@@ -3435,6 +3552,7 @@ public enum TrackMutation: Sendable {
     case setFileLibraryState(SetFileLibraryStatePayload)
     case observeFileLocation(ObserveFileLocationPayload)
     case observeFileIdentity(ObserveFileIdentityPayload)
+    case observeFileMetadata(ObserveFileMetadataPayload)
     case beginFileImport(BeginFileImportPayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)

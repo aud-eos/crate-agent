@@ -18,6 +18,37 @@ final class SeratoLibrarySyncSession: ObservableObject {
         case failed(String)
     }
 
+    enum SyncPhase: String { case validating = "Validating saved state", replaying = "Catching up on changes", parsing = "Reading Serato library", reconciling = "Checking library membership", refreshing = "Refreshing file info", draining = "Applying queued changes" }
+    @Published private(set) var phase: SyncPhase? {
+        didSet { LibrarySyncMetrics.current?.transition(to: phase?.rawValue) }
+    }
+
+    @Published private(set) var fileInfoFailures: [String] = []
+    private var startupReplay: FilesystemReplayReceipt?
+    private var startupReplayHandler: (@Sendable (FilesystemEventBatch) async throws -> Void)?
+    private(set) var retainedStartupObservations: [FSEventsObservation] = []
+    private(set) var validationWasSuperseded = false
+
+    func prepareStartupReplay(_ receipt: FilesystemReplayReceipt, handler: @escaping @Sendable (FilesystemEventBatch) async throws -> Void) {
+        startupReplay = receipt
+        startupReplayHandler = handler
+        retainedStartupObservations = []
+    }
+
+    func clearStartupReplay() {
+        startupReplay = nil
+        startupReplayHandler = nil
+        retainedStartupObservations = []
+    }
+
+    func retryRequest() -> LibrarySyncRequest {
+        lastRequest
+    }
+
+    private let checkpointStore: SyncCheckpointStore?
+    private let watchRoots: [String]
+    private var pendingRequest = LibrarySyncRequest.incremental
+    private var lastRequest = LibrarySyncRequest.incremental
     @Published private(set) var state: State = .idle
     @Published private(set) var initialSyncComplete = false
     @Published private(set) var conflicts: [SeratoPathConflict] = []
@@ -44,8 +75,11 @@ final class SeratoLibrarySyncSession: ObservableObject {
          scanner: LibraryScanner, operationEngine: OperationEngine, watchdog: SeratoWatchdog,
          readiness: LibrarySyncReadiness, stopProcessing: @escaping @MainActor () async -> Void = {},
          startProcessing: @escaping @MainActor () async -> Void = {},
-         conflictAnalyzer: SeratoConflictAnalyzer = SeratoConflictAnalyzer())
+         conflictAnalyzer: SeratoConflictAnalyzer = SeratoConflictAnalyzer(),
+         checkpointStore: SyncCheckpointStore? = nil, watchRoots: [String] = [])
     {
+        self.checkpointStore = checkpointStore
+        self.watchRoots = watchRoots
         self.reader = reader
         self.reconciler = reconciler
         self.scanner = scanner
@@ -57,7 +91,10 @@ final class SeratoLibrarySyncSession: ObservableObject {
         self.startProcessing = startProcessing
     }
 
-    func requestSync() {
+    func requestSync(_ request: LibrarySyncRequest = .incremental) {
+        if request == .forceRefresh {
+            pendingRequest = .forceRefresh
+        }
         requestGeneration += 1
         successfulGeneration = nil
         if let filesystemFailure, !filesystemRetryActive {
@@ -68,7 +105,12 @@ final class SeratoLibrarySyncSession: ObservableObject {
         readiness.invalidate()
         conflictsAreStale = !conflicts.isEmpty
         guard task == nil else { return }
-        task = Task { [weak self] in await self?.run() }
+        let metrics = LibrarySyncMetrics.current ?? LibrarySyncMetrics()
+        task = Task { [weak self] in
+            await SyncRevisionAccounting.$current.withValue(SyncRevisionAccounting()) {
+                await LibrarySyncMetrics.$current.withValue(metrics) { await self?.run() }
+            }
+        }
     }
 
     func waitUntilIdle() async {
@@ -87,9 +129,9 @@ final class SeratoLibrarySyncSession: ObservableObject {
         state = .idle
     }
 
-    func synchronize(retryingFailedCleanup: Bool = false) async throws {
+    func synchronize(_ request: LibrarySyncRequest = .incremental, retryingFailedCleanup: Bool = false) async throws {
         self.retryingFailedCleanup = self.retryingFailedCleanup || retryingFailedCleanup
-        requestSync()
+        requestSync(request)
         let requiredGeneration = requestGeneration
         await waitUntilIdle()
         try Task.checkCancellation()
@@ -175,25 +217,129 @@ final class SeratoLibrarySyncSession: ObservableObject {
             retryingFailedCleanup = false
             task = nil
             scanProgress = nil
+            phase = nil
             if requested {
                 requestSync()
             }
         }
         await stopProcessing()
+        var cumulativeChanges = ReconciliationSummary()
         do {
             while requested {
                 requested = false
                 let generation = requestGeneration
+                let request = pendingRequest
+                lastRequest = request
+                pendingRequest = .incremental
                 try Task.checkCancellation()
                 watchdog.refresh()
-                guard !watchdog.isSeratoRunning else { state = .waitingForSerato; return }
+                guard !watchdog.isSeratoRunning else { pendingRequest = request; state = .waitingForSerato; return }
                 state = .reconciling
                 let authorization = readiness.prepareDrain()
-                let snapshot = try await reader.read()
+                phase = .validating
+                let header: SyncCheckpointHeader?
+                do {
+                    let saved = try await checkpointStore?.loadHeader()
+                    header = saved?.complete == true ? saved : nil
+                } catch SyncCheckpointError.malformed where request == .forceRefresh { header = nil }
+                catch is DecodingError where request == .forceRefresh { header = nil }
+                let baseRevision = try await checkpointStore?.currentRevision()
+                SyncRevisionAccounting.current?.begin(at: baseRevision)
+                let ownRevisionStart = SyncRevisionAccounting.current?.changes ?? 0
+                validationWasSuperseded = false
+                let stats: SyncStatValidation?
+                if let checkpointStore, let baseRevision, header != nil, request != .forceRefresh {
+                    stats = try await checkpointStore.validateFileStats(expectedRevision: baseRevision)
+                } else {
+                    stats = nil
+                }
+                let cachedSource: SeratoSnapshotAuthorization?
+                if let header, header.watchRoots == watchRoots, request != .forceRefresh {
+                    do { cachedSource = try await reader.authorizeCachedSource(libraryID: header.libraryID, source: header.source) }
+                    catch SeratoMembershipSnapshotError.sourceChanged { cachedSource = nil }
+                } else {
+                    cachedSource = nil
+                }
+                let pendingWork = await operationEngine.hasPendingSynchronizationWork
+                if let checkpointStore, let header, let baseRevision, let cachedSource,
+                   header.complete, !header.hadConflicts, header.localRevision == baseRevision,
+                   stats?.changedFileIDs.isEmpty == true, !pendingWork, !filesystemRetryActive,
+                   startupReplay?.observations.isEmpty != false
+                {
+                    try readiness.install(.init(), for: authorization)
+                    try await checkpointStore.authorizeReady(expectedRevision: baseRevision, source: cachedSource, ready: authorization)
+                    let processingAuthorization = try readiness.capture()
+                    await SyncRevisionAccounting.$current.withValue(nil) { await startProcessing() }
+                    try processingAuthorization.check()
+                    try Task.checkCancellation()
+                    if requested {
+                        await stopProcessing(); continue
+                    }
+                    conflicts = []
+                    conflictsAreStale = false
+                    fileInfoFailures = []
+                    initialSyncComplete = true
+                    successfulGeneration = generation
+                    state = .ready(.init())
+                    continue
+                }
+                let checkpoint: LibrarySyncCheckpoint?
+                do { checkpoint = header == nil ? nil : try await checkpointStore?.load() }
+                catch SyncCheckpointError.malformed where request == .forceRefresh { checkpoint = nil }
+                catch is DecodingError where request == .forceRefresh { checkpoint = nil }
+                phase = .parsing
+                let snapshot: SeratoMembershipSnapshot
+                if cachedSource != nil, let checkpoint {
+                    snapshot = try reader.cachedSnapshot(records: checkpoint.records.map { record in try record.record() })
+                } else {
+                    snapshot = try await reader.read()
+                }
                 var validatedSnapshot = snapshot
-                var analysis = try await analyze(snapshot, authorization: authorization)
-                var summary = try await reconciler.reconcile(snapshot, analysis: analysis)
-                try await refreshMetadata(snapshot, analysis: analysis)
+                var files = try await scanner.identityProjectionsForConflictAnalysis()
+                phase = .reconciling
+                var analysis = try await analyze(snapshot, authorization: authorization, files: files)
+                if let startupReplay, let startupReplayHandler, !startupReplay.observations.isEmpty {
+                    let legacyIDs = Set(files.filter { file in file.libraryMembership == .legacyUnverified }.compactMap(\.id))
+                    if !legacyIDs.isEmpty {
+                        let legacyPlan = LibraryRefreshPlan(indexedFiles: files, metadataPaths: [], refreshPaths: [], reconcileFileIDs: legacyIDs, evidence: [:])
+                        _ = try await reconciler.reconcile(snapshot, analysis: analysis, plan: legacyPlan)
+                    }
+                    phase = .replaying
+                    do { try await startupReplayHandler(.init(observations: startupReplay.observations, highestEventID: startupReplay.eventID)) }
+                    catch let deferred as FilesystemConflictDeferral { retainedStartupObservations = deferred.observations }
+                    self.startupReplayHandler = nil
+                    try await reader.validate(snapshot)
+                    files = try await scanner.identityProjectionsForConflictAnalysis()
+                    analysis = try await analyze(snapshot, authorization: authorization, files: files)
+                }
+                let dirty = try await checkpointStore?.dirtyFiles()
+                var evidence = Dictionary(uniqueKeysWithValues: (checkpoint?.files ?? []).map { file in (file.fileID, file) })
+                if let checkpoint {
+                    let records = Dictionary(grouping: checkpoint.records) { record in SeratoPath.normalized(String(decoding: record.pathBytes, as: UTF8.self)) }
+                    var baselines: [FileMembershipToken: SeratoMetadata] = [:]
+                    for file in files {
+                        guard let identifier = file.id, let stored = evidence[identifier],
+                              stored.membershipRevision == file.membershipRevision, stored.identity == file.identity,
+                              let occurrences = records[SeratoPath.normalized(file.path)], occurrences.count == 1 else { continue }
+                        baselines[FileMembershipToken(fileId: identifier, revision: file.membershipRevision)] = occurrences[0].metadata
+                    }
+                    try await operationEngine.restoreObservedSeratoMetadata(baselines, authorization: reader.authorization(for: snapshot))
+                }
+                let plan: LibraryRefreshPlan?
+                if checkpointStore != nil {
+                    plan = try await LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: stats?.validatedFileIDs ?? [])
+                        .makePlan(request: request, snapshot: snapshot, indexedFiles: files,
+                                  previousRecords: checkpoint?.records.map { record in try record.record() } ?? [],
+                                  dirtyFileIDs: dirty?.fileIDs ?? [], dirtyPaths: dirty?.paths ?? [], analysis: analysis)
+                } else {
+                    plan = nil
+                }
+                var summary = try await reconciler.reconcile(snapshot, analysis: analysis, plan: plan)
+                cumulativeChanges.retired += summary.retired
+                cumulativeChanges.reactivated += summary.reactivated
+                phase = .refreshing
+                try await refreshMetadata(snapshot, analysis: analysis, plan: plan)
+                evidence.merge(await scanner.evidenceAfterLastScan()) { _, refreshed in refreshed }
                 try await reader.validate(snapshot)
                 try Task.checkCancellation()
                 if requested {
@@ -207,13 +353,20 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     return
                 }
                 let revision = watchdog.stateRevision
+                phase = .draining
                 let drain = try await LibrarySyncReadiness.$drainAuthorization.withValue(authorization) {
                     try await operationEngine.drainPendingSeratoUpdates(retryingFailedCleanup: retryingFailedCleanup)
                 }
                 retryingFailedCleanup = false
-                summary.supersededWrites = drain.supersededCount
+                cumulativeChanges.supersededWrites += drain.supersededCount
+                summary.supersededWrites = cumulativeChanges.supersededWrites
                 summary.conflictBlockedWriteCount = drain.conflictBlockedCount
                 summary.duplicateCleanupMessage = await operationEngine.duplicateCleanupMessage
+                if drain.appliedCount > 0, checkpointStore != nil {
+                    requested = true
+                    pendingRequest = request
+                    continue
+                }
                 if drain.appliedCount > 0 {
                     let refreshedSnapshot = try await reader.read()
                     validatedSnapshot = refreshedSnapshot
@@ -228,9 +381,33 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 }
                 try await reader.validate(validatedSnapshot)
                 try Task.checkCancellation()
-                try readiness.markReady(authorization)
+                if let checkpointStore, let baseRevision {
+                    let ownChanges = (SyncRevisionAccounting.current?.changes ?? 0) - ownRevisionStart
+                    let expectedRevision = baseRevision + ownChanges
+                    let finalFiles = try await scanner.identityProjectionsForConflictAnalysis()
+                    let retainedEvidence = finalFiles.compactMap { file -> SyncFileEvidence? in
+                        guard let identifier = file.id, let stored = evidence[identifier], stored.identity == file.identity,
+                              stored.membershipRevision == file.membershipRevision else { return nil }
+                        return stored
+                    }
+                    let header = SyncCheckpointHeader(libraryID: validatedSnapshot.libraryID, source: validatedSnapshot.source,
+                                                      localRevision: expectedRevision, watchRoots: watchRoots,
+                                                      eventID: (retainedStartupObservations.isEmpty ? startupReplay?.eventID : nil) ?? checkpoint?.header.eventID ?? 0,
+                                                      hadConflicts: !analysis.conflicts.isEmpty)
+                    let effects = try await checkpointStore.pendingEffects()
+                    if !effects.isEmpty, summary.conflictBlockedWriteCount > 0 {
+                        let knownPending = await operationEngine.pendingEffectFenceIDs
+                        try await checkpointStore.authorizeReady(expectedRevision: expectedRevision, source: reader.authorization(for: validatedSnapshot),
+                                                                 ready: authorization, allowedPendingEffects: knownPending)
+                    } else {
+                        try await checkpointStore.publish(.init(header: header, records: validatedSnapshot.records.map(SavedSeratoOccurrence.init), files: retainedEvidence),
+                                                          expectedRevision: expectedRevision, sourceAuthorization: reader.authorization(for: validatedSnapshot), ready: authorization)
+                    }
+                } else {
+                    try readiness.markReady(authorization)
+                }
                 let processingAuthorization = try readiness.capture()
-                await startProcessing()
+                await SyncRevisionAccounting.$current.withValue(nil) { await startProcessing() }
                 if requested {
                     await stopProcessing()
                     continue
@@ -242,6 +419,8 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     continue
                 }
                 try processingAuthorization.check()
+                summary.retired = cumulativeChanges.retired
+                summary.reactivated = cumulativeChanges.reactivated
                 summary.pathConflictCount = analysis.conflicts.count
                 conflicts = analysis.conflicts
                 conflictsAreStale = false
@@ -250,6 +429,10 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 state = .ready(summary)
             }
         } catch {
+            validationWasSuperseded = error is LibrarySyncReadinessError || (error as? SeratoMembershipSnapshotError) == .sourceChanged
+            if case SyncCheckpointError.changed = error {
+                validationWasSuperseded = true
+            }
             successfulGeneration = nil
             readiness.invalidate()
             conflictsAreStale = !conflicts.isEmpty
@@ -260,8 +443,13 @@ final class SeratoLibrarySyncSession: ObservableObject {
         }
     }
 
-    private func analyze(_ snapshot: SeratoMembershipSnapshot, authorization: LibrarySyncReadiness.Authorization) async throws -> SeratoConflictAnalysis {
-        let files = try await scanner.identityProjectionsForConflictAnalysis()
+    private func analyze(_ snapshot: SeratoMembershipSnapshot, authorization: LibrarySyncReadiness.Authorization, files suppliedFiles: [FileRecord]? = nil) async throws -> SeratoConflictAnalysis {
+        let files: [FileRecord]
+        if let suppliedFiles {
+            files = suppliedFiles
+        } else {
+            files = try await scanner.identityProjectionsForConflictAnalysis()
+        }
         let analysis = try await conflictAnalyzer.analyze(snapshot: snapshot, files: files)
         try await reader.validate(snapshot)
         try Task.checkCancellation()
@@ -269,7 +457,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         return analysis
     }
 
-    private func refreshMetadata(_ snapshot: SeratoMembershipSnapshot, analysis: SeratoConflictAnalysis) async throws {
+    private func refreshMetadata(_ snapshot: SeratoMembershipSnapshot, analysis: SeratoConflictAnalysis, plan: LibraryRefreshPlan? = nil) async throws {
         let progressStream = AsyncStream<LibraryScanner.ScanProgress>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let consumer = Task { [weak self] in
             for await progress in progressStream.stream {
@@ -281,9 +469,10 @@ final class SeratoLibrarySyncSession: ObservableObject {
             progressStream.continuation.finish()
             consumer.cancel()
         }
-        _ = try await scanner.scan(snapshot: snapshot, reader: reader, analysis: analysis) { progress in
+        let result = try await scanner.scan(snapshot: snapshot, reader: reader, analysis: analysis, plan: plan) { progress in
             progressStream.continuation.yield(progress)
         }
+        fileInfoFailures = result.fileInfoFailures
         progressStream.continuation.finish()
         await consumer.value
     }

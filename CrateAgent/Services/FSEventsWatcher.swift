@@ -49,7 +49,7 @@ enum FilesystemWatcherError: LocalizedError {
 /// SP-1 v1 captures path + event-type flags. Extended data (file ID
 /// + inode) lands in a follow-up when cross-volume move detection
 /// needs it.
-public final class FSEventsWatcher {
+public final class FSEventsWatcher: @unchecked Sendable {
     public typealias Handler = @Sendable (FilesystemEventBatch) -> Void
 
     /// Time window in seconds for the kernel to coalesce events
@@ -69,6 +69,36 @@ public final class FSEventsWatcher {
     private let dispatchQueue: DispatchQueue
     private let coalescingLatency: CFTimeInterval
     private var stream: FSEventStreamRef?
+
+    private let lifecycleLock = NSLock()
+    private var deliverySequence: UInt64 = 0
+    private var latestEventID: UInt64 = 0
+    private var historyFinished = false
+
+    func captureReplayBoundary() async throws -> UInt64 {
+        try Task.checkCancellation()
+        let sequence: UInt64 = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [self] in
+                lifecycleLock.lock()
+                defer { lifecycleLock.unlock() }
+                guard let stream else {
+                    continuation.resume(throwing: FilesystemReplayError.stopped)
+                    return
+                }
+                // FlushSync waits for callbacks, so it must run outside their queue.
+                FSEventStreamFlushSync(stream)
+                dispatchQueue.sync {
+                    deliverySequence += 1
+                    handler(FilesystemEventBatch(observations: [], highestEventID: latestEventID,
+                                                 deliverySequence: deliverySequence, replayBoundary: true,
+                                                 historyComplete: historyFinished))
+                    continuation.resume(returning: deliverySequence)
+                }
+            }
+        }
+        try Task.checkCancellation()
+        return sequence
+    }
 
     public init(
         watchedPaths: [String],
@@ -94,6 +124,8 @@ public final class FSEventsWatcher {
     }
 
     public func start() throws {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
         guard stream == nil else { return }
         guard !watchedPaths.isEmpty else { throw FilesystemWatcherError.creationFailed(watchedPaths) }
 
@@ -113,12 +145,13 @@ public final class FSEventsWatcher {
                 | kFSEventStreamCreateFlagWatchRoot
         )
 
+        latestEventID = sinceWhen == Self.sinceNow ? FSEventsGetCurrentEventId() : sinceWhen
         guard let createdStream = FSEventStreamCreate(
             kCFAllocatorDefault,
             FSEventsWatcher.callbackTrampoline,
             context,
             watchedPaths as CFArray,
-            sinceWhen,
+            latestEventID,
             coalescingLatency,
             flags
         ) else {
@@ -135,6 +168,8 @@ public final class FSEventsWatcher {
     }
 
     public func stop() {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
         guard let stream else { return }
         FSEventStreamStop(stream)
         FSEventStreamInvalidate(stream)
@@ -174,6 +209,10 @@ public final class FSEventsWatcher {
         var observations: [FSEventsObservation] = []
         observations.reserveCapacity(count)
         for index in 0 ..< count {
+            if Int(flagsBuffer[index]) & kFSEventStreamEventFlagHistoryDone != 0 {
+                historyFinished = true
+                continue
+            }
             guard let pathPointer = CFArrayGetValueAtIndex(pathsArray, index) else {
                 continue
             }
@@ -187,7 +226,10 @@ public final class FSEventsWatcher {
             ))
         }
 
-        handler(FilesystemEventBatch(observations: observations, highestEventID: idsBuffer.max() ?? 0))
+        latestEventID = max(latestEventID, idsBuffer.max() ?? 0)
+        deliverySequence += 1
+        handler(FilesystemEventBatch(observations: observations, highestEventID: latestEventID,
+                                     deliverySequence: deliverySequence, historyComplete: historyFinished))
     }
 }
 
@@ -214,7 +256,7 @@ public struct FSEventsObservation: Sendable, Equatable {
         self.eventID = eventID
         self.path = path
         let flagsAsInt = Int(rawFlags)
-        requiresReconciliation = (flagsAsInt & (kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped)) != 0
+        requiresReconciliation = (flagsAsInt & (kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped | kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount)) != 0
         isFile = (flagsAsInt & kFSEventStreamEventFlagItemIsFile) != 0
         isDirectory = (flagsAsInt & kFSEventStreamEventFlagItemIsDir) != 0
         isSymlink = (flagsAsInt & kFSEventStreamEventFlagItemIsSymlink) != 0

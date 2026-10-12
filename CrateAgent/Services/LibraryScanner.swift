@@ -19,6 +19,7 @@ import os.log
 /// Serato quits — same operation in both contexts.
 public actor LibraryScanner {
     public struct ScanProgress: Sendable, Equatable {
+        public var completedFileCount: Int? = nil
         public let seratoReferenceCount: Int
         public let filesIndexed: Int
         public let filesMetadataUpdated: Int
@@ -27,6 +28,7 @@ public actor LibraryScanner {
     }
 
     public struct ScanResult: Sendable, Equatable {
+        public var fileInfoFailures: [String] = []
         public let seratoReferenceCount: Int
         public let filesIndexed: Int
         public let filesMetadataUpdated: Int
@@ -44,14 +46,29 @@ public actor LibraryScanner {
     private let database: LibraryDatabase
     private let seratoLocator: SeratoLibraryLocator
 
-    public init(
-        operationEngine: OperationEngine,
-        database: LibraryDatabase,
-        seratoLocator: SeratoLibraryLocator
-    ) {
+    private let identityReader: @Sendable (String) throws -> FileMetadata
+    private let bitrateReader: @Sendable (String) throws -> Int?
+    private var refreshedEvidence: [Int64: SyncFileEvidence] = [:]
+
+    public init(operationEngine: OperationEngine, database: LibraryDatabase, seratoLocator: SeratoLibraryLocator) {
+        self.init(operationEngine: operationEngine, database: database, seratoLocator: seratoLocator,
+                  identityReader: { path in try FileMetadataCollector.collectVerified(at: path) },
+                  bitrateReader: { path in try readAudioTags(filePath: path).bitrateKbps.map(Int.init) })
+    }
+
+    init(operationEngine: OperationEngine, database: LibraryDatabase, seratoLocator: SeratoLibraryLocator,
+         identityReader: @escaping @Sendable (String) throws -> FileMetadata,
+         bitrateReader: @escaping @Sendable (String) throws -> Int?)
+    {
         self.operationEngine = operationEngine
         self.database = database
         self.seratoLocator = seratoLocator
+        self.identityReader = identityReader
+        self.bitrateReader = bitrateReader
+    }
+
+    func evidenceAfterLastScan() -> [Int64: SyncFileEvidence] {
+        refreshedEvidence
     }
 
     @discardableResult
@@ -234,10 +251,21 @@ public actor LibraryScanner {
         try await FileRecord.loadIdentityProjections(database: database)
     }
 
-    func scan(snapshot: SeratoMembershipSnapshot, reader: SeratoMembershipSnapshotReader, analysis suppliedAnalysis: SeratoConflictAnalysis? = nil, progress: ProgressHandler? = nil) async throws -> ScanResult {
+    func scan(snapshot: SeratoMembershipSnapshot, reader: SeratoMembershipSnapshotReader, analysis suppliedAnalysis: SeratoConflictAnalysis? = nil, plan: LibraryRefreshPlan? = nil, progress: ProgressHandler? = nil) async throws -> ScanResult {
+        refreshedEvidence.removeAll()
+        var fileInfoFailures: [String] = []
         try await reader.validate(snapshot)
         let directAuthorization = suppliedAnalysis == nil ? await operationEngine.captureConflictScope() : nil
-        let files = try await FileRecord.loadIdentityProjections(database: database)
+        let files: [FileRecord]
+        if let plan {
+            let refreshed = try await database.writer.read { connection in
+                try FileRecord.filter(plan.reconcileFileIDs.contains(Column("id"))).fetchAll(connection)
+            }
+            let byID = Dictionary(uniqueKeysWithValues: refreshed.compactMap { file in file.id.map { identifier in (identifier, file) } })
+            files = plan.indexedFiles.map { file in file.id.flatMap { identifier in byID[identifier] } ?? file }
+        } else {
+            files = try await FileRecord.loadIdentityProjections(database: database)
+        }
         let analysis: SeratoConflictAnalysis
         if let suppliedAnalysis {
             analysis = suppliedAnalysis
@@ -260,6 +288,8 @@ public actor LibraryScanner {
             guard analysis.scope.conflictingPath(for: SeratoConflictTarget(paths: [path])) == nil else { continue }
             guard records.updateValue(record, forKey: path) == nil else { throw SeratoReconciliationError.ambiguousIdentity(path) }
         }
+        let plannedCount = plan.map { plan in plan.refreshPaths.union(plan.metadataPaths).count } ?? records.count
+        var completed = 0
         var indexed = 0
         var updated = 0
         var skipped = 0
@@ -267,7 +297,28 @@ public actor LibraryScanner {
         for path in records.keys.sorted() {
             try Task.checkCancellation()
             guard let record = records[path] else { preconditionFailure("Snapshot path index lost a record") }
+            let rawPath = Data(record.path.utf8)
+            if let plan, !plan.refreshPaths.contains(rawPath), !plan.metadataPaths.contains(rawPath) {
+                continue
+            }
+            completed += 1
             let existing = byPath[path]
+            if let plan, plan.metadataPaths.contains(rawPath) {
+                guard let existing, let identifier = existing.id, let evidence = plan.evidence[identifier],
+                      evidence.identity == existing.identity, evidence.membershipRevision == existing.membershipRevision,
+                      let stamp = evidence.readIdentity else { throw SyncCheckpointError.changed }
+                let authorization = try await reader.authorization(for: snapshot)
+                let events = try await operationEngine.observeSnapshotMetadata(.init(fileId: identifier, expectedRevision: existing.membershipRevision,
+                                                                                     previousIdentity: existing.identity, identity: existing.identity,
+                                                                                     metadata: makeSeratoMetadata(fromRecord: record), bitrateKbps: existing.bitrateKbps,
+                                                                                     expectedState: existing.libraryState), authorization: authorization,
+                                                                               metadataEvidence: stamp, expectedMetadata: existing.seratoMetadata)
+                if !events.isEmpty {
+                    updated += 1
+                }
+                refreshedEvidence[identifier] = evidence
+                continue
+            }
             if let existing, existing.libraryMembership != .active || existing.fileAvailability != .available
                 || (existing.seratoLibraryId != nil && existing.seratoLibraryId != snapshot.libraryID)
             {
@@ -283,11 +334,25 @@ public actor LibraryScanner {
                 skipped += 1
                 continue
             }
-            let identity = try FileMetadataCollector.collectVerified(at: path)
+            let stamp = try AudioFileReadIdentity.read(at: path)
+            let identity = try identityReader(path)
             guard analysis.scope.conflictingPath(for: SeratoConflictTargets.identity(identity)) == nil else {
                 skipped += 1
                 continue
             }
+            let bitrate: Int?
+            var bitrateError: String?
+            do {
+                LibrarySyncMetrics.current?.record(.audioTag)
+                LibrarySyncMetrics.current?.record(.bitrate)
+                bitrate = try bitrateReader(path)
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                bitrate = nil
+                bitrateError = "\((path as NSString).lastPathComponent): \(error.localizedDescription)"
+                fileInfoFailures.append(bitrateError!)
+            }
+            try stamp.requireUnchanged(at: path)
             let metadata = makeSeratoMetadata(fromRecord: record)
             let authorization = try await reader.authorization(for: snapshot)
             if let existing, let fileID = existing.id {
@@ -297,14 +362,14 @@ public actor LibraryScanner {
                 }
                 let events = try await operationEngine.observeSnapshotMetadata(.init(fileId: fileID, expectedRevision: existing.membershipRevision,
                                                                                      previousIdentity: existing.identity, identity: identity, metadata: metadata,
-                                                                                     bitrateKbps: readBitrateKbps(forPathAt: path), expectedState: existing.libraryState), authorization: authorization)
+                                                                                     bitrateKbps: bitrate, bitrateWasRead: bitrateError == nil, expectedState: existing.libraryState), authorization: authorization)
                 if !events.isEmpty {
                     updated += 1
                 }
             } else {
                 _ = try await operationEngine.applyObservedBatch([.indexNewFile(.init(path: identity.path, volumeUuid: identity.volumeUuid, inode: identity.inode,
                                                                                       fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash,
-                                                                                      bitrateKbps: readBitrateKbps(forPathAt: path), metadata: metadata))], authorization: authorization)
+                                                                                      bitrateKbps: bitrate, metadata: metadata))], authorization: authorization)
                 guard let file = try await database.writer.read({ connection in
                     try FileRecord.filter(Column("path") == path).fetchOne(connection)
                 }), let fileID = file.id else { throw SeratoReconciliationError.ambiguousIdentity(path) }
@@ -322,13 +387,21 @@ public actor LibraryScanner {
                                                                             expectedState: active.libraryState), authorization: authorization)
                 indexed += 1
             }
+            if let refreshed = try await database.writer.read({ connection in
+                try FileRecord.filter(Column("path") == path).fetchOne(connection)
+            }), let identifier = refreshed.id {
+                try stamp.requireUnchanged(at: path)
+                refreshedEvidence[identifier] = SyncFileEvidence(fileID: identifier, membershipRevision: refreshed.membershipRevision,
+                                                                 identity: refreshed.identity, readIdentity: stamp, bitrateProbed: bitrateError == nil,
+                                                                 bitrateError: bitrateError)
+            }
             if (indexed + updated) % 50 == 0 {
-                progress?(ScanProgress(seratoReferenceCount: records.count, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped, lastChangedPath: path))
+                progress?(ScanProgress(completedFileCount: completed, seratoReferenceCount: plannedCount, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped, lastChangedPath: path))
             }
         }
         try await reader.validate(snapshot)
-        progress?(ScanProgress(seratoReferenceCount: records.count, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped, lastChangedPath: nil))
-        return ScanResult(seratoReferenceCount: records.count, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped)
+        progress?(ScanProgress(completedFileCount: completed, seratoReferenceCount: plannedCount, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped, lastChangedPath: nil))
+        return ScanResult(fileInfoFailures: fileInfoFailures, seratoReferenceCount: records.count, filesIndexed: indexed, filesMetadataUpdated: updated, filesSkipped: skipped)
     }
 
     /// Read Serato's database V2 and return the records keyed by

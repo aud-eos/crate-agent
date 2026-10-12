@@ -5,6 +5,25 @@ import XCTest
 
 @MainActor
 final class SeratoMembershipSnapshotTests: XCTestCase {
+    func testCachedAuthorizationDoesNotParseAndExpiresAfterSourceOrLifecycleChange() async throws {
+        let center = NotificationCenter()
+        let watchdog = observingWatchdog(center)
+        let locator = try fixture(emptyLibrary)
+        let initial = try await SeratoMembershipSnapshotReader(locator: locator, watchdog: watchdog).read()
+        let reader = SeratoMembershipSnapshotReader(locator: locator, watchdog: watchdog, parse: { _ in
+            XCTFail("Cached authorization parsed V2")
+            return []
+        })
+        let authorization = try await reader.authorizeCachedSource(libraryID: initial.libraryID, source: initial.source)
+        try authorization.check()
+        center.post(name: NSWorkspace.didLaunchApplicationNotification, object: nil, userInfo: [Self.notificationBundleIdentifierKey: "com.serato.dj"])
+        center.post(name: NSWorkspace.didTerminateApplicationNotification, object: nil, userInfo: [Self.notificationBundleIdentifierKey: "com.serato.dj"])
+        XCTAssertThrowsError(try authorization.check())
+        let next = try await reader.authorizeCachedSource(libraryID: initial.libraryID, source: initial.source)
+        try SeratoTestEncoding.library(paths: ["/different.wav"]).write(to: locator.databaseV2Url)
+        XCTAssertThrowsError(try next.check())
+    }
+
     private static let notificationBundleIdentifierKey = "testBundleIdentifier"
 
     private func observingWatchdog(_ center: NotificationCenter) -> SeratoWatchdog {

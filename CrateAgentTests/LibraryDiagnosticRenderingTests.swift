@@ -52,6 +52,22 @@ final class LibraryDiagnosticRenderingTests: XCTestCase {
         }
     }
 
+    func testIncrementalStatusAcrossAppearanceAndDensity() async throws {
+        for density in AppDensity.allCases {
+            for scheme in [ColorScheme.light, .dark] {
+                let suffix = "\(density.rawValue)-\(scheme == .dark ? "dark" : "light")"
+                try await render(VStack(spacing: 12) {
+                    LibrarySyncStatusView(state: .reconciling, retry: {}, phase: .validating)
+                    LibrarySyncStatusView(state: .reconciling, retry: {}, phase: .refreshing,
+                                          progress: .init(completedFileCount: 25, seratoReferenceCount: 50, filesIndexed: 1, filesMetadataUpdated: 2, filesSkipped: 0, lastChangedPath: nil))
+                    LibrarySyncStatusView(state: .waitingForSerato, retry: {})
+                    LibrarySyncStatusView(state: .ready(.init()), retry: {}, fileInfoFailures: ["Example.wav: Audio information could not be read.", "Another.flac: Access denied."])
+                    LibrarySyncStatusView(state: .failed(SyncCheckpointError.incompleteEffects.localizedDescription), retry: {})
+                }, name: "startup-status-\(suffix)", density: density, scheme: scheme, width: 1050, height: 470)
+            }
+        }
+    }
+
     private func render(_ content: some View, name: String, density: AppDensity, scheme: ColorScheme, width: CGFloat, height: CGFloat) async throws {
         let suite = "DiagnosticRender.\(UUID().uuidString)"
         let preferences = try XCTUnwrap(UserDefaults(suiteName: suite))

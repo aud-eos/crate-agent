@@ -32,11 +32,12 @@ final class ConcurrentImportBootstrapTests: XCTestCase {
         let engine = OperationEngine(database: database,
                                      seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
                                      seratoLocator: SeratoLibraryLocator(seratoDirectory: seratoDirectory))
-        writer.arm()
+        writer.arm(untilCreated: v2URL)
         async let first = engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(fileId: fileIDs[0], metadata: SeratoMetadata(title: "first"))))
         async let second = engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(fileId: fileIDs[1], metadata: SeratoMetadata(title: "second"))))
         _ = try await (first, second)
-        XCTAssertEqual(writer.submittedWrites, 6, "Two event transactions, two external writes, and two confirmations")
+        let effects = try await SyncCheckpointStore(database: database).pendingEffects()
+        XCTAssertTrue(effects.isEmpty, "Both imports must finish their durable external effects")
         let records = try readDatabaseRecords(databasePath: v2URL.path)
         XCTAssertEqual(Set(records.map(\.path)), Set(audioURLs.map { audio in SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audio.path) }))
         try await database.writer.read { connection in
@@ -53,48 +54,47 @@ final class ConcurrentImportBootstrapTests: XCTestCase {
 private final class BootstrapSchedulingWriter: DatabaseWriter, @unchecked Sendable {
     private let base: any DatabaseWriter
     private let lock = NSLock()
-    private var armed = false
-    private var submissionCount = 0
-    private let secondEventSubmitted = DispatchSemaphore(value: 0)
-    private let secondExternalWriteSubmitted = DispatchSemaphore(value: 0)
+    private var bootstrapURL: URL?
+    private var waitingPartner: DispatchSemaphore?
 
     init(_ base: any DatabaseWriter) {
         self.base = base
     }
 
-    func arm() {
+    func arm(untilCreated url: URL) {
         lock.lock()
-        armed = true
+        bootstrapURL = url
         lock.unlock()
-    }
-
-    var submittedWrites: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return submissionCount
     }
 
     func asyncWriteWithoutTransaction(_ updates: @escaping (Database) -> Void) {
         lock.lock()
-        if armed {
-            submissionCount += 1
-        }
-        let ordinal = armed ? submissionCount : 0
-        lock.unlock()
-        base.asyncWriteWithoutTransaction { [self] connection in
-            if ordinal == 1 {
-                XCTAssertEqual(secondEventSubmitted.wait(timeout: .now() + 10), .success)
+        let pair: DispatchSemaphore?
+        let waitsForPartner: Bool
+        if let bootstrapURL, !FileManager.default.fileExists(atPath: bootstrapURL.path) {
+            if let waitingPartner {
+                pair = waitingPartner
+                self.waitingPartner = nil
+                waitsForPartner = false
+            } else {
+                let partner = DispatchSemaphore(value: 0)
+                waitingPartner = partner
+                pair = partner
+                waitsForPartner = true
             }
-            if ordinal == 3 {
-                XCTAssertEqual(secondExternalWriteSubmitted.wait(timeout: .now() + 10), .success)
+        } else {
+            pair = nil
+            waitsForPartner = false
+        }
+        lock.unlock()
+        base.asyncWriteWithoutTransaction { connection in
+            if waitsForPartner, let pair {
+                XCTAssertEqual(pair.wait(timeout: .now() + 10), .success)
             }
             updates(connection)
         }
-        if ordinal == 2 {
-            secondEventSubmitted.signal()
-        }
-        if ordinal == 4 {
-            secondExternalWriteSubmitted.signal()
+        if !waitsForPartner {
+            pair?.signal()
         }
     }
 

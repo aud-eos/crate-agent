@@ -5,8 +5,14 @@ public struct FilesystemEventBatch: Sendable {
     public let observations: [FSEventsObservation]
     public let highestEventID: UInt64
     public let requiresReconciliation: Bool
+    public let deliverySequence: UInt64?
+    public let replayBoundary: Bool
+    public let historyComplete: Bool
 
-    public init(observations: [FSEventsObservation], highestEventID: UInt64) {
+    public init(observations: [FSEventsObservation], highestEventID: UInt64, deliverySequence: UInt64? = nil, replayBoundary: Bool = false, historyComplete: Bool = false) {
+        self.deliverySequence = deliverySequence
+        self.replayBoundary = replayBoundary
+        self.historyComplete = historyComplete
         self.observations = observations
         self.highestEventID = highestEventID
         requiresReconciliation = observations.contains {
@@ -36,8 +42,98 @@ public actor FilesystemEventProcessor {
         paused = initiallyPaused
     }
 
+    private var startupBoundary: UInt64?
+    private var invalidateStartup: (@Sendable () -> Void)?
+
+    func observeStartupBoundary(_ sequence: UInt64, invalidate: @escaping @Sendable () -> Void) {
+        startupBoundary = sequence
+        invalidateStartup = invalidate
+        if pending.contains(where: { batch in (batch.deliverySequence ?? 0) > sequence && !batch.observations.isEmpty }) {
+            invalidate()
+        }
+    }
+
+    private var nextDeliverySequence: UInt64 = 1
+    private var deliveries: [UInt64: FilesystemEventBatch] = [:]
+    private var replayWaiters: [UUID: (UInt64, CheckedContinuation<FilesystemReplayReceipt, Error>)] = [:]
+
+    func collectStartupReplay(through sequence: UInt64) async throws -> FilesystemReplayReceipt {
+        try Task.checkCancellation()
+        guard paused else { throw FilesystemReplayError.deliveryActive }
+        if let receipt = try replayReceipt(through: sequence) {
+            return receipt
+        }
+        let identifier = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                replayWaiters[identifier] = (sequence, continuation)
+                if Task.isCancelled {
+                    cancelReplay(identifier)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelReplay(identifier) }
+        }
+    }
+
+    private func cancelReplay(_ identifier: UUID) {
+        replayWaiters.removeValue(forKey: identifier)?.1.resume(throwing: CancellationError())
+    }
+
+    private func replayReceipt(through sequence: UInt64) throws -> FilesystemReplayReceipt? {
+        guard sequence < nextDeliverySequence else { return nil }
+        guard let boundary = pending.first(where: { batch in batch.deliverySequence == sequence }), boundary.replayBoundary else {
+            throw FilesystemReplayError.invalidBoundary
+        }
+        let captured = pending.filter { batch in (batch.deliverySequence ?? 0) <= sequence }
+        return FilesystemReplayReceipt(sequence: sequence, observations: captured.flatMap(\.observations),
+                                       eventID: captured.map(\.highestEventID).max() ?? 0,
+                                       requiresReconciliation: !boundary.historyComplete || captured.contains(where: \.requiresReconciliation))
+    }
+
+    private func resolveReplayWaiters() {
+        for (identifier, waiting) in replayWaiters {
+            do {
+                if let receipt = try replayReceipt(through: waiting.0) {
+                    replayWaiters.removeValue(forKey: identifier)
+                    waiting.1.resume(returning: receipt)
+                }
+            } catch {
+                replayWaiters.removeValue(forKey: identifier)
+                waiting.1.resume(throwing: error)
+            }
+        }
+    }
+
+    func finishStartupReplay(_ receipt: FilesystemReplayReceipt, retained: [FSEventsObservation] = []) async throws {
+        guard paused, try replayReceipt(through: receipt.sequence) != nil else { throw FilesystemReplayError.invalidBoundary }
+        startupBoundary = nil
+        invalidateStartup = nil
+        if retained.isEmpty, receipt.eventID != 0 {
+            try await checkpoint(receipt.eventID)
+        }
+        pending.removeAll { batch in (batch.deliverySequence ?? 0) <= receipt.sequence }
+        if !retained.isEmpty {
+            pending.insert(FilesystemEventBatch(observations: retained, highestEventID: receipt.eventID), at: 0)
+        }
+        paused = false
+    }
+
     public func enqueue(_ batch: FilesystemEventBatch) async throws {
-        pending.append(batch)
+        if let sequence = batch.deliverySequence {
+            guard sequence >= nextDeliverySequence, deliveries[sequence] == nil else { throw FilesystemReplayError.invalidBoundary }
+            deliveries[sequence] = batch
+            while let ordered = deliveries.removeValue(forKey: nextDeliverySequence) {
+                pending.append(ordered)
+                nextDeliverySequence += 1
+            }
+        } else {
+            pending.append(batch)
+        }
+        if let startupBoundary, (batch.deliverySequence ?? 0) > startupBoundary, !batch.observations.isEmpty {
+            invalidateStartup?()
+        }
+        resolveReplayWaiters()
         if let failure {
             throw failure
         }

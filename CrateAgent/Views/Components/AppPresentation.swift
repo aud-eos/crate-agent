@@ -3,6 +3,10 @@ import SwiftUI
 struct LibrarySyncStatusView: View {
     let state: SeratoLibrarySyncSession.State
     let retry: () -> Void
+    var phase: SeratoLibrarySyncSession.SyncPhase? = nil
+    var fileInfoFailures: [String] = []
+    var progress: LibraryScanner.ScanProgress? = nil
+    @State private var reviewingFileInfo = false
     var hasConflicts = false
     var review: (() -> Void)? = nil
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
@@ -14,8 +18,20 @@ struct LibrarySyncStatusView: View {
             } else {
                 Image(systemName: symbol).foregroundStyle(color)
             }
-            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
+                Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
+                if let completed = progress?.completedFileCount, let total = progress?.seratoReferenceCount {
+                    Text("\(completed) / \(total) files checked").font(.caption.monospacedDigit())
+                }
+                if let first = fileInfoFailures.first {
+                    Text("File-info errors: \(fileInfoFailures.count) · \(first)")
+                        .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                }
+            }
             Spacer(minLength: density.spacing)
+            if !fileInfoFailures.isEmpty {
+                Button("Review file-info errors") { reviewingFileInfo = true }
+            }
             if hasConflicts, let review {
                 Button(SeratoConflictMessages.review, action: review)
             }
@@ -26,13 +42,29 @@ struct LibrarySyncStatusView: View {
         .padding(.horizontal, density.pagePadding)
         .padding(.vertical, density.rowPadding)
         .background(color.opacity(0.06))
+        .sheet(isPresented: $reviewingFileInfo) {
+            VStack(alignment: .leading, spacing: density.spacing) {
+                HStack {
+                    Text("File-info read errors").font(.headline)
+                    Spacer()
+                    Button("Done") { reviewingFileInfo = false }
+                }
+                Text("These files will be retried during the next sync. Their previous library information remains available.")
+                    .font(.callout).foregroundStyle(.secondary)
+                List(Array(fileInfoFailures.enumerated()), id: \.offset) { failure in
+                    Text(failure.element).textSelection(.enabled)
+                }
+            }
+            .padding(density.pagePadding)
+            .frame(minWidth: 620, minHeight: 320)
+        }
     }
 
     private var message: String {
         switch state {
-        case .idle: "Serato file info has not been re-scanned this session."
+        case .idle: "Saved library is available for browsing. Validation is paused."
         case .waitingForSerato: "Waiting for Serato to close before checking its saved library."
-        case .reconciling: "Checking saved Serato membership and synchronizing changes…"
+        case .reconciling: (phase?.rawValue ?? "Checking saved Serato membership") + "…"
         case let .failed(message): message
         case let .ready(summary):
             "Library synced · \(summary.retired) removed from Serato · \(summary.reactivated) activated · \(summary.unavailable) unavailable"

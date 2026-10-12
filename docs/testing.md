@@ -128,3 +128,74 @@ passed. These measurements were not rerun to select a favorable sample.
 VoiceOver navigation remains part of the owner-app smoke check: the in-process
 AppKit accessibility tree exposes selectable text but not all SwiftUI controls,
 so it is not used as an oracle for the screen's buttons.
+
+
+## Incremental startup fixture
+
+`LibraryStartupPerformanceTests` uses 30,000 real, separate 108-byte WAV files,
+encoded V2 records, and a temporary WAL store. It runs full validation to populate
+the checkpoint, reopens the store with fresh services, and measures the production
+startup coordinator through readiness. The empty replay boundary is controlled;
+`FilesystemReplayBoundaryTests` separately exercise real native event delivery.
+
+The same fixture then changes one saved title and suspends parsing at an explicit
+barrier. It mounts the production sidebar and `LibraryPagedContent`, selects a
+sidebar row before releasing sync, and measures content rendering and navigation.
+It does not construct live `AppServices` or the complete History destination.
+Blank AppKit window creation is outside content-render timing. This keeps tests
+isolated from the owner's library and preferences.
+
+Use the same optimized **Test** settings for baseline and final measurements:
+
+```sh
+nice -n 10 xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent \
+  -configuration Test -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath build-output/DerivedData-StartupOptimized \
+  -jobs 1 -parallel-testing-enabled NO ONLY_ACTIVE_ARCH=YES \
+  SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+  SWIFT_OPTIMIZATION_LEVEL=-O SWIFT_COMPILATION_MODE=wholemodule \
+  ENABLE_HARDENED_RUNTIME=NO \
+  -only-testing:CrateAgentTests/LibraryStartupPerformanceTests test
+```
+
+The hardened-runtime override applies only to this isolated ad-hoc Test host;
+without it the optimized XCTest bundle can fail its Team ID check. Production
+signing settings stay intact. Xcode may not pass its niceness to the test child;
+only lower the priority of the matching Test-host executable when needed.
+
+`STARTUP_FULL`, `STARTUP_RESTART`, and `STARTUP_NAVIGATION` appear in the log and
+XCTest attachments. Hard assertions require ready within two seconds, content
+rendering/navigation within 500 ms, zero unchanged parser/tag/bitrate/hash reads,
+and one changed row after a single parse. Phase timings contain no paths or metadata.
+The file cache is warm after setup; tiny WAVs, one temporary directory, and a
+controlled replay boundary do not predict cold-disk or external-drive latency.
+
+Reference run on 2026-10-12, native arm64 with the optimized settings above:
+
+| Measurement | Time |
+| --- | ---: |
+| Previous full-sync baseline (product base `b83deec`) | 100.061 s |
+| Current full validation and checkpoint population | 101.755 s |
+| Unchanged restart with reopened WAL store | 0.099 s |
+| Production content rendering during held changed-source sync | 105 ms |
+| Production sidebar selection during the same sync | 6 ms |
+
+The unchanged run performed 30,000 stat checks and zero parser, tag, bitrate, or
+hash reads. The changed-title pass parsed once, updated one row, and read no audio.
+These are warm-fixture measurements, not a promise for every disk or library.
+
+
+Owner-app smoke check: launch against an already indexed library, navigate/search
+while validation runs, then relaunch unchanged; change one Serato title and close
+Serato; verify that title updates and unrelated rows remain available. Exercise
+**Re-scan File Info**, **Stop Sync**, and **Retry Sync**. Inspect any file-info errors
+and path conflicts before attempting processing on affected files.
+
+## Planning large-library work
+
+Plans touching startup, navigation, scanning, or bulk operations must start with
+the user journey, expected library size, interaction/ready budgets, and what stays
+usable during validation. Define a production-scale fixture and an actual-screen
+smoke checklist before implementation. Small correctness fixtures alone do not
+prove responsiveness; compare baseline and final measurements with the same data
+and build settings. See issues 120 and 129 for the failures this requirement prevents.

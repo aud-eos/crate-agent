@@ -111,13 +111,14 @@ struct SeratoPathConflict: Identifiable, Sendable {
 }
 
 struct SeratoConflictAnalysis: Sendable {
+    let source: SeratoSourceIdentity
     let libraryID: String
     let generation: UInt64
     let conflicts: [SeratoPathConflict]
     let scope: SeratoConflictScope
 
     func validate(_ snapshot: SeratoMembershipSnapshot) throws {
-        guard libraryID == snapshot.libraryID, generation == snapshot.generation else {
+        guard source == snapshot.source, libraryID == snapshot.libraryID, generation == snapshot.generation else {
             throw SeratoMembershipSnapshotError.sourceChanged
         }
     }

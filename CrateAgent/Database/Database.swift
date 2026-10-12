@@ -118,6 +118,8 @@ public final class LibraryDatabase {
         ResetFingerprintsForAlgorithmTest2Migration.register(in: &migrator)
         AddFingerprintFreshnessBasisMigration.register(in: &migrator)
         AddFileLibraryStateMigration.register(in: &migrator)
+        AddSyncCheckpointMigration.register(in: &migrator)
+        AddSyncStatProjectionMigration.register(in: &migrator)
         return migrator
     }
 }
