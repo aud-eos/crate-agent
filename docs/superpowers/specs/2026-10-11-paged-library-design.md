@@ -1,6 +1,6 @@
 # Full-library browsing with bounded paging
 
-Status: proposed for owner review. Implements #134 on top of #146 / PR #154.
+Status: approved by the owner on 2026-10-11. Implements #134 on top of #146 / PR #154.
 
 ## Intended outcome
 
