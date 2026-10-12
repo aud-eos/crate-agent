@@ -276,3 +276,7 @@ Every RED run must fail for the specified missing behavior or API, not fixture s
 ## Spec coverage check
 
 User outcome/UI → Tasks 5–6. Checkpoint/invalidation → Task 1. Launch/replay ordering → Tasks 2 and 5. Cached authorization/coverage → Task 3. Changed-record and queued-baseline semantics → Tasks 3–4. Conflicts/recovery/lifecycle → Tasks 4–5. Production-sized timing, native replay and actual concurrent navigation → Tasks 2 and 6. Every Review Focus item has an owning regression above.
+
+## Approved stat-validation amendment (2026-10-12)
+
+The owner approved replacing the header-only shortcut with a lightweight file-stat validation pass after native experiments delivered file changes after a synchronous FSEvents flush. This amendment supersedes event-coverage-only reuse below: every reused file requires current precise entry/target stat evidence and volume identity, including files under watched roots. A replay boundary orders delivered callbacks; it does not prove that all preceding physical changes have arrived. Unchanged audio is not reread. The 30,000-file stat microprobe took 0.57–1.03 seconds; the complete startup path must still meet the original performance acceptance checks.

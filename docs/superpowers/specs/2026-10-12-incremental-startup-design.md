@@ -234,3 +234,7 @@ Serato, forced rescan/cancellation and conflict-repair retry.
   https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html
 - Persistent queued-write recovery remains separately tracked:
   https://github.com/aud-eos/crate-agent/issues/110.
+
+## Approved stat-validation amendment (2026-10-12)
+
+The owner approved replacing the header-only shortcut with a lightweight file-stat validation pass after native experiments delivered file changes after a synchronous FSEvents flush. This amendment supersedes event-coverage-only reuse below: every reused file requires current precise entry/target stat evidence and volume identity, including files under watched roots. A replay boundary orders delivered callbacks; it does not prove that all preceding physical changes have arrived. Unchanged audio is not reread. The 30,000-file stat microprobe took 0.57–1.03 seconds; the complete startup path must still meet the original performance acceptance checks.
