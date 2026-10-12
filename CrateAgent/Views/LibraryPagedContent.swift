@@ -87,7 +87,7 @@ struct LibraryPagedContent: View {
                        var query = model.query
                        query.sort = .init(column: column, ascending: ascending)
                        model.setQuery(query)
-                   }, contextMenu: menu(for:), enabled: enabled, onFocus: { identifier, index in model.focus(id: identifier, index: index) })
+                   }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, onFocus: { identifier, index in model.focus(id: identifier, index: index) })
     }
 
     private func menu(for identifier: Int64) -> NSMenu? {

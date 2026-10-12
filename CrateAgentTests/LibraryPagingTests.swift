@@ -169,12 +169,14 @@ final class LibraryPagingTests: XCTestCase {
         let initialDecoded = model.results.decodedRowCount
         XCTAssertLessThanOrEqual(initialDecoded, 1000)
         let initialLatency = (CFAbsoluteTimeGetCurrent() - loadingStart) * 1000
+        try await Task.sleep(for: .milliseconds(20))
         let jumpStart = CFAbsoluteTimeGetCurrent()
         table.scrollRowToVisible(29999)
         scroll.layoutSubtreeIfNeeded()
         let jumpMilliseconds = (CFAbsoluteTimeGetCurrent() - jumpStart) * 1000
         await pagingEventually { model.results.row(at: 29999) != nil }
         let pageLatency = (CFAbsoluteTimeGetCurrent() - jumpStart) * 1000
+        try await Task.sleep(for: .milliseconds(20))
         table.scrollRowToVisible(0)
         await pagingEventually { model.results.row(at: 0) != nil }
         let snapshot = try XCTUnwrap(model.results.snapshot)

@@ -23,6 +23,7 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
     let onClear: () -> Void
     let onSort: (String, Bool) -> Void
     let contextMenu: (Snapshot.Row.ID) -> NSMenu?
+    var selectionVersion: () -> UInt64 = { 0 }
     var enabled = true
     var onFocus: (Snapshot.Row.ID?, Int) -> Void = { _, _ in }
 
@@ -52,7 +53,7 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
         private var boundsObserver: NSObjectProtocol?
         private var displayedGeneration: UInt64 = 0
         private var rangeAnchor: Int?
-        private var pendingSelection: (generation: UInt64, index: Int, modifiers: NSEvent.ModifierFlags)?
+        private var pendingSelection: (generation: UInt64, selectionVersion: UInt64, index: Int, modifiers: NSEvent.ModifierFlags)?
         private var sortedColumn: String?
         private var ascending = true
 
@@ -182,7 +183,7 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
                 configuration.onSelect([row], !modifiers.contains(.command) || !configuration.isSelected(row.id))
                 rangeAnchor = index
             } else {
-                pendingSelection = (configuration.controller.generation, index, modifiers)
+                pendingSelection = (configuration.controller.generation, configuration.selectionVersion(), index, modifiers)
                 configuration.controller.setViewport(index ..< (index + 1))
             }
         }
@@ -206,6 +207,12 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
                 }
             } else {
                 refreshVisibleRows(reloadCells: false)
+            }
+            if pendingSelection?.selectionVersion != configuration.selectionVersion() {
+                pendingSelection = nil
+            }
+            if let focusedRow = configuration.controller.row(at: table.selectedRow) {
+                configuration.onFocus(focusedRow.id, table.selectedRow)
             }
             if let pendingSelection, pendingSelection.generation == displayedGeneration,
                configuration.controller.row(at: pendingSelection.index) != nil

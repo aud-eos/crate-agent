@@ -9,6 +9,7 @@ final class PagedSelectionController<Provider: PagedSelectionProvider>: Observab
     @Published private(set) var visibleSelectedIDs: Set<Snapshot.Row.ID> = []
     @Published private(set) var isBusy = false
     @Published private(set) var error: String?
+    @Published private(set) var interactionVersion: UInt64 = 0
     private let provider: Provider
     private var snapshot: Snapshot?
     private var visibleIdentities: [Identity] = []
@@ -27,14 +28,17 @@ final class PagedSelectionController<Provider: PagedSelectionProvider>: Observab
     }
 
     func set(_ identities: [Identity], selected: Bool) {
+        interactionVersion &+= 1
         enqueue { [provider] in try await provider.set(identities, selected: selected) }
     }
 
     func setScope(_ snapshot: Snapshot, selected: Bool) {
+        interactionVersion &+= 1
         enqueue { [provider] in try await provider.setScope(snapshot, selected: selected) }
     }
 
     func setRange(_ range: Range<Int>, in snapshot: Snapshot, selected: Bool) {
+        interactionVersion &+= 1
         enqueue { [provider] in try await provider.setRange(range, in: snapshot, selected: selected) }
     }
 
@@ -76,6 +80,7 @@ final class PagedSelectionController<Provider: PagedSelectionProvider>: Observab
     }
 
     func clear() {
+        interactionVersion &+= 1
         membershipVersion &+= 1
         membershipTask?.cancel()
         visibleSelectedIDs.removeAll()
@@ -88,6 +93,7 @@ final class PagedSelectionController<Provider: PagedSelectionProvider>: Observab
 
     func retry() {
         if let failedCommand {
+            interactionVersion &+= 1
             enqueue(failedCommand)
         } else {
             refresh()
@@ -95,6 +101,7 @@ final class PagedSelectionController<Provider: PagedSelectionProvider>: Observab
     }
 
     func stop() {
+        interactionVersion &+= 1
         intent &+= 1
         readVersion &+= 1
         membershipVersion &+= 1

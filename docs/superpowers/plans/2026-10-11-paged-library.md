@@ -274,7 +274,7 @@ git diff --check
 ```
 
 Run swiftformat on every changed Swift file before committing; use line ranges for small edits in legacy files to avoid unrelated formatting churn. Inspect generated screenshots using view_image. Existing environment skips must be reported; new tests must not be skipped. Baseline from PR #154: 693 Swift tests, 15 environment skips, zero failures; 82 Rust tests.
-- [ ] Commit `Adopt paged Library browsing and full-query selection`. Use the requesting-code-review skill for one fresh whole-branch review against `24f347449d9884ac7da1b868792d4de740d513f2`, fix verified findings and rerun affected checks. Push `feat/paged-library`, open a PR closing #134 with the three review sections, measured metrics, tests and remaining limitations. Do not merge. Keep this worktree while the PR is open.
+- [x] Commit `Adopt paged Library browsing and full-query selection`. Use the requesting-code-review skill for one fresh whole-branch review against `24f347449d9884ac7da1b868792d4de740d513f2`, fix verified findings and rerun affected checks. Push `feat/paged-library`, open a PR closing #134 with the three review sections, measured metrics, tests and remaining limitations. Do not merge. Keep this worktree while the PR is open.
 
 ## Plan self-review
 

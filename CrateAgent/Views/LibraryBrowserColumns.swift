@@ -19,27 +19,25 @@ enum LibraryBrowserColumns {
 
 private final class LibraryBrowserCell: NSTableCellView {
     private let primary = NSTextField(labelWithString: "")
-    private let secondary = NSTextField(labelWithString: "")
+    private var secondary: NSTextField?
 
     init() {
         super.init(frame: .zero)
-        for label in [primary, secondary] {
-            label.lineBreakMode = .byTruncatingTail
-            label.maximumNumberOfLines = 1
-            addSubview(label)
-        }
+        primary.lineBreakMode = .byTruncatingTail
+        primary.maximumNumberOfLines = 1
+        addSubview(primary)
         textField = primary
     }
 
     override func layout() {
         super.layout()
         let content = bounds.insetBy(dx: 4, dy: 1)
-        if secondary.isHidden {
-            primary.frame = content
-        } else {
+        if let secondary, !secondary.isHidden {
             let detailHeight: CGFloat = 13
             secondary.frame = NSRect(x: content.minX, y: content.minY, width: content.width, height: detailHeight)
             primary.frame = NSRect(x: content.minX, y: content.minY + detailHeight, width: content.width, height: max(0, content.height - detailHeight))
+        } else {
+            primary.frame = content
         }
     }
 
@@ -50,10 +48,8 @@ private final class LibraryBrowserCell: NSTableCellView {
     func update(row: BrowserRow?, column: LibraryBrowseSort.Column?, title: String, showsFilenames: Bool, density: AppDensity) {
         needsLayout = true
         primary.font = .systemFont(ofSize: density == .compact ? 11 : 13)
-        secondary.font = .systemFont(ofSize: density == .compact ? 10 : 11)
         primary.textColor = .labelColor
-        secondary.textColor = .secondaryLabelColor
-        secondary.isHidden = true
+        secondary?.isHidden = true
         primary.maximumNumberOfLines = column == nil ? 2 : 1
         guard let row else {
             primary.stringValue = column == .title ? PagingLabels.loading : ""
@@ -69,8 +65,22 @@ private final class LibraryBrowserCell: NSTableCellView {
         case .title:
             primary.stringValue = row.title ?? row.filenameOnly
             primary.textColor = row.title == nil ? .secondaryLabelColor : .labelColor
-            secondary.stringValue = row.filenameOnly
-            secondary.isHidden = !showsFilenames || row.title == nil || row.title == row.filenameOnly
+            if showsFilenames, row.title != nil, row.title != row.filenameOnly {
+                let detail: NSTextField
+                if let secondary {
+                    detail = secondary
+                } else {
+                    detail = NSTextField(labelWithString: "")
+                    detail.lineBreakMode = .byTruncatingTail
+                    detail.maximumNumberOfLines = 1
+                    detail.textColor = .secondaryLabelColor
+                    secondary = detail
+                    addSubview(detail)
+                }
+                detail.font = .systemFont(ofSize: density == .compact ? 10 : 11)
+                detail.stringValue = row.filenameOnly
+                detail.isHidden = false
+            }
         case .bpm:
             primary.stringValue = row.bpm ?? ""
             primary.font = .monospacedDigitSystemFont(ofSize: density == .compact ? 11 : 13, weight: .regular)

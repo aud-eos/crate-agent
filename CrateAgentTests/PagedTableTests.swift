@@ -13,6 +13,8 @@ final class PagedTableTests: XCTestCase {
         var allCalls = 0
         var contextID: Int?
         var selectedRange: Range<Int>?
+        var selectionVersion: UInt64 = 0
+        var focusedID: Int?
         let configuration = PagedTable(controller: controller, columns: [
             PagedTableColumn<FixtureRow>(identifier: "name", title: "Name", width: 200,
                                          makeCell: { NSTextField(labelWithString: "") },
@@ -28,7 +30,7 @@ final class PagedTableTests: XCTestCase {
         onClear: { selected.removeAll() }, onSort: { _, _ in }, contextMenu: { identifier in
             contextID = identifier
             return NSMenu()
-        })
+        }, selectionVersion: { selectionVersion }, onFocus: { identifier, _ in focusedID = identifier })
         let coordinator = configuration.makeCoordinator()
         let scroll = coordinator.makeScrollView()
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
@@ -50,6 +52,28 @@ final class PagedTableTests: XCTestCase {
         await source.releaseAll()
         await pagingEventually { controller.row(at: 4) != nil && table.numberOfRows == 5 }
         XCTAssertTrue(selected.isEmpty)
+        let held = PagedQueryFixture(rowCount: 5, signature: "held")
+        await held.holdPages()
+        await controller.open(held)
+        await pagingEventually { controller.row(at: 0) == nil }
+        await Task.yield()
+        table.focusRow(3, modifiers: [], selecting: true)
+        XCTAssertNil(focusedID)
+        selected.removeAll()
+        selectionVersion += 1
+        await held.releaseAll()
+        await pagingEventually { controller.row(at: 3) != nil }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(selected.isEmpty, "An external Clear must cancel a pending placeholder click")
+        XCTAssertEqual(focusedID, 4, "Loaded placeholder focus must acquire its stable identity")
+        let focusOnly = PagedQueryFixture(rowCount: 5, signature: "focus-only")
+        await focusOnly.holdPages()
+        await controller.open(focusOnly, focusID: focusedID, focusFallback: 3)
+        await pagingEventually { table.selectedRow == 3 }
+        await focusOnly.releaseAll()
+        await pagingEventually { controller.row(at: 3) != nil }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(focusedID, 4, "Restored focus must retain its identity without selecting")
         table.focusRow(2, modifiers: [], selecting: true)
         XCTAssertEqual(selected, [3])
         table.focusRow(4, modifiers: [.shift], selecting: true)
