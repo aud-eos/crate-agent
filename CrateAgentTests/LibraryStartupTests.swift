@@ -1,3 +1,4 @@
+import Combine
 @testable import CrateAgent
 import GRDB
 import os
@@ -53,6 +54,95 @@ final class LibraryStartupTests: XCTestCase {
         XCTAssertNoThrow(try fixture.readiness.capture())
         do { _ = try await processor.collectStartupReplay(through: 1); XCTFail("Replay remained paused after startup") }
         catch FilesystemReplayError.deliveryActive {}
+    }
+
+    func testForcedRescanAfterFailedStartupReleasesWatcherDelivery() async throws {
+        let fixture = try await LibraryStartupPerformanceFixture(count: 1)
+        defer {
+            do { try fixture.cleanup() }
+            catch { XCTFail("Cannot clean startup fixture: \(error)") }
+        }
+        let session = fixture.makeSession(checkpointed: true)
+        let handled = OSAllocatedUnfairLock(initialState: 0)
+        let processor = FilesystemEventProcessor(initiallyPaused: true, handler: { _ in handled.withLock { $0 += 1 } }, checkpoint: { _ in })
+        let stream = StartupTestStream(processor: processor)
+        let failCapture = OSAllocatedUnfairLock(initialState: true)
+        let startup = LibraryStartupCoordinator(session: session, processor: processor, captureBoundary: {
+            if failCapture.withLock({ previous in let fail = previous; previous = false; return fail }) {
+                throw NSError(domain: "StartupRecoveryFixture", code: 1)
+            }
+            return try await stream.capture()
+        })
+        startup.start()
+        await startup.waitUntilIdle()
+        await session.waitUntilIdle()
+        guard case .failed = session.state else { return XCTFail("Startup failure was not visible") }
+        startup.requestRescan()
+        await startup.waitUntilIdle()
+        await session.waitUntilIdle()
+        XCTAssertTrue(startup.completed)
+        XCTAssertEqual(session.retryRequest(), .forceRefresh)
+        try await stream.deliver()
+        XCTAssertEqual(handled.withLock { $0 }, 1, "Rescan left the watcher paused")
+        XCTAssertNoThrow(try fixture.readiness.capture())
+    }
+
+    func testInitialRuntimeDrainFailureLeavesStartupCompleteAndCanBeRetried() async throws {
+        let fixture = try await LibraryStartupPerformanceFixture(count: 1)
+        defer {
+            do { try fixture.cleanup() }
+            catch { XCTFail("Cannot clean startup fixture: \(error)") }
+        }
+        let session = fixture.makeSession(checkpointed: true)
+        let failOnce = OSAllocatedUnfairLock(initialState: true)
+        let checkpoints = OSAllocatedUnfairLock(initialState: [UInt64]())
+        let processor = FilesystemEventProcessor(initiallyPaused: true, handler: { _ in
+            if failOnce.withLock({ previous in let fail = previous; previous = false; return fail }) {
+                throw NSError(domain: "StartupRecoveryFixture", code: 2)
+            }
+        }, checkpoint: { eventID in checkpoints.withLock { $0.append(eventID) } })
+        let startup = LibraryStartupCoordinator(session: session, processor: processor, captureBoundary: {
+            try await processor.enqueue(.init(observations: [], highestEventID: 0, deliverySequence: 1, replayBoundary: true, historyComplete: true))
+            try await processor.enqueue(.init(observations: [], highestEventID: 2, deliverySequence: 2))
+            return 1
+        })
+        startup.start()
+        await startup.waitUntilIdle()
+        await session.waitUntilIdle()
+        XCTAssertTrue(startup.completed, "Retry must use runtime recovery after delivery activates")
+        guard case .failed = session.state else { return XCTFail("Drain failure was hidden") }
+        XCTAssertThrowsError(try fixture.readiness.capture())
+        session.beginFilesystemRetry()
+        try await processor.retry()
+        session.finishFilesystemRetry(succeeded: true)
+        try await session.synchronize(session.retryRequest(), retryingFailedCleanup: true)
+        XCTAssertEqual(checkpoints.withLock { $0 }, [2])
+        XCTAssertNoThrow(try fixture.readiness.capture())
+    }
+
+    func testReadinessInvalidatedAtReadyPublicationIsRevalidatedAcrossHandoff() async throws {
+        let fixture = try await LibraryStartupPerformanceFixture(count: 1)
+        defer {
+            do { try fixture.cleanup() }
+            catch { XCTFail("Cannot clean startup fixture: \(error)") }
+        }
+        let session = fixture.makeSession(checkpointed: true)
+        let processor = FilesystemEventProcessor(initiallyPaused: true, handler: { _ in }, checkpoint: { _ in })
+        let stream = StartupTestStream(processor: processor)
+        let startup = LibraryStartupCoordinator(session: session, processor: processor, captureBoundary: { try await stream.capture() })
+        var invalidated = false
+        let observation = session.$state.sink { state in
+            if case .ready = state, !invalidated {
+                invalidated = true
+                fixture.readiness.invalidate()
+            }
+        }
+        startup.start()
+        await startup.waitUntilIdle()
+        XCTAssertTrue(invalidated)
+        XCTAssertTrue(startup.completed)
+        XCTAssertNoThrow(try fixture.readiness.capture(), "Ready presentation must not conceal an invalid handoff")
+        withExtendedLifetime(observation) {}
     }
 
     func testIncrementalAndForcedRefreshPreserveUnchangedExternalFieldsEditedLocally() async throws {

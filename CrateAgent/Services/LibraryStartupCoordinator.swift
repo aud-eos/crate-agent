@@ -8,6 +8,8 @@ final class LibraryStartupCoordinator {
     private let replay: @Sendable (FilesystemEventBatch) async throws -> Void
     private var task: Task<Void, Never>?
     private var restartRequested = false
+    private var pendingRequest: LibrarySyncRequest?
+    private var retryingFailedCleanup = false
     private(set) var completed = false
 
     init(session: SeratoLibrarySyncSession, processor: FilesystemEventProcessor,
@@ -20,12 +22,22 @@ final class LibraryStartupCoordinator {
         self.replay = replay
     }
 
-    func start() {
+    func start(_ request: LibrarySyncRequest? = nil, retryingFailedCleanup: Bool = false) {
+        if request == .forceRefresh || pendingRequest == nil {
+            pendingRequest = request
+        }
+        self.retryingFailedCleanup = self.retryingFailedCleanup || retryingFailedCleanup
         guard task == nil else { restartRequested = true; return }
         if completed {
-            session.requestSync(); return
+            session.requestSync(pendingRequest ?? .incremental)
+            pendingRequest = nil
+            return
         }
         task = Task { [weak self] in await self?.run() }
+    }
+
+    func requestRescan() {
+        start(.forceRefresh)
     }
 
     func stop() {
@@ -54,21 +66,33 @@ final class LibraryStartupCoordinator {
                 let readiness = session.readiness
                 await processor.observeStartupBoundary(boundary) { readiness.invalidate() }
                 session.prepareStartupReplay(receipt, handler: replay)
-                try await session.synchronize(session.retryRequest())
+                let request = pendingRequest ?? session.retryRequest()
+                pendingRequest = nil
+                try await session.synchronize(request, retryingFailedCleanup: retryingFailedCleanup)
+                retryingFailedCleanup = false
                 try Task.checkCancellation()
                 try await processor.finishStartupReplay(receipt, retained: session.retainedStartupObservations)
                 session.clearStartupReplay()
                 completed = true
+                try await processor.retry()
+                do { _ = try readiness.capture() }
+                catch LibrarySyncReadinessError.synchronizationRequired {
+                    try await session.synchronize(session.retryRequest())
+                }
                 return
             } catch {
                 if Task.isCancelled {
                     return
                 }
-                if session.validationWasSuperseded {
-                    continue
-                }
                 if case .waitingForSerato = session.state {
                     return
+                }
+                if completed {
+                    session.reportFilesystemFailure("Filesystem delivery failed: \(error.localizedDescription)")
+                    return
+                }
+                if session.validationWasSuperseded {
+                    continue
                 }
                 session.reportFailure("Filesystem startup validation failed: \(error.localizedDescription)")
                 return

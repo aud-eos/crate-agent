@@ -269,7 +269,7 @@ public final class AppServices: ObservableObject {
         guard !filesystemDeliveryStopped else { return }
         guard retryTask == nil else { return }
         if !startupCoordinator.completed {
-            startupCoordinator.start(); return
+            startupCoordinator.start(retryingFailedCleanup: true); return
         }
         retryTask = Task { [weak self] in
             guard let self else { return }
@@ -288,7 +288,7 @@ public final class AppServices: ObservableObject {
     }
 
     func requestLibraryRescan() {
-        syncSession.requestSync(.forceRefresh)
+        startupCoordinator.requestRescan()
     }
 
     func stopLibraryRescan() {

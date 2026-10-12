@@ -30,6 +30,7 @@ final class FilesystemReplayBoundaryTests: XCTestCase {
         XCTAssertEqual(before, [])
         XCTAssertEqual(handledBefore, [])
         try await processor.finishStartupReplay(receipt)
+        try await processor.retry()
         let after = await probe.checkpoints
         let handledAfter = await probe.paths
         XCTAssertEqual(after, [10, 11])

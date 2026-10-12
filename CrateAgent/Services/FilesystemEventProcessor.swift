@@ -116,7 +116,7 @@ public actor FilesystemEventProcessor {
         if !retained.isEmpty {
             pending.insert(FilesystemEventBatch(observations: retained, highestEventID: receipt.eventID), at: 0)
         }
-        try await resumeDelivery()
+        paused = false
     }
 
     public func enqueue(_ batch: FilesystemEventBatch) async throws {
