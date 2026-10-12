@@ -15,6 +15,7 @@ struct LibraryBrowserView: View {
     nonisolated static let visibleRowCap = 1000
 
     @State private var statusFilter: LibraryStatusFilter = .active
+    @State private var isLoading = true
     @State private var loadError: String?
     @State private var historyTarget: BrowserRow?
     @State private var rows: [BrowserRow] = []
@@ -43,7 +44,16 @@ struct LibraryBrowserView: View {
             if let loadError {
                 ActionErrorMessage(message: loadError).padding(density.pagePadding)
             }
-            tableSection
+            ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
+            if isLoading {
+                ProgressView("Loading library…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if rows.isEmpty && loadError == nil {
+                AppEmptyState(title: debouncedSearch.isEmpty ? "No tracks in this view" : ListControlLabels.noMatches,
+                              detail: debouncedSearch.isEmpty ? "Import tracks or choose another library status." : ListControlLabels.resetSearch,
+                              systemImage: "music.note.list")
+            } else {
+                tableSection
+            }
             Divider()
             footer
         }
@@ -204,7 +214,6 @@ struct LibraryBrowserView: View {
 
     private var tableSection: some View {
         LibraryBrowserTable(rows: rows, selectedFileIds: $selectedFileIds, sortOrder: $sortOrder, showsFilenames: statusFilter != .active)
-            .searchable(text: $searchText, prompt: "Filter by artist, title, album, or path…")
             .contextMenu(forSelectionType: BrowserRow.ID.self) { selectedIds in
                 if let singleId = selectedIds.first, selectedIds.count == 1,
                    let row = rows.first(where: { $0.id == singleId })
@@ -279,11 +288,13 @@ struct LibraryBrowserView: View {
     // MARK: - Data loading
 
     private func observeRows() async {
+        isLoading = true
         let observation = LibraryStatusBrowse.observation(filter: statusFilter, search: debouncedSearch,
                                                           sortOrder: sortOrder, limit: Self.visibleRowCap)
         do {
             for try await result in observation.values(in: services.database.writer) {
                 guard !Task.isCancelled else { return }
+                isLoading = false
                 rows = result.rows
                 totalRowCount = result.totalCount
                 selectedFileIds.formIntersection(rows.map(\.id))
@@ -291,6 +302,7 @@ struct LibraryBrowserView: View {
             }
         } catch {
             guard !Task.isCancelled else { return }
+            isLoading = false
             rows = []
             totalRowCount = 0
             loadError = "Could not load library: \(error.localizedDescription)"

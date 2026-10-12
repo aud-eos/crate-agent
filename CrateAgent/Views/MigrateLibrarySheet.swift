@@ -27,6 +27,8 @@ struct MigrateLibrarySheet: View {
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Music/_DJ_Library_")
     @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var plans: [LibraryMigrator.Plan] = []
+    @State private var query = ""
+    @State private var searchIndex: [String: String] = [:]
     @State private var scanID = UUID()
     @State private var isScanning: Bool = false
     @State private var isApplying: Bool = false
@@ -43,6 +45,8 @@ struct MigrateLibrarySheet: View {
             }
             header
             Divider()
+            ListSearchField(text: $query).padding(.horizontal, density.pagePadding).disabled(isApplying)
+            Text("Whole-library move · search filters the preview only").font(.callout).padding(.vertical, density.spacing)
             content
             Divider()
             footer
@@ -106,6 +110,8 @@ struct MigrateLibrarySheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if plans.isEmpty {
             emptyState
+        } else if visiblePlans.isEmpty {
+            AppEmptyState(title: ListControlLabels.noMatches, detail: ListControlLabels.resetSearch, systemImage: "magnifyingglass")
         } else {
             planList
         }
@@ -141,8 +147,13 @@ struct MigrateLibrarySheet: View {
         return "No tracked files were found under the current root. If you've already moved them manually, use \"Change Without Moving…\" in Settings instead."
     }
 
+    private var visiblePlans: [LibraryMigrator.Plan] {
+        let needle = ListSearch.normalized(query.trimmingCharacters(in: .whitespacesAndNewlines))
+        return needle.isEmpty ? plans : plans.filter { (searchIndex[$0.sourcePath] ?? "").contains(needle) }
+    }
+
     private var planList: some View {
-        List(plans) { plan in
+        List(visiblePlans) { plan in
             VStack(alignment: .leading, spacing: density.spacing) {
                 let identity = trackIdentities[plan.sourcePath]
                 TrackHeading(artist: identity?.artist, title: identity?.title, filename: (plan.sourcePath as NSString).lastPathComponent)
@@ -205,6 +216,7 @@ struct MigrateLibrarySheet: View {
             }
             guard scanID == requestID else { return }
             trackIdentities = TrackDisplayIdentity.index(preview.0)
+            searchIndex = ListSearch.index(preview.0).mapValues(ListSearch.normalized)
             plans = preview.1
         } catch {
             guard scanID == requestID else { return }

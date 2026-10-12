@@ -20,6 +20,7 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
     let selectAll: () -> Void
     let enabled: Bool
     let density: AppDensity
+    var sort: ((String, Bool) -> Void)? = nil
     var isSelectable: (Row) -> Bool = { _ in true }
 
     func makeCoordinator() -> Coordinator {
@@ -35,6 +36,8 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+        private var sortedColumn: String?
+        private var ascending = true
         private var configuration: VirtualizedPreviewTable
         private weak var table: PreviewNSTableView?
         private static var selectionColumnID: NSUserInterfaceItemIdentifier {
@@ -105,6 +108,19 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
                 }
             }
             refreshVisibleCheckboxes()
+        }
+
+        func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
+            guard configuration.enabled, let sort = configuration.sort,
+                  tableColumn.identifier != Self.selectionColumnID else { return }
+            let identifier = tableColumn.identifier.rawValue
+            ascending = sortedColumn == identifier ? !ascending : true
+            sortedColumn = identifier
+            for column in tableView.tableColumns {
+                tableView.setIndicatorImage(nil, in: column)
+            }
+            tableView.setIndicatorImage(NSImage(named: ascending ? NSImage.touchBarGoUpTemplateName : NSImage.touchBarGoDownTemplateName), in: tableColumn)
+            sort(identifier, ascending)
         }
 
         func numberOfRows(in _: NSTableView) -> Int {

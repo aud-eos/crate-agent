@@ -449,8 +449,37 @@ final class AutoTagSessionTests: XCTestCase {
         await fixture.session.performSearch()
         XCTAssertEqual(fixture.session.searchState.results.matches.map(\.id), [fixture.fileIDs[200]])
         XCTAssertEqual(fixture.session.selectedFileIDs.count, 201)
+        fixture.session.setVisibleFileIDs([fixture.fileIDs[200]], selected: false)
+        XCTAssertEqual(fixture.session.selectedFileIDs.count, 200)
+        fixture.session.selectionMode = .search
+        fixture.session.updateSearchQuery("track-")
+        await fixture.session.loadSelectionPage(1)
+        XCTAssertEqual(fixture.session.searchState.results.matches.count, 1)
+        XCTAssertEqual(fixture.session.searchState.results.totalMatchCount, 201)
+        XCTAssertEqual(fixture.session.selectedFileIDs.count, 200)
+        fixture.session.clearSelection()
+        XCTAssertTrue(fixture.session.selectedFileIDs.isEmpty)
+
         let lookups = await fixture.loader.lookupCount
         XCTAssertEqual(lookups, 0, "Opening and selecting browser pages never starts audio lookup")
+    }
+
+    func testReplacedSelectionRequiresExplicitReselectionFromCurrentView() async throws {
+        let fixture = try SessionFixture(fileCount: 2)
+        fixture.session.updateSearchQuery("track-")
+        await fixture.session.performSearch()
+        await fixture.session.loadBrowsePage()
+        fixture.session.selectVisibleFileIDs(fixture.fileIDs)
+        let changedID = fixture.fileIDs[0]
+        try await fixture.database.writer.write { connection in
+            try connection.execute(sql: "UPDATE files SET membership_revision = membership_revision + 1 WHERE id = ?", arguments: [changedID])
+        }
+        await fixture.session.loadBrowsePage()
+        XCTAssertEqual(fixture.session.selectedFileIDs, [fixture.fileIDs[1]])
+        XCTAssertNotNil(fixture.session.selectionNotice)
+        fixture.session.selectVisibleFileIDs([changedID])
+        await fixture.session.startScan()
+        XCTAssertEqual(fixture.session.scannedFileIDs, fixture.fileIDs)
     }
 
     func testChoosingCurrentRecordingCancelsAnOlderPendingSwitch() async throws {

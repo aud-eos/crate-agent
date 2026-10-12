@@ -33,3 +33,8 @@ moves. Rejected files stay at their original locations and receive no rename eve
   migration from the old root. Unavailable files count toward that check even
   though they cannot be selected for processing. Following external-write recovery,
   review the paths before changing the watched folder in Settings.
+
+Preview search filters the displayed files only. Move library remains a
+whole-library action and its confirmation includes every planned move; it changes
+the watched root only after the existing completion checks pass. See the
+[shared list-control contract](list-controls.md).

@@ -5,6 +5,7 @@ struct AutoTaggerView: View {
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @State private var showResetConfirmation = false
+    @State private var reviewQuery = ""
     @State private var chooserFile: ChooserFile?
 
     private struct ChooserFile: Identifiable { let id: Int64 }
@@ -51,34 +52,57 @@ struct AutoTaggerView: View {
                     }
                     Text("Missing fields means artist, title, or album in the indexed Serato library. Scanning reads the file’s actual tags. A MusicBrainz match identifies the recording; it does not mean this copy’s tags were written.")
                         .font(.callout).foregroundStyle(.secondary)
-                } else {
-                    TextField("Search by artist or title", text: Binding(get: { session.searchState.query }, set: session.updateSearchQuery))
-                        .textFieldStyle(.roundedBorder)
                 }
-            }.padding(density.pagePadding)
+                ListSearchField(text: Binding(get: { session.selectionMode == .browse ? session.browseQuery : session.searchState.query }, set: { query in
+                    if session.selectionMode == .browse {
+                        session.updateBrowseQuery(query)
+                    } else {
+                        session.updateSearchQuery(query)
+                    }
+                }))
+            }.padding(density.pagePadding).disabled(session.isScanning || session.isApplying)
             Divider()
             selectionResults
-            if session.selectionMode == .browse {
-                browsePagination
-            }
+            browsePagination
             Divider()
             ActionBar {
                 if let error = session.actionError {
                     ActionErrorMessage(message: error)
                 } else {
-                    Text("\(session.selectedFileIDs.count) selected across pages and searches").font(.callout.monospacedDigit())
+                    ListResultSummary(results: totalSelectionResults, selected: session.selectedFileIDs.count,
+                                      hidden: session.selectedFileIDs.subtracting(visibleFiles.map(\.id)).count, hiddenScope: "outside this page")
+                    if let notice = session.selectionNotice {
+                        Text(notice).font(.callout)
+                    }
                 }
             } actions: {
-                Button(session.selectionMode == .browse ? "Select this page" : "Select these results") {
-                    session.selectVisibleFileIDs(visibleFiles.filter(\.canProcess).map(\.id))
-                }.disabled(visibleFiles.isEmpty || selectionIsLoading || session.isScanning)
-                Button("Clear selection", action: session.clearSelection).disabled(session.selectedFileIDs.isEmpty || session.isScanning)
+                BatchSelectionControls(count: session.selectedFileIDs.count, scopeCount: eligiblePageIDs.count,
+                                       coverage: ListSelectionCoverage.coverage(selected: session.selectedFileIDs, scope: Set(eligiblePageIDs)),
+                                       enabled: !selectionIsLoading && !session.isScanning && !session.isApplying,
+                                       scopeLabel: "Select page (\(eligiblePageIDs.count) eligible)",
+                                       setSelected: { session.setVisibleFileIDs(eligiblePageIDs, selected: $0) }, clear: session.clearSelection)
                 Button("Scan selected (\(session.selectedFileIDs.count))") { Task { await session.startScan() } }
                     .disabled(session.selectedFileIDs.isEmpty || session.isScanning || session.isApplying)
                     .keyboardShortcut(.defaultAction)
             }
         }
         .task { await session.ensureBrowseLoaded() }
+    }
+
+    private var eligiblePageIDs: [Int64] {
+        visibleFiles.filter(\.canProcess).map(\.id)
+    }
+
+    private var totalSelectionResults: Int {
+        session.selectionMode == .browse ? session.browseResults.totalMatchCount : session.searchState.results.totalMatchCount
+    }
+
+    private var selectionPage: Int {
+        session.selectionMode == .browse ? session.browseResults.page : session.searchState.results.page
+    }
+
+    private var hasNextSelectionPage: Bool {
+        session.selectionMode == .browse ? session.browseResults.hasNextPage : session.searchState.results.hasNextPage
     }
 
     private var visibleFiles: [BrowserRow] {
@@ -107,9 +131,9 @@ struct AutoTaggerView: View {
                 }
             }.padding(density.pagePadding).frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if session.selectionMode == .search, session.searchState.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            AppEmptyState(title: "Search to find tracks", detail: "Enter an artist or title. Your existing selections stay selected.", systemImage: "magnifyingglass")
+            AppEmptyState(title: "Search to find tracks", detail: "Enter an artist, title, album, or path. Your existing selections stay selected.", systemImage: "magnifyingglass")
         } else if visibleFiles.isEmpty {
-            AppEmptyState(title: "No tracks found", detail: "Try another filter or search. Opening this view never scans or writes files.", systemImage: "music.note.list")
+            AppEmptyState(title: session.selectionMode == .search || !session.browseQuery.isEmpty ? ListControlLabels.noMatches : "No tracks in this view", detail: "Try another filter or search. Opening this view never scans or writes files.", systemImage: "music.note.list")
         } else {
             VStack(spacing: 0) {
                 List(visibleFiles, id: \.id) { file in
@@ -119,23 +143,19 @@ struct AutoTaggerView: View {
                                         onToggle: { session.toggleSelection(file.id) })
                         .equatable().disabled(session.isScanning)
                 }.listStyle(.inset)
-                if session.selectionMode == .search, session.searchState.results.totalMatchCount > visibleFiles.count {
-                    Text("Showing \(visibleFiles.count) of \(session.searchState.results.totalMatchCount) matches — refine your search for more.")
-                        .font(.callout).foregroundStyle(.secondary).padding(density.spacing)
-                }
             }
         }
     }
 
     private var browsePagination: some View {
         ActionBar {
-            Text("Page \(session.browseResults.page + 1) · \(session.browseResults.totalMatchCount) matching files")
+            Text("Page \(selectionPage + 1) · \(totalSelectionResults) matching files")
                 .font(.callout.monospacedDigit())
         } actions: {
-            Button("Previous page") { Task { await session.loadBrowsePage(session.browseResults.page - 1) } }
-                .disabled(session.browseResults.page == 0 || session.isBrowsing)
-            Button("Next page") { Task { await session.loadBrowsePage(session.browseResults.page + 1) } }
-                .disabled(!session.browseResults.hasNextPage || session.isBrowsing)
+            Button("Previous page") { Task { await session.loadSelectionPage(selectionPage - 1) } }
+                .disabled(selectionPage == 0 || selectionIsLoading || session.isScanning || session.isApplying)
+            Button("Next page") { Task { await session.loadSelectionPage(selectionPage + 1) } }
+                .disabled(!hasNextSelectionPage || selectionIsLoading || session.isScanning || session.isApplying)
         }
     }
 
@@ -158,6 +178,11 @@ struct AutoTaggerView: View {
                 }
             }.padding(density.pagePadding)
             Divider()
+            if session.reviewMode == .list {
+                ListSearchField(text: $reviewQuery).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing).disabled(session.isApplying)
+                Text("\(visibleReviewIDs.count) results · \(session.confirmedFileIDs.count) approved · \(session.confirmedFileIDs.subtracting(visibleReviewIDs).count) approvals outside current filter")
+                    .font(.callout.monospacedDigit())
+            }
             if session.reviewMode == .focus, let fileID = session.focusedFileID,
                let index = session.scannedFileIDs.firstIndex(of: fileID)
             {
@@ -170,11 +195,23 @@ struct AutoTaggerView: View {
                 {
                     reviewEntry(fileID, isFocused: true)
                 }
+            } else if visibleReviewIDs.isEmpty {
+                AppEmptyState(title: ListControlLabels.noMatches, detail: ListControlLabels.resetSearch, systemImage: "magnifyingglass")
             } else {
-                List(session.scannedFileIDs, id: \.self) { fileID in reviewEntry(fileID, isFocused: false) }.listStyle(.inset)
+                List(visibleReviewIDs, id: \.self) { fileID in reviewEntry(fileID, isFocused: false) }.listStyle(.inset)
             }
             Divider()
+            approvalControls
+            Divider()
             reviewFooter
+        }
+    }
+
+    private var visibleReviewIDs: [Int64] {
+        let needle = ListSearch.normalized(reviewQuery.trimmingCharacters(in: .whitespacesAndNewlines))
+        return needle.isEmpty ? session.scannedFileIDs : session.scannedFileIDs.filter { identifier in
+            guard let file = session.filesByID[identifier] else { return false }
+            return ListSearch.normalized(ListSearch.text(artist: file.artist, title: file.title, album: file.album, path: file.path)).contains(needle)
         }
     }
 
@@ -226,6 +263,20 @@ struct AutoTaggerView: View {
         !(session.lookupService.recordingAlternatives[fileID]?.entries.isEmpty ?? true)
     }
 
+    private var approvalControls: some View {
+        ActionBar {
+            Text("Approval applies to the whole scan").font(.callout)
+        } actions: {
+            Button("Approve all suggested matches", action: session.approveAllSuggested)
+            Button("Approve all ready matches") {
+                for fileID in session.scannedFileIDs {
+                    session.setApproved(true, for: fileID)
+                }
+            }
+            Button("Clear all approvals", action: session.clearApprovals)
+        }.disabled(session.isApplying || session.rowModels.isEmpty)
+    }
+
     private var reviewFooter: some View {
         ActionBar {
             if session.isApplying {
@@ -250,15 +301,7 @@ struct AutoTaggerView: View {
             if session.isScanning {
                 Button("Stop scan", action: session.stopScan).disabled(session.isApplying)
             }
-            Menu("Approval") {
-                Button("Approve suggested matches", action: session.approveAllSuggested)
-                Button("Approve all ready matches") {
-                    for fileID in session.scannedFileIDs {
-                        session.setApproved(true, for: fileID)
-                    }
-                }
-                Button("Clear approvals", action: session.clearApprovals)
-            }.disabled(session.isApplying || session.rowModels.isEmpty)
+
             if session.pendingResyncBatchId != nil {
                 Button("Re-sync") { Task { await session.resyncPartialApply() } }.disabled(session.isApplying)
             } else {

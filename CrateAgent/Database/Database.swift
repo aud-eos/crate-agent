@@ -66,6 +66,7 @@ public final class LibraryDatabase {
     private static func makeConfiguration() -> Configuration {
         var configuration = Configuration()
         configuration.prepareDatabase { database in
+            ListSearch.register(in: database)
             // NORMAL is the WAL-mode recommended setting: durable
             // across power loss (committed transactions survive),
             // but only fsyncs once per commit instead of twice.
