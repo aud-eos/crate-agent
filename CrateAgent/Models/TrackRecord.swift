@@ -12,8 +12,8 @@ import GRDB
 /// (auto-tagging); they live in this schema from SP-1 so we don't pay
 /// a migration cost when the auto-tagger lands.
 public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
-    Hashable, Identifiable
-{
+    Hashable, Identifiable {
+
     public static let databaseTableName = "tracks"
     public static let databaseColumnDecodingStrategy =
         DatabaseColumnDecodingStrategy.convertFromSnakeCase

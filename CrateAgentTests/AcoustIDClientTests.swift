@@ -8,7 +8,7 @@ final class AcoustIDClientTests: XCTestCase {
         try await limiter.acquire()
         let loader = StubLoader(status: 200, body: Data())
         let requester = RetryingLookupRequester(loader: loader, limiter: limiter)
-        let request = try URLRequest(url: XCTUnwrap(URL(string: "https://example.invalid/lookup")))
+        let request = URLRequest(url: URL(string: "https://example.invalid/lookup")!)
         let task = Task { try await requester.perform(request) }
         await fulfillment(of: [waiting], timeout: 2)
         task.cancel()
@@ -184,12 +184,12 @@ final class AcoustIDClientTests: XCTestCase {
 
     func testRetryAfterLegacyYearUsesRollingFiftyYearBoundary() async throws {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let withinWindow = try XCTUnwrap(calendar.date(from: DateComponents(
             year: 2044, month: 11, day: 6, hour: 8, minute: 49, second: 0
         )))
         try await assertRetryAfter("Sunday, 06-Nov-44 08:49:00 GMT",
-                                   expectedDelay: withinWindow.timeIntervalSince1970 - 784_111_777)
+                                   expectedDelay: withinWindow.timeIntervalSince1970 - 784111777)
         try await assertRetryAfter("Sunday, 06-Nov-44 08:50:37 GMT", expectedDelay: 0)
     }
 
@@ -208,7 +208,7 @@ final class AcoustIDClientTests: XCTestCase {
         let sleeper = RecordingSleeper()
         let requester = RetryingLookupRequester(
             loader: loader, limiter: .noop, sleeper: sleeper,
-            now: { Date(timeIntervalSince1970: 784_111_777) }
+            now: { Date(timeIntervalSince1970: 784111777) }
         )
         let body = try await requester.perform(URLRequest(url: URL(string: "https://example.invalid/retry")!))
         XCTAssertEqual(body, Data("complete".utf8))
@@ -484,9 +484,7 @@ private struct ObservedSystemClock: RateLimiterClock {
     let waiting: XCTestExpectation
     private let system = SystemClock()
 
-    var now: TimeInterval {
-        system.now
-    }
+    var now: TimeInterval { system.now }
 
     func sleep(until deadline: TimeInterval) async throws {
         waiting.fulfill()
@@ -616,13 +614,8 @@ private struct CancellingSleeper: BackoffSleeping {
 private final class CancelBox: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelAction: (() -> Void)?
-    func set(_ action: @escaping () -> Void) {
-        lock.withLock { cancelAction = action }
-    }
-
-    func cancel() {
-        (lock.withLock { cancelAction })?()
-    }
+    func set(_ action: @escaping () -> Void) { lock.withLock { cancelAction = action } }
+    func cancel() { (lock.withLock { cancelAction })?() }
 }
 
 /// Cancels the enclosing Task, then performs a REAL `Task.sleep` — which, on the
@@ -632,10 +625,7 @@ private final class CancelBox: @unchecked Sendable {
 /// `try await sleeper.sleep` / `Task.checkCancellation()`.
 private final class CancelThenRealSleep: BackoffSleeping, @unchecked Sendable {
     private let box: CancelBox
-    init(box: CancelBox) {
-        self.box = box
-    }
-
+    init(box: CancelBox) { self.box = box }
     func sleep(seconds: TimeInterval) async throws {
         box.cancel()
         try await Task.sleep(for: .seconds(seconds))

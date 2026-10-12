@@ -6,6 +6,7 @@ import XCTest
 /// the background worker's flush from clobbering a newer on-demand fingerprint
 /// the auto-tagger already wrote (finding #4000806487).
 final class FingerprintPersistencePendingGuardTests: XCTestCase {
+
     private func makeDatabase() throws -> LibraryDatabase {
         try LibraryDatabase.openInMemory()
     }

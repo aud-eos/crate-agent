@@ -1,5 +1,5 @@
-import Combine
 @testable import CrateAgent
+import Combine
 import GRDB
 import XCTest
 

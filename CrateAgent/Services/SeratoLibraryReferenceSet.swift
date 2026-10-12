@@ -18,6 +18,7 @@ import Foundation
 /// the next scan. Live watching of `~/Music/_Serato_/` is a later
 /// enhancement.
 public struct SeratoLibraryReferenceSet: Sendable, Equatable {
+
     public let paths: Set<String>
 
     public init(paths: Set<String>) {

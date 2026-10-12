@@ -1,8 +1,8 @@
-@testable import CrateAgent
 import CryptoKit
 import GRDB
 import SQLite3
 import XCTest
+@testable import CrateAgent
 
 /// Group C2 (#836 + #3998713590): the batch-apply / external-write path.
 ///
@@ -26,7 +26,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         }
         defer { try? FileManager.default.removeItem(at: directory.deletingLastPathComponent()) }
         let fileIDs = try await database.writer.write { db in
-            try (0 ..< 1100).map { index in
+            try (0..<1100).map { index in
                 var file = FileRecord(path: "/large/\(index).mp3", volumeUuid: "large", inode: Int64(index), fileSize: 1, mtime: 1)
                 file.libraryMembership = .active
                 file.fileAvailability = .available
@@ -39,7 +39,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
             .writeFileTags(WriteFileTagsPayload(fileId: fileID, metadata: SeratoMetadata(title: "Original"))),
         ] }
         _ = try await engine.applyBatch(mutations, batchId: "large-hygiene")
-        _ = try await engine.applyBatch([XCTUnwrap(fileIDs.first), XCTUnwrap(fileIDs.last)].map { fileID in
+        _ = try await engine.applyBatch([fileIDs.first!, fileIDs.last!].map { fileID in
             .writeFileTags(WriteFileTagsPayload(fileId: fileID, metadata: SeratoMetadata(title: "Newer")))
         }, batchId: "newer-tags")
         try await database.writer.write { db in
@@ -56,8 +56,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
 
     func testResyncRejectsMalformedReplayablePayloadsBeforeWriting() async throws {
         for eventType in [EventType.fileRenamed, .musicBrainzMatchApplied, .musicBrainzMatchReverted,
-                          .metadataCommittedToSerato, .fileTagsWritten]
-        {
+                          .metadataCommittedToSerato, .fileTagsWritten] {
             for malformedPayload in ["{", "{}"] {
                 let tagWriter = ThrowingTagWriter()
                 let (engine, database, directory, fileIDs) = try await MainActor.run {
@@ -395,8 +394,8 @@ final class OperationEnginePartialFailureTests: XCTestCase {
                 payload.removeValue(forKey: "isSeratoAuthoritative")
                 var inverse = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(event.inversePayloadJson.utf8)) as? [String: Any])
                 inverse.removeValue(forKey: "isSeratoAuthoritative")
-                let payloadJSON = try String(decoding: JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
-                let inverseJSON = try String(decoding: JSONSerialization.data(withJSONObject: inverse), as: UTF8.self)
+                let payloadJSON = String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
+                let inverseJSON = String(decoding: try JSONSerialization.data(withJSONObject: inverse), as: UTF8.self)
                 try db.execute(sql: "UPDATE events SET payload_json = ?, inverse_payload_json = ? WHERE event_id = ?",
                                arguments: [payloadJSON, inverseJSON, eventID])
             }
@@ -419,9 +418,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         ], batchId: batchID)
         let databaseURL = seratoDirectory.appendingPathComponent("database V2")
         let appliedBytes = try Data(contentsOf: databaseURL)
-        if legacyJournal {
-            try await stripMetadataAuthority(in: database)
-        }
+        if legacyJournal { try await stripMetadataAuthority(in: database) }
         try Data([0xFF, 0xFF, 0xFF]).write(to: databaseURL)
         var undoID: String?
         do {
@@ -434,9 +431,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         let restored = try await database.writer.read { db in try FileRecord.fetchOne(db, key: fileID) }
         XCTAssertEqual(restored?.artist, "old")
         try appliedBytes.write(to: databaseURL)
-        if legacyJournal {
-            try await stripMetadataAuthority(in: database)
-        }
+        if legacyJournal { try await stripMetadataAuthority(in: database) }
         _ = try await engine.resyncSeratoForBatch(undoBatchID)
         let records = try readDatabaseRecords(databasePath: databaseURL.path)
         let record = try XCTUnwrap(records.first { $0.path == seratoPaths[0] })

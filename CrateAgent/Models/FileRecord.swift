@@ -11,8 +11,8 @@ import GRDB
 /// same path — populated on initial scan and refreshed when Serato
 /// quits (via SeratoSyncCoordinator's reload hook).
 public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
-    Hashable, Identifiable, Sendable
-{
+    Hashable, Identifiable, Sendable {
+
     public static let databaseTableName = "files"
     public static let databaseColumnDecodingStrategy =
         DatabaseColumnDecodingStrategy.convertFromSnakeCase
@@ -144,8 +144,7 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
 /// Stored as a TEXT column to keep schema browseable; the enum value
 /// is the source of truth in Swift.
 public enum FingerprintStatus: String, Codable, DatabaseValueConvertible,
-    Hashable, Sendable
-{
+    Hashable, Sendable {
     case pending
     case done
     case failed

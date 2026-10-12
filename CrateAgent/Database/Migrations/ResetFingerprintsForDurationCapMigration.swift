@@ -22,11 +22,11 @@ enum ResetFingerprintsForDurationCapMigration {
         migrator.registerMigration("005_reset_fingerprints_for_duration_cap") { db in
             try db.execute(
                 sql: """
-                UPDATE files
-                SET chromaprint_fingerprint = NULL,
-                    fingerprint_status = 'pending'
-                WHERE fingerprint_status = 'done'
-                """
+                    UPDATE files
+                    SET chromaprint_fingerprint = NULL,
+                        fingerprint_status = 'pending'
+                    WHERE fingerprint_status = 'done'
+                    """
             )
         }
     }
