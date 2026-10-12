@@ -23,7 +23,6 @@ import Foundation
 /// for cross-volume detection (those are the same file from the
 /// user's perspective: a copy).
 public enum LightweightHashCalculator {
-
     /// 1MB read window for each of head and tail.
     public static let windowSize = 1 * 1024 * 1024
 
@@ -34,6 +33,7 @@ public enum LightweightHashCalculator {
     /// nil for files that can't be opened — the caller treats this as
     /// "no hash available, fall back to inode-only behavior."
     public static func compute(forFileAt path: String) -> Data? {
+        LibrarySyncMetrics.current?.record(.hash)
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
 

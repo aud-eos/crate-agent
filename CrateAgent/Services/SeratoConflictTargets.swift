@@ -23,6 +23,9 @@ enum SeratoConflictTargets {
             fileID = payload.fileId
             target.paths.append(payload.path)
             target.physicalIdentities.insert(.init(volumeID: payload.volumeUuid, inode: UInt64(bitPattern: payload.inode)))
+        case let .observeFileMetadata(payload):
+            fileID = payload.observation.fileId
+            include(payload.observation.identity, in: &target)
         case let .observeFileIdentity(payload):
             fileID = payload.fileId
             include(payload.previousIdentity, in: &target)

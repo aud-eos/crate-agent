@@ -15,7 +15,10 @@ final class PhysicalFileMoveTransaction {
                                         afterTransfer: @escaping @Sendable (URL) throws -> Void = { _ in },
                                         _ body: @escaping @Sendable (Database, PhysicalFileMoveTransaction) throws -> Result) async throws -> Result
     {
-        try await writer.writeWithoutTransaction { database in
+        let accounting = SyncRevisionAccounting.current
+        return try await writer.writeWithoutTransaction { database in
+            let revisionBefore = try SyncCheckpointStore.revision(in: database)
+            try accounting?.validate(revisionBefore)
             let fence = "physical:\(batchId)"
             try SyncCheckpointStore.beginEffect(batchID: fence, in: database)
             let transaction = PhysicalFileMoveTransaction(afterTransfer: afterTransfer)
@@ -39,6 +42,8 @@ final class PhysicalFileMoveTransaction {
             do { try transaction.finish() }
             catch { throw OperationEngineError.externalSyncIncomplete(batchId: batchId, underlying: error.localizedDescription) }
             try SyncCheckpointStore.finishEffect(batchID: fence, in: database)
+            let revisionAfter = try SyncCheckpointStore.revision(in: database)
+            accounting?.record(revisionAfter - revisionBefore)
             return result!
         }
     }

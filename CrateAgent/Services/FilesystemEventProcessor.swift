@@ -42,6 +42,17 @@ public actor FilesystemEventProcessor {
         paused = initiallyPaused
     }
 
+    private var startupBoundary: UInt64?
+    private var invalidateStartup: (@Sendable () -> Void)?
+
+    func observeStartupBoundary(_ sequence: UInt64, invalidate: @escaping @Sendable () -> Void) {
+        startupBoundary = sequence
+        invalidateStartup = invalidate
+        if pending.contains(where: { batch in (batch.deliverySequence ?? 0) > sequence && !batch.observations.isEmpty }) {
+            invalidate()
+        }
+    }
+
     private var nextDeliverySequence: UInt64 = 1
     private var deliveries: [UInt64: FilesystemEventBatch] = [:]
     private var replayWaiters: [UUID: (UInt64, CheckedContinuation<FilesystemReplayReceipt, Error>)] = [:]
@@ -94,12 +105,17 @@ public actor FilesystemEventProcessor {
         }
     }
 
-    func finishStartupReplay(_ receipt: FilesystemReplayReceipt) async throws {
+    func finishStartupReplay(_ receipt: FilesystemReplayReceipt, retained: [FSEventsObservation] = []) async throws {
         guard paused, try replayReceipt(through: receipt.sequence) != nil else { throw FilesystemReplayError.invalidBoundary }
-        if receipt.eventID != 0 {
+        startupBoundary = nil
+        invalidateStartup = nil
+        if retained.isEmpty, receipt.eventID != 0 {
             try await checkpoint(receipt.eventID)
         }
         pending.removeAll { batch in (batch.deliverySequence ?? 0) <= receipt.sequence }
+        if !retained.isEmpty {
+            pending.insert(FilesystemEventBatch(observations: retained, highestEventID: receipt.eventID), at: 0)
+        }
         try await resumeDelivery()
     }
 
@@ -113,6 +129,9 @@ public actor FilesystemEventProcessor {
             }
         } else {
             pending.append(batch)
+        }
+        if let startupBoundary, (batch.deliverySequence ?? 0) > startupBoundary, !batch.observations.isEmpty {
+            invalidateStartup?()
         }
         resolveReplayWaiters()
         if let failure {

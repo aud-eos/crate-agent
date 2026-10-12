@@ -47,16 +47,9 @@ struct MainWindowView: View {
     var body: some View {
         VStack(spacing: 0) {
             if services.syncState != .idle {
-                LibrarySyncStatusView(state: services.syncState, retry: services.retrySync, hasConflicts: !services.syncSession.conflicts.isEmpty, review: services.reviewConflicts)
+                LibrarySyncStatusView(state: services.syncState, retry: services.retrySync, phase: services.syncPhase, fileInfoFailures: services.syncFileInfoFailures, progress: services.scanProgress, hasConflicts: !services.syncSession.conflicts.isEmpty, review: services.reviewConflicts)
             }
-            NavigationSplitView {
-                List(Section.allCases.filter { section in section != .conflicts || !services.syncSession.conflicts.isEmpty || selection == .conflicts }, selection: $selection) { section in
-                    Label(section.displayName, systemImage: section.iconName)
-                        .tag(section)
-                }
-                .navigationTitle("crate-agent")
-                .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 260)
-            } detail: {
+            MainWindowNavigation(selection: $selection, hasConflicts: !services.syncSession.conflicts.isEmpty) {
                 detailView
             }
             Divider()

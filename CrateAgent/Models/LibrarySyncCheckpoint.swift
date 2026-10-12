@@ -41,6 +41,7 @@ struct SyncFileEvidence: Codable, Equatable, Sendable {
     let identity: FileMetadata
     let readIdentity: AudioFileReadIdentity?
     let bitrateProbed: Bool
+    var bitrateError: String? = nil
 }
 
 struct LibrarySyncCheckpoint: Sendable {
@@ -62,8 +63,8 @@ enum SyncCheckpointError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .changed: "Library evidence changed during startup validation. Retry sync."
-        case .incompleteEffects: "Some library changes have not finished. Retry Sync or review their History before using cached validation."
-        case .malformed: "Saved startup validation data is invalid. A complete library validation is required."
+        case .incompleteEffects: "Some library changes have not finished. Retry Sync or review History before processing resumes."
+        case .malformed: "Saved validation data is invalid. Use Re-scan File Info to rebuild it."
         }
     }
 }

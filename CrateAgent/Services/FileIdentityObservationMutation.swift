@@ -6,12 +6,14 @@ struct FileObservationExpectation: Sendable {
     let revision: Int64
     let identity: FileMetadata
     let state: FileLibraryState
+    var metadata: SeratoMetadata? = nil
 
     func validate(in database: GRDB.Database) throws {
         guard let current = try FileRecord.fetchOne(database, key: fileId),
               current.membershipRevision == revision,
               current.identity == identity,
-              current.libraryState == state
+              current.libraryState == state,
+              metadata == nil || current.seratoMetadata == metadata
         else {
             throw FileProcessingEligibilityError.superseded(fileId: fileId)
         }
@@ -21,7 +23,7 @@ struct FileObservationExpectation: Sendable {
 extension FileObservationExpectation {
     init(file: FileRecord) throws {
         guard let fileID = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
-        self.init(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)
+        self.init(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState, metadata: file.seratoMetadata)
     }
 }
 
@@ -32,11 +34,18 @@ public struct ObserveFileIdentityPayload: Codable, Sendable {
     public let identity: FileMetadata
     public var metadata: SeratoMetadata? = nil
     public var bitrateKbps: Int? = nil
+    public var bitrateWasRead: Bool? = nil
     public var expectedState: FileLibraryState? = nil
     public var ownedTagWriteEventID: Int64? = nil
     public var observedMetadata: SeratoMetadata? = nil
     public var previousObservedMetadata: SeratoMetadata? = nil
     public var uncertainV2Fields: [String]? = nil
+}
+
+public struct ObserveFileMetadataPayload: Codable, Sendable {
+    let observation: ObserveFileIdentityPayload
+    let evidence: AudioFileReadIdentity
+    let expectedMetadata: SeratoMetadata
 }
 
 extension FileRecord {
@@ -46,7 +55,7 @@ extension FileRecord {
     }
 
     static func loadIdentityProjections(database: LibraryDatabase) async throws -> [FileRecord] {
-        let columns = "id, track_id, path, volume_uuid, inode, file_size, mtime, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision"
+        let columns = "id, track_id, path, volume_uuid, inode, file_size, mtime, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision, artist, title, album, genre, bpm, musical_key, comment, length, label, bitrate_kbps"
         var result: [FileRecord] = []
         var cursor: Int64 = 0
         while true {
@@ -84,7 +93,7 @@ enum FileIdentityObservationMutation {
                                             forwardPayload: payload, inversePayload: previous, in: database)
     }
 
-    static func apply(_ payload: ObserveFileIdentityPayload, batchId: String, timestamp: Int64, in database: GRDB.Database) throws -> Int64? {
+    static func apply(_ payload: ObserveFileIdentityPayload, batchId: String, timestamp: Int64, in database: GRDB.Database, metadataEvidence: AudioFileReadIdentity? = nil, expectedMetadata: SeratoMetadata? = nil) throws -> Int64? {
         guard var file = try FileRecord.fetchOne(database, key: payload.fileId) else {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
@@ -96,8 +105,18 @@ enum FileIdentityObservationMutation {
         }
         let previous = file
         let identity = payload.identity
-        guard try FileMetadataCollector.collectVerified(at: identity.path) == identity else {
-            throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+        if let metadataEvidence {
+            guard identity == file.identity, payload.metadata != nil, expectedMetadata == file.seratoMetadata else {
+                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            }
+            try metadataEvidence.requireUnchanged(at: identity.path)
+            guard FileMetadataCollector.collect(at: identity.path)?.volumeUuid == identity.volumeUuid else {
+                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            }
+        } else {
+            guard try FileMetadataCollector.collectVerified(at: identity.path) == identity else {
+                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            }
         }
         if file.volumeUuid == LegacyFileIdentity.unknownVolume, !LegacyFileIdentity.canAdoptVolume(file, identity: identity) {
             throw SeratoReconciliationError.ambiguousIdentity(identity.path)
@@ -127,7 +146,9 @@ enum FileIdentityObservationMutation {
         if let metadata = payload.metadata {
             applyMetadata(metadata, to: &file)
         }
-        if let bitrate = payload.bitrateKbps {
+        if payload.bitrateWasRead == true {
+            file.bitrateKbps = payload.bitrateKbps
+        } else if let bitrate = payload.bitrateKbps {
             file.bitrateKbps = bitrate
         }
         var journaled = payload

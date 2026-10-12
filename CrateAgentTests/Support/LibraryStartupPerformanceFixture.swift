@@ -67,9 +67,11 @@ final class LibraryStartupPerformanceFixture {
         }
     }
 
-    func makeSession() -> SeratoLibrarySyncSession {
+    func makeSession(checkpointed: Bool = false) -> SeratoLibrarySyncSession {
         SeratoLibrarySyncSession(reader: reader, reconciler: reconciler, scanner: scanner,
-                                 operationEngine: engine, watchdog: watchdog, readiness: readiness)
+                                 operationEngine: engine, watchdog: watchdog, readiness: readiness,
+                                 checkpointStore: checkpointed ? SyncCheckpointStore(database: database) : nil,
+                                 watchRoots: [directory.path])
     }
 
     func cleanup() throws {

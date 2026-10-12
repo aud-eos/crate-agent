@@ -10,7 +10,7 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         let sourceURL = fixture.directory.appendingPathComponent("database V2")
         try SeratoTestEncoding.library(paths: ["/changed.wav"]).write(to: sourceURL)
         let changed = try SeratoMembershipSnapshot(libraryID: "fixture", records: fixture.records, source: SeratoSourceIdentity.read(sourceURL), generation: 1)
-        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, coveredFileIDs: [1, 2, 3])
+        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, validatedFileIDs: [1, 2, 3])
         do {
             _ = try await planner.makePlan(request: .incremental, snapshot: changed, indexedFiles: fixture.files,
                                            previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
@@ -27,7 +27,7 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         files[0].title = "Newer local intent"
         let snapshot = SeratoMembershipSnapshot(libraryID: "fixture", records: current, source: fixture.source, generation: 1)
         let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
-        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, coveredFileIDs: [1, 2, 3], inspect: { _ in
+        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, validatedFileIDs: [1, 2, 3], inspect: { _ in
             XCTFail("Covered unchanged audio was inspected")
             return nil
         })
@@ -54,12 +54,12 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         XCTAssertEqual(changedStamp.target.size, previousStamp.target.size)
         XCTAssertEqual(changedStamp.target.modifiedSeconds, previousStamp.target.modifiedSeconds)
         XCTAssertNotEqual(changedStamp, previousStamp)
-        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, coveredFileIDs: [1, 3])
+        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, validatedFileIDs: [1, 3])
         let plan = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: fixture.files,
                                               previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
         XCTAssertEqual(plan.refreshPaths, [Data(changedPath.utf8)])
         XCTAssertEqual(plan.reconcileFileIDs, [2])
-        let lost = LibraryRefreshPlanner(evidence: fixture.evidence, coveredFileIDs: [], requiresReconciliation: true)
+        let lost = LibraryRefreshPlanner(evidence: fixture.evidence, validatedFileIDs: [], requiresReconciliation: true)
         let broad = try await lost.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: fixture.files,
                                             previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
         XCTAssertEqual(broad.reconcileFileIDs, [1, 2, 3])
@@ -89,7 +89,7 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         XCTAssertNotEqual(changed.target, stamp.target)
         let snapshot = SeratoMembershipSnapshot(libraryID: "fixture", records: fixture.records, source: fixture.source, generation: 1)
         let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
-        let planner = LibraryRefreshPlanner(evidence: evidence, coveredFileIDs: [2, 3])
+        let planner = LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: [2, 3])
         let plan = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: files,
                                               previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
         XCTAssertEqual(plan.refreshPaths, [Data(path.utf8)])
@@ -103,7 +103,7 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: fixture.files)
         let missing = fixture.files[1].path
         let replaced = fixture.files[2].path
-        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, coveredFileIDs: [1], inspect: { path in
+        let planner = LibraryRefreshPlanner(evidence: fixture.evidence, validatedFileIDs: [1], inspect: { path in
             if path == missing {
                 return nil
             }

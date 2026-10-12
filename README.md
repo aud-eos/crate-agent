@@ -17,8 +17,10 @@ with nothing selected; filtered selections remain visible in the counts. See the
 [list-control contract](docs/list-controls.md) for scopes, keyboard controls, and
 screen-specific exceptions.
 
-In **Library**, use **Re-scan File Info** to check Serato's complete saved library;
-the scan stays off at startup and can be stopped while it is running. Fingerprinting
+The saved library opens for browsing immediately. Startup and Serato closing trigger
+automatic validation; unchanged files use cached evidence checked against current
+file stats. In **Library**, **Re-scan File Info** forces a complete refresh and can
+be stopped while it is running. Fingerprinting waits for validated readiness, then
 continues as independent background work. Removing a track from Serato
 retires its crate-agent entry while preserving the audio, recording identity, and
 History. Missing audio that Serato still references remains a member but cannot

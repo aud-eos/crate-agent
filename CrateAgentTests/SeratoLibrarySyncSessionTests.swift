@@ -6,6 +6,80 @@ import XCTest
 
 @MainActor
 final class SeratoLibrarySyncSessionTests: XCTestCase {
+    func testPlannedExternalMetadataChangeDoesNotReadAudioOrTouchUnchangedTrack() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let changed = try await fixture.add("changed.wav")
+        let untouched = try await fixture.add("untouched.wav")
+        let files = [changed, untouched]
+        try fixture.save(paths: files.map(\.path))
+        let previous = try await fixture.reader.read()
+        var evidence: [Int64: SyncFileEvidence] = [:]
+        var baselines: [FileMembershipToken: SeratoMetadata] = [:]
+        for file in files {
+            let identifier = try XCTUnwrap(file.id)
+            evidence[identifier] = try SyncFileEvidence(fileID: identifier, membershipRevision: file.membershipRevision,
+                                                        identity: file.identity, readIdentity: AudioFileReadIdentity.read(at: file.path), bitrateProbed: true)
+            baselines[FileMembershipToken(fileId: identifier, revision: file.membershipRevision)] = .empty
+        }
+        try await fixture.engine.restoreObservedSeratoMetadata(baselines, authorization: fixture.reader.authorization(for: previous))
+        let bytes = try SeratoTestEncoding.record("vrsn", XCTUnwrap("2.0/Serato Scratch LIVE Database".data(using: .utf16BigEndian)))
+            + SeratoTestEncoding.record("otrk", SeratoTestEncoding.record("pfil", XCTUnwrap(changed.path.data(using: .utf16BigEndian)))
+                + SeratoTestEncoding.record("tsng", XCTUnwrap("External title".data(using: .utf16BigEndian))))
+            + SeratoTestEncoding.record("otrk", SeratoTestEncoding.record("pfil", XCTUnwrap(untouched.path.data(using: .utf16BigEndian))))
+        try bytes.write(to: fixture.locator.databaseV2Url)
+        let snapshot = try await fixture.reader.read()
+        let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+        let planner = LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: Set(files.compactMap(\.id)))
+        let plan = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: files,
+                                              previousRecords: previous.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
+        let scanner = LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator,
+                                     identityReader: { _ in XCTFail("Metadata-only scan hashed audio"); throw SyncCheckpointError.changed },
+                                     bitrateReader: { _ in XCTFail("Metadata-only scan probed audio"); return nil })
+        let metrics = LibrarySyncMetrics()
+        try await LibrarySyncMetrics.$current.withValue(metrics) {
+            _ = try await fixture.reconciler.reconcile(snapshot, analysis: analysis, plan: plan)
+            _ = try await scanner.scan(snapshot: snapshot, reader: fixture.reader, analysis: analysis, plan: plan)
+        }
+        let updated = try await fixture.row(changed)
+        let retained = try await fixture.row(untouched)
+        XCTAssertEqual(updated.title, "External title")
+        XCTAssertEqual(retained, untouched)
+        XCTAssertEqual(metrics.snapshot().lightweightHashReads, 0)
+        XCTAssertEqual(metrics.snapshot().audioTagReads, 0)
+        let events = try await fixture.events()
+        XCTAssertEqual(events, 1)
+        let unchanged = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: [updated, retained],
+                                                   previousRecords: snapshot.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
+        _ = try await scanner.scan(snapshot: snapshot, reader: fixture.reader, analysis: analysis, plan: unchanged)
+        let repeated = try await fixture.events()
+        XCTAssertEqual(repeated, events)
+    }
+
+    func testPlannedMetadataObservationRejectsLaterLocalEdit() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("later-edit.wav")
+        try fixture.save(paths: [file.path])
+        let snapshot = try await fixture.reader.read()
+        let identifier = try XCTUnwrap(file.id)
+        let evidence = try AudioFileReadIdentity.read(at: file.path)
+        let authorization = try await fixture.reader.authorization(for: snapshot)
+        let observation = ObserveFileIdentityPayload(fileId: identifier, expectedRevision: file.membershipRevision,
+                                                     previousIdentity: file.identity, identity: file.identity,
+                                                     metadata: .init(title: "External title"), expectedState: file.libraryState)
+        try await fixture.engine.apply(.setMetadata(.init(fileId: identifier, metadata: .init(title: "Newer local title"))))
+        do {
+            _ = try await fixture.engine.observeSnapshotMetadata(observation, authorization: authorization,
+                                                                 metadataEvidence: evidence, expectedMetadata: file.seratoMetadata)
+            XCTFail("Older observation overwrote a later local edit")
+        } catch FileProcessingEligibilityError.superseded {}
+        let retained = try await fixture.row(file)
+        XCTAssertEqual(retained.title, "Newer local title")
+        let events = try await fixture.events()
+        XCTAssertEqual(events, 1)
+    }
+
     func testConflictSyncRetiresOnlyIndependentRowsAndRetainsStaleDetailsUntilValidatedRepair() async throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)

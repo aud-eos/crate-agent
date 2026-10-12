@@ -6,6 +6,7 @@ enum LibrarySyncRequest: Equatable, Sendable {
 }
 
 struct LibraryRefreshPlan: Sendable {
+    let indexedFiles: [FileRecord]
     let metadataPaths: Set<Data>
     let refreshPaths: Set<Data>
     let reconcileFileIDs: Set<Int64>
@@ -24,15 +25,15 @@ struct FileRefreshObservation: Sendable {
 
 struct LibraryRefreshPlanner: Sendable {
     private let evidence: [Int64: SyncFileEvidence]
-    private let coveredFileIDs: Set<Int64>
+    private let validatedFileIDs: Set<Int64>
     private let requiresReconciliation: Bool
     private let inspect: @Sendable (String) throws -> FileRefreshObservation?
 
-    init(evidence: [Int64: SyncFileEvidence], coveredFileIDs: Set<Int64>, requiresReconciliation: Bool = false,
+    init(evidence: [Int64: SyncFileEvidence], validatedFileIDs: Set<Int64>, requiresReconciliation: Bool = false,
          inspect: @escaping @Sendable (String) throws -> FileRefreshObservation? = { path in try FileRefreshObservation.read(at: path) })
     {
         self.evidence = evidence
-        self.coveredFileIDs = coveredFileIDs
+        self.validatedFileIDs = validatedFileIDs
         self.requiresReconciliation = requiresReconciliation
         self.inspect = inspect
     }
@@ -55,13 +56,13 @@ struct LibraryRefreshPlanner: Sendable {
             guard let identifier = file.id, analysis.scope.conflictingPath(for: .file(file)) == nil else { continue }
             let path = SeratoPath.normalized(file.path)
             let dirty = dirtyFileIDs.contains(identifier) || normalizedDirtyPaths.contains(path)
-            var reusable = request != .forceRefresh && !requiresReconciliation && !dirty
+            var reusable = request != .forceRefresh && !requiresReconciliation
                 && file.libraryMembership == .active && file.fileAvailability == .available
                 && file.seratoLibraryId == snapshot.libraryID && savedPaths.contains(path)
             if let stored = evidence[identifier], stored.membershipRevision == file.membershipRevision,
                stored.identity == file.identity, stored.bitrateProbed, let stamp = stored.readIdentity
             {
-                if reusable, !coveredFileIDs.contains(identifier) {
+                if reusable, dirty || !validatedFileIDs.contains(identifier) {
                     let observation = try inspect(file.path)
                     reusable = observation?.identity == stamp && observation?.volumeID == file.volumeUuid
                 }
@@ -93,6 +94,6 @@ struct LibraryRefreshPlanner: Sendable {
                 metadata.insert(bytes)
             }
         }
-        return LibraryRefreshPlan(metadataPaths: metadata, refreshPaths: refresh, reconcileFileIDs: reconcile, evidence: evidence)
+        return LibraryRefreshPlan(indexedFiles: indexedFiles, metadataPaths: metadata, refreshPaths: refresh, reconcileFileIDs: reconcile, evidence: evidence)
     }
 }

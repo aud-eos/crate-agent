@@ -7,8 +7,10 @@ import GRDB
 /// `canUndo` are derived from the set of `EventType` values, not
 /// stored anywhere.
 public struct BatchSummary: Sendable, Equatable, Identifiable {
+    public var id: String {
+        batchId
+    }
 
-    public var id: String { batchId }
     public let batchId: String
     public let firstTimestampMillis: Int64
     public let eventCount: Int
@@ -39,7 +41,6 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
 }
 
 public enum EventHistoryQuery {
-
     static func loadFileHistory(fileID: Int64, in database: GRDB.Database, limit: Int = 200, offset: Int = 0) throws -> [EventRecord] {
         precondition(limit > 0 && offset >= 0)
         return try EventRecord.filter(Column("file_id") == fileID)
@@ -72,7 +73,7 @@ public enum EventHistoryQuery {
         struct Row: FetchableRecord, Decodable {
             let batchId: String
             let firstTimestamp: Int64
-            let eventTypes: String   // comma-separated EventType raw values
+            let eventTypes: String // comma-separated EventType raw values
             let eventCount: Int
         }
 
@@ -80,16 +81,16 @@ public enum EventHistoryQuery {
         // total event count, and a delimited list of event types so
         // we can derive the description in Swift.
         let sql = """
-            SELECT
-                batch_id AS batchId,
-                MIN(timestamp) AS firstTimestamp,
-                GROUP_CONCAT(event_type) AS eventTypes,
-                COUNT(*) AS eventCount
-            FROM events
-            GROUP BY batch_id
-            ORDER BY MIN(timestamp) DESC
-            LIMIT ?
-            """
+        SELECT
+            batch_id AS batchId,
+            MIN(timestamp) AS firstTimestamp,
+            GROUP_CONCAT(event_type) AS eventTypes,
+            COUNT(*) AS eventCount
+        FROM events
+        GROUP BY batch_id
+        ORDER BY MIN(timestamp) DESC
+        LIMIT ?
+        """
 
         let rows: [Row] = try await database.writer.read { db in
             try Row.fetchAll(db, sql: sql, arguments: [limit])
@@ -173,7 +174,9 @@ public enum EventHistoryQuery {
         var counts: [EventType: Int] = [:]
         for raw in typeRawValues {
             guard let eventType = EventType(rawValue: raw) else { continue }
-            if counts[eventType] == nil { seen.append(eventType) }
+            if counts[eventType] == nil {
+                seen.append(eventType)
+            }
             counts[eventType, default: 0] += 1
         }
         return seen.map { ($0, counts[$0]!) }

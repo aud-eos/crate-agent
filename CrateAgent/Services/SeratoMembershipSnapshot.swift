@@ -100,6 +100,7 @@ final class SeratoMembershipSnapshotReader {
         let locator = locator
         let afterParsing = afterParsing
         let parse = parse
+        let metrics = LibrarySyncMetrics.current
         let task = Task.detached {
             try Task.checkCancellation()
             let directory = locator.seratoDirectory.resolvingSymlinksInPath().standardizedFileURL
@@ -118,6 +119,7 @@ final class SeratoMembershipSnapshotReader {
             }
             let records: [SeratoTrackRecord]
             do {
+                metrics?.record(.parse)
                 records = try parse(sourceURL.path)
             } catch CoreError.IoError {
                 throw SeratoMembershipSnapshotError.sourceUnavailable

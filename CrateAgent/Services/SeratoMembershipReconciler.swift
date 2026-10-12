@@ -63,14 +63,19 @@ actor SeratoMembershipReconciler {
         self.beforeCommit = beforeCommit
     }
 
-    func reconcile(_ snapshot: SeratoMembershipSnapshot, analysis suppliedAnalysis: SeratoConflictAnalysis? = nil) async throws -> ReconciliationSummary {
+    func reconcile(_ snapshot: SeratoMembershipSnapshot, analysis suppliedAnalysis: SeratoConflictAnalysis? = nil, plan: LibraryRefreshPlan? = nil) async throws -> ReconciliationSummary {
         guard !running else { throw SeratoReconciliationError.alreadyReconciling }
         running = true
         defer { running = false }
         try await reader.validate(snapshot)
         let savedPaths = Set(snapshot.records.map { record in SeratoPath.normalized(record.path) })
         let directAuthorization = suppliedAnalysis == nil ? await operationEngine.captureConflictScope() : nil
-        let files = try await FileRecord.loadIdentityProjections(database: database)
+        let files: [FileRecord]
+        if let plan {
+            files = plan.indexedFiles
+        } else {
+            files = try await FileRecord.loadIdentityProjections(database: database)
+        }
         let analysis: SeratoConflictAnalysis
         if let suppliedAnalysis {
             analysis = suppliedAnalysis
@@ -93,6 +98,9 @@ actor SeratoMembershipReconciler {
         summary.pathConflictCount = analysis.conflicts.count
         let batchID = UUID().uuidString
         for file in eligibleFiles {
+            if let plan, let identifier = file.id, !plan.reconcileFileIDs.contains(identifier) {
+                continue
+            }
             try Task.checkCancellation()
             guard let fileID = file.id else { continue }
             guard file.seratoLibraryId == nil || file.seratoLibraryId == snapshot.libraryID else {

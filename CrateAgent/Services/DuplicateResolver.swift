@@ -25,7 +25,6 @@ import Foundation
 /// running). The caller (the UI's Resolve button) is also expected
 /// to gate on `isSeratoRunning` for clearer UX.
 public actor DuplicateResolver {
-
     public struct Outcome: Sendable, Equatable {
         /// The single batch id all events from this resolution
         /// share. Hand to the History view for cross-reference.
@@ -146,5 +145,4 @@ public actor DuplicateResolver {
             errors: errors
         )
     }
-
 }

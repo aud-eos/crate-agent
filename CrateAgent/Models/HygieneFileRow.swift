@@ -20,7 +20,6 @@ import GRDB
 public struct HygieneFileRow:
     Codable, FetchableRecord, Hashable, Identifiable, Sendable
 {
-
     public static let databaseTableName = "files"
     public static let databaseColumnDecodingStrategy =
         DatabaseColumnDecodingStrategy.convertFromSnakeCase
@@ -42,10 +41,10 @@ public struct HygieneFileRow:
     /// The column list matches the property names (snake_case in SQL,
     /// camelCase in Swift via the decoding strategy above).
     public static let hygieneFetchSQL = """
-        SELECT id, membership_revision, path, artist, title, album, genre, bpm, musical_key, comment, length, label
-        FROM files
-        WHERE \(FileProcessingEligibility.processableSQL)
-        """
+    SELECT id, membership_revision, path, artist, title, album, genre, bpm, musical_key, comment, length, label
+    FROM files
+    WHERE \(FileProcessingEligibility.processableSQL)
+    """
 
     public init(
         id: Int64? = nil,

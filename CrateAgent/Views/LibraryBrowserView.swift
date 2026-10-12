@@ -123,7 +123,7 @@ struct LibraryBrowserView: View {
                     .foregroundStyle(.secondary)
             } else if isRescanning {
                 ProgressView().controlSize(density.controlSize)
-                Text("Reading saved Serato file info…")
+                Text((services.syncPhase?.rawValue ?? "Checking saved library") + "…")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else if let fingerprintError = services.fingerprintProgress?.error {
@@ -154,7 +154,7 @@ struct LibraryBrowserView: View {
             Spacer()
 
             if isRescanning {
-                Button("Stop Re-scan", role: .cancel) {
+                Button("Stop Sync", role: .cancel) {
                     services.stopLibraryRescan()
                 }
             } else {
