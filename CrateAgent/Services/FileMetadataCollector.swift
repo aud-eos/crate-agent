@@ -49,7 +49,7 @@ public struct FileMetadata: Codable, Sendable, Equatable {
 
 /// Audio paths may be links. Keep both their directory entry and regular target
 /// stable across a read; database V2 deliberately uses the stricter lstat check.
-struct AudioFileReadIdentity: Equatable, Sendable {
+struct AudioFileReadIdentity: Codable, Equatable, Sendable {
     let entry: SeratoSourceIdentity
     let target: SeratoSourceIdentity
     let resolvedPath: String

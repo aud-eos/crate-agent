@@ -569,6 +569,7 @@ public actor OperationEngine {
             return current
         }
         pendingFieldConflicts.formUnion(conflicts)
+        try await finishResolvedEffectFences(Set(captured.map(\.eventId)))
         queueDepthSubject.send(pendingSeratoWrites.count)
         if !conflicts.isEmpty {
             await note("Queued metadata for \((payload.identity.path as NSString).lastPathComponent) was superseded in \(conflicts.count) change(s): saved Serato fields changed or their original external baseline is unknown. Other fields remain queued.")
@@ -1486,6 +1487,7 @@ public actor OperationEngine {
                 pendingSeratoWrites.remove(at: index)
             }
             queueDepthSubject.send(pendingSeratoWrites.count)
+            try await finishResolvedEffectFences([next.eventId])
             try await finishQueuedDuplicateStep(eventID: next.eventId, succeeded: applied.contains(next.eventId))
         }
         let outcome = ResyncOutcome(appliedCount: applied.count,
@@ -1598,7 +1600,45 @@ public actor OperationEngine {
         }
     }
 
+    private var activeEffectEvents: [Int64: Int] = [:]
+
+    private func finishResolvedEffectFences(_ eventIDs: Set<Int64>) async throws {
+        let pending = Set(pendingSeratoWrites.map(\.eventId))
+        let resolved = eventIDs.subtracting(pending).filter { eventID in activeEffectEvents[eventID, default: 0] == 0 }
+        try await database.writer.write { connection in
+            for eventID in resolved {
+                try SyncCheckpointStore.finishEffect(batchID: SyncCheckpointStore.eventFence(eventID), in: connection)
+            }
+        }
+    }
+
     private func applyGuardedSeratoWrites(_ writes: [GuardedSeratoWrite]) async throws -> ResyncOutcome {
+        let eventIDs = Set(writes.map(\.eventId))
+        for eventID in eventIDs {
+            activeEffectEvents[eventID, default: 0] += 1
+        }
+        let outcome: ResyncOutcome
+        do {
+            try await database.writer.write { connection in
+                for eventID in eventIDs {
+                    try SyncCheckpointStore.beginEffect(batchID: SyncCheckpointStore.eventFence(eventID), in: connection)
+                }
+            }
+            outcome = try await applyGuardedSeratoWritesUnchecked(writes)
+        } catch {
+            for eventID in eventIDs {
+                activeEffectEvents[eventID, default: 0] -= 1
+            }
+            throw error
+        }
+        for eventID in eventIDs {
+            activeEffectEvents[eventID, default: 0] -= 1
+        }
+        try await finishResolvedEffectFences(eventIDs)
+        return outcome
+    }
+
+    private func applyGuardedSeratoWritesUnchecked(_ writes: [GuardedSeratoWrite]) async throws -> ResyncOutcome {
         let partition = try await partitionConflictWrites(writes)
         enqueueConflictWrites(partition.blocked)
         let blockedEvents = Set(partition.blocked.map(\.eventId))
@@ -2262,6 +2302,9 @@ public actor OperationEngine {
             try readiness?.requireUnconflicted(target)
         }
         try scopeAuthorization?.check()
+        for write in result.seratoWrites {
+            try SyncCheckpointStore.beginEffect(batchID: SyncCheckpointStore.eventFence(write.eventId), in: database)
+        }
         return result
     }
 
