@@ -1,9 +1,46 @@
 import Foundation
 
+/// How a recording candidate was found. Fingerprint evidence carries the
+/// AcoustID confidence; metadata evidence carries only the app's own
+/// artist/title text similarity, which is never an audio score.
+enum MatchEvidence: Equatable, Sendable {
+    case fingerprint(acoustID: String, score: Double)
+    case metadataSearch(textScore: Double)
+
+    /// Orders candidates found the same way; never compare across kinds.
+    var rankingScore: Double {
+        switch self {
+        case let .fingerprint(_, score): score
+        case let .metadataSearch(textScore): textScore
+        }
+    }
+
+    var acoustID: String? {
+        switch self {
+        case let .fingerprint(acoustID, _): acoustID
+        case .metadataSearch: nil
+        }
+    }
+
+    var isMetadataSearch: Bool {
+        if case .metadataSearch = self {
+            return true
+        }
+        return false
+    }
+}
+
 struct RecordingAlternative: Equatable, Identifiable, Sendable {
     let recordingID: String
-    let acoustID: String
-    let score: Double
+    let evidence: MatchEvidence
+    var score: Double {
+        evidence.rankingScore
+    }
+
+    var acoustID: String? {
+        evidence.acoustID
+    }
+
     var id: String {
         recordingID
     }
@@ -33,7 +70,7 @@ struct RecordingAlternatives: Equatable, Sendable {
     init(results: [AcoustIDResult]) {
         let ranked = results.flatMap { result in
             result.recordingIDs.map { recordingID in
-                RecordingAlternative(recordingID: recordingID, acoustID: result.id, score: result.score)
+                RecordingAlternative(recordingID: recordingID, evidence: .fingerprint(acoustID: result.id, score: result.score))
             }
         }.sorted { first, second in
             if first.score != second.score {
@@ -42,10 +79,23 @@ struct RecordingAlternatives: Equatable, Sendable {
             if first.recordingID != second.recordingID {
                 return first.recordingID < second.recordingID
             }
-            return first.acoustID < second.acoustID
+            return (first.acoustID ?? "") < (second.acoustID ?? "")
         }
         var seen: Set<String> = []
         entries = ranked.filter { entry in seen.insert(entry.recordingID).inserted }
+    }
+
+    /// Candidates from a MusicBrainz artist/title search, already ranked
+    /// by `MetadataMatchRanker`.
+    init(metadataMatches: [MetadataRecordingMatch]) {
+        var seen: Set<String> = []
+        entries = metadataMatches
+            .filter { match in seen.insert(match.details.id).inserted }
+            .map { match in RecordingAlternative(recordingID: match.details.id, evidence: .metadataSearch(textScore: match.textScore)) }
+    }
+
+    var isMetadataSearch: Bool {
+        entries.first?.evidence.isMetadataSearch ?? false
     }
 
     func collapsed(using details: [String: MBRecordingDetails]) -> [RecordingAlternative] {

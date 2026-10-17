@@ -185,6 +185,71 @@ final class AutoTaggerServiceTests: XCTestCase {
         FingerprintEncoder.base64(fromStoredBytes: FingerprintEncoder.serialize(hashes))!
     }
 
+    private func taggedReader(artist: String?, title: String?) -> AudioTagsReading {
+        { _ in
+            AudioTags(bitrateKbps: nil, title: title, artist: artist, album: nil, albumArtist: nil, genre: nil, year: nil,
+                      trackNumber: nil, totalTracks: nil, bpm: nil, comment: nil, durationSeconds: 200)
+        }
+    }
+
+    func testEmptyAcoustIDAnswerSearchesEmbeddedArtistAndTitleAndYieldsReviewOnlyMetadataCandidate() async throws {
+        let database = try makeDatabase()
+        let fileID = try insertFile(in: database, path: "/music/voodoo-intro.mp3")
+        let searches = SearchRecorder()
+        let hits = [
+            MBRecordingDetails(id: "base", title: "Voodoo Ray", creditedArtistName: "A Guy Called Gerald", disambiguation: nil, durationMilliseconds: nil),
+            MBRecordingDetails(id: "intro", title: "Voodoo Ray (Intro)", creditedArtistName: "A Guy Called Gerald", disambiguation: nil, durationMilliseconds: nil),
+        ]
+        let recording = makeRecording(title: "Voodoo Ray (Intro)", artistName: "A Guy Called Gerald")
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in [AcoustIDResult(id: "fingerprint-without-recordings", score: 0.95, recordingIDs: [])] },
+            musicBrainzClient: StubMusicBrainzClient(search: { artist, title in searches.record(artist, title); return hits }) { _ in recording },
+            keyStore: StubKeyProvider(), audioTagsReader: taggedReader(artist: "A Guy Called Gerald", title: "Voodoo Ray (Intro)")
+        )
+        await service.run(fileIDs: [fileID])
+
+        XCTAssertEqual(searches.calls, [["A Guy Called Gerald", "Voodoo Ray"]], "Search the base title; the version label only ranks")
+        guard case let .weak(candidate) = service.rows[fileID] else { return XCTFail("Metadata candidates must never classify strong: \(String(describing: service.rows[fileID]))") }
+        XCTAssertEqual(candidate.recordingMBID, "intro")
+        XCTAssertTrue(candidate.evidence.isMetadataSearch)
+        XCTAssertNil(service.matchAssessment(for: candidate), "No audio assessment, so no bulk approval")
+        let payload = AutoTagRowModel(candidate: candidate).payload()
+        XCTAssertNil(payload.acoustID, "A text match must not store an AcoustID identifier")
+        XCTAssertEqual(payload.recordingMBID, "intro")
+        XCTAssertEqual(service.recordingAlternatives[fileID]?.entries.map(\.recordingID), ["intro", "base"])
+    }
+
+    func testMetadataSearchRunsOnlyAfterSuccessfulEmptyAcoustIDAnswerWithBothTags() async throws {
+        let recording = makeRecording()
+        let cases: [(name: String, acoustID: @Sendable (String) throws -> [AcoustIDResult], artist: String?, title: String?)] = [
+            ("audio candidates", { _ in [AcoustIDResult(id: "match", score: 0.99, recordingIDs: ["recording"])] }, "Artist", "Song"),
+            ("missing artist", { _ in [] }, nil, "Song"),
+            ("blank title", { _ in [] }, "Artist", "  "),
+            ("AcoustID failure", { _ in throw LookupError.transport("AcoustID body error") }, "Artist", "Song"),
+        ]
+        for scenario in cases {
+            let database = try makeDatabase()
+            let fileID = try insertFile(in: database, path: "/music/\(scenario.name).mp3")
+            let service = AutoTaggerService(
+                database: database, acoustIDClient: StubAcoustIDClient(handler: scenario.acoustID),
+                musicBrainzClient: StubMusicBrainzClient { _ in recording },
+                keyStore: StubKeyProvider(), audioTagsReader: taggedReader(artist: scenario.artist, title: scenario.title)
+            )
+            await service.run(fileIDs: [fileID])
+            switch (scenario.name, service.rows[fileID]) {
+            case let ("audio candidates", .strong(candidate)):
+                XCTAssertFalse(candidate.evidence.isMetadataSearch)
+            case ("missing artist", .noMatch), ("blank title", .noMatch):
+                break
+            case let ("AcoustID failure", .failed(reason)):
+                XCTAssertTrue(reason.contains("AcoustID body error"), reason)
+            default:
+                XCTFail("\(scenario.name): \(String(describing: service.rows[fileID]))")
+            }
+        }
+    }
+
     private func makeRecording(
         title: String = "Test Title",
         artistName: String = "Test Artist",
@@ -1434,10 +1499,22 @@ private struct StubAcoustIDClient: AcoustIDLookupClient {
 }
 
 private struct StubMusicBrainzClient: MusicBrainzLookupClient {
+    let searchHandler: @Sendable (String, String) throws -> [MBRecordingDetails]
     let handler: @Sendable (String) throws -> MBRecording
+
+    init(search searchHandler: @escaping @Sendable (String, String) throws -> [MBRecordingDetails] = { _, _ in
+        throw LookupError.transport("unexpected MusicBrainz metadata search")
+    }, handler: @escaping @Sendable (String) throws -> MBRecording) {
+        self.searchHandler = searchHandler
+        self.handler = handler
+    }
 
     func recording(mbid: String) async throws -> MBRecording {
         try handler(mbid)
+    }
+
+    func searchRecordings(artist: String, title: String) async throws -> [MBRecordingDetails] {
+        try searchHandler(artist, title)
     }
 }
 
@@ -1517,5 +1594,18 @@ private actor AsyncGate {
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
         }
+    }
+}
+
+private final class SearchRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [[String]] = []
+
+    var calls: [[String]] {
+        lock.withLock { recorded }
+    }
+
+    func record(_ artist: String, _ title: String) {
+        lock.withLock { recorded.append([artist, title]) }
     }
 }

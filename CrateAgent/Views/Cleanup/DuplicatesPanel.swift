@@ -6,7 +6,6 @@ struct DuplicatesPanel: View {
 
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var mode: DuplicateFinder.Mode = .byteLevel
     @State private var results = ListResultSelection<ScannedGroup>()
@@ -45,6 +44,11 @@ struct DuplicatesPanel: View {
     /// radio toggle invalidated all visible rows, fanning out to
     /// hundreds of redundant picker invocations per click.
     @State private var keeperIdByGroup: [String: Int64] = [:]
+    /// Bumped by every rescan so a slower, older scan can't overwrite
+    /// the results of a newer one (live updates and Rescan overlap).
+    @State private var scanGeneration = 0
+    /// Coalesces bursts of fingerprint writes into one rescan.
+    private static let liveRescanInterval: Duration = .milliseconds(1500)
 
     private struct BatchProgress: Equatable {
         var trashed: Int
@@ -67,10 +71,7 @@ struct DuplicatesPanel: View {
         VStack(spacing: 0) {
             PageHeading("Duplicate tracks", subtitle: "Choose one keeper per group. Review the other copies before moving them to Trash.")
                 .padding(density.pagePadding)
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before resolving duplicates.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("resolving duplicates"))
             modeBar.disabled(isScanning || isResolving)
             Divider()
             ResultListHeader(results: $results, enabled: !isScanning && !isResolving)
@@ -83,6 +84,7 @@ struct DuplicatesPanel: View {
             }
         }
         .task { await rescan() }
+        .task { await rescanAsLibraryChanges() }
         .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
         // Cache invalidation: when the group set changes (after a
         // rescan, or after a resolve removed files) or the user
@@ -152,10 +154,9 @@ struct DuplicatesPanel: View {
                 Label("Move \(totalNonKeeperCount) duplicate files to Trash", systemImage: "trash")
                     .labelStyle(.titleAndIcon)
             }
-            .disabled(isScanning || isResolving || seratoWatchdog.isSeratoRunning || totalNonKeeperCount == 0)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
-                : "Trash every non-keeper across selected groups in one undoable-as-an-audit-log batch.")
+            .disabled(isScanning || isResolving || totalNonKeeperCount == 0)
+            .seratoWriteGated(help: "Trash every non-keeper across selected groups in one undoable-as-an-audit-log batch.",
+                              runningHelp: SeratoGateMessages.duplicateResolveBlocked)
         }
         .background(Color.secondary.opacity(0.06))
     }
@@ -242,10 +243,9 @@ struct DuplicatesPanel: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .controlSize(density.controlSize)
-                .disabled(isResolving || seratoWatchdog.isSeratoRunning || conflictReason(group) != nil)
-                .help(seratoWatchdog.isSeratoRunning
-                    ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
-                    : "Move non-keepers in this group to Trash and remove their Serato references in one batch.")
+                .disabled(isResolving || conflictReason(group) != nil)
+                .seratoWriteGated(help: "Move non-keepers in this group to Trash and remove their Serato references in one batch.",
+                                  runningHelp: SeratoGateMessages.duplicateResolveBlocked)
             }
             if let reason = conflictReason(group) {
                 Text(reason).font(.callout).foregroundStyle(.orange)
@@ -403,16 +403,57 @@ struct DuplicatesPanel: View {
         }
     }
 
-    private func rescan() async {
-        isScanning = true
-        defer { isScanning = false }
-        actionError = nil
+    /// Rescans while the panel is visible whenever fingerprints land or
+    /// files change, at most once per `liveRescanInterval`. Resolving
+    /// rescans on completion, so changes during a resolve are covered.
+    private func rescanAsLibraryChanges() async {
+        let changes = AsyncStream<Error?>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let observation = DuplicateScanObservation.start(in: services.database, onChange: {
+            changes.continuation.yield(nil)
+        }, onError: { error in
+            changes.continuation.yield(error)
+            changes.continuation.finish()
+        })
+        defer { observation.cancel() }
+        for await failure in changes.stream {
+            if let failure {
+                actionError = "Live duplicate updates stopped: \(failure.localizedDescription). Use Rescan to refresh."
+                return
+            }
+            do {
+                try await Task.sleep(for: Self.liveRescanInterval)
+            } catch {
+                return
+            }
+            if !isResolving {
+                await rescan(showingProgress: false)
+            }
+        }
+    }
+
+    /// `showingProgress` is false for live updates, which must neither
+    /// flash the scanning state nor clear a resolve error on screen.
+    private func rescan(showingProgress: Bool = true) async {
+        scanGeneration += 1
+        let generation = scanGeneration
+        if showingProgress {
+            isScanning = true
+            actionError = nil
+        }
+        defer {
+            if showingProgress {
+                isScanning = false
+            }
+        }
         let mode = mode
         do {
             let scan = try await services.database.writer.read { database in
                 try (groups: DuplicateFinder.findDuplicates(in: database, mode: mode), coverage: DuplicateFinder.fingerprintCoverage(in: database))
             }
-            groups = scan.groups
+            guard generation == scanGeneration else { return }
+            if scan.groups != groups {
+                groups = scan.groups
+            }
             fingerprintCoverage = scan.coverage
             // Drop overrides for groups that no longer exist after
             // the rescan — preserves the user's per-group picks for

@@ -4,7 +4,6 @@ import SwiftUI
 struct WhitespacePanel: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var files: [HygieneFileRow] = []
@@ -26,10 +25,7 @@ struct WhitespacePanel: View {
         VStack(spacing: 0) {
             PageHeading("Whitespace", subtitle: "Review visible whitespace changes before applying fixes to library fields.")
                 .padding(density.pagePadding)
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before fixing whitespace.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("fixing whitespace"))
             Text(WhitespacePreview.legend)
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -91,10 +87,8 @@ struct WhitespacePanel: View {
                 Task { await fixAll() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(results.selectedIDs.isEmpty || isScanning || isFixing || seratoWatchdog.isSeratoRunning)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                : "Trim whitespace from every flagged field in one undoable batch.")
+            .disabled(results.selectedIDs.isEmpty || isScanning || isFixing)
+            .seratoWriteGated(help: "Trim whitespace from every flagged field in one undoable batch.", runningHelp: SeratoGateMessages.cleanupApplyBlocked)
         }
     }
 
