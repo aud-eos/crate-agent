@@ -128,7 +128,7 @@ final class DurableSeratoQueueTests: XCTestCase {
             }
         }
         let group = DuplicateFinder.DuplicateGroup(groupKey: "restart", mode: .byteLevel, files: [keeper, target])
-        let outcome = try await DuplicateResolver(operationEngine: first).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "restart-cleanup")
+        let outcome = try await DuplicateResolver(operationEngine: first, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "restart-cleanup")
         try await fixture.database.writer.write { database in database.trace(nil) }
         XCTAssertTrue(fixture.lifecycle.running, "The real mutation boundary must restart Serato")
         XCTAssertEqual(outcome.trashedCount, 0)
@@ -219,7 +219,7 @@ final class DurableSeratoQueueTests: XCTestCase {
             """)
         }
         let group = DuplicateFinder.DuplicateGroup(groupKey: "interrupted", mode: .byteLevel, files: [keeper, target])
-        _ = try await DuplicateResolver(operationEngine: first).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "interrupted-trash")
+        _ = try await DuplicateResolver(operationEngine: first, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "interrupted-trash")
         try await fixture.database.writer.write { database in try database.execute(sql: "DROP TRIGGER crash_after_trash") }
         XCTAssertEqual(recorder.trashed, [target.path])
 
