@@ -322,11 +322,12 @@ final class DurableSeratoQueueTests: XCTestCase {
         try await fixture.engine.apply(.removeFileFromCrates(.init(fileId: removedID)))
         setRunning(fixture, false)
         let queued = try await fixture.engine.pendingSeratoWriteCount
+        XCTAssertEqual(queued, 4)
         let savedLibrary = try Data(contentsOf: fixture.locator.databaseV2Url)
         try FileManager.default.removeItem(at: fixture.locator.databaseV2Url)
 
         await XCTAssertThrowsErrorAsync(try await fixture.engine.drainPendingSeratoUpdates()) { error in
-            XCTAssertEqual(error as? OperationEngineError, .seratoDatabaseMissing(path: fixture.locator.databaseV2Url.path, waitingCount: 4))
+            XCTAssertEqual(error as? OperationEngineError, .seratoDatabaseMissing(path: fixture.locator.databaseV2Url.path, waitingCount: queued))
         }
         let stillQueued = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(stillQueued, queued)

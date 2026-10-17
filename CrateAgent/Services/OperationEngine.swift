@@ -1935,7 +1935,7 @@ public actor OperationEngine {
     /// row records that same error, so the count and message agree.
     private func failures(of run: SegmentRun) async throws -> [Error] {
         guard !run.awaitingDatabase.isEmpty else { return run.failures }
-        let missing = OperationEngineError.seratoDatabaseMissing(path: seratoLocator.databaseV2Url.path, waitingCount: Set(run.awaitingDatabase.map(\.eventId)).count)
+        let missing = OperationEngineError.seratoDatabaseMissing(path: seratoLocator.databaseV2Url.path, waitingCount: run.awaitingDatabase.count)
         try await recordFailure(run.awaitingDatabase, error: missing)
         return [missing] + run.failures
     }
@@ -1967,6 +1967,9 @@ public actor OperationEngine {
         /// pass waits too, so the pass reports one consistent state.
         var awaitingDatabase: [GuardedSeratoWrite] = []
         var databaseMissing = false
+        /// The files and paths of rows held for `database V2`; a later row
+        /// sharing one waits for it too, and is counted with it.
+        var heldForDatabase = SeratoQueueDependency()
         /// A batched segment that failed failed on its store, so later
         /// segments of that kind in the pass would fail the same way.
         var failedBatchKinds = Set<SeratoWriteSegment.Kind>()
@@ -2011,6 +2014,10 @@ public actor OperationEngine {
             if entry.dependency.intersects(run.blocked) {
                 run.block(entry.write, dependency: entry.dependency)
             } else if entry.dependency.intersects(run.waiting) || claimedQueueIDs[queueID] != nil {
+                if entry.dependency.intersects(run.heldForDatabase) {
+                    run.awaitingDatabase.append(entry.write)
+                    run.heldForDatabase.formUnion(entry.dependency)
+                }
                 run.wait(entry.write, dependency: entry.dependency)
             } else {
                 dependencies[queueID] = entry.dependency
@@ -2063,6 +2070,7 @@ public actor OperationEngine {
             for write in rows {
                 if write.write.writesSeratoLibrary || dependency(of: write).intersects(heldDependency) {
                     heldDependency.formUnion(dependency(of: write))
+                    run.heldForDatabase.formUnion(dependency(of: write))
                     run.awaitingDatabase.append(write)
                     run.wait(write, dependency: dependency(of: write))
                 } else {
