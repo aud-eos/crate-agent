@@ -110,6 +110,7 @@ public actor OperationEngine {
     struct MutationContext: Sendable {
         let readiness: LibrarySyncReadiness?
         let locator: SeratoLibraryLocator
+        let watchdog: SeratoWatchdog
         var cleanupTargetFileID: Int64?
     }
 
@@ -164,7 +165,7 @@ public actor OperationEngine {
         self.seratoAddTrackBatchWriter = seratoAddTrackBatchWriter
         self.fileTrasher = fileTrasher
         self.activityLog = activityLog
-        mutationContext = MutationContext(readiness: readiness, locator: seratoLocator)
+        mutationContext = MutationContext(readiness: readiness, locator: seratoLocator, watchdog: seratoWatchdog)
     }
 
     private func note(_ message: String) async {
@@ -1484,7 +1485,10 @@ public actor OperationEngine {
     /// `emitting` selects what the writes are for. Field ownership (`false`)
     /// counts every field an event applied, including file-tag fields it left
     /// out because the file already held them (#114); a replay (`true`) emits
-    /// only what the event actually wrote.
+    /// only what the event actually wrote. The revert of such a match is
+    /// credited with those fields as well. That is harmless: an omitted
+    /// field's pre-match value equals the match value, so the restore and
+    /// the match agree on it.
     private static func resyncWrites(
         for event: EventRecord,
         pathByFileId: [Int64: String],
@@ -3034,8 +3038,10 @@ public actor OperationEngine {
         if let target {
             try readiness?.requireUnconflicted(target)
         }
+        let externalWritesQueue = context.watchdog.isRunningForExternalWrite || readiness?.permitsExternalWrites == false
         let result = try executeAndLogUnchecked(mutation: mutation, batchId: batchId, in: database,
-                                                physicalMoves: physicalMoves, expectedPhysicalSource: expectedPhysicalSource)
+                                                physicalMoves: physicalMoves, expectedPhysicalSource: expectedPhysicalSource,
+                                                externalWritesQueue: externalWritesQueue)
         if let target {
             try readiness?.requireUnconflicted(target)
         }
@@ -3051,7 +3057,8 @@ public actor OperationEngine {
         batchId: String,
         in database: GRDB.Database,
         physicalMoves: PhysicalFileMoveTransaction? = nil,
-        expectedPhysicalSource: SeratoSourceIdentity? = nil
+        expectedPhysicalSource: SeratoSourceIdentity? = nil,
+        externalWritesQueue: Bool
     ) throws -> GuardedExecutionResult {
         if let fileID = mutation.processingFileID {
             guard let file = try FileRecord.fetchOne(database, key: fileID) else {
@@ -3074,7 +3081,7 @@ public actor OperationEngine {
             effectiveMutation = .renameFile(RenameFilePayload(fileId: payload.fileId, newPath: payload.newPath,
                                                               previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true))
         }
-        let result = try executeMutation(mutation: effectiveMutation, batchId: batchId, in: database)
+        let result = try executeMutation(mutation: effectiveMutation, batchId: batchId, in: database, externalWritesQueue: externalWritesQueue)
         guard !result.seratoWrites.isEmpty else {
             return GuardedExecutionResult(eventId: result.eventId, seratoWrites: [])
         }
@@ -3099,7 +3106,8 @@ public actor OperationEngine {
     private static func executeMutation(
         mutation: TrackMutation,
         batchId: String,
-        in db: GRDB.Database
+        in db: GRDB.Database,
+        externalWritesQueue: Bool
     ) throws -> ExecutionResult {
         let timestampMillis = Int64(Date().timeIntervalSince1970 * 1000)
         switch mutation {
@@ -3189,7 +3197,7 @@ public actor OperationEngine {
             )
         case let .applyMusicBrainzMatch(payload):
             let (eventId, seratoWrites) = try applyMusicBrainzMatch(
-                payload, batchId: batchId, timestamp: timestampMillis, in: db
+                payload, batchId: batchId, timestamp: timestampMillis, in: db, tagWriteQueues: externalWritesQueue
             )
             return ExecutionResult(eventId: eventId, seratoWrites: seratoWrites)
         case let .revertMusicBrainzMatch(payload):
@@ -3697,9 +3705,14 @@ public actor OperationEngine {
     /// while the event still owns them. A tag write still queued for the file
     /// will change it first, and a file whose journaled identity moved since
     /// review was rewritten after the capture (a tag write that landed while
-    /// apply was suspended), so then nothing is left out.
-    private static func fileTagFieldsAlreadyOnDisk(_ payload: ApplyMusicBrainzMatchPayload, file: FileRecord, in db: GRDB.Database) throws -> Set<MatchFileTagField> {
-        guard payload.expectedFileSize == file.fileSize, payload.expectedMtime == file.mtime else { return [] }
+    /// apply was suspended), so then nothing is left out. Nor is anything left
+    /// out of a write that will queue: Serato or an edit can change the file
+    /// before it drains, and only a full write is refused visibly by the
+    /// physical-target check then (#207).
+    private static func fileTagFieldsAlreadyOnDisk(_ payload: ApplyMusicBrainzMatchPayload, file: FileRecord, tagWriteQueues: Bool,
+                                                   in db: GRDB.Database) throws -> Set<MatchFileTagField>
+    {
+        guard !tagWriteQueues, payload.expectedFileSize == file.fileSize, payload.expectedMtime == file.mtime else { return [] }
         let queuedTagWrite = try SeratoWriteQueue.fetch(fileID: payload.fileID, in: db).contains { queued in queued.write.kind == .fileTagWrite }
         guard !queuedTagWrite else { return [] }
         let unchanged = SeratoMetadata(
@@ -3735,7 +3748,8 @@ public actor OperationEngine {
         _ payload: ApplyMusicBrainzMatchPayload,
         batchId: String,
         timestamp: Int64,
-        in db: GRDB.Database
+        in db: GRDB.Database,
+        tagWriteQueues: Bool
     ) throws -> (Int64, [SeratoPendingWrite]) {
         guard var fileRecord = try FileRecord.fetchOne(db, key: payload.fileID) else {
             throw OperationEngineError.fileNotFound(fileId: payload.fileID)
@@ -3871,7 +3885,7 @@ public actor OperationEngine {
         forwardPayload.previousFileYear = payload.currentFileYear
         forwardPayload.previousTrackIdentifiers = previousTrackIdentifiers
         forwardPayload.createdTrackRow = createdTrackRow
-        forwardPayload.fileTagFieldsAlreadyOnDisk = try fileTagFieldsAlreadyOnDisk(payload, file: fileRecord, in: db)
+        forwardPayload.fileTagFieldsAlreadyOnDisk = try fileTagFieldsAlreadyOnDisk(payload, file: fileRecord, tagWriteQueues: tagWriteQueues, in: db)
 
         let inversePayload = RevertMusicBrainzMatchPayload(applied: forwardPayload)
 

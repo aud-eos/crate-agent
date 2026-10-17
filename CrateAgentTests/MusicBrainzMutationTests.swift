@@ -1739,6 +1739,29 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertTrue(recorder.calls.isEmpty)
     }
 
+    func testAnExactConfirmWhileSeratoRunsStillQueuesEveryTagField() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder, seratoIsRunning: true)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: "Nas", title: "Halftime", album: "Illmatic", year: 1994,
+                currentFileYear: 1994, currentFileArtist: "Nas", currentFileTitle: "Halftime", currentFileAlbum: "Illmatic"
+            )),
+            batchId: "exact-confirm-while-running"
+        )
+
+        // Serato can rewrite the file before the queue drains; only a queued
+        // write can then be refused visibly instead of leaving its tags.
+        let queueDepth = try await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queueDepth, 2, "The file-tag write was left out while Serato runs")
+        await runningState?.stop()
+        try await engine.drainPendingSeratoUpdates()
+        XCTAssertEqual(recorder.calls.map(\.update.title), ["Halftime"])
+    }
+
     func testAFileRewrittenSinceReviewGetsEveryAppliedField() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, _, fileId) = try await MainActor.run {

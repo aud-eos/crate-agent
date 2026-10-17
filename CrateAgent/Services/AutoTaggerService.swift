@@ -385,11 +385,11 @@ final class AutoTaggerService: ObservableObject {
         }
 
         // D-A: snapshot the file's ACTUAL on-disk identity as the lookup
-        // sees it now — not the DB-indexed `FileRecord.fileSize`/`mtime`,
-        // which no in-place edit ever updates. This is what apply-time
-        // revalidation (`staleFileIDs`) re-checks against. Falls back to the
-        // indexed values only if the stat fails (the file was just read for
-        // tags, so that's degenerate).
+        // sees it now. The indexed `FileRecord.fileSize`/`mtime` follow our
+        // own tag writes but not an external in-place edit until a rescan.
+        // This is what apply-time revalidation (`staleFileIDs`) re-checks
+        // against. Falls back to the indexed values only if the stat fails
+        // (the file was just read for tags, so that's degenerate).
         let lookupFreshness = await onDiskFreshness(ofFileAt: file.path)
             ?? FileFreshnessSnapshot(fileSize: file.fileSize, mtime: file.mtime)
 
