@@ -48,10 +48,12 @@ public struct SongFamilyService: Sendable {
     }
 
     /// Groups at least two distinct recordings, first linking any unlinked
-    /// file to the recording its fingerprint identifies. Throws
-    /// `SongFamilyError.memberAlreadyInFamily` instead of reassigning a member
-    /// (offer `merge`), and `fingerprintCollision` instead of sharing a
-    /// recording another file or MusicBrainz already claims.
+    /// file to the recording its fingerprint identifies. A recording whose
+    /// family has fewer than two live versions is taken over, dissolving that
+    /// family until undo. Throws `SongFamilyError.memberAlreadyInFamily`
+    /// instead of reassigning a member of a live family (offer `merge`), and
+    /// `fingerprintCollision` instead of sharing a recording another file or
+    /// MusicBrainz already claims.
     public func create(_ members: [SongFamilyMember], representative: SongFamilyMember? = nil) async throws -> SongFamilyResult {
         try await apply(.create(members: members, representative: representative), linking: members, familyId: nil)
     }
@@ -81,6 +83,9 @@ public struct SongFamilyService: Sendable {
         try await apply(.setRepresentative(familyId: familyId, trackId: trackId), familyId: familyId)
     }
 
+    /// Nil for a family with fewer than two live versions: it is dissolved
+    /// as far as the user can tell, though it keeps its members so returning
+    /// files restore it.
     public func family(id: Int64) async throws -> SongFamily? {
         try await database.writer.read { database in try Self.fetchFamily(id: id, in: database) }
     }
@@ -113,7 +118,7 @@ public struct SongFamilyService: Sendable {
         let tracks = try TrackRecord.filter(Column("work_id") == id).filter(sql: SongFamilyMutation.liveTrackSQL).order(Column("id")).fetchAll(database)
         let files = try Row.fetchAll(database, sql: """
         SELECT id, track_id, artist, title, (\(FileProcessingEligibility.processableSQL)) AS available
-        FROM files WHERE track_id IN (SELECT id FROM tracks WHERE work_id = ?)
+        FROM files WHERE track_id IN (SELECT id FROM tracks WHERE work_id = ?) AND \(FileProcessingEligibility.activeSQL)
         ORDER BY available DESC, id
         """, arguments: [id])
         let filesByTrack = Dictionary(grouping: files) { row in row["track_id"] as Int64 }
@@ -129,7 +134,7 @@ public struct SongFamilyService: Sendable {
                 isAvailable: trackFiles.contains { row in row["available"] as Bool }
             )
         }
-        guard let representative = SongFamilyRepresentative.choose(from: members, saved: record.representativeTrackId) else { return nil }
+        guard members.count >= 2, let representative = SongFamilyRepresentative.choose(from: members, saved: record.representativeTrackId) else { return nil }
         let ordered = members.filter { member in member.trackId == representative } + members.filter { member in member.trackId != representative }
         return SongFamily(id: id, savedRepresentativeTrackId: record.representativeTrackId, representativeTrackId: representative, members: ordered)
     }

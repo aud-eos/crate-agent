@@ -26,28 +26,41 @@ rules:
    observation, decide which recording a file is. Grouping only fills a gap:
    it links a non-retired, unlinked file with a current fingerprint to the
    recording that fingerprint identifies, and only when that recording is new
-   or unclaimed. Unclaimed means no other file is linked to it and it has no
+   or unclaimed. Unclaimed means no other non-retired file is linked to it and it has no
    AcoustID, MusicBrainz, or ISRC identifier. Anything else is refused with
    `fingerprintCollision`, naming the other file when there is one. A 120-second
    fingerprint can match two different recordings (Clean and Dirty edits), and
    grouping must not merge them or hand one the other's MusicBrainz identity.
+   Such files share an audio fingerprint, so crate-agent treats them as one
+   recording, and they cannot yet be grouped as separate versions.
 2. **Each grouping link is its own per-file event**
    (`song_family_recording_linked`, with `file_id` set). It shows in the file's
-   History, and undo applies the retired and replaced-file guard to it.
+   History. Its undo and redo check the link itself (rule 3) instead of the
+   general retired and replaced-file guard.
 3. **Undo removes a grouping link only while grouping still owns it.** That is,
    while the file is still linked to that recording and the recording is still
    unclaimed. Once a later match claims it, undo keeps the link (the match owns
-   it now) and still undoes the membership. Redo re-creates a link only under
-   rule 1.
+   it now) and still undoes the membership. A retired file also keeps its link,
+   as retirement keeps every file's link, so undoing a group never waits for a
+   file to return. Redo re-creates a link only under rule 1.
 4. **Live members.** A member counts only while at least one non-retired file is
    linked to it. A member whose last file is retired, replaced, or re-matched to
    another recording keeps its assignment silently, so undoing that change
    brings it back. Members without files never count toward the version count,
    the two-member minimum, or the displayed representative. A change that
-   dissolves a family clears them too.
+   dissolves a family clears them too. A family with fewer than two live
+   members is dissolved as far as the user can tell: `family(id:)` returns nil
+   and Library offers no family commands for it, while its assignments wait for
+   files to return.
 5. **Membership never moves silently.** Adding a recording that is already in
-   the family is a no-op. A live recording in another family is refused with
-   `memberAlreadyInFamily`, and the client offers `merge` instead.
+   the family is a no-op. A recording in another family with two or more live
+   members is refused with `memberAlreadyInFamily`, which names that family's
+   versions, and the client offers `merge` instead. A recording whose family has
+   fewer than two live members is taken over: the change dissolves that family
+   in the same journaled event, so undo restores it.
+
+Refusals name files and recordings by title, or by file name when a file has
+no title.
 
 ## API
 
