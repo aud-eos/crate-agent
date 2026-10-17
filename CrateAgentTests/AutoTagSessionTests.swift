@@ -12,10 +12,10 @@ final class AutoTagSessionTests: XCTestCase {
         let freshness = SessionFreshnessSuspension(started: started)
         let fixture = try SessionFixture(fileCount: 1, fileFreshnessReader: { freshness.read($0) })
         let recorded = SessionTokenRecorder()
-        let engine = OperationEngine(database: fixture.database,
-                                     seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
-                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
-                                     fileTagWriter: { _, _ in })
+        let engine = try OperationEngine(database: fixture.database,
+                                         seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                         seratoLocator: makeEmptySeratoLibrary(),
+                                         fileTagWriter: { _, _ in })
         let session = AutoTagSession(database: fixture.database, lookupService: fixture.service, applyBatch: { mutations, batchID, tokens in
             await recorded.record(tokens)
             _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens)

@@ -216,7 +216,7 @@ enum SongFamilyRepresentative {
     static func rank(title: String?, isMusicBrainzMatched: Bool) -> Int {
         let annotations = (title.map(TitleMatcher.annotationSegments) ?? []).map { segment in
             ListSearch.normalized(segment).trimmingCharacters(in: .whitespaces)
-        }
+        }.filter { annotation in !isNonVersionAnnotation(annotation) }
         let tier = if annotations.contains(where: isMainVersionLabel) {
             0
         } else if annotations.isEmpty {
@@ -230,9 +230,23 @@ enum SongFamilyRepresentative {
     }
 
     private static let explicitEditLabels: Set<String> = ["dirty", "explicit", "dirty version", "explicit version"]
+    private static let mainVersionTerms: Set<String> = ["main", "original mix", "album version"]
+    private static let creditWords: Set<String> = ["feat", "feat.", "ft", "ft.", "featuring", "with"]
+
+    /// A featured-artist credit, a remaster note, or a bare year names the
+    /// same version as the bare title.
+    private static func isNonVersionAnnotation(_ annotation: String) -> Bool {
+        let firstWord = annotation.split(whereSeparator: { character in character.isWhitespace }).first.map(String.init)
+        if let firstWord, creditWords.contains(firstWord) {
+            return true
+        }
+        return annotation.range(of: #"^((19|20)\d{2}\s+)?(digital(ly)?\s+)?(remaster(ed)?(\s+(version|edition))?(\s+(19|20)\d{2})?|(19|20)\d{2})$"#,
+                                options: .regularExpression) != nil
+    }
 
     private static func isMainVersionLabel(_ annotation: String) -> Bool {
         let firstWord = annotation.split(whereSeparator: { character in character.isWhitespace }).first
-        return firstWord == "main" || firstWord == "original" || annotation == "album version"
+        let isMainLabel = firstWord == "main" || firstWord == "original" || annotation == "album version"
+        return isMainLabel && !TitleMatcher.containsVersionTerm(annotation, excluding: mainVersionTerms)
     }
 }
