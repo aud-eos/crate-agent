@@ -288,9 +288,9 @@ checks the actual target and original content intent, and rechecks after journal
 lookups under writer serialization. Ordered reference renames retain their explicit
 path transition; an unrelated occupant of an old path cannot authorize rewriting
 or removing that occupant's V2/crate references. The one exception is a chain or
-swap within the write set: when a later rename moves a different file into an
-earlier rename's old path, that occupant does not supersede the earlier rename
-(#199). Expected supersession removes only
+swap within one drain pass: when a later rename moves a different file into an
+earlier rename's old path, that occupant does not supersede the earlier rename,
+even when the two land in different bounded segments (#199). Expected supersession removes only
 the obsolete queued work and records a `serato_write_dispositions` row so the drop
 stays visible after a restart; unexpected I/O failure stays visible and retryable.
 
