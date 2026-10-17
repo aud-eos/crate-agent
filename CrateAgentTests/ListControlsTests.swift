@@ -150,8 +150,8 @@ final class ListControlsTests: XCTestCase {
     @MainActor
     func testFilteredMissingBatchWritesOnlyExplicitTargetsIncludingHiddenSelection() async throws {
         let database = try LibraryDatabase.openInMemory()
-        let engine = OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
-                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")), fileTagWriter: { _, _ in })
+        let engine = try OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                         seratoLocator: makeEmptySeratoLibrary(), fileTagWriter: { _, _ in })
         try await database.writer.write { connection in
             for identifier in 1 ... 3 {
                 var file = FileRecord(id: Int64(identifier), path: "/fixture/\(identifier).mp3", volumeUuid: "fixture", inode: Int64(identifier), fileSize: 1, mtime: 1, title: "Keep \(identifier)")

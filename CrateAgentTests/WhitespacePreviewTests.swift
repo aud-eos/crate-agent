@@ -104,10 +104,10 @@ final class WhitespacePreviewTests: XCTestCase {
         ]
         for fixture in cases {
             let database = try LibraryDatabase.openInMemory()
-            let engine = OperationEngine(
+            let engine = try OperationEngine(
                 database: database,
                 seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
-                seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
+                seratoLocator: makeEmptySeratoLibrary(),
                 fileTagWriter: { _, _ in }
             )
             try await engine.apply(.indexNewFile(IndexNewFilePayload(
