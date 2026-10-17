@@ -2100,7 +2100,7 @@ public actor OperationEngine {
                 }
                 rows = try await eligibleWrites(survivors)
                 try await supersedeMissing(from: survivors, keeping: rows, reported: reported, run: &run)
-                    } catch let ExternalWriteInterruption.stale(stale) {
+            } catch let ExternalWriteInterruption.stale(stale) {
                 rows = holdingBack(stale, from: rows, run: &run)
             } catch let ExternalWriteInterruption.conflicted(conflicted) {
                 var survivors: [GuardedSeratoWrite] = []
