@@ -12,6 +12,10 @@ enum SeratoWriteDispositionMessages {
         }
     }
 
+    static func unrecognizedSummary(count: Int) -> String {
+        "\(changes(count, "queued")) not applied for a reason this version does not recognize"
+    }
+
     static func historyBadge(count: Int) -> String {
         "\(changes(count, nil)) not applied"
     }

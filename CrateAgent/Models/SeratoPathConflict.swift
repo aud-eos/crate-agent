@@ -126,6 +126,9 @@ struct SeratoPathConflict: Identifiable, Sendable {
     let id: String
     let occurrences: [SeratoConflictOccurrence]
     let fileIDs: Set<Int64>
+    /// For a queued rename onto a path Serato already holds, the saved path
+    /// the rename moves the file from.
+    let renameSource: String?
 }
 
 struct SeratoConflictAnalysis: Sendable {

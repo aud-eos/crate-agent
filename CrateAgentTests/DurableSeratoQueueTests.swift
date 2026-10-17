@@ -154,13 +154,15 @@ final class DurableSeratoQueueTests: XCTestCase {
 
     /// B then C are queued for one file. An interruption leaves C's row behind
     /// after B (or the coalesced B+C) reached V2; the next sync must still end
-    /// at C without reporting our own edit as superseded.
+    /// at C without reporting our own edit as superseded. If nothing was sent
+    /// and the user saved B in Serato themselves, that edit is theirs and wins.
     func testNewestQueuedEditWinsWhenAnEarlierEditLandedBeforeItsRowCleared() async throws {
         let cases: [(interruption: String, renameBetween: Bool, baselineKnown: Bool)] = [
             ("crash during one coalesced rewrite", false, true),
             ("crash before commit", true, true),
             ("Serato relaunched", true, true),
             ("Serato relaunched, baseline unknown", true, false),
+            ("Serato saved B itself", false, true),
         ]
         for testCase in cases {
             let label = testCase.interruption
@@ -182,7 +184,18 @@ final class DurableSeratoQueueTests: XCTestCase {
                 try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: title), isSeratoAuthoritative: false)))
                 try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: title))))
             }
+            if label == "Serato saved B itself" {
+                try setV2(fixture, path: file.path, title: "Queued B")
+            }
             setRunning(fixture, false)
+            if label == "Serato saved B itself" {
+                let session = makeSession(fixture, engine: fixture.engine)
+                try await session.synchronize()
+                XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first?.title, "Queued B", label)
+                guard case let .ready(summary) = session.state else { return XCTFail("\(label): sync did not reach ready") }
+                XCTAssertEqual(summary.notAppliedWrites[.superseded], 1, label)
+                continue
+            }
             if label.hasPrefix("crash") {
                 try await fixture.database.writer.write { database in
                     try database.execute(sql: """
@@ -411,6 +424,34 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
     }
 
+    /// No sync has observed Serato yet, so only the edit's journal records what
+    /// Serato held before it (#115: A, queued B, unchanged A must apply B).
+    func testQueuedEditUsesItsJournaledPreviousValueWhenNoBaselineWasObserved() async throws {
+        for savedDuringSession in ["Original A", "Serato C"] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav())
+            try save(fixture, paths: [file.path])
+            try setV2(fixture, path: file.path, title: "Original A")
+            let fileID = try XCTUnwrap(file.id)
+            setRunning(fixture, true)
+            try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: "Local B"), isSeratoAuthoritative: false)))
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: "Local B"),
+                                                                         previousMetadata: .init(title: "Original A"))))
+            try setV2(fixture, path: file.path, title: savedDuringSession)
+            setRunning(fixture, false)
+
+            let session = makeSession(fixture, engine: fixture.engine)
+            try await session.synchronize()
+
+            let unchanged = savedDuringSession == "Original A"
+            XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first?.title,
+                           unchanged ? "Local B" : savedDuringSession, savedDuringSession)
+            guard case let .ready(summary) = session.state else { return XCTFail("\(savedDuringSession): sync did not reach ready") }
+            XCTAssertEqual(summary.notAppliedWrites, SeratoWriteDispositionCounts(counts: unchanged ? [:] : [.superseded: 1]), savedDuringSession)
+        }
+    }
+
     func testReplacedTargetIsDroppedVisiblyAcrossRestart() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
@@ -506,6 +547,28 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertEqual(fences, [])
         let header = try await store.loadHeader()
         XCTAssertNotNil(header)
+    }
+
+    /// An outcome written by a newer build must not keep readiness closed
+    /// after a downgrade; it is reported as not applied instead.
+    func testUnrecognizedRecordedOutcomeIsReportedWithoutBlockingSync() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("downgraded.wav", bytes: FinalRemovalIntegrationTests.wav())
+        try save(fixture, paths: [file.path])
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: """
+            INSERT INTO serato_write_dispositions (event_id, batch_id, kind, disposition, detail, created_at, reported)
+            VALUES (1, 'newer-build', 'metadataUpdate', 'deferredByNewerBuild', NULL, 0, 0)
+            """)
+        }
+
+        let session = makeSession(fixture, engine: fixture.engine)
+        // The sync's own error is the failure under test, so the state is asserted.
+        try? await session.synchronize()
+
+        guard case let .ready(summary) = session.state else { return XCTFail("Sync did not reach ready: \(session.state)") }
+        XCTAssertEqual(summary.notAppliedWrites.total, 1)
     }
 
     private func setRunning(_ fixture: SeratoRemovalFixture, _ running: Bool) {

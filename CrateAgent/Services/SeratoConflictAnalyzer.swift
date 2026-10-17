@@ -95,7 +95,7 @@ struct SeratoConflictAnalyzer: Sendable {
                 target.include(files[index])
             }
             scope.protect(target, group: current)
-            conflicts.append(SeratoPathConflict(id: current, occurrences: occurrences, fileIDs: target.fileIDs))
+            conflicts.append(SeratoPathConflict(id: current, occurrences: occurrences, fileIDs: target.fileIDs, renameSource: collision.savedPath))
         }
         for path in duplicatePaths {
             try Task.checkCancellation()
@@ -128,7 +128,7 @@ struct SeratoConflictAnalyzer: Sendable {
                 }
             }
             scope.protect(target, group: path)
-            conflicts.append(SeratoPathConflict(id: path, occurrences: occurrences, fileIDs: target.fileIDs))
+            conflicts.append(SeratoPathConflict(id: path, occurrences: occurrences, fileIDs: target.fileIDs, renameSource: nil))
         }
         return SeratoConflictAnalysis(source: snapshot.source, libraryID: snapshot.libraryID, generation: snapshot.generation, conflicts: conflicts, scope: scope)
     }

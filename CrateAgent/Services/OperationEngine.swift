@@ -76,6 +76,7 @@ public actor OperationEngine {
         case deferred
         case superseded(Set<Int64>)
         case stale(Set<Int64>)
+        case conflicted(Set<Int64>)
     }
 
     private enum DuplicateCleanupInterruption: Error {
@@ -694,8 +695,10 @@ public actor OperationEngine {
         var reduction = QueuedMetadataReduction(overlay: overlay, journaledBaseline: baseline)
         var ownWrittenFields = Set<String>()
         var earlierIntended: [String: Set<String?>] = [:]
+        // Only a row whose I/O was attempted can have landed; an unattempted
+        // row's value in Serato is an external edit that happens to match it.
         let intents: [[String: String?]] = queued.map { guarded in
-            guard case let .metadataUpdate(update) = guarded.write else { return [:] }
+            guard guarded.attempts > 0, case let .metadataUpdate(update) = guarded.write else { return [:] }
             return metadataFieldMap(update.metadata).mapValues { value in value.isEmpty ? nil : value }
         }
         for (position, guarded) in queued.enumerated() {
@@ -731,8 +734,8 @@ public actor OperationEngine {
                     ownWrittenFields.insert(field)
                 }
             }
-            for field in desired.keys {
-                earlierIntended[field, default: []].insert(desired[field].flatMap { value in value.isEmpty ? nil : value })
+            for (field, value) in intents[position] {
+                earlierIntended[field, default: []].insert(value)
             }
             let dropped = Set(desired.keys).subtracting(permitted).subtracting(covered)
             reduction.uncertainFields.formUnion(dropped.subtracting(knownFields))
@@ -752,7 +755,7 @@ public actor OperationEngine {
     }
 
     /// `base` with the named fields copied from `source`, including absent values.
-    private static func merging(_ fields: Set<String>, from source: SeratoMetadata, into base: SeratoMetadata) -> SeratoMetadata {
+    static func merging(_ fields: Set<String>, from source: SeratoMetadata, into base: SeratoMetadata) -> SeratoMetadata {
         SeratoMetadata(artist: fields.contains("artist") ? source.artist : base.artist,
                        title: fields.contains("title") ? source.title : base.title,
                        album: fields.contains("album") ? source.album : base.album,
@@ -1189,6 +1192,21 @@ public actor OperationEngine {
     /// ownership of the audio-tag field.
     private static let fieldOwnershipEventTypes: Set<EventType> =
         metadataOrTagProjectingEventTypes.union([.metadataSet, .fileIdentityObserved])
+
+    /// The V2 values the producing event recorded as current before our edit,
+    /// when it recorded them.
+    static func journaledV2Previous(eventID: Int64, in database: GRDB.Database) throws -> SeratoMetadata? {
+        guard let event = try EventRecord.fetchOne(database, key: eventID) else { return nil }
+        let decoder = JSONDecoder()
+        switch event.eventType {
+        case .metadataCommittedToSerato:
+            return try decodeEventPayload(CommitMetadataToSeratoPayload.self, event: event, decoder: decoder).previousMetadata
+        case .musicBrainzMatchApplied:
+            return try decodeEventPayload(ApplyMusicBrainzMatchPayload.self, event: event, decoder: decoder).previousMetadata
+        default:
+            return nil
+        }
+    }
 
     /// The non-nil fields of a `SeratoMetadata`, keyed by a stable field name.
     /// An empty-string value (a clear) is a real value and IS included.
@@ -1942,6 +1960,16 @@ public actor OperationEngine {
                 try await supersedeMissing(from: survivors, keeping: rows, reported: reported, run: &run)
             } catch let ExternalWriteInterruption.stale(stale) {
                 rows = holdingBack(stale, from: rows, run: &run)
+            } catch let ExternalWriteInterruption.conflicted(conflicted) {
+                var survivors: [GuardedSeratoWrite] = []
+                for write in rows {
+                    if write.queueID.map(conflicted.contains) == true || dependency(of: write).intersects(run.blocked) {
+                        run.block(write, dependency: dependency(of: write))
+                    } else {
+                        survivors.append(write)
+                    }
+                }
+                rows = survivors
             } catch is SeratoPathConflictError {
                 for write in rows {
                     run.block(write, dependency: dependency(of: write))
@@ -2155,9 +2183,7 @@ public actor OperationEngine {
             else {
                 throw ExternalWriteInterruption.deferred
             }
-            for write in writes {
-                try readiness?.requireUnconflicted(SeratoConflictTargets.write(write, in: database))
-            }
+            try Self.requireUnconflicted(writes, readiness: readiness, in: database)
             var superseded = Set<Int64>()
             for write in writes {
                 guard let queueID = write.queueID else { continue }
@@ -2173,9 +2199,7 @@ public actor OperationEngine {
             }
             guard !watchdog.isRunningForExternalWrite,
                   readiness?.permitsExternalWrites(drain: drainAuthorization) != false else { throw ExternalWriteInterruption.deferred }
-            for write in writes {
-                try readiness?.requireUnconflicted(SeratoConflictTargets.write(write, in: database))
-            }
+            try Self.requireUnconflicted(writes, readiness: readiness, in: database)
             let result = try operation(database)
             if completing {
                 try Self.completeQueuedWrites(writes, locator: locator, in: database)
@@ -2188,6 +2212,22 @@ public actor OperationEngine {
         let eligible = try await eligibleWrites(writes)
         guard eligible.count == writes.count, await !(seratoWatchdog.isSeratoRunning), readiness?.permitsExternalWrites != false else {
             throw ExternalWriteInterruption.deferred
+        }
+        let readiness = readiness
+        try await database.writer.read { database in try Self.requireUnconflicted(writes, readiness: readiness, in: database) }
+    }
+
+    /// Names every row whose target the conflict scope protects, so a
+    /// coalesced pass can hold back only those rows.
+    private static func requireUnconflicted(_ writes: [GuardedSeratoWrite], readiness: LibrarySyncReadiness?, in database: GRDB.Database) throws {
+        guard let readiness, readiness.hasConflicts else { return }
+        var conflicted = Set<Int64>()
+        for write in writes where try readiness.conflictPath(for: SeratoConflictTargets.write(write, in: database)) != nil {
+            guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
+            conflicted.insert(queueID)
+        }
+        if !conflicted.isEmpty {
+            throw ExternalWriteInterruption.conflicted(conflicted)
         }
     }
 

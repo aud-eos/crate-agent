@@ -196,3 +196,8 @@ OperationEngine.swift, SeratoWriteEligibility.swift, SyncCheckpointStore.swift, 
   whose old and new paths both have saved records reuses `SeratoPathConflict`
   and the review screen.
 - The History badge is a minimal count of changes not applied, per batch.
+- A saved value counts as our own landed write only for rows with attempts > 0.
+- With no observed baseline, insert uses the event's journaled `previousMetadata`
+  (commit to Serato, MusicBrainz match) for the written fields.
+- The write boundary names every conflicted row (`ExternalWriteInterruption.conflicted`);
+  phase-one classification already blocks rows conflicted when the pass starts.

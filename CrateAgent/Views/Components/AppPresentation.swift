@@ -71,6 +71,7 @@ struct LibrarySyncStatusView: View {
                 + (summary.pathConflictCount > 0 ? " · \(summary.pathConflictCount) path conflicts · \(summary.conflictBlockedWriteCount) changes waiting for repair" : "")
                 + SeratoWriteDisposition.allCases.filter { disposition in summary.notAppliedWrites[disposition] > 0 }
                 .map { disposition in " · " + SeratoWriteDispositionMessages.summary(disposition, count: summary.notAppliedWrites[disposition]) }.joined()
+                + (summary.notAppliedWrites.unrecognized > 0 ? " · " + SeratoWriteDispositionMessages.unrecognizedSummary(count: summary.notAppliedWrites.unrecognized) : "")
                 + (summary.duplicateCleanupMessage.map { " · " + $0 } ?? "")
         }
     }

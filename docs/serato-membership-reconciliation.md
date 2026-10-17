@@ -333,8 +333,11 @@ that row. Consecutive renames share one path batch, and every other write is its
 own segment. Edits to the same record are merged in queue order before the batch
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
-write, so it is neither reapplied nor reported. A failed segment fails all of its
-rows together and blocks their dependents.
+write, so it is neither reapplied nor reported. Both landed-write rules apply only
+to rows whose I/O was attempted: a saved value matching an unsent edit is the
+user's own Serato edit and wins. A failed segment fails all of its rows together
+and blocks their dependents; a row whose target becomes conflicted at the write
+boundary is blocked alone with its dependents, and the rest of the segment applies.
 
 A file with a queued rename is observed at the path Serato still holds: the
 record at the oldest pending rename's old path supplies that file's saved
@@ -342,14 +345,17 @@ metadata, so a Serato edit made there is kept rather than overwritten by the
 rename. When Serato holds records at both the old and the new path, the rename
 is a path conflict: it appears in **Review conflicts** and its writes stay queued.
 
-A queued edit whose captured baseline is unknown learns the fields of an earlier
-edit of ours once that edit lands, so it applies instead of being dropped as
-uncertain. An interrupted cleanup Trash finishes on restart only when its last
+When no baseline was observed, a queued edit takes the pre-edit values its event
+journaled (`previousMetadata`) as the baseline for the fields it writes; a field
+an earlier queued edit still owes takes that edit's baseline instead. A queued
+edit whose baseline is still unknown learns the fields of an earlier edit of ours
+once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its last
 attempt left no error; a failed Trash attempt is not proof the audio moved.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, or legacy unrecoverable) once, and turns to a
-warning. History marks a batch with the number of its changes that were not
+warning. An outcome this version does not recognize, such as one recorded by a
+newer build, is counted as not applied rather than blocking readiness. History marks a batch with the number of its changes that were not
 applied.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,

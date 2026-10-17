@@ -77,12 +77,10 @@ struct SeratoQueuedWritePayload: Codable, Equatable, Sendable {
 
 enum SeratoWriteQueueError: LocalizedError {
     case malformedRow(queueID: Int64)
-    case unknownDisposition(String)
 
     var errorDescription: String? {
         switch self {
         case let .malformedRow(queueID): "Queued Serato change \(queueID) is unreadable. Review History before retrying sync."
-        case let .unknownDisposition(value): "A recorded queued-change outcome (\(value)) is not recognized by this version."
         }
     }
 }
@@ -99,8 +97,12 @@ enum SeratoWriteQueue {
     {
         var stored = write
         stored.originalReferencePaths = write.originalReferencePaths.isEmpty ? write.write.referencePaths : write.originalReferencePaths
-        if case .metadataUpdate = write.write, stored.externalBaseline == nil {
-            stored.externalBaseline = try SeratoExternalBaselines.load(token: write.token, identity: write.originalIdentity, locator: locator, in: database)
+        if case let .metadataUpdate(update) = write.write, stored.externalBaseline == nil {
+            if let loaded = try SeratoExternalBaselines.load(token: write.token, identity: write.originalIdentity, locator: locator, in: database) {
+                stored.externalBaseline = loaded
+            } else if let previous = try OperationEngine.journaledV2Previous(eventID: write.eventId, in: database) {
+                (stored.externalBaseline, stored.baselineKnownFields) = try journaledBaseline(previous, for: update, token: write.token, in: database)
+            }
         }
         let payload = try encode(stored)
         let verb = ignoringExisting ? "INSERT OR IGNORE" : "INSERT"
@@ -121,6 +123,29 @@ enum SeratoWriteQueue {
             throw OperationEngineError.insertDidNotReturnRowId
         }
         return try decode(existing)
+    }
+
+    /// With no observed baseline, the producing event's pre-edit values stand
+    /// in for what Serato holds. A field an earlier queued edit of ours still
+    /// owes was never written, so it takes that edit's baseline, or stays
+    /// unknown when that edit's baseline is unknown too.
+    private static func journaledBaseline(_ previous: SeratoMetadata, for update: SeratoPendingMetadataUpdate, token: FileMembershipToken,
+                                          in database: Database) throws -> (SeratoMetadata, Set<String>)
+    {
+        var baseline = previous
+        var known = Set(OperationEngine.metadataFieldMap(update.metadata).keys)
+        var resolved = Set<String>()
+        for earlier in try fetch(fileID: token.fileId, in: database) where earlier.token == token {
+            guard case let .metadataUpdate(owed) = earlier.write else { continue }
+            let shared = Set(OperationEngine.metadataFieldMap(owed.metadata).keys).intersection(known).subtracting(resolved)
+            resolved.formUnion(shared)
+            let carried = shared.filter { field in earlier.knowsBaseline(of: field) }
+            if let earlierBaseline = earlier.externalBaseline {
+                baseline = OperationEngine.merging(carried, from: earlierBaseline, into: baseline)
+            }
+            known.subtract(shared.subtracting(carried))
+        }
+        return (baseline, known)
     }
 
     static func fetchOrdered(in database: Database) throws -> [GuardedSeratoWrite] {
@@ -297,13 +322,16 @@ enum SeratoWriteDisposition: String, Sendable, CaseIterable {
 /// Not-applied queued changes by disposition, each counted once per event.
 struct SeratoWriteDispositionCounts: Sendable, Equatable {
     var counts: [SeratoWriteDisposition: Int] = [:]
+    /// Changes recorded with an outcome this version does not know, such as
+    /// one written by a newer build before a downgrade.
+    var unrecognized = 0
 
     subscript(disposition: SeratoWriteDisposition) -> Int {
         counts[disposition] ?? 0
     }
 
     var total: Int {
-        counts.values.reduce(0, +)
+        counts.values.reduce(unrecognized, +)
     }
 }
 
@@ -326,10 +354,11 @@ enum SeratoWriteDispositions {
     static func takeUnreported(in database: Database) throws -> SeratoWriteDispositionCounts {
         var result = SeratoWriteDispositionCounts()
         for row in try Row.fetchAll(database, sql: "SELECT disposition, COUNT(DISTINCT event_id) AS count FROM serato_write_dispositions WHERE reported = 0 GROUP BY disposition") {
-            guard let disposition = SeratoWriteDisposition(rawValue: row["disposition"]) else {
-                throw SeratoWriteQueueError.unknownDisposition(row["disposition"])
+            if let disposition = SeratoWriteDisposition(rawValue: row["disposition"]) {
+                result.counts[disposition] = row["count"]
+            } else {
+                result.unrecognized += row["count"] as Int
             }
-            result.counts[disposition] = row["count"]
         }
         try database.execute(sql: "UPDATE serato_write_dispositions SET reported = 1 WHERE reported = 0")
         return result
