@@ -181,13 +181,13 @@ dictionary SeratoPathRename {
   string new_path;
 };
 
-// What a `database V2` batch write did. `unmatched_paths` names each
-// requested path whose track the library does not hold afterwards (for a
-// rename, the requested old path), so "nothing to change" is
+// What a Serato batch write did. `unmatched_indices` lists, in order, the
+// position of each request whose track the file does not hold afterwards
+// (for a rename, at its final path), so "nothing to change" is
 // distinguishable from "no such track" (#105).
 dictionary SeratoBatchWriteResult {
   u32 rewritten_count;
-  sequence<string> unmatched_paths;
+  sequence<u32> unmatched_indices;
 };
 
 // One track's metadata update in a `batch_update_database_records`

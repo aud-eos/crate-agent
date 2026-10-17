@@ -160,9 +160,9 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         try save(fixture, paths: [file.path])
         let targetPath = SeratoLibraryLocator.seratoRelativePath(fromAbsolute: file.path)
         let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator, seratoMetadataBatchWriter: { source, updates in
-            let count = try batchUpdateDatabaseRecords(databasePath: source, updates: updates)
+            let result = try batchUpdateDatabaseRecords(databasePath: source, updates: updates)
             _ = try batchUpdateDatabaseRecords(databasePath: source, updates: [.init(trackPath: targetPath, update: .init(artist: "Saved during drain", title: nil, album: nil, genre: nil, bpm: nil, key: nil, comment: nil, length: nil, label: nil))])
-            return count
+            return result
         })
         let session = makeSession(fixture, engine: engine)
         try await session.synchronize()

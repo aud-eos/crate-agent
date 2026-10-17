@@ -28,49 +28,59 @@ pub struct SeratoTrackMetadataUpdate {
     pub update: SeratoMetadataUpdate,
 }
 
-/// What a `database V2` batch write did: how many records it changed, and
-/// which requested paths matched no record, so a caller can tell a write
-/// that had nothing to change from one whose track is not in the library.
+/// What a Serato batch write did: how many records it changed, and which
+/// requests matched no record, so a caller can tell a write that had nothing
+/// to change from one whose track is not in the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeratoBatchWriteResult {
     pub rewritten_count: u32,
-    pub unmatched_paths: Vec<String>,
+    /// Positions in the request list, in order.
+    pub unmatched_indices: Vec<u32>,
 }
 
 impl SeratoBatchWriteResult {
-    fn new(count: usize, unmatched_paths: Vec<String>) -> Self {
+    /// `held_paths` reports which of the `held_at` paths, one per request,
+    /// a track is held at.
+    fn new<'a>(
+        count: usize,
+        held_at: Vec<&'a str>,
+        held_paths: impl FnOnce(Vec<&'a str>) -> HashSet<String>,
+    ) -> Self {
+        let held = held_paths(held_at.clone());
         Self {
             rewritten_count: u32::try_from(count).expect("rewrite count exceeded u32"),
-            unmatched_paths,
+            unmatched_indices: held_at
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| !held.contains(**path))
+                .map(|(index, _)| u32::try_from(index).expect("request index exceeded u32"))
+                .collect(),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            rewritten_count: 0,
+            unmatched_indices: Vec::new(),
         }
     }
 }
 
-/// The requested paths whose track is not held at their `held_at` path,
-/// in request order. `held_paths` reports which `held_at` paths are held.
-fn unmatched<'a>(
-    requested: impl IntoIterator<Item = (&'a str, &'a str)>,
-    held_paths: impl FnOnce(Vec<&'a str>) -> HashSet<String>,
-) -> Vec<String> {
-    let requested: Vec<(&str, &str)> = requested.into_iter().collect();
-    let held = held_paths(requested.iter().map(|(_, held_at)| *held_at).collect());
-    requested
-        .into_iter()
-        .filter(|(_, held_at)| !held.contains(*held_at))
-        .map(|(requested_path, _)| requested_path.to_owned())
-        .collect()
-}
-
-/// Each rename's old path with where its record ends up. A rename missing
-/// from `map` belongs to a chain that ends where it started.
-fn rename_destinations<'a>(
-    renames: &'a [SeratoPathRename],
-    map: &'a HashMap<String, String>,
-) -> impl Iterator<Item = (&'a str, &'a str)> {
-    renames.iter().map(|rename| {
-        let destination = map.get(&rename.old_path).unwrap_or(&rename.old_path);
-        (rename.old_path.as_str(), destination.as_str())
-    })
+/// Where each rename's record ends up: its new path, carried through every
+/// later rename of that path. Read back to front, a record at a rename's old
+/// path ends wherever one at its new path ends after it.
+fn rename_destinations(renames: &[SeratoPathRename]) -> Vec<&str> {
+    let mut final_paths: HashMap<&str, &str> = HashMap::new();
+    let mut destinations = vec![""; renames.len()];
+    for (index, rename) in renames.iter().enumerate().rev() {
+        let destination = final_paths
+            .get(rename.new_path.as_str())
+            .copied()
+            .unwrap_or(&rename.new_path);
+        destinations[index] = destination;
+        final_paths.insert(&rename.old_path, destination);
+    }
+    destinations
 }
 
 /// One track in a `batch_add_tracks_to_database` call.
@@ -233,7 +243,7 @@ pub fn batch_rewrite_database_paths(
     renames: Vec<SeratoPathRename>,
 ) -> Result<SeratoBatchWriteResult, CoreError> {
     if renames.is_empty() {
-        return Ok(SeratoBatchWriteResult::new(0, Vec::new()));
+        return Ok(SeratoBatchWriteResult::empty());
     }
     let map = rename_map(&renames);
     let path = PathBuf::from(database_path);
@@ -242,10 +252,11 @@ pub fn batch_rewrite_database_paths(
     if count > 0 {
         database.write_to_path(&path)?;
     }
-    let unmatched_paths = unmatched(rename_destinations(&renames, &map), |paths| {
-        database.held_paths(paths)
-    });
-    Ok(SeratoBatchWriteResult::new(count, unmatched_paths))
+    Ok(SeratoBatchWriteResult::new(
+        count,
+        rename_destinations(&renames),
+        |paths| database.held_paths(paths),
+    ))
 }
 
 /// Bulk variant of `rewrite_crate_path`. One file read + one file
@@ -257,7 +268,7 @@ pub fn batch_rewrite_crate_paths(
     renames: Vec<SeratoPathRename>,
 ) -> Result<SeratoBatchWriteResult, CoreError> {
     if renames.is_empty() {
-        return Ok(SeratoBatchWriteResult::new(0, Vec::new()));
+        return Ok(SeratoBatchWriteResult::empty());
     }
     let map = rename_map(&renames);
     let path = PathBuf::from(crate_path);
@@ -266,10 +277,11 @@ pub fn batch_rewrite_crate_paths(
     if count > 0 {
         crate_file.write_to_path(&path)?;
     }
-    let unmatched_paths = unmatched(rename_destinations(&renames, &map), |paths| {
-        crate_file.held_paths(paths)
-    });
-    Ok(SeratoBatchWriteResult::new(count, unmatched_paths))
+    Ok(SeratoBatchWriteResult::new(
+        count,
+        rename_destinations(&renames),
+        |paths| crate_file.held_paths(paths),
+    ))
 }
 
 pub fn remove_track_from_database(
@@ -338,7 +350,7 @@ pub fn batch_update_database_records(
     updates: Vec<SeratoTrackMetadataUpdate>,
 ) -> Result<SeratoBatchWriteResult, CoreError> {
     if updates.is_empty() {
-        return Ok(SeratoBatchWriteResult::new(0, Vec::new()));
+        return Ok(SeratoBatchWriteResult::empty());
     }
     let path = PathBuf::from(database_path);
     let mut database = serato::DatabaseV2::read_from_path(&path)?;
@@ -354,13 +366,11 @@ pub fn batch_update_database_records(
     if count > 0 {
         database.write_to_path(&path)?;
     }
-    let unmatched_paths = unmatched(
-        requested
-            .iter()
-            .map(|track_path| (track_path.as_str(), track_path.as_str())),
+    Ok(SeratoBatchWriteResult::new(
+        count,
+        requested.iter().map(String::as_str).collect(),
         |paths| database.held_paths(paths),
-    );
-    Ok(SeratoBatchWriteResult::new(count, unmatched_paths))
+    ))
 }
 
 /// Bulk import registration: one file read + one file write, with the
@@ -453,30 +463,46 @@ mod batch_write_result_tests {
 
     #[test]
     fn renames_report_only_those_whose_track_is_not_at_its_final_path() {
-        let file = library(&[
-            "Music/A.mp3",
-            "Music/Moved.mp3",
-            "Music/Loop.mp3",
-            "Music/Back.mp3",
-        ]);
-        let result = batch_rewrite_database_paths(
-            file.to_str().unwrap().into(),
+        let rewrite = |held: &[&str], renames: Vec<SeratoPathRename>| {
+            let file = library(held);
+            let result =
+                batch_rewrite_database_paths(file.to_str().unwrap().into(), renames).unwrap();
+            fs::remove_file(&file).unwrap();
+            (result.rewritten_count, result.unmatched_indices)
+        };
+        let chains_and_cycles = vec![
+            rename("Music/A.mp3", "Music/B.mp3"),
+            rename("Music/B.mp3", "Music/C.mp3"),
+            rename("Music/Earlier.mp3", "Music/Moved.mp3"),
+            rename("Music/Gone.mp3", "Music/Nowhere.mp3"),
+            rename("Music/Loop.mp3", "Music/Away.mp3"),
+            rename("Music/Away.mp3", "Music/Loop.mp3"),
+            rename("Music/Back.mp3", "Music/Forth.mp3"),
+            rename("Music/Forth.mp3", "Music/Back.mp3"),
+            rename("Music/Back.mp3", "Music/Forth.mp3"),
+        ];
+        assert_eq!(
+            rewrite(
+                &[
+                    "Music/A.mp3",
+                    "Music/Moved.mp3",
+                    "Music/Loop.mp3",
+                    "Music/Back.mp3"
+                ],
+                chains_and_cycles
+            ),
+            (2, vec![3])
+        );
+
+        let reused_old_path = || {
             vec![
                 rename("Music/A.mp3", "Music/B.mp3"),
-                rename("Music/B.mp3", "Music/C.mp3"),
-                rename("Music/Earlier.mp3", "Music/Moved.mp3"),
-                rename("Music/Gone.mp3", "Music/Nowhere.mp3"),
-                rename("Music/Loop.mp3", "Music/Away.mp3"),
-                rename("Music/Away.mp3", "Music/Loop.mp3"),
-                rename("Music/Back.mp3", "Music/Forth.mp3"),
-                rename("Music/Forth.mp3", "Music/Back.mp3"),
-                rename("Music/Back.mp3", "Music/Forth.mp3"),
-            ],
-        )
-        .unwrap();
-        fs::remove_file(&file).unwrap();
-        assert_eq!(result.rewritten_count, 2);
-        assert_eq!(result.unmatched_paths, vec!["Music/Gone.mp3".to_owned()]);
+                rename("Music/X.mp3", "Music/A.mp3"),
+                rename("Music/A.mp3", "Music/C.mp3"),
+            ]
+        };
+        assert_eq!(rewrite(&["Music/X.mp3"], reused_old_path()).1, vec![0]);
+        assert_eq!(rewrite(&["Music/A.mp3"], reused_old_path()).1, vec![1, 2]);
     }
 }
 

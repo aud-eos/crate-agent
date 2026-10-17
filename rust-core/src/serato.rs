@@ -381,6 +381,11 @@ fn rewrite_path_in_otrks(
 /// Multi-rename variant: rewrite every otrk whose path field matches
 /// any key in `renames`, replacing it with the mapped value. One pass
 /// over the records; only otrks holding a rename source are parsed.
+///
+/// Every matching path field is rewritten, while `held_paths_in_otrks`
+/// reads only the first decodable one. They differ only for an otrk with
+/// several path fields, which Serato does not write; rewriting all of them
+/// keeps such a record from pointing at the old path anywhere.
 fn rewrite_paths_in_otrks(
     records: &mut [TlvRecord],
     path_tag: &[u8; 4],
