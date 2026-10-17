@@ -46,7 +46,7 @@ How to apply: when writing a new mutation, the inverse computation is part of th
 
 Why this exists: Serato caches the library in memory and overwrites the disk version when it saves. Any write we make while Serato is running gets silently overwritten when Serato next saves. From the user's perspective: their changes vanish at random.
 
-How to apply: anything touching the files above goes through `OperationEngine`, which routes through `SeratoWatchdog`. Never write directly to `_Serato_` files from another code path. When adding a new Serato-side operation, audit every directory in the list above — silent omissions surface as "the rewrite kept getting undone" mysteries (see PR #65).
+How to apply: anything touching the files above goes through `OperationEngine`, which routes through `SeratoWatchdog`. In the UI, every control whose action writes those files uses `.seratoWriteGated(help:runningHelp:)` and its view places a `SeratoRunningBanner`; never hand-roll an `isSeratoRunning` check. Never write directly to `_Serato_` files from another code path. When adding a new Serato-side operation, audit every directory in the list above — silent omissions surface as "the rewrite kept getting undone" mysteries (see PR #65).
 
 ### 4. Track identity is Chromaprint, not path
 

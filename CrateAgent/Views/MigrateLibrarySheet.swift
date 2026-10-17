@@ -13,14 +13,13 @@ import SwiftUI
 ///   4. On confirm: run `LibraryMigrator.migrate`, then update
 ///      `UserPreferences.watchedMusicFolder` and prompt for restart.
 ///
-/// Same-volume only for SP-1. Gated on `!seratoWatchdog.isSeratoRunning`
-/// like Resolve All — the per-file `renameFile` mutations write to
-/// Serato library files and shouldn't compete with Serato.
+/// Same-volume only for SP-1. Gated by `seratoWriteGated` like Resolve
+/// All — the per-file `renameFile` mutations write to Serato library
+/// files and shouldn't compete with Serato.
 struct MigrateLibrarySheet: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
 
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
     @Environment(\.dismiss) private var dismiss
 
     @State private var newRoot: URL = (try? UserPreferences.defaultLibraryRoot())
@@ -39,10 +38,7 @@ struct MigrateLibrarySheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before moving the library.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("moving the library"))
             header
             Divider()
             ListSearchField(text: $query).padding(.horizontal, density.pagePadding).disabled(isApplying)
@@ -192,10 +188,9 @@ struct MigrateLibrarySheet: View {
                 pendingConfirm = true
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(plans.isEmpty || isScanning || isApplying || seratoWatchdog.isSeratoRunning)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before moving — the Serato library writes shouldn't run while Serato is open."
-                : "Move every tracked file to the new root and update Serato + DB in one batch.")
+            .disabled(plans.isEmpty || isScanning || isApplying)
+            .seratoWriteGated(help: "Move every tracked file to the new root and update Serato + DB in one batch.",
+                              runningHelp: "Quit Serato before moving — the Serato library writes shouldn't run while Serato is open.")
         }
     }
 

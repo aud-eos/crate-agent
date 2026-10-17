@@ -4,7 +4,6 @@ import SwiftUI
 struct CaseConsistencyPanel: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var files: [HygieneFileRow] = []
     @State private var results = ListResultSelection<LibraryHygiene.CaseInconsistencyGroup>()
@@ -34,10 +33,7 @@ struct CaseConsistencyPanel: View {
         VStack(spacing: 0) {
             PageHeading("Consistent capitalization", subtitle: "Choose the spelling to keep for each group, or skip that group.")
                 .padding(density.pagePadding)
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before normalizing case.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("normalizing case"))
             ResultListHeader(results: $results, enabled: !isScanning && !isApplying)
             groupListSection.disabled(isScanning || isApplying)
             Divider()
@@ -161,10 +157,8 @@ struct CaseConsistencyPanel: View {
                 Task { await applySelections() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(activeGroupCount == 0 || isScanning || isApplying || seratoWatchdog.isSeratoRunning)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                : "Apply the selected canonicals in one undoable batch.")
+            .disabled(activeGroupCount == 0 || isScanning || isApplying)
+            .seratoWriteGated(help: "Apply the selected canonicals in one undoable batch.", runningHelp: SeratoGateMessages.cleanupApplyBlocked)
         }
     }
 

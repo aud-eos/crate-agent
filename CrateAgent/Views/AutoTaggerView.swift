@@ -4,7 +4,6 @@ struct AutoTaggerView: View {
     @ObservedObject var session: AutoTagSession
     var readiness: LibrarySyncReadiness?
     var conflictRevision: UInt64 = 0
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @State private var showResetConfirmation = false
     @State private var reviewQuery = ""
@@ -14,10 +13,7 @@ struct AutoTaggerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — applied library and tag writes queue until you quit Serato.")
-                Divider()
-            }
+            SeratoRunningBanner(message: "Serato is running — applied library and tag writes queue until you quit Serato.")
             if let fatalError = session.fatalError {
                 ActionErrorMessage(message: fatalError).padding(density.pagePadding)
                 Divider()

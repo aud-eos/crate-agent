@@ -4,7 +4,6 @@ import SwiftUI
 struct FindReplacePanel: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var findText: String = ""
     @State private var replaceText: String = ""
@@ -52,10 +51,7 @@ struct FindReplacePanel: View {
         VStack(spacing: 0) {
             PageHeading("Find and replace", subtitle: "Preview each field replacement and select only the changes you want.")
                 .padding(density.pagePadding)
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before applying find/replace.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("applying find/replace"))
             queryForm.disabled(isApplying || isLoading)
             Divider()
             ResultListHeader(results: $results, enabled: !isApplying && !isLoading)
@@ -168,10 +164,8 @@ struct FindReplacePanel: View {
                 Task { await applySelected() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(selectedMatchIds.isEmpty || !previewIsCurrent || isLoading || isApplying || seratoWatchdog.isSeratoRunning)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                : "Apply the selected replacements in one undoable batch.")
+            .disabled(selectedMatchIds.isEmpty || !previewIsCurrent || isLoading || isApplying)
+            .seratoWriteGated(help: "Apply the selected replacements in one undoable batch.", runningHelp: SeratoGateMessages.cleanupApplyBlocked)
         }
     }
 
