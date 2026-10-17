@@ -57,6 +57,11 @@ bar at the bottom of the window shows the title and artist, elapsed and total ti
 a scrub bar, play/pause, ±10 s skip and stop. One track plays at a time, app-wide,
 across screens. Playback only reads the file.
 
+Right-click a track in Library, Duplicates or Auto-Tag for **Open in** its default
+app (Command-O on the focused Library row), an **Open With** list of other apps
+that can open it, and **Reveal in Finder**. A failed open is shown at the bottom
+of the window.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing
