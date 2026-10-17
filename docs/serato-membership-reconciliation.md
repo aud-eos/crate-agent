@@ -237,7 +237,11 @@ An immediate add failure also retains the original guarded add as a durable
 `serato_write_queue` row and reports a pending-sync import result. A drop journals
 each file in its own batch, so each stays separately undoable, then applies all of
 the drop's queued adds in one scoped pass. Consecutive adds share one `database V2`
-rewrite, and each file's result comes from its own queue rows (#187). The Library drop flow publishes
+rewrite per 200 files, and each file's result comes from its own queue rows and
+dispositions (#187). A file that changes before its add runs is reported as not
+added and stays pending; dropping it again observes the changed file and starts a
+new import. A file listed twice in one drop, such as a folder and a file inside it,
+is imported once. The Library drop flow publishes
 the failure through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or
 changing the original event payloads/inverses. Failed or unattempted adds are

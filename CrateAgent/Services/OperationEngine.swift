@@ -502,29 +502,27 @@ public actor OperationEngine {
     }
 
     /// Applies the queued writes of `batches` in one scoped pass, so their
-    /// consecutive Serato adds share one `database V2` rewrite. Returns, per
-    /// batch id, why its writes did not land; a batch whose writes applied,
-    /// were superseded, or wait for Serato to close has no entry.
+    /// consecutive Serato adds share each capped `database V2` rewrite.
+    /// Returns, per batch id, why its writes did not land; a batch whose
+    /// writes applied or wait for Serato to close has no entry.
     func routeDeferredSeratoWrites(_ batches: [DeferredSeratoBatch]) async throws -> [String: String] {
         let queueIDs = Set(batches.flatMap(\.queueIDs))
         guard !queueIDs.isEmpty else { return [:] }
-        if await seratoWatchdog.isSeratoRunning || readiness?.permitsExternalWrites == false {
-            try await refreshQueueDepth()
-            return [:]
-        }
-        var passFailure: Error?
+        let passFailure: Error?
         do {
-            let outcome = try await processScopedRows(queueIDs)
-            if outcome.supersededCount > 0 {
-                await note(outcome.summaryMessage)
-            }
+            guard try await processScopedRowsIfPermitted(queueIDs) != nil else { return [:] }
+            passFailure = nil
         } catch {
             passFailure = error
         }
-        let remaining = try await database.writer.read { database in
-            try Row.fetchAll(database, sql: "SELECT queue_id, last_error FROM serato_write_queue").reduce(into: [Int64: String?]()) { rows, row in
-                rows[row["queue_id"]] = row["last_error"]
-            }
+        let batchIDs = batches.map(\.batchId)
+        let (remaining, dropped) = try await database.writer.read { database in
+            let remaining = try Row.fetchAll(database, sql: "SELECT queue_id, last_error FROM serato_write_queue WHERE queue_id IN (\(queueIDs.map { _ in "?" }.joined(separator: ",")))",
+                                             arguments: StatementArguments(Array(queueIDs)))
+                .reduce(into: [Int64: String?]()) { rows, row in rows[row["queue_id"]] = row["last_error"] }
+            let dropped = try String.fetchSet(database, sql: "SELECT batch_id FROM serato_write_dispositions WHERE batch_id IN (\(batchIDs.map { _ in "?" }.joined(separator: ",")))",
+                                              arguments: StatementArguments(batchIDs))
+            return (remaining, dropped)
         }
         var failures: [String: String] = [:]
         for batch in batches {
@@ -533,9 +531,27 @@ public actor OperationEngine {
                 failures[batch.batchId] = recorded
             } else if let passFailure, !unfinished.isEmpty {
                 failures[batch.batchId] = String(describing: passFailure)
+            } else if dropped.contains(batch.batchId) {
+                failures[batch.batchId] = Self.supersededDeferredWriteMessage
             }
         }
         return failures
+    }
+
+    static let supersededDeferredWriteMessage = "Not added to Serato: the file changed before it could be registered. Drop it again to import it."
+
+    /// Applies `queueIDs` now unless Serato is running or readiness closes
+    /// external writes, in which case they stay queued and this returns nil.
+    private func processScopedRowsIfPermitted(_ queueIDs: Set<Int64>) async throws -> ResyncOutcome? {
+        if await seratoWatchdog.isSeratoRunning || readiness?.permitsExternalWrites == false {
+            try await refreshQueueDepth()
+            return nil
+        }
+        let outcome = try await processScopedRows(queueIDs)
+        if outcome.supersededCount > 0 {
+            await note(outcome.summaryMessage)
+        }
+        return outcome
     }
 
     private func executeBatch(_ mutations: [TrackMutation], batchId: String,
@@ -896,15 +912,9 @@ public actor OperationEngine {
         batchId: String
     ) async throws -> ResyncOutcome {
         guard !writes.isEmpty else { return ResyncOutcome(appliedCount: 0, queuedCount: 0) }
-        let isSeratoRunning = await seratoWatchdog.isSeratoRunning
-        if isSeratoRunning || readiness?.permitsExternalWrites == false {
-            try await refreshQueueDepth()
-            return ResyncOutcome(appliedCount: 0, queuedCount: Set(writes.map(\.eventId)).count)
-        }
         do {
-            let outcome = try await processScopedRows(Set(writes.compactMap(\.queueID)))
-            if outcome.supersededCount > 0 {
-                await note(outcome.summaryMessage)
+            guard let outcome = try await processScopedRowsIfPermitted(Set(writes.compactMap(\.queueID))) else {
+                return ResyncOutcome(appliedCount: 0, queuedCount: Set(writes.map(\.eventId)).count)
             }
             return outcome
         } catch {
@@ -4224,6 +4234,13 @@ public actor OperationEngine {
     }
 }
 
+/// A journaled batch whose Serato writes wait in the queue for
+/// `OperationEngine.routeDeferredSeratoWrites`.
+struct DeferredSeratoBatch: Sendable, Equatable {
+    let batchId: String
+    let queueIDs: [Int64]
+}
+
 // MARK: - Resync types
 
 /// Result of `resyncSeratoForBatch`. Separates writes that
@@ -4232,13 +4249,6 @@ public actor OperationEngine {
 /// this split to phrase the result honestly — "Re-sync complete"
 /// when N actually landed vs "Queued N — quit Serato to apply"
 /// when nothing did.
-/// A journaled batch whose Serato writes wait in the queue for
-/// `OperationEngine.routeDeferredSeratoWrites`.
-struct DeferredSeratoBatch: Sendable, Equatable {
-    let batchId: String
-    let queueIDs: [Int64]
-}
-
 public struct ResyncOutcome: Sendable, Equatable {
     public let appliedCount: Int
     public let queuedCount: Int

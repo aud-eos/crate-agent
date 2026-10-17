@@ -7,7 +7,8 @@ import os.log
 /// audio tags via the existing FFI, and journals each file in its own batch
 /// (`indexNewFile`, then `beginFileImport` + `addTrackToSerato`) through the
 /// OperationEngine. The drop's Serato adds are then applied in one pass, so
-/// a drop rewrites `database V2` once rather than once per file (#187).
+/// a drop rewrites `database V2` once per 200 files rather than once per
+/// file (#187).
 ///
 /// `indexNewFile` registers the file in crate-agent's DB; the path
 /// uniqueness constraint makes re-drops a safe no-op. `addTrackToSerato`
@@ -75,9 +76,9 @@ public actor ImportCoordinator {
         var blockedFiles: [String] = []
         var awaitingSerato: [(batch: DeferredSeratoBatch, fileName: String)] = []
 
+        var seenPaths = Set<String>()
         for rootUrl in urls {
-            let audioFileUrls = enumerateAudioFiles(at: rootUrl)
-            for fileUrl in audioFileUrls {
+            for fileUrl in enumerateAudioFiles(at: rootUrl) where seenPaths.insert(SeratoPath.normalized(fileUrl.path)).inserted {
                 switch await importSingleFile(at: fileUrl) {
                 case let .awaitingSerato(batch):
                     awaitingSerato.append((batch, fileUrl.lastPathComponent))
@@ -91,8 +92,10 @@ public actor ImportCoordinator {
         let failures: [String: String]
         do { failures = try await operationEngine.routeDeferredSeratoWrites(awaitingSerato.map(\.batch)) }
         catch {
-            Self.logger.error("registering dropped files with Serato failed: \(error.localizedDescription, privacy: .public)")
-            let message = error.localizedDescription
+            // Only the status read after the pass throws here, so which adds
+            // landed is unknown; Retry Sync replays any still queued.
+            Self.logger.error("confirming dropped files with Serato failed: \(error.localizedDescription, privacy: .public)")
+            let message = "Could not confirm the Serato registration: \(error.localizedDescription)"
             failures = Dictionary(awaitingSerato.map { entry in (entry.batch.batchId, message) }, uniquingKeysWith: { first, _ in first })
         }
         for entry in awaitingSerato {
@@ -138,9 +141,19 @@ public actor ImportCoordinator {
                 return candidates.first
             }
             if let existing {
-                guard existing.libraryMembership != .active,
-                      FileImportIdentity.matches(existing, identity: fileMetadata),
-                      let existingID = existing.id else { return .skipped }
+                guard existing.libraryMembership != .active, let existingID = existing.id else { return .skipped }
+                if !FileImportIdentity.matches(existing, identity: fileMetadata) {
+                    // The file at this path changed since it was indexed, as when
+                    // an earlier drop's add was superseded; observe it first.
+                    _ = try await operationEngine.apply(
+                        .observeFileIdentity(ObserveFileIdentityPayload(
+                            fileId: existingID, expectedRevision: existing.membershipRevision,
+                            previousIdentity: existing.identity, identity: fileMetadata,
+                            metadata: seratoMetadata, bitrateKbps: bitrateKbps, expectedState: existing.libraryState
+                        )),
+                        batchId: batchId
+                    )
+                }
                 fileId = existingID
             } else {
                 _ = try await operationEngine.apply(
