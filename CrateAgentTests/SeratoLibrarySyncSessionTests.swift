@@ -169,7 +169,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         try await session.synchronize()
         guard case let .ready(summary) = session.state else { return XCTFail("\(session.state)") }
         XCTAssertEqual(summary.conflictBlockedWriteCount, 2)
-        XCTAssertEqual(summary.supersededWrites, 0)
+        XCTAssertEqual(summary.notAppliedWrites.total, 0)
         let saved = try readDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path)
         XCTAssertEqual(saved.first { record in SeratoPath.normalized(record.path) == independent.path }?.title, "Independent")
         XCTAssertTrue(saved.filter { record in SeratoPath.normalized(record.path) == protected.path }.allSatisfy { record in record.title == nil && record.artist == nil })

@@ -179,5 +179,37 @@ OperationEngine.swift, SeratoWriteEligibility.swift, SyncCheckpointStore.swift, 
   observation reducer is FIFO-aware; an interrupted cleanup Trash finishes on
   the next sync; pass claims are owned and taken atomically; malformed rows and
   fences are quarantined with a `malformed` disposition.
-- Known ordering gap left for step 7: a scoped pass applies its metadata group
-  before renames in the same scope.
+- The ordering gap where a scoped pass applied its metadata group before renames
+  in the same scope is closed in PR 2: scoped and full drains share segmentation.
+
+## Implementation notes (PR 2, steps 7–9)
+
+- `SeratoWriteSegmenter` groups rows; an independent tag write between renames
+  still ends the rename batch.
+- A metadata segment is one V2 rewrite, so its rows succeed or fail together.
+- The reducer also treats a saved value equal to a later queued edit as our own
+  coalesced write; a row left with nothing to do is deleted without a disposition.
+- Rows carry `baselineKnownFields`: the fields whose baseline is known. Rebasing
+  after one of our edits lands marks that edit's fields as known.
+- Rename-path observation needs no planner change: the scanner observes the
+  Serato record at the old path for the file's oldest pending rename. A rename
+  whose old and new paths both have saved records reuses `SeratoPathConflict`
+  and the review screen.
+- The History badge is a minimal count of changes not applied, per batch.
+- A saved value counts as our own landed write only for rows with attempts > 0.
+- With no observed baseline, insert uses the event's journaled `previousMetadata`
+  (commit to Serato, MusicBrainz match) for the written fields.
+- The write boundary names every conflicted row (`ExternalWriteInterruption.conflicted`);
+  phase-one classification already blocks rows conflicted when the pass starts.
+
+## Implementation notes (#117 completion)
+
+- One pass over queued rows runs at a time; a pass started inside another (a
+  cleanup step a drain advances) joins it. Overlapping passes stranded a rename
+  behind another pass's unfinished row until the next sync.
+- A rename batch applies its renames in order, so old → middle → new lands at the
+  final path instead of stopping at the middle one.
+- A row counts as possibly landed only when its last attempt recorded no error.
+- Undo refuses to remove an indexed row once its membership changed, so only
+  `removeFile` (duplicate cleanup) removes a row with queued work; the file ID is
+  `AUTOINCREMENT`, so a re-indexed row never matches the removed row's tokens.

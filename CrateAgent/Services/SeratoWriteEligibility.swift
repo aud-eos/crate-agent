@@ -18,12 +18,26 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     let originalIdentity: FileMetadata
     var originalReferencePaths: [String] = []
     var externalBaseline: SeratoMetadata?
+    /// The fields `externalBaseline` actually knows; nil means all of them.
+    var baselineKnownFields: Set<String>?
     var requiredKeeper: FileActionAuthority?
     var queueID: Int64?
     var queuedPayload: Data?
     var attempts = 0
     var lastError: String?
     var cleanupTargetFileID: Int64?
+}
+
+extension GuardedSeratoWrite {
+    func knowsBaseline(of field: String) -> Bool {
+        externalBaseline != nil && baselineKnownFields?.contains(field) != false
+    }
+
+    /// `recordAttempt` clears the error before I/O and a thrown write records
+    /// one, so only an attempt that recorded no error can have landed.
+    var mayHaveLanded: Bool {
+        attempts > 0 && lastError == nil
+    }
 }
 
 enum SeratoWriteEligibility {

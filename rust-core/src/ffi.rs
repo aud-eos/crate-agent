@@ -28,12 +28,32 @@ pub struct SeratoTrackMetadataUpdate {
     pub update: SeratoMetadataUpdate,
 }
 
+/// Renames apply in order. The rewrite looks each record up once, so a
+/// rename of an earlier rename's destination (old → middle, middle → new)
+/// is folded into that chain to land the record at its final path.
 fn rename_map(renames: &[SeratoPathRename]) -> HashMap<String, String> {
-    renames
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut origins_by_destination: HashMap<String, Vec<String>> = HashMap::new();
+    for rename in renames
         .iter()
         .filter(|rename| rename.old_path != rename.new_path)
-        .map(|rename| (rename.old_path.clone(), rename.new_path.clone()))
-        .collect()
+    {
+        let mut origins = origins_by_destination
+            .remove(&rename.old_path)
+            .unwrap_or_default();
+        if !map.contains_key(&rename.old_path) {
+            origins.push(rename.old_path.clone());
+        }
+        for origin in &origins {
+            map.insert(origin.clone(), rename.new_path.clone());
+        }
+        origins_by_destination
+            .entry(rename.new_path.clone())
+            .or_default()
+            .extend(origins);
+    }
+    map.retain(|old_path, new_path| old_path != new_path);
+    map
 }
 
 #[derive(Debug, Error)]

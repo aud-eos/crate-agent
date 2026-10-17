@@ -82,6 +82,11 @@ struct HistoryView: View {
                     StatusBadge(title: batch.isUndoBatch ? "Undo batch" : "Recorded changes",
                                 systemImage: batch.isUndoBatch ? "arrow.uturn.backward.circle" : "clock")
                 }
+                if batch.notAppliedCount > 0 {
+                    StatusBadge(title: SeratoWriteDispositionMessages.historyBadge(count: batch.notAppliedCount),
+                                systemImage: "exclamationmark.triangle", tint: .orange)
+                        .help(SeratoWriteDispositionMessages.historyHelp)
+                }
             }
         } actions: {
             if batch.canResync {
