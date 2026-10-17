@@ -471,7 +471,10 @@ The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
 warning. An outcome this version does not recognize, such as one recorded by a
 newer build, is counted as not applied rather than blocking readiness. History marks a batch with the number of its changes that were not
-applied.
+applied and one reason line per disposition. Its Show files button pages the
+affected files through `EventHistoryQuery.loadNotAppliedFiles`, each with its
+own reasons; a file whose events project onto Serato or audio-tag writes can be
+re-synced alone through `OperationEngine.resyncSeratoForBatch(_:fileID:)`.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.
