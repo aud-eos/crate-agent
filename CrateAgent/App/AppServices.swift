@@ -32,7 +32,7 @@ public final class AppServices: ObservableObject {
     public let fingerprintWorker: FingerprintWorker
     public let duplicateEvidenceVerifier: DuplicateEvidenceVerifier
     public let activityLog: ActivityLog
-    let audioPreview = AudioPreviewPlayer()
+    let trackPlayer = TrackPlayer()
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession

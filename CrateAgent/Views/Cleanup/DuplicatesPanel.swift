@@ -78,7 +78,6 @@ struct DuplicatesPanel: View {
                 .padding(density.pagePadding)
             SeratoRunningBanner(message: SeratoGateMessages.quitBefore("resolving duplicates"))
             modeBar.disabled(isScanning || isResolving)
-            AudioPreviewFailureMessage(player: services.audioPreview).padding(.horizontal, density.pagePadding)
             Divider()
             ResultListHeader(results: $results, enabled: !isScanning && !isResolving)
             groupListSection.disabled(isScanning || isResolving)
@@ -92,7 +91,6 @@ struct DuplicatesPanel: View {
         .task { await rescan() }
         .task { await rescanAsLibraryChanges() }
         .onDisappear {
-            services.audioPreview.stop()
             checkTask?.task.cancel()
             checkTask = nil
         }
@@ -376,7 +374,7 @@ struct DuplicatesPanel: View {
             ForEach(kept, id: \.file.id) { entry in
                 HStack(alignment: .top, spacing: density.spacing) {
                     if let identifier = entry.file.id {
-                        AudioPreviewButton(player: services.audioPreview, fileID: identifier, path: entry.file.path)
+                        TrackPlayButton(player: services.trackPlayer, track: PlayerTrack(fileID: identifier, path: entry.file.path, title: entry.file.title, artist: entry.file.artist))
                     }
                     VStack(alignment: .leading, spacing: density.detailSpacing) {
                         TrackHeading(artist: entry.file.artist, title: entry.file.title, filename: (entry.file.path as NSString).lastPathComponent)
@@ -424,7 +422,7 @@ struct DuplicatesPanel: View {
             .accessibilityValue(isKeeper ? "Selected keeper" : "Not selected")
             .help("Set as the keeper for this group.")
             if let identifier = file.id {
-                AudioPreviewButton(player: services.audioPreview, fileID: identifier, path: file.path)
+                TrackPlayButton(player: services.trackPlayer, track: PlayerTrack(fileID: identifier, path: file.path, title: file.title, artist: file.artist))
             }
             VStack(alignment: .leading, spacing: density.detailSpacing) {
                 TrackHeading(artist: file.artist, title: file.title, filename: (file.path as NSString).lastPathComponent)
@@ -697,7 +695,7 @@ struct DuplicatesPanel: View {
             return
         }
         isResolving = true
-        services.audioPreview.stop()
+        services.trackPlayer.stop()
         defer { isResolving = false }
         actionError = nil
         lastResolution = nil
@@ -735,7 +733,7 @@ struct DuplicatesPanel: View {
         }
 
         isResolving = true
-        services.audioPreview.stop()
+        services.trackPlayer.stop()
         defer {
             isResolving = false
             batchProgress = .idle
