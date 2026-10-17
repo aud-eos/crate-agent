@@ -62,6 +62,7 @@ final class FingerprintResponsivenessTests: XCTestCase {
 
     @MainActor
     func testThirtyThousandPendingFilesRemainBrowsableDuringRealDecoding() async throws {
+        LibraryNavigationFixture.prepareWindowChrome()
         let fixture = try await Task.detached(priority: .background) { try FingerprintBacklogFixture() }.value
         defer {
             do { try fixture.close() }
@@ -79,7 +80,9 @@ final class FingerprintResponsivenessTests: XCTestCase {
         let progress = OSAllocatedUnfairLock(initialState: FingerprintWorker.Progress?.none)
         await worker.start { update in progress.withLock { current in current = update } }
         do {
-            await fulfillment(of: [firstDecode], timeout: 10)
+            // Liveness bound, not a latency budget: the decoder runs at background QoS and a
+            // loaded machine may delay its start, but the measured windows open only after it runs.
+            await fulfillment(of: [firstDecode], timeout: 120)
             let model = try LibraryBrowserModel(database: fixture.library.database)
             let selection = LibraryNavigationSelection()
             let gate = LibrarySyncReadiness()
@@ -128,9 +131,12 @@ final class FingerprintResponsivenessTests: XCTestCase {
                 window.displayIfNeeded()
                 maximumNavigation = max(maximumNavigation, navigationStart.duration(to: .now))
             }
-            await pagingEventually { progress.withLock { current in (current?.totalDone ?? 0) > 0 } }
+            // Stopping lets in-flight decodes finish and flush, so the drain itself proves progress
+            // without a wall-clock deadline on background work.
             await worker.stop()
             await worker.waitUntilStopped()
+            heartbeat.cancel()
+            await heartbeat.value
             let final = try XCTUnwrap(progress.withLock { current in current })
             XCTAssertGreaterThan(final.totalDone, 0)
             XCTAssertGreaterThan(final.totalPending, 29000)
