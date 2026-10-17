@@ -6,7 +6,6 @@ struct DuplicatesPanel: View {
 
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var mode: DuplicateFinder.Mode = .byteLevel
     @State private var results = ListResultSelection<ScannedGroup>()
@@ -72,10 +71,7 @@ struct DuplicatesPanel: View {
         VStack(spacing: 0) {
             PageHeading("Duplicate tracks", subtitle: "Choose one keeper per group. Review the other copies before moving them to Trash.")
                 .padding(density.pagePadding)
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before resolving duplicates.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("resolving duplicates"))
             modeBar.disabled(isScanning || isResolving)
             Divider()
             ResultListHeader(results: $results, enabled: !isScanning && !isResolving)
@@ -158,10 +154,9 @@ struct DuplicatesPanel: View {
                 Label("Move \(totalNonKeeperCount) duplicate files to Trash", systemImage: "trash")
                     .labelStyle(.titleAndIcon)
             }
-            .disabled(isScanning || isResolving || seratoWatchdog.isSeratoRunning || totalNonKeeperCount == 0)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
-                : "Trash every non-keeper across selected groups in one undoable-as-an-audit-log batch.")
+            .disabled(isScanning || isResolving || totalNonKeeperCount == 0)
+            .seratoWriteGated(help: "Trash every non-keeper across selected groups in one undoable-as-an-audit-log batch.",
+                              runningHelp: SeratoGateMessages.duplicateResolveBlocked)
         }
         .background(Color.secondary.opacity(0.06))
     }
@@ -248,10 +243,9 @@ struct DuplicatesPanel: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .controlSize(density.controlSize)
-                .disabled(isResolving || seratoWatchdog.isSeratoRunning || conflictReason(group) != nil)
-                .help(seratoWatchdog.isSeratoRunning
-                    ? "Quit Serato before resolving — Serato can clobber the database V2 changes from its in-memory cache."
-                    : "Move non-keepers in this group to Trash and remove their Serato references in one batch.")
+                .disabled(isResolving || conflictReason(group) != nil)
+                .seratoWriteGated(help: "Move non-keepers in this group to Trash and remove their Serato references in one batch.",
+                                  runningHelp: SeratoGateMessages.duplicateResolveBlocked)
             }
             if let reason = conflictReason(group) {
                 Text(reason).font(.callout).foregroundStyle(.orange)

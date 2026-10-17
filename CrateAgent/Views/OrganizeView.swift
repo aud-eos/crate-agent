@@ -12,10 +12,7 @@ struct OrganizeView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before organizing.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("organizing"))
             PageHeading("Organize", subtitle: "Review track locations, then move selected files into your artist letter folders.")
                 .padding(density.pagePadding)
             header
@@ -114,7 +111,8 @@ struct OrganizeView: View {
                                        enabled: !preview.isBusy, setSelected: preview.selectScope, clear: preview.clearSelection)
                 Button("Move \(preview.selection.count) selected files") { pendingConfirm = true }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(preview.selection.count == 0 || preview.isBusy || seratoWatchdog.isSeratoRunning)
+                    .disabled(preview.selection.count == 0 || preview.isBusy)
+                    .seratoWriteGated(help: "Move the selected files into their artist letter folders.", runningHelp: SeratoGateMessages.quitBefore("organizing"))
             }
         }
         .padding(.top, density.spacing)
