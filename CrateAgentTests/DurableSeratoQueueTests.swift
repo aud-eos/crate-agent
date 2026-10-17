@@ -160,6 +160,7 @@ final class DurableSeratoQueueTests: XCTestCase {
         let cases: [(interruption: String, renameBetween: Bool, baselineKnown: Bool)] = [
             ("crash during one coalesced rewrite", false, true),
             ("crash before commit", true, true),
+            ("crash before commit, then a failed retry", true, true),
             ("Serato relaunched", true, true),
             ("Serato relaunched, baseline unknown", true, false),
             ("Serato saved B itself", false, true),
@@ -219,6 +220,13 @@ final class DurableSeratoQueueTests: XCTestCase {
                 try await fixture.database.writer.write { database in
                     try database.execute(sql: "DROP TRIGGER crash_after_io")
                     try database.execute(sql: "UPDATE serato_write_queue SET last_error = NULL")
+                }
+                if label.hasSuffix("failed retry") {
+                    // The retry's error must not erase that the crashed attempt may have landed B.
+                    let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                                  seratoMetadataBatchWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+                    do { _ = try await failing.drainPendingSeratoUpdates(); XCTFail("\(label): the failing writer accepted the edits") }
+                    catch {}
                 }
             } else {
                 let relaunched = LockedTestFlag()

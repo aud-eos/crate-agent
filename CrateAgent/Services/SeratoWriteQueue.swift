@@ -89,7 +89,7 @@ enum SeratoWriteQueueError: LocalizedError {
 /// transaction as the mutation that produced it and deleted in the writer
 /// transaction that performs (or supersedes) its I/O.
 enum SeratoWriteQueue {
-    private static let columns = "queue_id, event_id, kind, file_id, membership_revision, payload, cleanup_target_file_id, attempts, last_error"
+    private static let columns = "queue_id, event_id, kind, file_id, membership_revision, payload, cleanup_target_file_id, attempts, last_error, may_have_landed"
 
     @discardableResult
     static func insert(_ write: GuardedSeratoWrite, cleanupTargetFileID: Int64? = nil, locator: SeratoLibraryLocator,
@@ -246,9 +246,14 @@ enum SeratoWriteQueue {
         try Int.fetchOne(database, sql: "SELECT COUNT(DISTINCT event_id) FROM serato_write_queue") ?? 0
     }
 
+    /// Clearing the error before I/O would forget that an earlier attempt
+    /// reached I/O without one, so that is kept before the error is cleared.
     static func recordAttempt(_ writes: [GuardedSeratoWrite], in database: Database) throws {
         for queueID in writes.compactMap(\.queueID) {
-            try database.execute(sql: "UPDATE serato_write_queue SET attempts = attempts + 1, last_attempt_at = ?, last_error = NULL WHERE queue_id = ?",
+            try database.execute(sql: """
+                                 UPDATE serato_write_queue SET may_have_landed = may_have_landed OR (attempts > 0 AND last_error IS NULL),
+                                   attempts = attempts + 1, last_attempt_at = ?, last_error = NULL WHERE queue_id = ?
+                                 """,
                                  arguments: [now(), queueID])
         }
     }
@@ -285,6 +290,7 @@ enum SeratoWriteQueue {
         write.queuedPayload = bytes
         write.attempts = row["attempts"]
         write.lastError = row["last_error"]
+        write.earlierAttemptMayHaveLanded = row["may_have_landed"]
         write.cleanupTargetFileID = row["cleanup_target_file_id"]
         return write
     }

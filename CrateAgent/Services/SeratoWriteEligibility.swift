@@ -25,6 +25,7 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     var queuedPayload: Data?
     var attempts = 0
     var lastError: String?
+    var earlierAttemptMayHaveLanded = false
     var cleanupTargetFileID: Int64?
 }
 
@@ -34,9 +35,10 @@ extension GuardedSeratoWrite {
     }
 
     /// `recordAttempt` clears the error before I/O and a thrown write records
-    /// one, so only an attempt that recorded no error can have landed.
+    /// one, so only an attempt that recorded no error can have landed; a later
+    /// failed retry does not undo an earlier attempt that may have.
     var mayHaveLanded: Bool {
-        attempts > 0 && lastError == nil
+        earlierAttemptMayHaveLanded || (attempts > 0 && lastError == nil)
     }
 }
 

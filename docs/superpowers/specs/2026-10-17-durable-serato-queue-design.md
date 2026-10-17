@@ -209,7 +209,8 @@ OperationEngine.swift, SeratoWriteEligibility.swift, SyncCheckpointStore.swift, 
   behind another pass's unfinished row until the next sync.
 - A rename batch applies its renames in order, so old → middle → new lands at the
   final path instead of stopping at the middle one.
-- A row counts as possibly landed only when its last attempt recorded no error.
+- A row counts as possibly landed only when an attempt recorded no error; the
+  `may_have_landed` column keeps that across a later failed retry.
 - Undo refuses to remove an indexed row once its membership changed, so only
   `removeFile` (duplicate cleanup) removes a row with queued work; the file ID is
   `AUTOINCREMENT`, so a re-indexed row never matches the removed row's tokens.

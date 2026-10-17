@@ -347,8 +347,9 @@ at the final path. Every other write is its own segment. Edits to the same recor
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
-to rows whose last attempt recorded no error: a saved value matching an unsent
-edit, or one whose write threw, is the user's own Serato edit and wins. A failed segment fails all of its rows together
+to rows with an attempt that recorded no error, even when a later retry threw: a
+saved value matching an unsent edit, or one whose every write threw, is the user's
+own Serato edit and wins. A failed segment fails all of its rows together
 and blocks their dependents; a row whose target becomes conflicted at the write
 boundary is blocked alone with its dependents, and the rest of the segment applies.
 
@@ -362,7 +363,7 @@ When no baseline was observed, a queued edit takes the pre-edit values its event
 journaled (`previousMetadata`) as the baseline for the fields it writes; a field
 an earlier queued edit still owes takes that edit's baseline instead. A queued
 edit whose baseline is still unknown learns the fields of an earlier edit of ours
-once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its last
+once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when an
 attempt left no error; a failed Trash attempt is not proof the audio moved.
 
 The ready summary reports each dropped change by disposition (superseded,
