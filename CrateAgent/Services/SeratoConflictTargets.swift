@@ -48,6 +48,7 @@ enum SeratoConflictTargets {
         case let .revertMusicBrainzMatch(payload):
             fileID = payload.applied.fileID
             try includeSharedTrack(payload.applied.fingerprintHash, in: &target, database: database)
+        case .songFamily: fileID = nil
         }
         if let fileID {
             target.fileIDs.insert(fileID)

@@ -1,0 +1,168 @@
+import Foundation
+import GRDB
+
+/// One recording in a song family, with the display values of its files.
+public struct SongFamilyMemberSummary: Equatable, Sendable {
+    public let trackId: Int64
+    public let title: String?
+    public let artist: String?
+    public let isMusicBrainzMatched: Bool
+    /// Every file encoding this recording; several encodings are one version.
+    public let fileIds: [Int64]
+    /// Whether any of its files is active in the library and present on disk.
+    public let isAvailable: Bool
+}
+
+public struct SongFamily: Equatable, Sendable, Identifiable {
+    public let id: Int64
+    /// The user's manual main-version choice, kept even while it is unavailable.
+    public let savedRepresentativeTrackId: Int64?
+    /// The member shown for the family right now (`SongFamilyRepresentative`).
+    public let representativeTrackId: Int64
+    /// The representative first, then the alternates by recording id.
+    public let members: [SongFamilyMemberSummary]
+
+    public var versionCount: Int {
+        members.count
+    }
+}
+
+public struct SongFamilyResult: Equatable, Sendable {
+    /// History batch that undoes the change.
+    public let batchId: String
+    /// The family created or changed; nil when the change dissolved it.
+    public let familyId: Int64?
+}
+
+/// The API every song-family client uses. Changes go through
+/// `OperationEngine` as `.songFamily` mutations; undo is History's
+/// `undoBatch(batchId)`. Grouping never writes tags, Serato files, or
+/// recording identifiers.
+public struct SongFamilyService: Sendable {
+    private let engine: OperationEngine
+    private let database: LibraryDatabase
+
+    public init(engine: OperationEngine, database: LibraryDatabase) {
+        self.engine = engine
+        self.database = database
+    }
+
+    /// Groups at least two distinct recordings. Throws
+    /// `SongFamilyError.memberAlreadyInFamily` instead of reassigning a member;
+    /// offer `merge` for that conflict.
+    public func create(_ members: [SongFamilyMember], representative: SongFamilyMember? = nil) async throws -> SongFamilyResult {
+        try await apply(.create(members: members, representative: representative), familyId: nil)
+    }
+
+    public func attach(_ members: [SongFamilyMember], to familyId: Int64) async throws -> SongFamilyResult {
+        try await apply(.attach(familyId: familyId, members: members), familyId: familyId)
+    }
+
+    /// Removing members that leaves fewer than two recordings dissolves the family.
+    public func detach(_ trackIds: [Int64], from familyId: Int64) async throws -> SongFamilyResult {
+        try await apply(.detach(familyId: familyId, trackIds: trackIds), familyId: familyId)
+    }
+
+    /// Moves every member of `familyIds` into `familyId`, keeping its main version.
+    public func merge(_ familyIds: [Int64], into familyId: Int64) async throws -> SongFamilyResult {
+        try await apply(.merge(familyId: familyId, mergedFamilyIds: familyIds), familyId: familyId)
+    }
+
+    /// Moves at least two members into a new family; the result names the new family.
+    public func split(_ trackIds: [Int64], from familyId: Int64) async throws -> SongFamilyResult {
+        try await apply(.split(familyId: familyId, trackIds: trackIds), familyId: nil)
+    }
+
+    /// Saves a manual main version, or clears it with nil to use the automatic choice.
+    public func setRepresentative(_ trackId: Int64?, of familyId: Int64) async throws -> SongFamilyResult {
+        try await apply(.setRepresentative(familyId: familyId, trackId: trackId), familyId: familyId)
+    }
+
+    public func family(id: Int64) async throws -> SongFamily? {
+        try await database.writer.read { database in try Self.fetchFamily(id: id, in: database) }
+    }
+
+    public func family(containingTrack trackId: Int64) async throws -> SongFamily? {
+        try await database.writer.read { database in
+            guard let familyID = try TrackRecord.fetchOne(database, key: trackId)?.workId else { return nil }
+            return try Self.fetchFamily(id: familyID, in: database)
+        }
+    }
+
+    private func apply(_ operation: SongFamilyOperation, familyId: Int64?) async throws -> SongFamilyResult {
+        let batchID = UUID().uuidString
+        guard let eventID = try await engine.apply(.songFamily(operation), batchId: batchID) else {
+            return SongFamilyResult(batchId: batchID, familyId: familyId)
+        }
+        let change = try await database.writer.read { database in
+            guard let event = try EventRecord.fetchOne(database, key: eventID) else {
+                throw OperationEngineError.batchNotFound(batchId: batchID)
+            }
+            return try JSONDecoder().decode(SongFamilyChange.self, from: Data(event.payloadJson.utf8))
+        }
+        return SongFamilyResult(batchId: batchID, familyId: change.familyId)
+    }
+
+    static func fetchFamily(id: Int64, in database: GRDB.Database) throws -> SongFamily? {
+        guard let record = try SongFamilyRecord.fetchOne(database, key: id) else { return nil }
+        let tracks = try TrackRecord.filter(Column("work_id") == id).order(Column("id")).fetchAll(database)
+        let files = try Row.fetchAll(database, sql: """
+        SELECT id, track_id, artist, title, (\(FileProcessingEligibility.processableSQL)) AS available
+        FROM files WHERE track_id IN (SELECT id FROM tracks WHERE work_id = ?)
+        ORDER BY available DESC, id
+        """, arguments: [id])
+        let filesByTrack = Dictionary(grouping: files) { row in row["track_id"] as Int64 }
+        let members = tracks.compactMap { track -> SongFamilyMemberSummary? in
+            guard let trackID = track.id else { return nil }
+            let trackFiles = filesByTrack[trackID] ?? []
+            return SongFamilyMemberSummary(
+                trackId: trackID,
+                title: trackFiles.lazy.compactMap { row in row["title"] as String? }.first ?? track.title,
+                artist: trackFiles.lazy.compactMap { row in row["artist"] as String? }.first ?? track.artist,
+                isMusicBrainzMatched: track.musicbrainzRecordingId != nil,
+                fileIds: trackFiles.map { row in row["id"] as Int64 }.sorted(),
+                isAvailable: trackFiles.contains { row in row["available"] as Bool }
+            )
+        }
+        guard let representative = SongFamilyRepresentative.choose(from: members, saved: record.representativeTrackId) else { return nil }
+        let ordered = members.filter { member in member.trackId == representative } + members.filter { member in member.trackId != representative }
+        return SongFamily(id: id, savedRepresentativeTrackId: record.representativeTrackId, representativeTrackId: representative, members: ordered)
+    }
+}
+
+/// Chooses the member a family displays. Available members win over
+/// unavailable ones, so a retired or missing saved choice is passed over for
+/// now without being replaced. Among the candidates: the saved choice, then a
+/// title marked Main/Original, then a MusicBrainz-matched unannotated
+/// recording, any MusicBrainz match, any unannotated title, and finally the
+/// lowest recording id.
+enum SongFamilyRepresentative {
+    static func choose(from members: [SongFamilyMemberSummary], saved: Int64?) -> Int64? {
+        let available = members.filter(\.isAvailable)
+        let candidates = available.isEmpty ? members : available
+        if let saved, candidates.contains(where: { member in member.trackId == saved }) {
+            return saved
+        }
+        return candidates.min { first, second in
+            (rank(first), first.trackId) < (rank(second), second.trackId)
+        }?.trackId
+    }
+
+    private static func rank(_ member: SongFamilyMemberSummary) -> Int {
+        let annotations = member.title.map(TitleMatcher.annotationSegments) ?? []
+        if annotations.contains(where: isMainVersionLabel) {
+            return 0
+        }
+        switch (member.isMusicBrainzMatched, annotations.isEmpty) {
+        case (true, true): return 1
+        case (true, false): return 2
+        case (false, true): return 3
+        case (false, false): return 4
+        }
+    }
+
+    private static func isMainVersionLabel(_ annotation: String) -> Bool {
+        let firstWord = ListSearch.normalized(annotation).split(whereSeparator: { character in character.isWhitespace }).first
+        return firstWord == "main" || firstWord == "original"
+    }
+}

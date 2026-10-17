@@ -465,7 +465,7 @@ public actor OperationEngine {
     private func readinessAuthorization(for mutations: [TrackMutation]) throws -> LibrarySyncReadiness.Authorization? {
         let requiresReady = mutations.contains { mutation in
             switch mutation {
-            case .indexNewFile, .beginFileImport, .addTrackToSerato: false
+            case .indexNewFile, .beginFileImport, .addTrackToSerato, .songFamily: false
             default: true
             }
         }
@@ -1012,7 +1012,9 @@ public actor OperationEngine {
         case .trackRemovedFromSerato: .removeFromDatabase
         case .fileRemovedFromCrates: .removeFromCrates
         case .fileTrashed: .trashFile
-        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested: nil
+        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored: nil
         }
     }
 
@@ -1429,7 +1431,9 @@ public actor OperationEngine {
             true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
             false
         }
     }
@@ -1524,7 +1528,9 @@ public actor OperationEngine {
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
             return []
         }
     }
@@ -1771,6 +1777,9 @@ public actor OperationEngine {
                 ApplyMusicBrainzMatchPayload.self, from: inverseJsonData
             )
             return .applyMusicBrainzMatch(payload)
+        case .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+            return try .songFamily(.restore(decoder.decode(RestoreSongFamiliesPayload.self, from: inverseJsonData)))
         }
     }
 
@@ -3049,6 +3058,9 @@ public actor OperationEngine {
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(eventId: eventId, seratoWrites: seratoWrites)
+        case let .songFamily(operation):
+            let eventId = try SongFamilyMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         }
     }
 
@@ -4085,6 +4097,7 @@ public enum TrackMutation: Sendable {
     /// `decodeInverseMutation` during undo. Never constructed by
     /// feature code directly.
     case revertMusicBrainzMatch(RevertMusicBrainzMatchPayload)
+    case songFamily(SongFamilyOperation)
 }
 
 /// Move the file at `fileId` to the user's Trash via
