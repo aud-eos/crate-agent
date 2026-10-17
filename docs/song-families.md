@@ -13,7 +13,9 @@ every member belongs to one MusicBrainz release.
   recording belongs to at most one family. Files reach a family through
   `files.track_id`, so files linked to the same recording row count as one
   version. Encodings whose fingerprints differ (most FLAC and MP3 pairs) are
-  separate recordings, and count as separate versions.
+  separate recordings, but recordings that share a MusicBrainz recording ID
+  are one version (`SongFamilyMutation.versionKeySQL`), and `family(id:)`
+  lists them together. Unmatched recordings are each their own version.
 - Members keep their own fingerprint identity, tags, and MusicBrainz IDs.
   Grouping never writes audio tags, Serato files, or recording identifiers.
 
@@ -51,9 +53,10 @@ rules:
    linked to it. A member whose last file is retired, replaced, or re-matched to
    another recording keeps its assignment silently, so undoing that change
    brings it back. Members without files never count toward the version count,
-   the two-member minimum, or the displayed representative. A change that
-   dissolves a family clears them too. A family with fewer than two live
-   members is dissolved as far as the user can tell: `family(id:)` returns nil
+   the two-version minimum, or the displayed representative. A change that
+   dissolves a family clears them too. Every minimum counts versions, not
+   recordings: `create` and `split` need two versions, and a family with
+   fewer than two live versions is dissolved as far as the user can tell: `family(id:)` returns nil
    and Library offers no family commands for it, while its assignments wait for
    files to return.
 5. **Membership never moves silently.** Adding a recording that is already in
@@ -91,10 +94,16 @@ and recordings with no file in the library with `recordingHasNoFiles`.
 ## Displayed representative
 
 `SongFamilyRepresentative` chooses the member shown for a family. Members with
-an active, available file are preferred. Among those, the saved choice wins,
-then a title marked Main or Original (`(Original Mix)`, `[Main Version]`), then
-a MusicBrainz-matched recording without a version annotation, any
-MusicBrainz-matched recording, any unannotated title, and finally the lowest
+an active, available file are preferred. Among those, the saved choice wins.
+Otherwise members are ranked in tiers:
+
+1. a title marked Main, Original or Album Version (`(Original Mix)`,
+   `[Main Version]`, `(Album Version)`);
+2. a bare title, with no version annotation;
+3. a Dirty or Explicit edit with no other qualifier (`(Dirty)`, `[Explicit]`);
+4. anything else.
+
+Within a tier a MusicBrainz-matched recording comes first, then the lowest
 recording id. A retired or missing saved choice is passed over without being
 replaced, and returns when it is available again.
 

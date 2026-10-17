@@ -6,11 +6,20 @@ public struct SongFamilyMemberSummary: Equatable, Sendable {
     public let trackId: Int64
     public let title: String?
     public let artist: String?
-    public let isMusicBrainzMatched: Bool
+    public let musicBrainzRecordingId: String?
     /// Every file encoding this recording; several encodings are one version.
     public let fileIds: [Int64]
     /// Whether any of its files is active in the library and present on disk.
     public let isAvailable: Bool
+
+    public var isMusicBrainzMatched: Bool {
+        musicBrainzRecordingId != nil
+    }
+
+    /// Recordings that share a MusicBrainz recording are one version.
+    var versionKey: String {
+        musicBrainzRecordingId ?? "track:\(trackId)"
+    }
 }
 
 public struct SongFamily: Equatable, Sendable, Identifiable {
@@ -19,11 +28,13 @@ public struct SongFamily: Equatable, Sendable, Identifiable {
     public let savedRepresentativeTrackId: Int64?
     /// The member shown for the family right now (`SongFamilyRepresentative`).
     public let representativeTrackId: Int64
-    /// The representative first, then the alternates by recording id.
+    /// The representative first, then the alternates by recording id, with
+    /// the recordings of one version kept together.
     public let members: [SongFamilyMemberSummary]
 
+    /// Different versions: members sharing a MusicBrainz recording count once.
     public var versionCount: Int {
-        members.count
+        Set(members.map(\.versionKey)).count
     }
 }
 
@@ -129,23 +140,29 @@ public struct SongFamilyService: Sendable {
                 trackId: trackID,
                 title: trackFiles.lazy.compactMap { row in row["title"] as String? }.first ?? track.title,
                 artist: trackFiles.lazy.compactMap { row in row["artist"] as String? }.first ?? track.artist,
-                isMusicBrainzMatched: track.musicbrainzRecordingId != nil,
+                musicBrainzRecordingId: track.musicbrainzRecordingId,
                 fileIds: trackFiles.map { row in row["id"] as Int64 }.sorted(),
                 isAvailable: trackFiles.contains { row in row["available"] as Bool }
             )
         }
-        guard members.count >= 2, let representative = SongFamilyRepresentative.choose(from: members, saved: record.representativeTrackId) else { return nil }
-        let ordered = members.filter { member in member.trackId == representative } + members.filter { member in member.trackId != representative }
+        guard Set(members.map(\.versionKey)).count >= 2, let representative = SongFamilyRepresentative.choose(from: members, saved: record.representativeTrackId) else { return nil }
+        let first = members.filter { member in member.trackId == representative } + members.filter { member in member.trackId != representative }
+        let versionOrder = first.map(\.versionKey).reduce(into: [String]()) { order, version in
+            if !order.contains(version) {
+                order.append(version)
+            }
+        }
+        let ordered = versionOrder.flatMap { version in first.filter { member in member.versionKey == version } }
         return SongFamily(id: id, savedRepresentativeTrackId: record.representativeTrackId, representativeTrackId: representative, members: ordered)
     }
 }
 
 /// Chooses the member a family displays. Available members win over
 /// unavailable ones, so a retired or missing saved choice is passed over for
-/// now without being replaced. Among the candidates: the saved choice, then a
-/// title marked Main/Original, then a MusicBrainz-matched unannotated
-/// recording, any MusicBrainz match, any unannotated title, and finally the
-/// lowest recording id.
+/// now without being replaced. Among the candidates: the saved choice, then
+/// by tier — a title marked Main, Original or Album Version; a bare title;
+/// a Dirty or Explicit edit with no other qualifier; anything else — with a
+/// MusicBrainz match first within a tier, and finally the lowest recording id.
 enum SongFamilyRepresentative {
     static func choose(from members: [SongFamilyMemberSummary], saved: Int64?) -> Int64? {
         let available = members.filter(\.isAvailable)
@@ -159,20 +176,29 @@ enum SongFamilyRepresentative {
     }
 
     private static func rank(_ member: SongFamilyMemberSummary) -> Int {
-        let annotations = member.title.map(TitleMatcher.annotationSegments) ?? []
-        if annotations.contains(where: isMainVersionLabel) {
-            return 0
-        }
-        switch (member.isMusicBrainzMatched, annotations.isEmpty) {
-        case (true, true): return 1
-        case (true, false): return 2
-        case (false, true): return 3
-        case (false, false): return 4
-        }
+        rank(title: member.title, isMusicBrainzMatched: member.isMusicBrainzMatched)
     }
 
+    static func rank(title: String?, isMusicBrainzMatched: Bool) -> Int {
+        let annotations = (title.map(TitleMatcher.annotationSegments) ?? []).map { segment in
+            ListSearch.normalized(segment).trimmingCharacters(in: .whitespaces)
+        }
+        let tier = if annotations.contains(where: isMainVersionLabel) {
+            0
+        } else if annotations.isEmpty {
+            1
+        } else if annotations.allSatisfy(explicitEditLabels.contains) {
+            2
+        } else {
+            3
+        }
+        return tier * 2 + (isMusicBrainzMatched ? 0 : 1)
+    }
+
+    private static let explicitEditLabels: Set<String> = ["dirty", "explicit", "dirty version", "explicit version"]
+
     private static func isMainVersionLabel(_ annotation: String) -> Bool {
-        let firstWord = ListSearch.normalized(annotation).split(whereSeparator: { character in character.isWhitespace }).first
-        return firstWord == "main" || firstWord == "original"
+        let firstWord = annotation.split(whereSeparator: { character in character.isWhitespace }).first
+        return firstWord == "main" || firstWord == "original" || annotation == "album version"
     }
 }

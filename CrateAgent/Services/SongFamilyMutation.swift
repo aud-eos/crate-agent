@@ -95,10 +95,11 @@ public struct SongFamilySnapshot: Codable, Sendable, Equatable {
         families[index].representativeTrackId = exists ? representativeTrackId : nil
     }
 
-    /// Clears a family left with fewer than two live members, including any
-    /// members without files, leaving the rest standalone.
-    mutating func dissolveIfTooSmall(_ familyId: Int64, live: Set<Int64>) {
-        guard members(of: familyId).filter(live.contains).count < 2 else { return }
+    /// Clears a family left with fewer than two live versions, including any
+    /// members without files, leaving the rest standalone. `liveVersions`
+    /// maps each live member to its version key.
+    mutating func dissolveIfTooSmall(_ familyId: Int64, liveVersions: [Int64: String]) {
+        guard Set(members(of: familyId).compactMap { member in liveVersions[member] }).count < 2 else { return }
         dissolve(familyId)
     }
 
@@ -224,7 +225,7 @@ enum SongFamilyMutation {
         switch operation {
         case let .create(members, representative):
             let trackIDs = try resolve(members, in: database)
-            guard trackIDs.count >= 2 else { throw SongFamilyError.tooFewMembers }
+            guard try versionKeys(of: trackIDs, in: database).count >= 2 else { throw SongFamilyError.tooFewMembers }
             let dissolving = try familiesToDissolve(for: trackIDs, joining: nil, batchId: batchId, in: database)
             let representativeID = try representative.map { member in try resolve([member], in: database)[0] }
             if let representativeID, !trackIDs.contains(representativeID) {
@@ -258,7 +259,7 @@ enum SongFamilyMutation {
             if let representative = before.family(familyID)?.representativeTrackId, trackIds.contains(representative) {
                 after.setFamily(familyID, exists: true, representativeTrackId: nil)
             }
-            try after.dissolveIfTooSmall(familyID, live: liveTracks(in: before, database: database))
+            try after.dissolveIfTooSmall(familyID, liveVersions: liveVersions(in: before, database: database))
             return SongFamilyChange(operation: operation, familyId: after.family(familyID)?.exists == true ? familyID : nil, before: before, after: after)
 
         case let .merge(familyID, mergedFamilyIds):
@@ -277,12 +278,12 @@ enum SongFamilyMutation {
 
         case let .split(familyID, trackIds):
             let moving = Set(trackIds)
-            guard moving.count >= 2 else { throw SongFamilyError.tooFewMembers }
+            guard try versionKeys(of: moving, in: database).count >= 2 else { throw SongFamilyError.tooFewMembers }
             try requireFamily(familyID, in: database)
             var before = try capture(familyIds: [familyID], trackIds: moving, in: database)
             try requireMembers(moving, of: familyID, in: before, database: database)
-            let live = try liveTracks(in: before, database: database)
-            guard before.members(of: familyID).contains(where: { member in live.contains(member) && !moving.contains(member) }) else {
+            let live = try liveVersions(in: before, database: database)
+            guard before.members(of: familyID).contains(where: { member in live[member] != nil && !moving.contains(member) }) else {
                 throw SongFamilyError.splitTakesEveryMember
             }
             let splitID = try insertFamily(into: &before, in: database)
@@ -294,7 +295,7 @@ enum SongFamilyMutation {
             if representativeMoves {
                 after.setFamily(familyID, exists: true, representativeTrackId: nil)
             }
-            after.dissolveIfTooSmall(familyID, live: live)
+            after.dissolveIfTooSmall(familyID, liveVersions: live)
             return SongFamilyChange(operation: operation, familyId: splitID, before: before, after: after)
 
         case let .setRepresentative(familyID, trackID):
@@ -446,9 +447,21 @@ enum SongFamilyMutation {
     /// assignment so restoring the file restores the member.
     static let liveTrackSQL = "EXISTS (SELECT 1 FROM files WHERE files.track_id = tracks.id AND \(FileProcessingEligibility.activeSQL))"
 
-    private static func liveTracks(in snapshot: SongFamilySnapshot, database: GRDB.Database) throws -> Set<Int64> {
-        let trackIDs = snapshot.assignments.map(\.trackId)
-        return try Set(Int64.fetchAll(database, TrackRecord.select(Column("id")).filter(keys: trackIDs).filter(sql: liveTrackSQL)))
+    /// What makes recordings one version: rows that share a MusicBrainz
+    /// recording are one version, every other row is its own.
+    static let versionKeySQL = "COALESCE(tracks.musicbrainz_recording_id, 'track:' || tracks.id)"
+
+    private static func versionsByTrack(_ request: QueryInterfaceRequest<TrackRecord>, in database: GRDB.Database) throws -> [Int64: String] {
+        try Row.fetchAll(database, request.select(Column("id"), SQL(sql: versionKeySQL).forKey("version")))
+            .reduce(into: [Int64: String]()) { byTrack, row in byTrack[row["id"]] = row["version"] }
+    }
+
+    private static func versionKeys(of trackIds: some Sequence<Int64>, in database: GRDB.Database) throws -> Set<String> {
+        try Set(versionsByTrack(TrackRecord.filter(keys: Array(trackIds)), in: database).values)
+    }
+
+    private static func liveVersions(in snapshot: SongFamilySnapshot, database: GRDB.Database) throws -> [Int64: String] {
+        try versionsByTrack(TrackRecord.filter(keys: snapshot.assignments.map(\.trackId)).filter(sql: liveTrackSQL), in: database)
     }
 
     private static func requireFamily(_ familyID: Int64, in database: GRDB.Database) throws {
@@ -474,13 +487,14 @@ enum SongFamilyMutation {
         var dissolving = Set<Int64>()
         for track in try TrackRecord.filter(keys: trackIds).fetchAll(database) {
             guard let current = track.workId, current != familyID, !dissolving.contains(current), let trackID = track.id else { continue }
-            let liveVersions = try Int64.fetchAll(database, TrackRecord.select(Column("id")).filter(Column("work_id") == current)
-                .filter(liveBeforeBatch).order(Column("id")))
-            guard liveVersions.count >= 2 else {
+            let liveVersions = try versionsByTrack(TrackRecord.filter(Column("work_id") == current).filter(liveBeforeBatch), in: database)
+            guard Set(liveVersions.values).count >= 2 else {
                 dissolving.insert(current)
                 continue
             }
-            let otherVersions = liveVersions.filter { version in version != trackID }
+            let ownVersion = try versionKeys(of: [trackID], in: database).first
+            let otherVersions = Dictionary(grouping: liveVersions.keys, by: { member in liveVersions[member] })
+                .filter { version, _ in version != ownVersion }.values.compactMap { members in members.min() }.sorted()
             throw try SongFamilyError.memberAlreadyInFamily(recording: name(ofTrack: trackID, in: database),
                                                             familyVersions: otherVersions.map { version in try name(ofTrack: version, in: database) })
         }
