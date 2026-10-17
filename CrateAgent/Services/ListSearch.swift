@@ -16,7 +16,7 @@ enum ListSearch {
     }
 
     static func normalized(_ text: String) -> String {
-        text.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        text.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
     }
 
     static func text(artist: String?, title: String?, album: String?, path: String) -> String {
