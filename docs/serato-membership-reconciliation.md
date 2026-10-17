@@ -5,6 +5,14 @@
 An encoded valid empty library can retire online members owned by that library.
 Crate membership does not participate in this decision.
 
+Only `read_database_records_strict` (`DatabaseV2::strict_track_records`) may supply
+evidence that something is absent from Serato. The permissive
+`read_database_records` / `track_records` path silently skips `otrk` entries without
+a `pfil`, and the legacy `LibraryScanner.scan(progress:)` turns a missing
+`database V2` into an empty record list. Both are acceptable for display-only imports and
+wrong for retirement, duplicate cleanup or any other decision that a track is no
+longer in Serato.
+
 The reconciler reads identity projections in pages of 256, without fingerprint
 blobs, and checks only indexed locations and paths in the saved snapshot. It does
 not enumerate a music folder or Trash. Ownership mismatches and offline volumes
@@ -156,7 +164,42 @@ directory once, creating that directory if necessary, and watches the normalized
 deduplicated music and Trash paths in one stream. This captures native Trash
 destinations without enumerating Trash or scanning it per missing row. A verified
 Trash destination marks the indexed original path as trashed; it never becomes a
-V2 rename target. Root derivation and stream creation/start failures fail startup
+V2 rename target. The verified Trash item (path, volume, inode, size, mtime and sampled
+content hash) is persisted in `file_trash_locations` by the same journaled
+library-state mutation. Without Full Disk Access a Trash item can be stat-able but
+unreadable; it is then recorded by its stat identity alone, and later checks compare
+only the fields that were captured, so a permission failure never reads as an
+emptied Trash. Verification lives in `FileTrashLocation`: stat identity (volume,
+inode, size, mtime) is compared first, so a replaced or emptied item is `missing`
+without being read. Content is compared only when a hash was recorded and the item
+can be opened, and it is hashed through that open descriptor after confirming the
+descriptor is the stat-checked item, so a replacement between stat and read is
+never hashed in its place; an item that vanishes mid-check is `missing`. Only `EACCES`/`EPERM` fall back to stat identity; any other read
+failure is an error. An item whose identity cannot be read reports `inaccessible`,
+never `missing`. Stat-only identity relies on APFS/HFS+ file IDs, which are not
+reused. The mutation clears the item when the row becomes available or missing
+(restore, re-import, replacement). It keeps the item through offline and
+inaccessible, which say nothing about whether the item still exists, and accepts a
+location with those states so every logged inverse can be applied. A write that
+repeats the row's state and supplies no new location is a no-op and verifies
+nothing. A change to `.trashed` rechecks existence and stat identity inside the
+transaction, because Trash can be emptied while the caller awaits the commit. A
+row whose own indexed path is in Trash counts as trashed only while that path holds
+the row's volume and inode, both when reconciling and under the lock; otherwise the
+recorded item, if any, decides. Callers pass the
+item they verified, so the event records which item justified it. A failed recheck
+is row-level staleness (`FileTrashLocationError.itemChanged`): the filesystem
+coordinator requests reconciliation, and the reconciler counts the row in the sync
+summary ("changed in Trash, checked next sync") and leaves it out of the published
+checkpoint evidence, so the next sync re-checks it instead of taking the fast path;
+neither fails its batch. A known path that now holds a
+different file requests reconciliation; a missing or trashed row keeps its state
+until then, and an available row becomes `unknown`. A removal
+event at that Trash path, or any reconciliation that finds the indexed path
+missing, keeps the row trashed only while that exact item still verifies;
+otherwise it becomes missing. A trashed row
+without a persisted item (recorded before this table existed) cannot be verified
+and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
 first checkpoint for that set, the old music-root cursor is a conservative replay
 fallback; checkpoints advance only after the combined batch succeeds. Watch roots
@@ -213,8 +256,8 @@ blocked while any other notified or observed Serato application remains running.
 
 Main window and menu bar share waiting, reconciliation, result, and failure status
 with Retry Sync. Missing or corrupt source errors retain queued writes. Fingerprint
-worker database errors appear in the Library header and activity log without changing
-file-info scan state; **Retry Fingerprinting** restarts only that worker. Initial
+worker database errors appear in the Library header, Workers, and activity log without
+changing file-info scan state; **Retry Fingerprinting** in Workers restarts only that worker. Initial
 completion becomes true only after the whole scan sequence succeeds.
 
 Synchronization acknowledgements belong to the latest requested generation, not
@@ -305,6 +348,12 @@ Canonical path comparison groups Unicode-equivalent spellings, while diagnostics
 preserve original UTF-8 bytes, metadata, and physical-file observations. Only
 conflicted spellings are inspected for diagnostics; analysis does not decode audio
 or fingerprint the library.
+Swift `String` equality, `Set<String>` and `String`-keyed dictionaries compare by
+canonical equivalence, so an NFC and an NFD spelling of one path collapse to a
+single key. Code that must keep Serato occurrences distinct keys them by
+`Data(path.utf8)` or by occurrence index, as `SeratoConflictAnalyzer` and
+`LibraryRefreshPlan` do. It applies `SeratoPath.normalized` only after conflict
+analysis has run.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared
@@ -346,7 +395,10 @@ a rename of an earlier rename's destination (old → middle → new) lands the r
 at the final path. Consecutive adds of different files share one registration:
 Serato's existing paths are read once, every add lands in one V2 rewrite, and
 each import is confirmed in the same transaction; a second add of the same file
-starts a new registration. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
+starts a new registration. Every other write is its own segment. A batched
+segment holds at most 200 rows, since its I/O, verification and confirmations
+share one writer transaction; a larger backlog continues in the next segment
+(#189). Edits to the same record are merged in queue order before the batch
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
@@ -357,8 +409,8 @@ reaching it, or every I/O call threw. A writer that validates or records after
 its I/O (Trash, audio tags, V2 removal, imports) reports the moment that I/O
 returns, so a later throw keeps the mark. A later attempt keeps an earlier
 attempt's mark (`may_have_landed`), and an attempt never clears a mark it did not
-set. Upgrading keeps a row attempted without a recorded error as possibly landed,
-as it was read before the marker existed. A saved value matching an edit that
+set. Rows queued before migration 016 start with the marker unset, which is
+acceptable because no install had a populated queue when 016 shipped. A saved value matching an edit that
 never reached I/O, or whose every I/O call threw, is the user's own Serato edit
 and wins. That a thrown I/O call did not land holds because every Serato
 library write (`database V2`, Subcrates and SmartCrates) replaces its file
@@ -424,6 +476,12 @@ Schema-only migrations add versioned saved occurrences, file evidence, a slim st
 projection, dirty-row tracking, durable physical-move fences, and the durable Serato write queue. Raw path bytes
 and occurrence multiplicity are preserved. SQLite triggers advance a revision for
 relevant file changes; fingerprint progress alone does not invalidate the cache.
+The invalidation triggers created by `AddSyncCheckpointMigration`
+(`011_add_sync_checkpoint`) name the relevant `files` columns explicitly. A new
+`files` column that affects membership, identity, availability, Serato-mirrored
+metadata or recording links must ship with a migration that recreates those triggers
+to include it. Otherwise an unchanged launch keeps stale cached state. Columns that
+only record fingerprint progress stay out of the list.
 
 An unchanged pass reads the header and slim stat projection, validates entry/target
 identity and volume UUID, checks source identity and the database revision, and
@@ -452,3 +510,10 @@ the start of each sync: a replayable event is rebuilt into queue rows from its
 journal, a destructive one is recorded as `legacyUnrecoverable`, and the fence is
 deleted in the same transaction. The checkpoint is derived evidence; queued intent
 lives in the queue.
+Any code that performs a physical or Serato-side effect records its fence with
+`SyncCheckpointStore.beginEffect` in a transaction that commits before the effect
+starts. It clears the fence only after the effect completes or is explicitly
+superseded. A fence written inside the effect's own rollback transaction does not
+survive a crash, so the next launch could take the clean fast path over a
+half-applied write. `PhysicalFileMoveTransaction` and the engine's guarded Serato
+write paths follow this pattern.

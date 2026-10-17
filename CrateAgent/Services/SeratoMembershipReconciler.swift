@@ -10,6 +10,9 @@ struct ReconciliationSummary: Sendable, Equatable {
     var pathConflictCount: Int = 0
     var conflictBlockedWriteCount: Int = 0
     var duplicateCleanupMessage: String?
+    /// Rows whose Trash item changed before their state was saved. They keep their old
+    /// state and are left out of the checkpoint, so the next sync checks them again.
+    var trashChangedFileIDs: Set<Int64> = []
 }
 
 enum SeratoReconciliationError: LocalizedError {
@@ -111,8 +114,15 @@ actor SeratoMembershipReconciler {
             if observed == .offline {
                 summary.skippedUnsupported += 1
             }
-            if observed == .missing, file.fileAvailability == .trashed {
-                observed = .trashed
+            if observed == .trashed {
+                observed = try FileTrashLocation.ownPathAvailability(path: path, volumeUuid: observedIdentity?.volumeUuid ?? file.volumeUuid,
+                                                                     inode: observedIdentity?.inode ?? file.inode, resolver: availability)
+            }
+            var verifiedTrashLocation: FileMetadata?
+            if observed == .missing {
+                let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
+                observed = try FileTrashLocation.availability(of: location, resolver: availability)
+                verifiedTrashLocation = observed == .trashed ? location : nil
             }
             let saved = savedPaths.contains(SeratoPath.normalized(path))
             let ownedRemoval = try await operationEngine.pendingCleanupOwnsRemoval(of: file)
@@ -147,11 +157,17 @@ actor SeratoMembershipReconciler {
             let state = FileLibraryState(membership: membership, availability: observed,
                                          libraryID: observed == .offline ? file.seratoLibraryId : snapshot.libraryID,
                                          retiredAt: membership == .retired ? (file.retiredAt ?? Int64(Date().timeIntervalSince1970 * 1000)) : nil)
-            mutations.append(.setFileLibraryState(.init(fileId: fileID, expectedRevision: revision, state: state, observedReadditionAfterOwnedRemoval: readdedAfterOwnedRemoval ? true : nil)))
+            mutations.append(.setFileLibraryState(.init(fileId: fileID, expectedRevision: revision, state: state, observedReadditionAfterOwnedRemoval: readdedAfterOwnedRemoval ? true : nil,
+                                                        trashLocation: verifiedTrashLocation)))
             try await beforeCommit()
             let authorization = try await reader.authorization(for: snapshot)
             let expected = FileObservationExpectation(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)
-            _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
+            do {
+                _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
+            } catch FileTrashLocationError.itemChanged {
+                summary.trashChangedFileIDs.insert(fileID)
+                continue
+            }
             if readdedAfterOwnedRemoval {
                 try await operationEngine.supersedeReappearedCleanup(fileID: fileID)
             }
