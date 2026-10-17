@@ -282,11 +282,15 @@ each file in its own batch, so each stays separately undoable, then applies all 
 the drop's queued adds in one scoped pass. Consecutive adds share one `database V2`
 rewrite per 200 files, and each file's result comes from its own queue rows and
 dispositions (#187). A file that changes before its add runs is reported as not
-added and stays pending; dropping it again observes the changed file and starts a
-new import. Only a pending import adopts a changed file this way: a retired or
-removed row still refuses a replacement at its path. A file listed twice in one drop, such as a folder and a file inside it,
-is imported once. The Library drop flow publishes
-the failure through the shared sync status and Retry Sync action. Retry performs
+added and stays pending, with no Retry Sync, since nothing is left to retry;
+dropping it again observes the changed file and starts a new import. Only an
+import that never finished (pending or legacy-unverified) adopts a changed file
+this way: a retired or removed row still refuses a replacement at its path. When
+readiness is closed, that observation is refused and the file is reported with
+the readiness reason. A file listed twice in one drop, such as a folder and a
+file inside it, is imported once, and a file a still-running drop is importing
+is reported as already being imported by an overlapping drop. The Library drop
+flow publishes a failed add through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or
 changing the original event payloads/inverses. Failed or unattempted adds are
 retained once per event; already completed adds are not queued again. The normal

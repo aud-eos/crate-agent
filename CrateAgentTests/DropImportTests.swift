@@ -64,13 +64,40 @@ final class DropImportTests: XCTestCase {
         try await fixture.database.writer.write { connection in connection.trace(nil) }
 
         XCTAssertEqual(first.filesImported, 0, "A file whose add was superseded was reported as imported")
-        XCTAssertEqual(first.syncFailures.count, 1)
+        XCTAssertEqual(first.syncFailures, [], "A superseded add has nothing for Retry Sync to finish")
+        XCTAssertEqual(first.filesNotAdded.count, 1)
         let second = await importer.importDroppedItems([drop])
         XCTAssertEqual(second.filesImported, 1, "The changed file could not be dropped again")
         let registered = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).map { record in SeratoPath.normalized(record.path) }
         XCTAssertEqual(registered, [audio.path])
         let membership = try await fixture.database.writer.read { database in try FileRecord.fetchAll(database).map(\.libraryMembership) }
         XCTAssertEqual(membership, [.active])
+    }
+}
+
+extension DropImportTests {
+    func testOverlappingDropsImportEachFileOnce() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let drop = fixture.directory.appendingPathComponent("drop")
+        try FileManager.default.createDirectory(at: drop, withIntermediateDirectories: true)
+        for index in 0 ..< 3 {
+            try FinalRemovalIntegrationTests.wav(sample: UInt8(index + 1)).write(to: drop.appendingPathComponent("overlap-\(index).wav"))
+        }
+        fixture.lifecycle.running = true
+        fixture.watchdog.refresh()
+        let importer = ImportCoordinator(operationEngine: fixture.engine, database: fixture.database)
+
+        async let first = importer.importDroppedItems([drop])
+        async let second = importer.importDroppedItems([drop])
+        let results = await [first, second]
+
+        XCTAssertEqual(results.map(\.filesImported).sorted(), [0, 3])
+        XCTAssertEqual(results.map(\.filesAlreadyImporting.count).sorted(), [0, 3])
+        let requests = try await fixture.database.writer.read { database in
+            try EventRecord.filter(Column("event_type") == EventType.fileImportRequested.rawValue).fetchCount(database)
+        }
+        XCTAssertEqual(requests, 3, "A second drop restarted an import the first was still running")
     }
 }
 

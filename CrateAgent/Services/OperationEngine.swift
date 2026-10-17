@@ -498,14 +498,15 @@ public actor OperationEngine {
     /// apply several batches' writes in one pass.
     func applyBatchDeferringSerato(_ mutations: [TrackMutation], batchId: String) async throws -> DeferredSeratoBatch {
         let results = try await journalBatch(mutations, batchId: batchId)
-        return DeferredSeratoBatch(batchId: batchId, queueIDs: results.flatMap(\.seratoWrites).compactMap(\.queueID))
+        let writes = results.flatMap(\.seratoWrites)
+        return DeferredSeratoBatch(batchId: batchId, queueIDs: writes.compactMap(\.queueID), eventIDs: writes.map(\.eventId))
     }
 
     /// Applies the queued writes of `batches` in one scoped pass, so their
     /// consecutive Serato adds share each capped `database V2` rewrite.
     /// Returns, per batch id, why its writes did not land; a batch whose
     /// writes applied or wait for Serato to close has no entry.
-    func routeDeferredSeratoWrites(_ batches: [DeferredSeratoBatch]) async throws -> [String: String] {
+    func routeDeferredSeratoWrites(_ batches: [DeferredSeratoBatch]) async throws -> [String: DeferredSeratoShortfall] {
         let queueIDs = Set(batches.flatMap(\.queueIDs))
         guard !queueIDs.isEmpty else { return [:] }
         let passFailure: Error?
@@ -515,30 +516,31 @@ public actor OperationEngine {
         } catch {
             passFailure = error
         }
-        let batchIDs = batches.map(\.batchId)
+        let eventIDs = Array(Set(batches.flatMap(\.eventIDs)))
         let (remaining, dropped) = try await database.writer.read { database in
-            let remaining = try Row.fetchAll(database, sql: "SELECT queue_id, last_error FROM serato_write_queue WHERE queue_id IN (\(queueIDs.map { _ in "?" }.joined(separator: ",")))",
-                                             arguments: StatementArguments(Array(queueIDs)))
-                .reduce(into: [Int64: String?]()) { rows, row in rows[row["queue_id"]] = row["last_error"] }
-            let dropped = try String.fetchSet(database, sql: "SELECT batch_id FROM serato_write_dispositions WHERE batch_id IN (\(batchIDs.map { _ in "?" }.joined(separator: ",")))",
-                                              arguments: StatementArguments(batchIDs))
+            let remaining = try Self.idChunks(Array(queueIDs)).flatMap { chunk in
+                try Row.fetchAll(database, sql: "SELECT queue_id, last_error FROM serato_write_queue WHERE queue_id IN (\(databaseQuestionMarks(count: chunk.count)))",
+                                 arguments: StatementArguments(chunk))
+            }.reduce(into: [Int64: String?]()) { rows, row in rows[row["queue_id"]] = row["last_error"] }
+            let dropped = try Self.idChunks(eventIDs).reduce(into: Set<Int64>()) { dropped, chunk in
+                try dropped.formUnion(Int64.fetchSet(database, sql: "SELECT event_id FROM serato_write_dispositions WHERE event_id IN (\(databaseQuestionMarks(count: chunk.count)))",
+                                                     arguments: StatementArguments(chunk)))
+            }
             return (remaining, dropped)
         }
-        var failures: [String: String] = [:]
+        var shortfalls: [String: DeferredSeratoShortfall] = [:]
         for batch in batches {
             let unfinished = batch.queueIDs.filter { queueID in remaining.keys.contains(queueID) }
             if let recorded = unfinished.lazy.compactMap({ queueID in remaining[queueID] ?? nil }).first {
-                failures[batch.batchId] = recorded
+                shortfalls[batch.batchId] = .failed(recorded)
             } else if let passFailure, !unfinished.isEmpty {
-                failures[batch.batchId] = String(describing: passFailure)
-            } else if dropped.contains(batch.batchId) {
-                failures[batch.batchId] = Self.supersededDeferredWriteMessage
+                shortfalls[batch.batchId] = .failed(String(describing: passFailure))
+            } else if batch.eventIDs.contains(where: dropped.contains) {
+                shortfalls[batch.batchId] = .superseded
             }
         }
-        return failures
+        return shortfalls
     }
-
-    static let supersededDeferredWriteMessage = "Not added to Serato: the file changed before it could be registered. Drop it again to import it."
 
     /// Applies `queueIDs` now unless Serato is running or readiness closes
     /// external writes, in which case they stay queued and this returns nil.
@@ -1386,8 +1388,8 @@ public actor OperationEngine {
         }
     }
 
-    private static func fileIDChunks(_ fileIDs: [Int64]) -> [[Int64]] {
-        let uniqueIDs = Array(Set(fileIDs)).sorted()
+    private static func idChunks(_ ids: [Int64]) -> [[Int64]] {
+        let uniqueIDs = Array(Set(ids)).sorted()
         // Leave room for event-type bindings even on a 999-variable SQLite.
         let chunkSize = 900
         return stride(from: 0, to: uniqueIDs.count, by: chunkSize).map { start in
@@ -1396,14 +1398,14 @@ public actor OperationEngine {
     }
 
     private static func fetchFiles(fileIDs: [Int64], in db: GRDB.Database) throws -> [FileRecord] {
-        try fileIDChunks(fileIDs).flatMap { chunk in try FileRecord.filter(keys: chunk).fetchAll(db) }
+        try idChunks(fileIDs).flatMap { chunk in try FileRecord.filter(keys: chunk).fetchAll(db) }
     }
 
     private static func fetchFileEvents(
         fileIDs: [Int64], eventTypes: Set<EventType>, in db: GRDB.Database
     ) throws -> [EventRecord] {
         let typeValues = eventTypes.map(\.rawValue)
-        return try fileIDChunks(fileIDs).flatMap { chunk in
+        return try idChunks(fileIDs).flatMap { chunk in
             try EventRecord.fetchAll(db, sql: """
             SELECT * FROM events
             WHERE file_id IN (\(databaseQuestionMarks(count: chunk.count)))
@@ -4147,6 +4149,16 @@ public actor OperationEngine {
 struct DeferredSeratoBatch: Sendable, Equatable {
     let batchId: String
     let queueIDs: [Int64]
+    let eventIDs: [Int64]
+}
+
+/// Why a deferred batch's Serato writes did not land.
+enum DeferredSeratoShortfall: Sendable, Equatable {
+    /// A write failed and stays queued for Retry Sync.
+    case failed(String)
+    /// A write was dropped because its file or record changed first; there
+    /// is nothing to retry.
+    case superseded
 }
 
 // MARK: - Resync types
