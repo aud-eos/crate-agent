@@ -155,7 +155,12 @@ actor SeratoMembershipReconciler {
             try await beforeCommit()
             let authorization = try await reader.authorization(for: snapshot)
             let expected = FileObservationExpectation(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)
-            _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
+            do {
+                _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
+            } catch FileTrashLocationError.itemChanged {
+                // Trash changed after this row's check; the Trash event or next pass re-checks it.
+                continue
+            }
             if readdedAfterOwnedRemoval {
                 try await operationEngine.supersedeReappearedCleanup(fileID: fileID)
             }

@@ -152,16 +152,25 @@ content hash) is persisted in `file_trash_locations` by the same journaled
 library-state mutation. Without Full Disk Access a Trash item can be stat-able but
 unreadable; it is then recorded by its stat identity alone, and later checks compare
 only the fields that were captured, so a permission failure never reads as an
-emptied Trash. Only `EACCES`/`EPERM` select the stat-only identity; any other read
-failure is an error, and an item whose identity cannot be read reports
-`inaccessible`, never `missing`. Stat-only identity relies on APFS/HFS+ file IDs,
-which are not reused. The mutation clears the item when the row becomes available
-or missing (restore, re-import, replacement). It keeps the item through offline and
+emptied Trash. Verification lives in `FileTrashLocation`: stat identity (volume,
+inode, size, mtime) is compared first, so a replaced or emptied item is `missing`
+without being read. Content is compared only when a hash was recorded and the item
+can be opened. Only `EACCES`/`EPERM` fall back to stat identity; any other read
+failure is an error. An item whose identity cannot be read reports `inaccessible`,
+never `missing`. Stat-only identity relies on APFS/HFS+ file IDs, which are not
+reused. The mutation clears the item when the row becomes available or missing
+(restore, re-import, replacement). It keeps the item through offline and
 inaccessible, which say nothing about whether the item still exists, and accepts a
-location with those states so every logged inverse can be applied. Every write that
-leaves a row `.trashed` re-verifies its Trash item inside the transaction, because
-Trash can be emptied while the caller awaits the commit; callers also pass the item
-they verified, so the event records which item justified it. A removal
+location with those states so every logged inverse can be applied. A write that
+repeats the row's state and supplies no new location is a no-op and verifies
+nothing. A change to `.trashed` rechecks existence and stat identity inside the
+transaction, because Trash can be emptied while the caller awaits the commit; a
+row whose own indexed path is in Trash is rechecked the same way. Callers pass the
+item they verified, so the event records which item justified it. A failed recheck
+is row-level staleness (`FileTrashLocationError.itemChanged`): the filesystem
+coordinator requests reconciliation and the reconciler leaves that row for the
+Trash event or next pass; neither fails its batch. A known path that now holds a
+different file requests reconciliation instead of writing a state. A removal
 event at that Trash path, or any reconciliation that finds the indexed path
 missing, keeps the row trashed only while that exact item still verifies;
 otherwise it becomes missing. A trashed row

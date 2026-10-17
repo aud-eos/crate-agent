@@ -88,7 +88,7 @@ public actor FilesystemSyncCoordinator {
             if try await resolvePendingMove(for: knownPath, batchID: batchID) {
                 return
             }
-            let current = try await currentAvailability(of: knownPath)
+            guard let current = try await currentAvailability(of: knownPath) else { return }
             try await observe(file: knownPath, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
             return
         }
@@ -156,8 +156,9 @@ public actor FilesystemSyncCoordinator {
     }
 
     /// A trashed row keeps its indexed path, so only its recorded Trash item proves the audio still exists.
-    private func currentAvailability(of file: FileRecord) async throws -> (availability: FileAvailability, trashLocation: FileMetadata?) {
-        let availability = try inspectKnownIdentity(file)
+    /// Nil when the indexed path holds a different file: reconciliation is requested instead of a write.
+    private func currentAvailability(of file: FileRecord) async throws -> (availability: FileAvailability, trashLocation: FileMetadata?)? {
+        guard let availability = try identityAvailability(file) else { return nil }
         guard availability == .missing, let fileID = file.id else { return (availability, nil) }
         let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
         let observed = try FileTrashLocation.availability(of: location, resolver: availabilityResolver)
@@ -172,8 +173,7 @@ public actor FilesystemSyncCoordinator {
         }
         for file in trashedFiles {
             try await operationEngine.requireUnconflicted(.file(file))
-            let current = try await currentAvailability(of: file)
-            guard current.availability != file.fileAvailability else { continue }
+            guard let current = try await currentAvailability(of: file), current.availability != file.fileAvailability else { continue }
             try await observe(file: file, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
         }
     }
@@ -295,14 +295,21 @@ public actor FilesystemSyncCoordinator {
         return true
     }
 
+    /// For move resolution, a path now holding a different file still counts as the row's
+    /// previous missing or trashed state.
     private func inspectKnownIdentity(_ file: FileRecord) throws -> FileAvailability {
+        try identityAvailability(file) ?? (file.fileAvailability == .missing || file.fileAvailability == .trashed ? file.fileAvailability : .unknown)
+    }
+
+    /// Nil when the indexed path holds a different file; reconciliation is requested.
+    private func identityAvailability(_ file: FileRecord) throws -> FileAvailability? {
         let availability = try availabilityResolver.inspect(path: file.path, volumeID: file.volumeUuid)
         guard availability == .available || availability == .trashed else { return availability }
         guard let metadata = FileMetadataCollector.collect(at: file.path),
               metadata.inode == file.inode, metadata.volumeUuid == file.volumeUuid
         else {
             requiresReconciliation = true
-            return file.fileAvailability == .missing || file.fileAvailability == .trashed ? file.fileAvailability : .unknown
+            return nil
         }
         return availability
     }
@@ -328,7 +335,11 @@ public actor FilesystemSyncCoordinator {
                                                             path: metadata.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode)))
             }
         }
-        _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID, moveExpectation: moveExpectation)
+        do {
+            _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID, moveExpectation: moveExpectation)
+        } catch FileTrashLocationError.itemChanged {
+            requiresReconciliation = true
+        }
     }
 }
 

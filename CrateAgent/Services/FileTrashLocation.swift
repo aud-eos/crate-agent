@@ -35,27 +35,33 @@ enum FileTrashLocation {
     /// identity relies on APFS/HFS+ file IDs, which are never reused; msdosfs IDs can be.
     static func capture(at path: String, for file: FileRecord) throws -> FileMetadata? {
         let readIdentity = try AudioFileReadIdentity.read(at: path)
-        guard case let .identity(location) = try observe(at: path, hashing: true) else {
+        guard case let .identity(statIdentity) = try observe(at: path) else {
             throw FileTrashLocationError.unverifiable(path: path)
         }
+        let location = try FileMetadata(path: statIdentity.path, volumeUuid: statIdentity.volumeUuid, inode: statIdentity.inode,
+                                        fileSize: statIdentity.fileSize, mtime: statIdentity.mtime, lightweightHash: contentHash(of: statIdentity))
         try readIdentity.requireUnchanged(at: path)
         let matches = location.lightweightHash == nil
-            ? file.fileSize == location.fileSize && file.inode == location.inode && file.volumeUuid == location.volumeUuid
-            && file.mtime == location.mtime
+            ? Self.sameStatIdentity(location, file.identity)
             : FileIdentityObservationMutation.matchesContent(file, identity: location)
         return matches ? location : nil
     }
 
     /// Availability of a row whose indexed path no longer exists. Only a recorded Trash item
-    /// that still verifies keeps it trashed; an item that cannot be checked is never taken as gone.
-    static func availability(of location: FileMetadata?, resolver: FileAvailabilityResolver) throws -> FileAvailability {
+    /// that still verifies keeps it trashed; an item that cannot be checked is never taken as
+    /// gone. Stat identity is compared first, so a replaced item is missing without being read.
+    /// Under the write lock, `comparingContent: false` rechecks only existence and stat identity.
+    static func availability(of location: FileMetadata?, resolver: FileAvailabilityResolver, comparingContent: Bool = true) throws -> FileAvailability {
         guard let location else { return .missing }
         switch try resolver.inspect(path: location.path, volumeID: location.volumeUuid) {
         case .trashed:
-            switch try observe(at: location.path, hashing: location.lightweightHash != nil) {
-            case let .identity(current): return stillIdentifies(location, current: current) ? .trashed : .missing
+            switch try observe(at: location.path) {
             case .gone: return .missing
             case .inaccessible: return .inaccessible
+            case let .identity(current):
+                guard sameStatIdentity(location, current) else { return .missing }
+                guard comparingContent, let recordedHash = location.lightweightHash else { return .trashed }
+                return try contentHash(of: current).map { currentHash in currentHash == recordedHash ? .trashed : .missing } ?? .trashed
             }
         case .offline: return .offline
         case .inaccessible: return .inaccessible
@@ -69,9 +75,8 @@ enum FileTrashLocation {
         case inaccessible
     }
 
-    /// Hashes the item only when it can be opened; denied read permission yields a stat-only
-    /// identity, and any other read failure is an error rather than a guess.
-    private static func observe(at path: String, hashing: Bool) throws -> Observation {
+    /// The item's stat identity, without reading its content.
+    private static func observe(at path: String) throws -> Observation {
         var status = stat()
         guard stat(path, &status) == 0 else {
             switch errno {
@@ -81,40 +86,44 @@ enum FileTrashLocation {
             }
         }
         guard status.st_mode & S_IFMT == S_IFREG else { return .gone }
-        let readable = hashing ? try canOpen(path) : false
-        guard let metadata = FileMetadataCollector.collect(at: path, includeLightweightHash: readable) else { return .inaccessible }
-        guard !readable || metadata.lightweightHash != nil else { throw FileTrashLocationError.unverifiable(path: path) }
+        guard let metadata = FileMetadataCollector.collect(at: path) else { return .inaccessible }
         return .identity(metadata)
     }
 
-    private static func canOpen(_ path: String) throws -> Bool {
-        let descriptor = open(path, O_RDONLY)
+    /// Nil when there is no content to compare: an empty item, or one whose read permission is
+    /// denied, where the stat identity decides. Any other read failure is an error, not a guess.
+    private static func contentHash(of item: FileMetadata) throws -> Data? {
+        guard item.fileSize > 0 else { return nil }
+        let descriptor = open(item.path, O_RDONLY)
         guard descriptor >= 0 else {
             if errno == EACCES || errno == EPERM {
-                return false
+                return nil
             }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         close(descriptor)
-        return true
+        guard let hash = LightweightHashCalculator.compute(forFileAt: item.path) else {
+            throw FileTrashLocationError.unverifiable(path: item.path)
+        }
+        return hash
     }
 
-    /// Compares only what was captured: a content hash that can no longer be read is a
-    /// permission failure, so the stat identity decides.
-    private static func stillIdentifies(_ location: FileMetadata, current: FileMetadata) -> Bool {
-        guard current.volumeUuid == location.volumeUuid, current.inode == location.inode, current.fileSize == location.fileSize,
-              current.mtime == location.mtime else { return false }
-        guard let recordedHash = location.lightweightHash, let currentHash = current.lightweightHash else { return true }
-        return recordedHash == currentHash
+    private static func sameStatIdentity(_ location: FileMetadata, _ current: FileMetadata) -> Bool {
+        current.volumeUuid == location.volumeUuid && current.inode == location.inode && current.fileSize == location.fileSize
+            && current.mtime == location.mtime
     }
 }
 
 enum FileTrashLocationError: LocalizedError, Equatable {
     case unverifiable(path: String)
+    /// The Trash item a write relied on changed before commit. Row-level staleness: callers
+    /// leave the row for the next check instead of failing their batch.
+    case itemChanged(fileId: Int64)
 
     var errorDescription: String? {
         switch self {
         case let .unverifiable(path): "The Trash item at \(path) could not be verified."
+        case let .itemChanged(fileId): "The Trash item recorded for file \(fileId) changed before it could be saved; it will be checked again."
         }
     }
 }

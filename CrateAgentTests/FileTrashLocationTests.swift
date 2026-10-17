@@ -172,7 +172,7 @@ final class FileTrashLocationContractTests: XCTestCase {
                 fileId: XCTUnwrap(file.id), expectedRevision: file.membershipRevision, state: state(of: file, availability: .trashed)
             ))], batchId: "return-to-trash")
             XCTFail("An emptied Trash item must not justify a trashed row")
-        } catch FileProcessingEligibilityError.superseded {}
+        } catch FileTrashLocationError.itemChanged {}
         let row = try await reload(file)
         XCTAssertEqual(row.fileAvailability, .inaccessible)
     }
@@ -193,6 +193,56 @@ final class FileTrashLocationContractTests: XCTestCase {
         XCTAssertEqual(row.fileAvailability, .inaccessible)
         let restored = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
         XCTAssertEqual(restored, location)
+    }
+
+    func testKnownPathHoldingAnotherFileRequestsReconciliationWithoutHaltingSync() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let indexedPath = directory.appendingPathComponent("saved-over.mp3")
+        try Data([5, 6, 7, 8]).write(to: indexedPath)
+        let location = try emptiedLocation()
+        let file = try await database.writer.write { connection in
+            var file = FileRecord(path: indexedPath.path, volumeUuid: location.volumeUuid, inode: 1, fileSize: 4, mtime: 1,
+                                  lightweightHash: location.lightweightHash)
+            file.libraryMembership = .active
+            file.fileAvailability = .trashed
+            try file.insert(connection)
+            try FileTrashLocation.store(location, fileID: XCTUnwrap(file.id), in: connection)
+            return file
+        }
+        let coordinator = FilesystemSyncCoordinator(operationEngine: engine, database: database)
+        try await coordinator.handleObservations([.init(path: indexedPath.path, isFile: true, wasRenamed: true)])
+        let row = try await reload(file)
+        XCTAssertEqual(row.fileAvailability, .trashed, "an undetermined identity is left for reconciliation, not rewritten")
+        let requested = await coordinator.takeReconciliationRequest()
+        XCTAssertTrue(requested)
+    }
+
+    func testCaptureRecordsUnreadableAndEmptyItemsByStatIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let unreadable = directory.appendingPathComponent("denied.mp3")
+        let empty = directory.appendingPathComponent("empty.mp3")
+        try Data([1, 2, 3, 4]).write(to: unreadable)
+        try Data().write(to: empty)
+        let unreadableRow = try indexedRow(at: unreadable.path)
+        let emptyRow = try indexedRow(at: empty.path)
+        XCTAssertEqual(chmod(unreadable.path, 0), 0)
+        defer { chmod(unreadable.path, 0o644) }
+
+        let deniedLocation = try FileTrashLocation.capture(at: unreadable.path, for: unreadableRow)
+        XCTAssertEqual(deniedLocation?.inode, unreadableRow.inode)
+        XCTAssertNil(deniedLocation?.lightweightHash, "denied read permission records stat identity only")
+        let emptyLocation = try FileTrashLocation.capture(at: empty.path, for: emptyRow)
+        XCTAssertEqual(emptyLocation?.inode, emptyRow.inode, "an empty item has no content to read and is still recorded")
+    }
+
+    private func indexedRow(at path: String) throws -> FileRecord {
+        let metadata = try XCTUnwrap(FileMetadataCollector.collect(at: path, includeLightweightHash: true))
+        return FileRecord(path: path, volumeUuid: metadata.volumeUuid, inode: metadata.inode, fileSize: metadata.fileSize,
+                          mtime: metadata.mtime, lightweightHash: metadata.lightweightHash)
     }
 
     private func emptiedLocation() throws -> FileMetadata {

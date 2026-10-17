@@ -32,9 +32,10 @@ enum FileLibraryStateMutation {
         }
         let previousState = file.libraryState
         let previousTrashLocation = try FileTrashLocation.load(fileID: payload.fileId, in: database)
-        let trashLocation = try nextTrashLocation(payload, previous: previousTrashLocation)
         let readded = payload.observedReadditionAfterOwnedRemoval == true
-        guard startsImportIntent || readded || previousState != payload.state || previousTrashLocation != trashLocation else { return nil }
+        let suppliesNewLocation = payload.trashLocation.map { location in location != previousTrashLocation } ?? false
+        guard startsImportIntent || readded || previousState != payload.state || suppliesNewLocation else { return nil }
+        let trashLocation = try nextTrashLocation(payload, file: file, previous: previousTrashLocation)
 
         if startsImportIntent || readded || file.libraryMembership != payload.state.membership {
             file.membershipRevision += 1
@@ -56,17 +57,23 @@ enum FileLibraryStateMutation {
     }
 
     /// A recorded Trash item belongs to a trashed row. Offline and inaccessible say nothing
-    /// about whether that item still exists, so they keep it for the next check. A trashed
-    /// state is re-verified here, under the write lock, because Trash can be emptied while
-    /// the caller awaits the commit.
-    private static func nextTrashLocation(_ payload: SetFileLibraryStatePayload, previous: FileMetadata?) throws -> FileMetadata? {
+    /// about whether that item still exists, so they keep it for the next check. A change to
+    /// trashed is re-checked here, under the write lock, because Trash can be emptied while
+    /// the caller awaits the commit; the caller's own pre-check already compared content.
+    private static func nextTrashLocation(_ payload: SetFileLibraryStatePayload, file: FileRecord, previous: FileMetadata?) throws -> FileMetadata? {
         switch payload.state.availability {
         case .trashed:
-            guard let location = payload.trashLocation ?? previous else { return nil }
-            guard try FileTrashLocation.availability(of: location, resolver: FileAvailabilityResolver()) == .trashed else {
-                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            let resolver = FileAvailabilityResolver()
+            if let location = payload.trashLocation ?? previous {
+                guard try FileTrashLocation.availability(of: location, resolver: resolver, comparingContent: false) == .trashed else {
+                    throw FileTrashLocationError.itemChanged(fileId: payload.fileId)
+                }
+                return location
             }
-            return location
+            guard try resolver.inspect(path: file.path, volumeID: file.volumeUuid) == .trashed else {
+                throw FileTrashLocationError.itemChanged(fileId: payload.fileId)
+            }
+            return nil
         case .offline, .inaccessible:
             return payload.trashLocation ?? previous
         case .available, .missing, .unknown:
