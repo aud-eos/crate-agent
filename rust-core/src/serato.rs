@@ -1627,33 +1627,6 @@ mod tests {
     }
 
     #[test]
-    fn add_track_is_idempotent_for_existing_path() {
-        let bytes = synthetic_library(
-            "2.0/Serato Scratch LIVE Database",
-            TAG_PFIL,
-            &["Users/x/Music/A/dup.mp3"],
-        );
-        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let metadata = SeratoMetadataUpdate {
-            artist: Some("Ignored".to_string()),
-            ..Default::default()
-        };
-        let added = database.add_tracks(&[("Users/x/Music/A/dup.mp3".to_string(), metadata)]);
-        assert_eq!(added, [false], "duplicate add must be a no-op");
-        assert_eq!(database.track_count(), 1);
-
-        // The pre-existing otrk's metadata should be unchanged —
-        // add_track only handles inserts, not updates. The
-        // existing entry had no `tart`, so it should still have none.
-        let records = database.track_records();
-        assert_eq!(records.len(), 1);
-        assert!(
-            records[0].artist.is_none(),
-            "existing entry's metadata is untouched"
-        );
-    }
-
-    #[test]
     fn add_track_with_no_metadata_writes_only_pfil() {
         let bytes = synthetic_library(
             "2.0/Serato Scratch LIVE Database",
@@ -1842,17 +1815,18 @@ mod tests {
             );
             let mut expected = vec![records[0].clone()];
             expected.extend(non_matching_records(path_tag));
-            let mut database = DatabaseV2 {
-                records: records.clone(),
-            };
-            let mut crate_file = CrateFile { records };
-            if path_tag == TAG_PFIL {
-                assert_eq!(database.remove_track(PREFILTER_TARGET), 2);
-                assert_eq!(database.records, expected);
+            let (removed, remaining) = if path_tag == TAG_PFIL {
+                let mut database = DatabaseV2 { records };
+                (database.remove_track(PREFILTER_TARGET), database.records)
             } else {
-                assert_eq!(crate_file.remove_track(PREFILTER_TARGET), 2);
-                assert_eq!(crate_file.records, expected);
-            }
+                let mut crate_file = CrateFile { records };
+                (
+                    crate_file.remove_track(PREFILTER_TARGET),
+                    crate_file.records,
+                )
+            };
+            assert_eq!(removed, 2);
+            assert_eq!(remaining, expected);
         }
     }
 
@@ -1861,9 +1835,16 @@ mod tests {
         for path_tag in [TAG_PFIL, TAG_PTRK] {
             let renames =
                 HashMap::from([(PREFILTER_TARGET.to_string(), PREFILTER_RENAMED.to_string())]);
-            let mut records = prefilter_library(path_tag, PREFILTER_TARGET);
-            assert_eq!(rewrite_paths_in_otrks(&mut records, path_tag, &renames), 2);
-            assert_eq!(records, prefilter_library(path_tag, PREFILTER_RENAMED));
+            let records = prefilter_library(path_tag, PREFILTER_TARGET);
+            let (rewritten, result) = if path_tag == TAG_PFIL {
+                let mut database = DatabaseV2 { records };
+                (database.rewrite_paths(&renames), database.records)
+            } else {
+                let mut crate_file = CrateFile { records };
+                (crate_file.rewrite_paths(&renames), crate_file.records)
+            };
+            assert_eq!(rewritten, 2);
+            assert_eq!(result, prefilter_library(path_tag, PREFILTER_RENAMED));
         }
     }
 

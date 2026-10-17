@@ -2295,7 +2295,7 @@ public actor OperationEngine {
         case let .metadataUpdate(update):
             try await applySeratoMetadataUpdate(update, guardedWrites: guardedWrites)
         case .addTrack:
-            try await applySeratoAddTracks(guardedWrites)
+            preconditionFailure("Queued adds are registered by applySeratoAddTracks, never one row at a time")
         case let .fileTagWrite(write):
             try await applyFileTagWrite(write, guardedWrites: guardedWrites)
         case let .removeFromDatabase(removal):
