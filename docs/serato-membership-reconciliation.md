@@ -300,9 +300,11 @@ swap within one drain pass: when a later rename moves a different file into an
 earlier rename's old path, the earlier rename skips the old-path occupancy check,
 even when the two land in different bounded segments. It keeps every other
 identity check. A rename that some store already took also skips that check, so
-it finishes in the rest. When a rename is dropped, every later rename in the pass
-into its old path is dropped too, transitively, because the record there never
-moved (#199). Expected supersession removes only
+it finishes in the rest. When a rename is dropped, the same transaction drops every
+later queued rename into its old path, transitively and each with its own
+disposition, because the record there never moved (#199). The exception is an
+old path that the same file's latest earlier rename, also not applied, never
+reached: no record waits there. Expected supersession removes only
 the obsolete queued work and records a `serato_write_dispositions` row so the drop
 stays visible after a restart; unexpected I/O failure stays visible and retryable.
 
@@ -368,6 +370,14 @@ single key. Code that must keep Serato occurrences distinct keys them by
 `Data(path.utf8)` or by occurrence index, as `SeratoConflictAnalyzer` and
 `LibraryRefreshPlan` do. It applies `SeratoPath.normalized` only after conflict
 analysis has run.
+
+The Rust writers for `database V2`, Subcrates and SmartCrates use the same rule:
+a rename, metadata update, removal, addition or held-path check matches a stored
+path by its NFC form, so a decomposed spelling Finder stored matches a composed
+request, and the reverse. Matching never rewrites a path field's bytes; only a
+rename replaces the matched field, with the requested destination. Two records whose
+spellings are equivalent form a conflict, which the scope above
+keeps away from those writers.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared
@@ -456,9 +466,22 @@ rename whose track neither `database V2` nor any crate holds at its final path
 afterwards, completes as `noSeratoRecord` in the transaction that removes its
 row, and does not advance the external baseline: the Rust batch writers report
 each unmatched path, so a write with nothing to change is told apart from one
-with no entry, and Re-sync counts it as not written (#105). A missing
-`database V2` is not evidence that a track is absent and keeps its tolerant
-behavior.
+with no entry, and Re-sync counts it as not written (#105).
+
+A missing `database V2` is not evidence that a track is absent (#192), and
+crate-agent never creates it. While it is missing, every queued Serato library
+write waits: adds and imports, metadata updates, renames, and removals from
+`database V2` and crates, with the later rows that depend on them. Audio-tag
+writes and Trash, which touch no Serato library file, still drain. No
+`Subcrates` or `SmartCrates` file is rewritten either, so the three file sets
+never disagree about a track. The check runs per drain segment, after
+readiness and conflict deferral, and again at each writer; once a pass finds
+the file missing, the rest of its Serato library writes wait too. Every held row
+records one `seratoDatabaseMissing` error naming the path and how many changes
+the pass held, and the drain or Re-sync fails with it, so the sync status shows
+it and **Retry Sync** applies the rows once the file is back. On a Mac where
+Serato has never run, sync itself reports `sourceMissing`: open Serato once to
+create its library. Discarding queued changes instead is #163.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
