@@ -77,6 +77,8 @@ pub enum CoreError {
     Fingerprint { message: String },
     #[error("tag error: {message}")]
     Tag { message: String },
+    #[error("{message}")]
+    LandedNotDurable { message: String },
 }
 
 impl From<std::io::Error> for CoreError {
@@ -92,6 +94,9 @@ impl From<serato::SeratoError> for CoreError {
         match err {
             serato::SeratoError::Io(io_err) => CoreError::IoError {
                 message: io_err.to_string(),
+            },
+            landed @ serato::SeratoError::LandedNotDurable { .. } => CoreError::LandedNotDurable {
+                message: landed.to_string(),
             },
             other => CoreError::SeratoFormat {
                 message: other.to_string(),
