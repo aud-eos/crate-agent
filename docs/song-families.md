@@ -51,6 +51,35 @@ MusicBrainz-matched recording, any unannotated title, and finally the lowest
 recording id. A retired or missing saved choice is passed over without being
 replaced, and returns when it is available again.
 
+## Library
+
+- Each family shows one main row: the displayed representative's file, with
+  **5 versions** (distinct recordings in the current status scope) and, when any
+  member is selected, **5 versions · 2 selected**. Families sort by the main
+  row's values; alternates stay directly beneath it.
+- **Show N alternates** / **Hide alternates** (or Right and Left Arrow on the
+  focused row, or the context menu) changes disclosure only. Selecting the main
+  row never expands it, and collapsing keeps every selection.
+- A search matches every member. A family appears when any member matches;
+  matching alternates are shown while the search is active without changing
+  the saved disclosure state, and nothing is selected automatically.
+- **Select all** selects main and standalone rows. With **Include alternates**
+  checked beside it, it also selects each in-scope family's processable
+  alternates. Each main row's **Include alternates** checkbox selects or
+  deselects that family's processable alternates without expanding it, and is
+  mixed when only some are selected. Unavailable or retired alternates remain
+  visible and selectable by hand, but never through these controls.
+- The context menu groups the selection, adds selected files to the clicked
+  family, merges the selected files' families into it, splits selected members
+  into a new family, sets or clears the main version, and removes a member.
+  Each is one History entry.
+
+The projection runs in SQL (`LibraryBrowseQuery`): family files are ranked in
+small CTEs using the same `SongFamilyRepresentative` ordering as the service,
+and the outer pass over `files` joins only their results. On the 30,000-file
+paging fixture with 6,000 files in 2,000 families, count and page queries stay
+under the 1 s hard budget in `LibraryPagingTests`, which attaches the timings.
+
 ## History and undo
 
 Every call is one `OperationEngine` mutation (`.songFamily`) in its own batch.

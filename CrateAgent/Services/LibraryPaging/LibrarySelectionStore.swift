@@ -11,7 +11,7 @@ actor LibrarySelectionStore: PagedSelectionProvider {
     private var epoch: UInt64 = 0
 
     init(database: LibraryDatabase,
-         readIdentities: @escaping IdentityReader = { snapshot, after, limit in try await snapshot.identities(after: after, limit: limit) }) throws
+         readIdentities: @escaping IdentityReader = { snapshot, after, limit in try await snapshot.selectAllIdentities(after: after, limit: limit) }) throws
     {
         guard let pool = database.writer as? DatabasePool else { throw PagingError.unavailableDatabase }
         self.pool = pool
@@ -85,28 +85,45 @@ actor LibrarySelectionStore: PagedSelectionProvider {
         }
     }
 
+    /// Every explicitly selected id, for batch actions bounded by `limit`.
+    func selectedIDs(limit: Int) throws -> [Int64] {
+        let ids = try requireStorage().read { database in
+            try Int64.fetchAll(database, sql: "SELECT id FROM selected_identity WHERE included = 1 ORDER BY id LIMIT ?", arguments: [limit + 1])
+        }
+        guard ids.count <= limit else { throw LibrarySelectionError.tooManySelected(limit: limit) }
+        return ids
+    }
+
     func summary(in snapshot: Snapshot) async throws -> PagedSelectionSummary {
         let requestedEpoch = epoch
         let total = try await requireStorage().read { database in
             guard let count = try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM selected_identity WHERE included = 1") else { throw PagingError.incompletePage }
             return count
         }
-        let count = await snapshot.count()
-        var inScope = 0
-        if total > 0 {
-            var lastID: Int64?
-            while true {
-                try Task.checkCancellation()
-                let batch = try await snapshot.identities(after: lastID, limit: 200)
-                guard requestedEpoch == epoch else { throw CancellationError() }
-                if batch.isEmpty {
-                    break
-                }
-                inScope += try selectedIDs(in: batch).count
-                lastID = batch.last?.id
+        let scopeCount = await snapshot.selectAllCount()
+        guard total > 0 else { return .init(total: 0, inScope: 0, scopeCount: scopeCount, removed: 0, scopeSelected: 0) }
+        let inScope = try await countSelected { after in try await snapshot.identities(after: after, limit: 200) }
+        let scopeSelected = try await countSelected { after in try await snapshot.selectAllIdentities(after: after, limit: 200) }
+        guard requestedEpoch == epoch else { throw CancellationError() }
+        return .init(total: total, inScope: inScope, scopeCount: scopeCount, removed: 0, scopeSelected: scopeSelected)
+    }
+
+    /// Selected identities across a scope read in id-ordered batches.
+    private func countSelected(batch nextBatch: (Int64?) async throws -> [Identity]) async throws -> Int {
+        let requestedEpoch = epoch
+        var selected = 0
+        var lastID: Int64?
+        while true {
+            try Task.checkCancellation()
+            let batch = try await nextBatch(lastID)
+            guard requestedEpoch == epoch else { throw CancellationError() }
+            if batch.isEmpty {
+                break
             }
+            selected += try selectedIDs(in: batch).count
+            lastID = batch.last?.id
         }
-        return .init(total: total, inScope: inScope, scopeCount: count, removed: 0)
+        return selected
     }
 
     func reconcile() throws -> Int {
@@ -199,6 +216,16 @@ actor LibrarySelectionStore: PagedSelectionProvider {
                 try database.execute(sql: "DELETE FROM staged_identity WHERE operation = ?", arguments: [operation])
             }
             throw error
+        }
+    }
+}
+
+enum LibrarySelectionError: LocalizedError, Equatable {
+    case tooManySelected(limit: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case let .tooManySelected(limit): "Select at most \(limit) files for this action."
         }
     }
 }

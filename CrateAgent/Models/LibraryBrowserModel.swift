@@ -9,6 +9,13 @@ final class LibraryBrowserModel: ObservableObject {
     @Published private(set) var query = LibraryBrowseQuery()
     @Published private(set) var isRefreshing = false
     @Published var error: String?
+    /// Selection and eligibility of each visible family's members, including collapsed alternates.
+    @Published private(set) var familyStates: [Int64: LibraryFamilyState] = [:]
+    /// Changes whenever a family row's selection or disclosure display changes.
+    @Published private(set) var familyRevision: UInt64 = 0
+    private let selectionStore: LibrarySelectionStore
+    private var familyMembers: [Int64: [LibraryFamilyPlacement]] = [:]
+    private var familyTask: Task<Void, Never>?
     private let database: LibraryDatabase
     private let pool: DatabasePool
     private var observation: AnyDatabaseCancellable?
@@ -26,14 +33,83 @@ final class LibraryBrowserModel: ObservableObject {
         guard let pool = database.writer as? DatabasePool else { throw PagingError.unavailableDatabase }
         self.database = database
         self.pool = pool
-        selection = try PagedSelectionController(provider: LibrarySelectionStore(database: database))
+        selectionStore = try LibrarySelectionStore(database: database)
+        selection = PagedSelectionController(provider: selectionStore)
         results.objectWillChange.merge(with: selection.objectWillChange).sink { [weak self] in
             self?.objectWillChange.send()
         }.store(in: &subscriptions)
         results.$updateID.dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in
-            guard let self, let snapshot = results.snapshot else { return }
-            selection.updateVisibleIdentities(results.cachedRows.map { row in snapshot.identity(for: row) })
+            self?.loadFamilyMembers()
         }.store(in: &subscriptions)
+        selection.$visibleSelectedIDs.receive(on: RunLoop.main).sink { [weak self] selected in
+            self?.updateFamilyStates(selected: selected)
+        }.store(in: &subscriptions)
+    }
+
+    /// Identities of every visible row plus every member of the visible families, so
+    /// selection state covers alternates while their family is collapsed.
+    private var trackedIdentities: [PagedIdentity<Int64>] {
+        guard let snapshot = results.snapshot else { return [] }
+        let rows = results.cachedRows.map { row in snapshot.identity(for: row) }
+        let members = familyMembers.values.flatMap { placements in placements.map(\.identity) }
+        return Array(Set(rows + members))
+    }
+
+    private func loadFamilyMembers() {
+        guard let snapshot = results.snapshot else { return }
+        let familyIDs = Set(results.cachedRows.compactMap { row in row.familyRole == .main ? row.familyId : nil })
+        familyTask?.cancel()
+        familyTask = Task { [weak self] in
+            do {
+                let members = try await snapshot.familyMembers(familyIDs)
+                guard let self, !Task.isCancelled, results.snapshot === snapshot else { return }
+                familyMembers = members
+                selection.updateVisibleIdentities(trackedIdentities)
+                updateFamilyStates(selected: selection.visibleSelectedIDs)
+            } catch is CancellationError {
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    private func updateFamilyStates(selected: Set<Int64>) {
+        var states: [Int64: LibraryFamilyState] = [:]
+        for (familyID, members) in familyMembers {
+            states[familyID] = LibraryFamilyState(members: members, selected: selected, isExpanded: query.expandedFamilies.contains(familyID))
+        }
+        guard states != familyStates else { return }
+        familyStates = states
+        familyRevision &+= 1
+    }
+
+    func setExpanded(_ expanded: Bool, family familyID: Int64) {
+        var updated = query
+        if expanded {
+            updated.expandedFamilies.insert(familyID)
+        } else {
+            updated.expandedFamilies.remove(familyID)
+        }
+        apply(updated, reset: false)
+        updateFamilyStates(selected: selection.visibleSelectedIDs)
+    }
+
+    func setIncludeAlternates(_ include: Bool) {
+        var updated = query
+        updated.includeAlternates = include
+        apply(updated, reset: false)
+    }
+
+    /// Selects or deselects the family's eligible alternates without changing its disclosure or main row.
+    func setAlternatesSelected(_ selected: Bool, family familyID: Int64) {
+        guard let state = familyStates[familyID] else { return }
+        selection.set(state.eligibleAlternates, selected: selected)
+    }
+
+    /// The explicit selection, for batch actions. Throws when it exceeds `limit`.
+    func selectedFileIDs(limit: Int) async throws -> [Int64] {
+        try await selectionStore.selectedIDs(limit: limit)
     }
 
     func start() async {
@@ -71,13 +147,19 @@ final class LibraryBrowserModel: ObservableObject {
     }
 
     func setQuery(_ query: LibraryBrowseQuery) {
+        apply(query, reset: true)
+    }
+
+    private func apply(_ query: LibraryBrowseQuery, reset: Bool) {
         guard self.query != query else { return }
         self.query = query
         queryVersion &+= 1
-        results.stop()
-        focusedID = nil
-        focusedIndex = 0
-        requestRefresh(reset: true)
+        if reset {
+            results.stop()
+            focusedID = nil
+            focusedIndex = 0
+        }
+        requestRefresh(reset: reset)
     }
 
     func focus(id: Int64?, index: Int) {
@@ -107,6 +189,9 @@ final class LibraryBrowserModel: ObservableObject {
         observation = nil
         refreshTask?.cancel()
         refreshTask = nil
+        familyTask?.cancel()
+        familyTask = nil
+        familyMembers = [:]
         dirty = false
         results.stop()
         selection.stop()
@@ -150,7 +235,7 @@ final class LibraryBrowserModel: ObservableObject {
                     }
                     await results.open(snapshot, anchorID: anchor, fallbackIndex: fallback, focusID: reset ? nil : focusedID, focusFallback: reset ? nil : focusedIndex)
                     guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }
-                    selection.updateScope(snapshot, visibleIdentities: results.cachedRows.map { row in snapshot.identity(for: row) })
+                    selection.updateScope(snapshot, visibleIdentities: trackedIdentities)
                     selection.reconcile(in: snapshot)
                     error = nil
                 } catch {

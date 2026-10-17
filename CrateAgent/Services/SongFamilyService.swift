@@ -27,6 +27,13 @@ public struct SongFamily: Equatable, Sendable, Identifiable {
     }
 }
 
+/// A file's recording and the family that recording belongs to, if any.
+public struct SongFamilyFileMembership: Equatable, Sendable {
+    public let fileId: Int64
+    public let trackId: Int64?
+    public let familyId: Int64?
+}
+
 public struct SongFamilyResult: Equatable, Sendable {
     /// History batch that undoes the change.
     public let batchId: String
@@ -89,6 +96,18 @@ public struct SongFamilyService: Sendable {
         }
     }
 
+    public func memberships(ofFiles fileIds: [Int64]) async throws -> [SongFamilyFileMembership] {
+        let ids = "[" + fileIds.map(String.init).joined(separator: ",") + "]"
+        return try await database.writer.read { database in
+            try Row.fetchAll(database, sql: """
+            SELECT files.id, files.track_id, tracks.work_id FROM files LEFT JOIN tracks ON tracks.id = files.track_id
+            WHERE files.id IN (SELECT value FROM json_each(?)) ORDER BY files.id
+            """, arguments: [ids]).map { row in
+                SongFamilyFileMembership(fileId: row["id"], trackId: row["track_id"], familyId: row["work_id"])
+            }
+        }
+    }
+
     private func apply(_ operation: SongFamilyOperation, familyId: Int64?) async throws -> SongFamilyResult {
         let batchID = UUID().uuidString
         guard let eventID = try await engine.apply(.songFamily(operation), batchId: batchID) else {
@@ -105,55 +124,57 @@ public struct SongFamilyService: Sendable {
 
     static func fetchFamily(id: Int64, in database: GRDB.Database) throws -> SongFamily? {
         guard let record = try SongFamilyRecord.fetchOne(database, key: id) else { return nil }
-        let tracks = try TrackRecord.filter(Column("work_id") == id).order(Column("id")).fetchAll(database)
-        let files = try Row.fetchAll(database, sql: """
-        SELECT id, track_id, artist, title, (\(FileProcessingEligibility.processableSQL)) AS available
-        FROM files WHERE track_id IN (SELECT id FROM tracks WHERE work_id = ?)
-        ORDER BY available DESC, id
-        """, arguments: [id])
-        let filesByTrack = Dictionary(grouping: files) { row in row["track_id"] as Int64 }
-        let members = tracks.compactMap { track -> SongFamilyMemberSummary? in
-            guard let trackID = track.id else { return nil }
-            let trackFiles = filesByTrack[trackID] ?? []
-            return SongFamilyMemberSummary(
-                trackId: trackID,
-                title: trackFiles.lazy.compactMap { row in row["title"] as String? }.first ?? track.title,
-                artist: trackFiles.lazy.compactMap { row in row["artist"] as String? }.first ?? track.artist,
-                isMusicBrainzMatched: track.musicbrainzRecordingId != nil,
-                fileIds: trackFiles.map { row in row["id"] as Int64 }.sorted(),
-                isAvailable: trackFiles.contains { row in row["available"] as Bool }
-            )
+        let order = SongFamilyRepresentative.orderSQL(available: "available", saved: "saved", title: "COALESCE(files.title, tracks.title)",
+                                                      musicBrainzID: "tracks.musicbrainz_recording_id", recording: "tracks.id", file: "files.id")
+        let rows = try Row.fetchAll(database, sql: """
+        SELECT tracks.id AS track_id, tracks.musicbrainz_recording_id AS recording_mbid, files.id AS file_id,
+               COALESCE(files.title, tracks.title) AS title, COALESCE(files.artist, tracks.artist) AS artist,
+               COALESCE(\(FileProcessingEligibility.processableSQL), 0) AS available, tracks.id IS ? AS saved
+        FROM tracks LEFT JOIN files ON files.track_id = tracks.id
+        WHERE tracks.work_id = ?
+        ORDER BY \(order)
+        """, arguments: [record.representativeTrackId, id])
+        var members: [SongFamilyMemberSummary] = []
+        for (trackID, trackRows) in Dictionary(grouping: rows, by: { row in row["track_id"] as Int64 }) {
+            guard let best = trackRows.first else { continue }
+            members.append(SongFamilyMemberSummary(
+                trackId: trackID, title: best["title"], artist: best["artist"],
+                isMusicBrainzMatched: best["recording_mbid"] as String? != nil,
+                fileIds: trackRows.compactMap { row in row["file_id"] as Int64? }.sorted(),
+                isAvailable: trackRows.contains { row in row["available"] as Bool }
+            ))
         }
-        guard let representative = SongFamilyRepresentative.choose(from: members, saved: record.representativeTrackId) else { return nil }
-        let ordered = members.filter { member in member.trackId == representative } + members.filter { member in member.trackId != representative }
-        return SongFamily(id: id, savedRepresentativeTrackId: record.representativeTrackId, representativeTrackId: representative, members: ordered)
+        guard let representative = rows.first.map({ row in row["track_id"] as Int64 }) else { return nil }
+        members.sort { first, second in (first.trackId == representative ? 0 : 1, first.trackId) < (second.trackId == representative ? 0 : 1, second.trackId) }
+        return SongFamily(id: id, savedRepresentativeTrackId: record.representativeTrackId, representativeTrackId: representative, members: members)
     }
 }
 
-/// Chooses the member a family displays. Available members win over
-/// unavailable ones, so a retired or missing saved choice is passed over for
-/// now without being replaced. Among the candidates: the saved choice, then a
-/// title marked Main/Original, then a MusicBrainz-matched unannotated
-/// recording, any MusicBrainz match, any unannotated title, and finally the
-/// lowest recording id.
+/// Chooses the file, and so the recording, a family displays, as SQL ordering
+/// terms so Library sorting and the service share one rule. Available files
+/// win, so a retired or missing saved choice is passed over without being
+/// replaced. Then: the saved choice, a title marked Main/Original, a
+/// MusicBrainz-matched unannotated recording, any MusicBrainz match, any
+/// unannotated title, the lowest recording id, and the lowest file id.
 enum SongFamilyRepresentative {
-    static func choose(from members: [SongFamilyMemberSummary], saved: Int64?) -> Int64? {
-        let available = members.filter(\.isAvailable)
-        let candidates = available.isEmpty ? members : available
-        if let saved, candidates.contains(where: { member in member.trackId == saved }) {
-            return saved
-        }
-        return candidates.min { first, second in
-            (rank(first), first.trackId) < (rank(second), second.trackId)
-        }?.trackId
+    static let rankFunction = "song_family_rank"
+
+    static func register(in database: GRDB.Database) {
+        database.add(function: DatabaseFunction(rankFunction, argumentCount: 2, pure: true) { values in
+            rank(title: String.fromDatabaseValue(values[0]), isMusicBrainzMatched: !values[1].isNull)
+        })
     }
 
-    private static func rank(_ member: SongFamilyMemberSummary) -> Int {
-        let annotations = member.title.map(TitleMatcher.annotationSegments) ?? []
+    static func orderSQL(available: String, saved: String, title: String, musicBrainzID: String, recording: String, file: String) -> String {
+        "\(available) DESC, \(saved) DESC, \(rankFunction)(\(title), \(musicBrainzID)), \(recording), \(file)"
+    }
+
+    static func rank(title: String?, isMusicBrainzMatched: Bool) -> Int {
+        let annotations = title.map(TitleMatcher.annotationSegments) ?? []
         if annotations.contains(where: isMainVersionLabel) {
             return 0
         }
-        switch (member.isMusicBrainzMatched, annotations.isEmpty) {
+        switch (isMusicBrainzMatched, annotations.isEmpty) {
         case (true, true): return 1
         case (true, false): return 2
         case (false, true): return 3

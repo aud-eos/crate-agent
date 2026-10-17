@@ -6,23 +6,31 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
     nonisolated let signature: LibraryBrowseQuery
     private let reader: DatabaseSnapshot
     private let total: Int
+    private let selectAllTotal: Int
+    /// Loaded once per snapshot so selection scopes and family counts don't re-run the projection per batch.
+    private var cachedPlacements: [LibraryFamilyPlacement]?
 
-    private init(reader: DatabaseSnapshot, query: LibraryBrowseQuery, total: Int) {
+    private init(reader: DatabaseSnapshot, query: LibraryBrowseQuery, total: Int, selectAllTotal: Int) {
         self.reader = reader
         signature = query
         self.total = total
+        self.selectAllTotal = selectAllTotal
     }
 
     static func open(pool: DatabasePool, query: LibraryBrowseQuery) async throws -> LibraryPagedSnapshot {
         try Task.checkCancellation()
         let reader = try pool.makeSnapshot()
-        let total = try reader.read { database in try query.count(in: database) }
+        let counts = try reader.read { database in try query.counts(in: database) }
         try Task.checkCancellation()
-        return LibraryPagedSnapshot(reader: reader, query: query, total: total)
+        return LibraryPagedSnapshot(reader: reader, query: query, total: counts.visible, selectAllTotal: counts.selectAll)
     }
 
     func count() -> Int {
         total
+    }
+
+    func selectAllCount() -> Int {
+        selectAllTotal
     }
 
     func rows(in range: Range<Int>) throws -> [BrowserRow] {
@@ -33,41 +41,75 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
 
     func index(of id: Int64) throws -> Int? {
         try Task.checkCancellation()
-        return try reader.read { database in
-            try Int.fetchOne(database, sql: """
-            SELECT position FROM (
-                SELECT files.id, ROW_NUMBER() OVER (ORDER BY \(signature.sort.sql)) - 1 AS position
-                FROM files WHERE \(signature.predicate)
-            ) WHERE id = ?
-            """, arguments: signature.arguments + [id])
-        }
+        return try reader.read { database in try signature.index(of: id, in: database) }
     }
 
+    /// Every counted file, including alternates of collapsed families, so hidden selections stay in scope.
     func identities(after id: Int64?, limit: Int) throws -> [PagedIdentity<Int64>] {
+        try slice(placements(), after: id, limit: limit)
+    }
+
+    /// The files Select all selects: main and standalone rows, plus eligible alternates when the query includes them.
+    func selectAllIdentities(after id: Int64?, limit: Int) throws -> [PagedIdentity<Int64>] {
+        let includeAlternates = signature.includeAlternates
+        return try slice(placements().filter { placement in
+            placement.role != .alternate || (includeAlternates && placement.isEligible)
+        }, after: id, limit: limit)
+    }
+
+    func familyMembers(_ familyIds: Set<Int64>) throws -> [Int64: [LibraryFamilyPlacement]] {
+        guard !familyIds.isEmpty else { return [:] }
         try Task.checkCancellation()
-        guard limit > 0 else { throw PagingError.invalidRange }
-        return try reader.read { database in
-            let predicate = signature.predicate + (id == nil ? "" : " AND files.id > ?")
-            var arguments = signature.arguments
-            if let id {
-                arguments += [id]
+        var members: [Int64: [LibraryFamilyPlacement]] = [:]
+        for placement in try reader.read({ database in try signature.familyPlacements(familyIds, in: database) }) {
+            if let familyID = placement.familyId, familyIds.contains(familyID) {
+                members[familyID, default: []].append(placement)
             }
-            arguments += [limit]
-            return try GRDB.Row.fetchAll(database, sql: "SELECT files.id, files.membership_revision FROM files WHERE \(predicate) ORDER BY files.id LIMIT ?", arguments: arguments)
-                .map { row in .init(id: row["id"], revision: row["membership_revision"]) }
         }
+        return members
     }
 
     func identities(in range: Range<Int>) throws -> [PagedIdentity<Int64>] {
         try Task.checkCancellation()
         guard range.lowerBound >= 0, range.upperBound <= total else { throw PagingError.invalidRange }
-        return try reader.read { database in
-            try GRDB.Row.fetchAll(database, sql: "SELECT files.id, files.membership_revision FROM files WHERE \(signature.predicate) ORDER BY \(signature.sort.sql) LIMIT ? OFFSET ?", arguments: signature.arguments + [range.count, range.lowerBound])
-                .map { row in .init(id: row["id"], revision: row["membership_revision"]) }
-        }
+        return try reader.read { database in try signature.identities(in: database, range: range) }
     }
 
     nonisolated func identity(for row: BrowserRow) -> PagedIdentity<Int64> {
         .init(id: row.id, revision: row.membershipRevision)
+    }
+
+    private func placements() throws -> [LibraryFamilyPlacement] {
+        try Task.checkCancellation()
+        if let cachedPlacements {
+            return cachedPlacements
+        }
+        let loaded = try reader.read { database in try signature.placements(in: database) }
+        cachedPlacements = loaded
+        return loaded
+    }
+
+    private func slice(_ placements: [LibraryFamilyPlacement], after id: Int64?, limit: Int) throws -> [PagedIdentity<Int64>] {
+        try Task.checkCancellation()
+        guard limit > 0 else { throw PagingError.invalidRange }
+        let start = id.map { identifier in placements.partitioningIndex { placement in placement.identity.id > identifier } } ?? 0
+        return placements[start...].prefix(limit).map(\.identity)
+    }
+}
+
+private extension Array {
+    /// First index whose element satisfies `predicate`, for a predicate that is false then true across the array.
+    func partitioningIndex(where predicate: (Element) -> Bool) -> Int {
+        var low = 0
+        var high = count
+        while low < high {
+            let middle = (low + high) / 2
+            if predicate(self[middle]) {
+                high = middle
+            } else {
+                low = middle + 1
+            }
+        }
+        return low
     }
 }
