@@ -108,6 +108,10 @@ final class TitleMatcherTests: XCTestCase {
         XCTAssertFalse(TitleMatcher.hasDroppedAnnotation(current: "Foo Song", proposed: "Foo Song Deluxe"))
     }
 
+    func testHasDroppedAnnotationIgnoresVocabularyInsideALargerWord() {
+        XCTAssertFalse(TitleMatcher.hasDroppedAnnotation(current: "Domain Expansion", proposed: "Domain Expanse"))
+    }
+
     // MARK: - value(for:current:proposed:tier:)
 
     func testValueKeepReturnsCurrent() {
