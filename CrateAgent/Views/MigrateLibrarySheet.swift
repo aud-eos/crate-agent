@@ -153,15 +153,21 @@ struct MigrateLibrarySheet: View {
     }
 
     private var planList: some View {
-        List(visiblePlans) { plan in
-            VStack(alignment: .leading, spacing: density.spacing) {
-                let identity = trackIdentities[plan.sourcePath]
-                TrackHeading(artist: identity?.artist, title: identity?.title, filename: (plan.sourcePath as NSString).lastPathComponent)
-                MetadataComparison(current: plan.sourcePath, proposed: plan.destinationPath, field: "Location")
-            }
-            .padding(.vertical, density.rowPadding)
-        }
-        .listStyle(.inset)
+        let rows = visiblePlans
+        let identities = trackIdentities
+        return VirtualizedPreviewTable(
+            dataID: "\(scanID):\(query)", accessibilityLabel: "Library move preview", rowCount: rows.count,
+            row: { index in rows[index] },
+            columns: [
+                PreviewTableColumn(identifier: "artist", title: "Artist", width: 150, text: { plan in identities[plan.sourcePath]?.artist ?? "" }),
+                PreviewTableColumn(identifier: "title", title: "Title", width: 200, text: { plan in
+                    identities[plan.sourcePath]?.title ?? (plan.sourcePath as NSString).lastPathComponent
+                }),
+                PreviewTableColumn(identifier: "source", title: "Current path", width: 300, text: { plan in plan.sourcePath }),
+                PreviewTableColumn(identifier: "destination", title: "New path", width: 300, text: { plan in plan.destinationPath }),
+            ],
+            selection: nil, enabled: !isApplying, density: density
+        )
     }
 
     private var footer: some View {

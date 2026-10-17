@@ -167,16 +167,18 @@ struct OrganizePreviewTable: View {
                 PreviewTableColumn(identifier: "destination", title: "Proposed path", width: 300, text: { row in row.plan?.destinationPath ?? OrganizeMessages.noValue }),
                 PreviewTableColumn(identifier: "location", title: "Location", width: 160, text: { row in row.isOutsideMusicFolder ? "Outside music folder" : "Inside music folder" }),
             ],
-            accessibilityName: { row in "\(row.artist) \(row.title)" },
-            isSelected: preview.isSelected,
-            setSelected: { identifier, selected in
-                guard preview.snapshot.generation == snapshot.generation else { return }
-                preview.setSelected(selected, identifier: identifier)
-            },
-            selectAll: {
-                guard preview.snapshot.generation == snapshot.generation else { return }
-                preview.selectScope(true)
-            }, enabled: !preview.isBusy, density: density, sort: preview.sort, isSelectable: { row in row.plan != nil }
+            selection: .init(
+                accessibilityName: { row in "\(row.artist) \(row.title)" },
+                isSelected: preview.isSelected,
+                setSelected: { identifier, selected in
+                    guard preview.snapshot.generation == snapshot.generation else { return }
+                    preview.setSelected(selected, identifier: identifier)
+                },
+                selectAll: {
+                    guard preview.snapshot.generation == snapshot.generation else { return }
+                    preview.selectScope(true)
+                }, isSelectable: { row in row.plan != nil }
+            ), enabled: !preview.isBusy, density: density, sort: preview.sort
         )
     }
 }
