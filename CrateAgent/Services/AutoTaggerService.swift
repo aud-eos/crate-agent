@@ -641,7 +641,7 @@ final class AutoTaggerService: ObservableObject {
         return file.fingerprintBasis.isConfirmed(by: current)
     }
 
-    /// Reads the file's current on-disk size+mtime off the main actor via
+    /// Reads the file's current `FileFreshnessSnapshot` off the main actor via
     /// the injected `fileFreshnessReader`. Nil when the file can't be
     /// stat'd (missing/unreadable). The single seam both the D-B fingerprint
     /// freshness check and the D-A apply-time revalidation read through.

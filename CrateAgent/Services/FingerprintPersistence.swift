@@ -90,6 +90,22 @@ enum FingerprintPersistence {
         return db.changesCount > 0
     }
 
+    /// Returns `done` rows whose explicit fingerprint basis was recorded before subsecond times
+    /// were kept to the worker's queue. Such a basis can never be confirmed, so each file would
+    /// otherwise be decoded again on the Auto-Tag path; the worker refreshes it in the
+    /// background instead, and Workers counts it as pending. The stored fingerprint stays
+    /// until the new one lands, and the refreshed basis is the row's own identity.
+    @discardableResult static func requeueUnconfirmableBases(in db: Database) throws -> Int {
+        try db.execute(sql: """
+        UPDATE files
+        SET fingerprint_status = 'pending', fingerprinted_size = NULL, fingerprinted_mtime = NULL,
+            fingerprinted_mtime_nanoseconds = NULL, fingerprinted_inode = NULL
+        WHERE fingerprint_status = 'done' AND fingerprinted_size IS NOT NULL
+          AND (fingerprinted_mtime_nanoseconds IS NULL OR fingerprinted_inode IS NULL)
+        """)
+        return db.changesCount
+    }
+
     /// Returns failed and invalid `done` rows to `pending` so the worker recomputes them;
     /// valid fingerprints and files that cannot be processed are left alone. Nil retries
     /// every such row.

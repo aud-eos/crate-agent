@@ -147,7 +147,7 @@ enum FileTrashLocation {
         var status = stat()
         guard fstat(descriptor, &status) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         guard Int64(status.st_ino) == item.inode, Int64(status.st_size) == item.fileSize,
-              Int64(status.st_mtimespec.tv_sec) == item.mtime else { return .gone }
+              item.hasSameModificationTime(as: StatModificationTime(status)) else { return .gone }
         guard let hash = LightweightHashCalculator.compute(reading: handle) else {
             throw FileTrashLocationError.unverifiable(path: item.path)
         }
@@ -156,7 +156,7 @@ enum FileTrashLocation {
 
     private static func sameStatIdentity(_ location: FileMetadata, _ current: FileMetadata) -> Bool {
         current.volumeUuid == location.volumeUuid && current.inode == location.inode && current.fileSize == location.fileSize
-            && current.mtime == location.mtime
+            && current.hasSameModificationTime(as: location)
     }
 }
 

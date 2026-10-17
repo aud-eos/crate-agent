@@ -178,7 +178,7 @@ enum FileIdentityObservationMutation {
             return false
         }
         return file.volumeUuid != identity.volumeUuid || file.inode != identity.inode
-            || file.fileSize != identity.fileSize || file.mtime != identity.mtime
+            || file.fileSize != identity.fileSize || !file.hasSameModificationTime(as: identity)
             || (file.lightweightHash != nil && file.lightweightHash != identity.lightweightHash)
     }
 
@@ -197,7 +197,7 @@ enum FileIdentityObservationMutation {
         if let hash = file.lightweightHash {
             return hash == identity.lightweightHash
         }
-        return file.inode == identity.inode && file.volumeUuid == identity.volumeUuid && file.mtime == identity.mtime
+        return file.inode == identity.inode && file.volumeUuid == identity.volumeUuid && file.hasSameModificationTime(as: identity)
     }
 
     private static func applyMetadata(_ metadata: SeratoMetadata, to file: inout FileRecord) {

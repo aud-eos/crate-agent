@@ -522,6 +522,31 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
                                         operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: gate)
     }
 
+    /// Rows indexed before subsecond times were kept get them from their verified stat
+    /// evidence on the next incremental sync, without re-reading the audio (#118).
+    func testIncrementalSyncRecordsSubsecondTimeOfLegacyRowsFromStatEvidence() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("legacy.wav", bytes: FinalRemovalIntegrationTests.wav())
+        try fixture.save(paths: [file.path])
+        let session = SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler,
+                                               scanner: LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator),
+                                               operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: gate,
+                                               checkpointStore: SyncCheckpointStore(database: fixture.database))
+        try await session.synchronize()
+        try await fixture.database.writer.write { database in try database.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL") }
+
+        let counters = LibrarySyncMetrics()
+        try await LibrarySyncMetrics.$current.withValue(counters) { try await session.synchronize() }
+
+        let row = try await fixture.row(file)
+        XCTAssertNotNil(row.mtimeNanoseconds)
+        XCTAssertEqual(row.mtimeNanoseconds, FileMetadataCollector.collect(at: file.path)?.mtimeNanoseconds)
+        XCTAssertEqual(row.membershipRevision, file.membershipRevision)
+        XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
+    }
+
     func testRequiredFilesystemReconciliationRetainsFailedHeadAndCheckpoint() async throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)

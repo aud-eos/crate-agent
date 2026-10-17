@@ -332,7 +332,8 @@ public actor FilesystemSyncCoordinator {
         {
             if file.libraryMembership == .active {
                 mutations.append(.renameFile(.init(fileId: fileId, newPath: metadata.path,
-                                                   newVolumeUuid: metadata.volumeUuid, newInode: metadata.inode)))
+                                                   newVolumeUuid: metadata.volumeUuid, newInode: metadata.inode,
+                                                   newMtimeNanoseconds: metadata.mtimeNanoseconds)))
             } else {
                 mutations.append(.observeFileLocation(.init(fileId: fileId, expectedRevision: file.membershipRevision,
                                                             path: metadata.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode)))

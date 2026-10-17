@@ -31,8 +31,12 @@ public struct FileFreshnessSnapshot: Equatable, Sendable {
     /// A field that was never recorded proves nothing, so a legacy identity is never confirmed
     /// and the work derived from it is redone once.
     public func isConfirmed(by current: FileFreshnessSnapshot) -> Bool {
-        guard let inode, let mtimeNanoseconds else { return false }
-        return fileSize == current.fileSize && inode == current.inode && mtime == current.mtime
-            && mtimeNanoseconds == current.mtimeNanoseconds
+        inode != nil && mtimeNanoseconds != nil && describesSameFile(as: current)
+    }
+
+    /// Whether a live stat is still the file this identity describes, under the shared
+    /// identity rule: a legacy time without nanoseconds matches on whole seconds.
+    func describesSameFile(as current: FileFreshnessSnapshot) -> Bool {
+        fileSize == current.fileSize && inode == current.inode && hasSameModificationTime(as: current)
     }
 }

@@ -28,7 +28,7 @@ public struct FileMetadata: Codable, Sendable, Equatable {
     public let mtime: Int64
     /// The subsecond part of the modification time in nanoseconds (`st_mtimespec.tv_nsec`,
     /// 0..<1_000_000_000). Nil when it was never recorded: rows indexed and payloads
-    /// journaled before migration 016 hold seconds only.
+    /// journaled before migration 018 hold seconds only.
     public let mtimeNanoseconds: Int64?
     /// Optional because callers that don't care about cross-volume
     /// move detection skip the disk read. Nil when omitted or when
@@ -53,13 +53,13 @@ public struct FileMetadata: Codable, Sendable, Equatable {
         self.lightweightHash = lightweightHash
     }
 
-    /// Physical identity: equal when every recorded field matches. A side recorded before
-    /// subsecond times were kept matches on whole seconds, so legacy rows stay the same file;
-    /// freshness decisions use the stricter `FileFreshnessSnapshot.isConfirmed(by:)`.
+    /// Physical identity: equal when every recorded field matches, with modification times
+    /// compared by `hasSameModificationTime(as:)`. Like that test it is not transitive, so it
+    /// must not key a set or dictionary. Freshness of derived work uses the stricter
+    /// `FileFreshnessSnapshot.isConfirmed(by:)`.
     public static func == (lhs: FileMetadata, rhs: FileMetadata) -> Bool {
         lhs.path == rhs.path && lhs.volumeUuid == rhs.volumeUuid && lhs.inode == rhs.inode && lhs.fileSize == rhs.fileSize
-            && lhs.mtime == rhs.mtime && lhs.lightweightHash == rhs.lightweightHash
-            && (lhs.mtimeNanoseconds == nil || rhs.mtimeNanoseconds == nil || lhs.mtimeNanoseconds == rhs.mtimeNanoseconds)
+            && lhs.hasSameModificationTime(as: rhs) && lhs.lightweightHash == rhs.lightweightHash
     }
 }
 

@@ -43,7 +43,8 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var lightweightHash: Data?
     public var chromaprintFingerprint: Data?
     public var fingerprintStatus: FingerprintStatus
-    /// The file's on-disk size + mtime at the moment its current
+    /// The file's on-disk size and modification time (with the inode and
+    /// subsecond part since migration 018) at the moment its current
     /// `chromaprintFingerprint` was computed — the freshness basis the
     /// auto-tagger compares the live file against before trusting a stored
     /// fingerprint for a lookup. Written whenever the fingerprint is

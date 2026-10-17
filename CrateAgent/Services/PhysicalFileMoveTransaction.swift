@@ -56,7 +56,7 @@ final class PhysicalFileMoveTransaction {
         }
         let source = ownedSource.metadata
         guard !FileIdentityObservationMutation.isReplacement(file, identity: source),
-              source.fileSize == file.fileSize, source.mtime == file.mtime
+              source.fileSize == file.fileSize, source.hasSameModificationTime(as: file)
         else {
             throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
         }
@@ -95,7 +95,7 @@ final class PhysicalFileMoveTransaction {
         return try withDescriptor(path: source.path, flags: O_RDONLY | O_NOFOLLOW) { sourceDescriptor in
             let sourceStat = try descriptorStat(sourceDescriptor, path: source.path)
             guard Int64(sourceStat.st_ino) == source.inode, sourceStat.st_size == source.fileSize,
-                  sourceStat.st_mtimespec.tv_sec == source.mtime
+                  source.hasSameModificationTime(as: StatModificationTime(sourceStat))
             else {
                 throw MoveError.changedDestination(source.path)
             }
@@ -111,6 +111,8 @@ final class PhysicalFileMoveTransaction {
                 let currentDestination = try OwnedAudioIdentity.read(at: destination.path)
                 let copied = currentDestination.metadata
                 guard copied.inode == Int64(ownedStat.st_ino), copied.volumeUuid == volume,
+                      // Seconds only: the destination volume may keep coarser times than the
+                      // source (HFS+ keeps none below a second); the full digest proved the bytes.
                       copied.fileSize == source.fileSize, copied.mtime == source.mtime,
                       copied.lightweightHash == source.lightweightHash,
                       try OwnedAudioIdentity.read(at: source.path) == ownedSource,

@@ -814,7 +814,7 @@ public actor OperationEngine {
             guard let file = try FileRecord.fetchOne(database, key: payload.fileId),
                   identity.inode == payload.inode, identity.volumeUuid == payload.volumeUuid,
                   identity.fileSize == file.fileSize,
-                  file.lightweightHash.map({ hash in hash == identity.lightweightHash }) ?? (file.mtime == identity.mtime)
+                  file.lightweightHash.map({ hash in hash == identity.lightweightHash }) ?? file.hasSameModificationTime(as: identity)
             else {
                 throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
             }
@@ -1650,22 +1650,25 @@ public actor OperationEngine {
     /// compares each file's live stat with its row identity, which our own tag writes keep
     /// current: an external edit or replacement since the revert refuses the redo (#118).
     /// Stat runs here, outside the write transaction; the transaction rechecks the row.
-    private func liveFreshnessOfRedoneFiles(_ events: [EventRecord]) async throws -> [Int64: FileFreshnessSnapshot?] {
+    private func liveFreshnessOfRedoneFiles(_ events: [EventRecord]) async throws -> [Int64: FileFreshnessSnapshot] {
         let fileIDs = events.filter { event in event.eventType == .musicBrainzMatchReverted }.compactMap(\.fileId)
         guard !fileIDs.isEmpty else { return [:] }
         let paths = try await database.writer.read { database in
             try FileRecord.filter(keys: fileIDs).fetchAll(database).compactMap { file in file.id.map { fileID in (fileID, file.path) } }
         }
-        return await Task.detached(priority: .userInitiated) {
-            paths.reduce(into: [Int64: FileFreshnessSnapshot?]()) { result, entry in
-                result[entry.0] = FileMetadataCollector.collect(at: entry.1).map(FileFreshnessSnapshot.init)
+        return try await Task.detached(priority: .userInitiated) {
+            try paths.reduce(into: [Int64: FileFreshnessSnapshot]()) { result, entry in
+                guard let metadata = FileMetadataCollector.collect(at: entry.1) else {
+                    throw OperationEngineError.undoFileUnavailable(fileId: entry.0, path: entry.1, direction: .redo)
+                }
+                result[entry.0] = FileFreshnessSnapshot(metadata)
             }
         }.value
     }
 
-    private static func requireRedoneFilesUnchanged(_ liveFreshness: [Int64: FileFreshnessSnapshot?], in database: GRDB.Database) throws {
+    private static func requireRedoneFilesUnchanged(_ liveFreshness: [Int64: FileFreshnessSnapshot], in database: GRDB.Database) throws {
         for (fileID, live) in liveFreshness {
-            guard let live, let file = try FileRecord.fetchOne(database, key: fileID), file.freshness.isConfirmed(by: live) else {
+            guard let file = try FileRecord.fetchOne(database, key: fileID), file.freshness.describesSameFile(as: live) else {
                 throw OperationEngineError.redoFileChanged(fileId: fileID)
             }
         }
@@ -3079,7 +3082,8 @@ public actor OperationEngine {
             }
             let moved = try physicalMoves.move(payload, file: file, expectedSource: expectedPhysicalSource)
             effectiveMutation = .renameFile(RenameFilePayload(fileId: payload.fileId, newPath: payload.newPath,
-                                                              previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true))
+                                                              previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true,
+                                                              newMtimeNanoseconds: moved.mtimeNanoseconds))
         }
         let result = try executeMutation(mutation: effectiveMutation, batchId: batchId, in: database)
         guard !result.seratoWrites.isEmpty else {
@@ -3375,6 +3379,7 @@ public actor OperationEngine {
         let originalPath = fileRecord.path
         let originalVolumeUuid = fileRecord.volumeUuid
         let originalInode = fileRecord.inode
+        let originalMtimeNanoseconds = fileRecord.mtimeNanoseconds
 
         fileRecord.path = payload.newPath
         if let newVolumeUuid = payload.newVolumeUuid {
@@ -3382,6 +3387,7 @@ public actor OperationEngine {
         }
         if let newInode = payload.newInode {
             fileRecord.inode = newInode
+            fileRecord.mtimeNanoseconds = payload.newMtimeNanoseconds ?? fileRecord.mtimeNanoseconds
         }
         try fileRecord.update(db)
 
@@ -3393,7 +3399,8 @@ public actor OperationEngine {
             newInode: payload.newInode,
             previousVolumeUuid: payload.newVolumeUuid == nil ? nil : originalVolumeUuid,
             previousInode: payload.newInode == nil ? nil : originalInode,
-            physicalMove: payload.physicalMove
+            physicalMove: payload.physicalMove,
+            newMtimeNanoseconds: payload.newMtimeNanoseconds
         )
         let inversePayload = RenameFilePayload(
             fileId: payload.fileId,
@@ -3403,7 +3410,8 @@ public actor OperationEngine {
             newInode: payload.newInode == nil ? nil : originalInode,
             previousVolumeUuid: payload.newVolumeUuid,
             previousInode: payload.newInode,
-            physicalMove: payload.physicalMove
+            physicalMove: payload.physicalMove,
+            newMtimeNanoseconds: payload.newInode == nil ? nil : originalMtimeNanoseconds
         )
 
         let eventId = try insertEvent(
@@ -4413,7 +4421,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
     public let inode: Int64
     public let fileSize: Int64
     public let mtime: Int64
-    /// Nil in payloads journaled before migration 016 (see `FileMetadata.mtimeNanoseconds`).
+    /// Nil in payloads journaled before migration 018 (see `FileMetadata.mtimeNanoseconds`).
     public var mtimeNanoseconds: Int64?
     public let lightweightHash: Data?
     public let bitrateKbps: Int?
@@ -4550,6 +4558,9 @@ public struct RenameFilePayload: Codable, Sendable, Equatable {
     public let newInode: Int64?
     public let previousVolumeUuid: String?
     public let previousInode: Int64?
+    /// The destination's subsecond modification time on a cross-volume rename, which the
+    /// destination volume may keep at a coarser precision than the source.
+    public let newMtimeNanoseconds: Int64?
 
     public init(
         fileId: Int64,
@@ -4559,8 +4570,10 @@ public struct RenameFilePayload: Codable, Sendable, Equatable {
         newInode: Int64? = nil,
         previousVolumeUuid: String? = nil,
         previousInode: Int64? = nil,
-        physicalMove: Bool? = nil
+        physicalMove: Bool? = nil,
+        newMtimeNanoseconds: Int64? = nil
     ) {
+        self.newMtimeNanoseconds = newMtimeNanoseconds
         self.physicalMove = physicalMove
         self.fileId = fileId
         self.newPath = newPath

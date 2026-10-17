@@ -11,6 +11,9 @@ struct LibraryRefreshPlan: Sendable {
     let refreshPaths: Set<Data>
     let reconcileFileIDs: Set<Int64>
     let evidence: [Int64: SyncFileEvidence]
+    /// Unchanged rows indexed before subsecond times were kept, with the subsecond part
+    /// their verified stat evidence already holds, so it is recorded without re-reading.
+    var subsecondTimes: [Int64: Int64] = [:]
 }
 
 struct FileRefreshObservation: Sendable {
@@ -51,6 +54,7 @@ struct LibraryRefreshPlanner: Sendable {
         var metadata: Set<Data> = []
         var reconcile: Set<Int64> = []
         var sound: Set<Int64> = []
+        var subsecondTimes: [Int64: Int64] = [:]
         for file in indexedFiles {
             try Task.checkCancellation()
             guard let identifier = file.id, analysis.scope.conflictingPath(for: .file(file)) == nil else { continue }
@@ -71,6 +75,9 @@ struct LibraryRefreshPlanner: Sendable {
             }
             if reusable {
                 sound.insert(identifier)
+                if file.mtimeNanoseconds == nil, let stamp = evidence[identifier]?.readIdentity {
+                    subsecondTimes[identifier] = Int64(stamp.target.modifiedNanoseconds)
+                }
             } else {
                 reconcile.insert(identifier)
             }
@@ -94,6 +101,7 @@ struct LibraryRefreshPlanner: Sendable {
                 metadata.insert(bytes)
             }
         }
-        return LibraryRefreshPlan(indexedFiles: indexedFiles, metadataPaths: metadata, refreshPaths: refresh, reconcileFileIDs: reconcile, evidence: evidence)
+        return LibraryRefreshPlan(indexedFiles: indexedFiles, metadataPaths: metadata, refreshPaths: refresh, reconcileFileIDs: reconcile, evidence: evidence,
+                                  subsecondTimes: subsecondTimes.filter { entry in sound.contains(entry.key) })
     }
 }

@@ -44,7 +44,7 @@ enum SeratoPath {
         else { return false }
         let current = try FileMetadataCollector.collectVerified(at: file.path)
         return current.volumeUuid == identity.volumeUuid && current.inode == identity.inode
-            && current.fileSize == identity.fileSize && current.mtime == identity.mtime
+            && current.fileSize == identity.fileSize && current.hasSameModificationTime(as: identity)
             && current.lightweightHash == identity.lightweightHash
     }
 }
@@ -133,13 +133,15 @@ actor SeratoMembershipReconciler {
                 mutations.append(.observeFileIdentity(.init(fileId: fileID, expectedRevision: revision, previousIdentity: file.identity, identity: observedIdentity)))
             } else if observed == .available {
                 let identity = try FileMetadataCollector.collectVerified(at: path)
-                if identity != file.identity {
-                    if saved {
+                let recordsSubsecondTime = file.mtimeNanoseconds == nil && identity.mtimeNanoseconds != nil
+                if identity != file.identity || recordsSubsecondTime {
+                    let replacement = FileIdentityObservationMutation.isReplacement(file, identity: identity)
+                    if saved || (recordsSubsecondTime && !replacement) {
                         mutations.append(.observeFileIdentity(.init(fileId: fileID, expectedRevision: revision, previousIdentity: file.identity, identity: identity)))
-                        if FileIdentityObservationMutation.isReplacement(file, identity: identity) {
+                        if replacement {
                             revision += 1
                         }
-                    } else if FileIdentityObservationMutation.isReplacement(file, identity: identity) {
+                    } else if replacement {
                         observed = .unknown
                     }
                 }
@@ -181,9 +183,40 @@ actor SeratoMembershipReconciler {
                 summary.unavailable += 1
             }
         }
+        if let plan {
+            try await recordSubsecondTimes(plan, snapshot: snapshot, batchID: batchID)
+        }
         try await reader.validate(snapshot)
         return summary
     }
+
+    /// Records the subsecond time of unchanged rows indexed before it was kept, through the
+    /// metadata-observation path so their stat evidence stands in for re-reading the audio.
+    /// A row that changed meanwhile is left for the next sync, which plans it again.
+    private func recordSubsecondTimes(_ plan: LibraryRefreshPlan, snapshot: SeratoMembershipSnapshot, batchID: String) async throws {
+        let files = Dictionary(uniqueKeysWithValues: plan.indexedFiles.compactMap { file in file.id.map { fileID in (fileID, file) } })
+        let observations = plan.subsecondTimes.sorted { left, right in left.key < right.key }.compactMap { fileID, nanoseconds -> (TrackMutation, FileObservationExpectation)? in
+            guard let file = files[fileID], let evidence = plan.evidence[fileID]?.readIdentity,
+                  let expectation = try? FileObservationExpectation(file: file) else { return nil }
+            let current = file.identity
+            let identity = FileMetadata(path: current.path, volumeUuid: current.volumeUuid, inode: current.inode, fileSize: current.fileSize,
+                                        mtime: current.mtime, mtimeNanoseconds: nanoseconds, lightweightHash: current.lightweightHash)
+            let observation = ObserveFileIdentityPayload(fileId: fileID, expectedRevision: file.membershipRevision, previousIdentity: current,
+                                                         identity: identity, metadata: file.seratoMetadata)
+            return (.observeFileMetadata(.init(observation: observation, evidence: evidence, expectedMetadata: file.seratoMetadata)), expectation)
+        }
+        for chunk in stride(from: 0, to: observations.count, by: Self.subsecondBatchSize).map({ start in observations[start ..< min(start + Self.subsecondBatchSize, observations.count)] }) {
+            try Task.checkCancellation()
+            do {
+                _ = try await operationEngine.applyObservedBatch(chunk.map(\.0), authorization: reader.authorization(for: snapshot),
+                                                                 expectedFiles: chunk.map(\.1), batchId: batchID)
+            } catch is FileProcessingEligibilityError {
+                continue
+            }
+        }
+    }
+
+    private static let subsecondBatchSize = 500
 
     private func repairedLegacyVolume(_ file: FileRecord) throws -> FileMetadata? {
         guard file.volumeUuid == LegacyFileIdentity.unknownVolume,
@@ -256,7 +289,7 @@ actor SeratoMembershipReconciler {
     private static func matchesKnownFile(_ file: FileRecord, identity: FileMetadata) -> Bool {
         SeratoPath.normalized(file.path) == SeratoPath.normalized(identity.path)
             && file.inode == identity.inode && file.volumeUuid == identity.volumeUuid
-            && file.fileSize == identity.fileSize && file.mtime == identity.mtime
+            && file.fileSize == identity.fileSize && file.hasSameModificationTime(as: identity)
             && (file.lightweightHash == nil || file.lightweightHash == identity.lightweightHash)
     }
 
