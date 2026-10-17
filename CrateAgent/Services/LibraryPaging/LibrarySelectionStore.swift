@@ -135,34 +135,41 @@ actor LibrarySelectionStore: PagedSelectionProvider {
 
     func summary(in snapshot: Snapshot) async throws -> PagedSelectionSummary {
         let requestedEpoch = epoch
-        let total = try await requireStorage().read { database in
-            guard let count = try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM selected_identity WHERE included = 1") else { throw PagingError.incompletePage }
-            return count
-        }
+        let selected = try selectedIdentities()
         let scopeCount = await snapshot.selectAllCount()
-        guard total > 0 else { return .init(total: 0, inScope: 0, scopeCount: scopeCount, removed: 0, scopeSelected: 0) }
-        let inScope = try await countSelected { after in try await snapshot.identities(after: after, limit: 200) }
-        let scopeSelected = try await countSelected { after in try await snapshot.selectAllIdentities(after: after, limit: 200) }
+        guard !selected.isEmpty else { return .init(total: 0, inScope: 0, scopeCount: scopeCount, removed: 0, scopeSelected: 0) }
+        let inScope = try await countSelected(selected) { after in try await snapshot.identities(after: after, limit: Self.summaryBatch) }
+        let scopeSelected = try await countSelected(selected) { after in try await snapshot.selectAllIdentities(after: after, limit: Self.summaryBatch) }
         guard requestedEpoch == epoch else { throw CancellationError() }
-        return .init(total: total, inScope: inScope, scopeCount: scopeCount, removed: 0, scopeSelected: scopeSelected)
+        return .init(total: selected.count, inScope: inScope, scopeCount: scopeCount, removed: 0, scopeSelected: scopeSelected)
     }
 
+    private func selectedIdentities() throws -> Set<Identity> {
+        try requireStorage().read { database in
+            try Set(Row.fetchAll(database, sql: "SELECT id, revision FROM selected_identity WHERE included = 1").map { row in
+                Identity(id: row["id"], revision: row["revision"])
+            })
+        }
+    }
+
+    /// The summary reads the selection once and counts each scope in memory,
+    /// so a 30,000-file selection costs one storage read, not one per batch.
+    private static let summaryBatch = 5000
+
     /// Selected identities across a scope read in id-ordered batches.
-    private func countSelected(batch nextBatch: (Int64?) async throws -> [Identity]) async throws -> Int {
+    private func countSelected(_ selected: Set<Identity>, batch nextBatch: (Int64?) async throws -> [Identity]) async throws -> Int {
         let requestedEpoch = epoch
-        var selected = 0
+        var count = 0
         var lastID: Int64?
         while true {
             try Task.checkCancellation()
             let batch = try await nextBatch(lastID)
             guard requestedEpoch == epoch else { throw CancellationError() }
-            if batch.isEmpty {
-                break
-            }
-            selected += try selectedIDs(in: batch).count
-            lastID = batch.last?.id
+            guard let last = batch.last else { break }
+            count += batch.filter(selected.contains).count
+            lastID = last.id
         }
-        return selected
+        return count
     }
 
     func reconcile() throws -> Int {
