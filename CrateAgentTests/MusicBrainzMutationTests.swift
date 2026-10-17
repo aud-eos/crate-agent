@@ -224,7 +224,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             state.isRunning ? ["com.serato.djpro"] : []
         })
         state.watchdog = watchdog
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = try makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
