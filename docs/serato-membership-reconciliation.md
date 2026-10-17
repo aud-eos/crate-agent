@@ -234,7 +234,10 @@ Successful explicit adds and snapshots use the same volume UUID plus canonical
 directory ownership identifier. Add confirmation remains the engine's existing
 `import-confirmed:<eventID>` transaction. Failed adds retain pending membership.
 An immediate add failure also retains the original guarded add as a durable
-`serato_write_queue` row and reports a pending-sync import result. The Library drop flow publishes
+`serato_write_queue` row and reports a pending-sync import result. A drop journals
+each file in its own batch, so each stays separately undoable, then applies all of
+the drop's queued adds in one scoped pass. Consecutive adds share one `database V2`
+rewrite, and each file's result comes from its own queue rows (#187). The Library drop flow publishes
 the failure through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or
 changing the original event payloads/inverses. Failed or unattempted adds are

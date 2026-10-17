@@ -493,17 +493,75 @@ public actor OperationEngine {
         return requiresReady ? try readiness?.capture() : nil
     }
 
+    /// Journals `mutations` as one undoable batch, as `applyBatch` does, but
+    /// leaves its Serato writes queued, so `routeDeferredSeratoWrites` can
+    /// apply several batches' writes in one pass.
+    func applyBatchDeferringSerato(_ mutations: [TrackMutation], batchId: String) async throws -> DeferredSeratoBatch {
+        let results = try await journalBatch(mutations, batchId: batchId)
+        return DeferredSeratoBatch(batchId: batchId, queueIDs: results.flatMap(\.seratoWrites).compactMap(\.queueID))
+    }
+
+    /// Applies the queued writes of `batches` in one scoped pass, so their
+    /// consecutive Serato adds share one `database V2` rewrite. Returns, per
+    /// batch id, why its writes did not land; a batch whose writes applied,
+    /// were superseded, or wait for Serato to close has no entry.
+    func routeDeferredSeratoWrites(_ batches: [DeferredSeratoBatch]) async throws -> [String: String] {
+        let queueIDs = Set(batches.flatMap(\.queueIDs))
+        guard !queueIDs.isEmpty else { return [:] }
+        if await seratoWatchdog.isSeratoRunning || readiness?.permitsExternalWrites == false {
+            try await refreshQueueDepth()
+            return [:]
+        }
+        var passFailure: Error?
+        do {
+            let outcome = try await processScopedRows(queueIDs)
+            if outcome.supersededCount > 0 {
+                await note(outcome.summaryMessage)
+            }
+        } catch {
+            passFailure = error
+        }
+        let remaining = try await database.writer.read { database in
+            try Row.fetchAll(database, sql: "SELECT queue_id, last_error FROM serato_write_queue").reduce(into: [Int64: String?]()) { rows, row in
+                rows[row["queue_id"]] = row["last_error"]
+            }
+        }
+        var failures: [String: String] = [:]
+        for batch in batches {
+            let unfinished = batch.queueIDs.filter { queueID in remaining.keys.contains(queueID) }
+            if let recorded = unfinished.lazy.compactMap({ queueID in remaining[queueID] ?? nil }).first {
+                failures[batch.batchId] = recorded
+            } else if let passFailure, !unfinished.isEmpty {
+                failures[batch.batchId] = String(describing: passFailure)
+            }
+        }
+        return failures
+    }
+
     private func executeBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
                               expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
     {
+        let executionResults = try await journalBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
+                                                      expectedMetadata: expectedMetadata, filesystemObservation: filesystemObservation,
+                                                      moveExpectation: moveExpectation)
+        try await routeSeratoWrites(executionResults.flatMap(\.seratoWrites), batchId: batchId)
+        return executionResults.compactMap(\.eventId)
+    }
+
+    private func journalBatch(_ mutations: [TrackMutation], batchId: String,
+                              expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              expectedMetadata: [Int64: SeratoMetadata] = [:],
+                              filesystemObservation: Bool = false,
+                              moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [GuardedExecutionResult]
+    {
         guard !mutations.isEmpty else { return [] }
         let scopeAuthorization = readiness?.captureScope()
         let authorization = filesystemObservation ? nil : try readinessAuthorization(for: mutations)
         let context = mutationContext
-        let executionResults: [GuardedExecutionResult] = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { db, moves in
+        return try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: batchId) { db, moves in
             try authorization?.check()
             try scopeAuthorization?.check()
             try moveExpectation?.validate(in: db)
@@ -526,11 +584,6 @@ public actor OperationEngine {
             try scopeAuthorization?.check()
             return results
         }
-
-        let pendingWrites = executionResults.flatMap(\.seratoWrites)
-        try await routeSeratoWrites(pendingWrites, batchId: batchId)
-
-        return executionResults.compactMap(\.eventId)
     }
 
     func organizeFiles(_ plans: [LibraryOrganizer.Plan], batchId: String) async throws -> LibraryOrganizer.Outcome {
@@ -4179,6 +4232,13 @@ public actor OperationEngine {
 /// this split to phrase the result honestly — "Re-sync complete"
 /// when N actually landed vs "Queued N — quit Serato to apply"
 /// when nothing did.
+/// A journaled batch whose Serato writes wait in the queue for
+/// `OperationEngine.routeDeferredSeratoWrites`.
+struct DeferredSeratoBatch: Sendable, Equatable {
+    let batchId: String
+    let queueIDs: [Int64]
+}
+
 public struct ResyncOutcome: Sendable, Equatable {
     public let appliedCount: Int
     public let queuedCount: Int
