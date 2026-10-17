@@ -12,7 +12,6 @@ import SwiftUI
 struct HistoryView: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var batches: [BatchSummary] = []
     @State private var isLoading: Bool = false
@@ -93,10 +92,9 @@ struct HistoryView: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .controlSize(density.controlSize)
-                .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil || seratoWatchdog.isSeratoRunning)
-                .help(seratoWatchdog.isSeratoRunning
-                    ? "Quit Serato before re-syncing — writes would queue in memory and disappear on app restart."
-                    : "Re-run this batch's Serato library and audio-tag writes. Newer edits made in external tag editors can be overwritten.")
+                .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil)
+                .seratoWriteGated(help: "Re-run this batch's Serato library and audio-tag writes. Newer edits made in external tag editors can be overwritten.",
+                                  runningHelp: SeratoGateMessages.quitBefore("re-syncing"))
             }
 
             Button("Undo") {

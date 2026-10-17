@@ -4,7 +4,6 @@ import SwiftUI
 struct LibraryBrowserView: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var statusFilter: LibraryStatusFilter = .active
     @State private var loadError: String?
@@ -166,10 +165,8 @@ struct LibraryBrowserView: View {
                 } label: {
                     Label("Re-scan File Info", systemImage: "arrow.clockwise")
                 }
-                .disabled(seratoWatchdog.isSeratoRunning)
-                .help(seratoWatchdog.isSeratoRunning
-                    ? "Close Serato before re-scanning file info."
-                    : "Read Serato's saved library and refresh indexed file information.")
+                .seratoWriteGated(help: "Read Serato's saved library and refresh indexed file information.",
+                                  runningHelp: "Close Serato before re-scanning file info.")
             }
 
             Text("Watching: \(services.watchedMusicFolder.path)")

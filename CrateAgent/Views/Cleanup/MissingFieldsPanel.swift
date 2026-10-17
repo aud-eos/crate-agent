@@ -4,7 +4,6 @@ import SwiftUI
 struct MissingFieldsPanel: View {
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
-    @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var trackIdentities: [String: TrackDisplayIdentity] = [:]
     @State private var files: [HygieneFileRow] = []
@@ -33,10 +32,7 @@ struct MissingFieldsPanel: View {
         VStack(spacing: 0) {
             PageHeading("Missing library fields", subtitle: "Choose a missing field and review the value to fill on selected tracks.")
                 .padding(density.pagePadding)
-            if seratoWatchdog.isSeratoRunning {
-                SeratoRunningBanner(message: "Serato is running — quit it before filling missing fields.")
-                Divider()
-            }
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("filling missing fields"))
             summaryBar.disabled(isScanning || isApplying)
             Divider()
             fillForm.disabled(isScanning || isApplying)
@@ -170,10 +166,8 @@ struct MissingFieldsPanel: View {
                 Task { await applyFill() }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(canApply == false || isScanning || isApplying || seratoWatchdog.isSeratoRunning)
-            .help(seratoWatchdog.isSeratoRunning
-                ? "Quit Serato before applying — fixes write to Serato library files and would be clobbered on Serato's next save."
-                : "Fill the chosen field on every selected track.")
+            .disabled(canApply == false || isScanning || isApplying)
+            .seratoWriteGated(help: "Fill the chosen field on every selected track.", runningHelp: SeratoGateMessages.cleanupApplyBlocked)
         }
     }
 
