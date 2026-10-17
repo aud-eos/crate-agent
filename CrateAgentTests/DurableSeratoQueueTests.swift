@@ -428,6 +428,41 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertEqual(first.artist, "Second edit artist")
     }
 
+    func testALargeQueuedBacklogIsWrittenInBoundedRewrites() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        var files: [FileRecord] = []
+        for index in 0 ... SeratoWriteSegmenter.maximumEntriesPerSegment {
+            try await files.append(fixture.add("track-\(index).wav", bytes: FinalRemovalIntegrationTests.wav(sample: UInt8(index % 250))))
+        }
+        try save(fixture, paths: files.map(\.path))
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        setRunning(fixture, true)
+        for file in files {
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .init(title: "Edited \(file.id ?? 0)"))))
+        }
+        setRunning(fixture, false)
+
+        let rewriteSizes = LockedRewriteSizes()
+        let relaunched = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                         seratoMetadataBatchWriter: { databasePath, updates in
+                                             rewriteSizes.append(updates.count)
+                                             return try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+                                         })
+        _ = try await relaunched.drainPendingSeratoUpdates()
+
+        XCTAssertGreaterThan(rewriteSizes.values.count, 1, "One writer transaction held every queued row")
+        XCTAssertTrue(rewriteSizes.values.allSatisfy { size in size <= SeratoWriteSegmenter.maximumEntriesPerSegment })
+        let titles = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).reduce(into: [String: String]()) { titles, record in
+            titles[SeratoPath.normalized(record.path)] = record.title
+        }
+        for file in files {
+            XCTAssertEqual(titles[file.path], "Edited \(file.id ?? 0)")
+        }
+        let remaining = try await relaunched.pendingSeratoWriteCount
+        XCTAssertEqual(remaining, 0)
+    }
+
     func testImmediateBatchAppliesMetadataAfterItsFilesRename() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
@@ -968,5 +1003,18 @@ private final class BoundaryRecorder: @unchecked Sendable {
 
     func recordTrash(_ path: String) {
         lock.withLock { trashedPaths.append(path) }
+    }
+}
+
+private final class LockedRewriteSizes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [Int] = []
+
+    var values: [Int] {
+        lock.withLock { stored }
+    }
+
+    func append(_ size: Int) {
+        lock.withLock { stored.append(size) }
     }
 }
