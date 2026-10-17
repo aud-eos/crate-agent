@@ -1086,13 +1086,16 @@ public actor OperationEngine {
     /// applied vs queued counts (per replayed event) so the UI can tell the
     /// user whether anything actually landed on disk — "Re-sync complete"
     /// while nothing did bit a user before (issue #64).
+    ///
+    /// With `fileID`, only that file's events in the batch are replayed.
     @discardableResult
-    public func resyncSeratoForBatch(_ batchId: String) async throws -> ResyncOutcome {
+    public func resyncSeratoForBatch(_ batchId: String, fileID: Int64? = nil) async throws -> ResyncOutcome {
         let events: [EventRecord] = try await database.writer.read { db in
-            try EventRecord
-                .filter(Column("batch_id") == batchId)
-                .order(Column("event_id").asc)
-                .fetchAll(db)
+            var request = EventRecord.filter(Column("batch_id") == batchId)
+            if let fileID {
+                request = request.filter(Column("file_id") == fileID)
+            }
+            return try request.order(Column("event_id").asc).fetchAll(db)
         }
         guard !events.isEmpty else {
             throw OperationEngineError.batchNotFound(batchId: batchId)
