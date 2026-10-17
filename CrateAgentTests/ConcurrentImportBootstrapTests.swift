@@ -36,8 +36,8 @@ final class ConcurrentImportBootstrapTests: XCTestCase {
         async let first = engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(fileId: fileIDs[0], metadata: SeratoMetadata(title: "first"))))
         async let second = engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(fileId: fileIDs[1], metadata: SeratoMetadata(title: "second"))))
         _ = try await (first, second)
-        let effects = try await SyncCheckpointStore(database: database).pendingEffects()
-        XCTAssertTrue(effects.isEmpty, "Both imports must finish their durable external effects")
+        let queued = try await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queued, 0, "Both imports must finish their durable external effects")
         let records = try readDatabaseRecords(databasePath: v2URL.path)
         XCTAssertEqual(Set(records.map(\.path)), Set(audioURLs.map { audio in SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audio.path) }))
         try await database.writer.read { connection in

@@ -58,12 +58,14 @@ struct SyncDirtyFiles: Sendable {
 enum SyncCheckpointError: LocalizedError {
     case changed
     case incompleteEffects
+    case queuedChangesPending
     case malformed
 
     var errorDescription: String? {
         switch self {
         case .changed: "Library evidence changed during startup validation. Retry sync."
-        case .incompleteEffects: "Some library changes have not finished. Retry Sync or review History before processing resumes."
+        case .incompleteEffects: "An interrupted file move or pre-upgrade change has not finished. Retry Sync or review History before processing resumes."
+        case .queuedChangesPending: "Queued library changes have not finished applying. Retry Sync to apply them."
         case .malformed: "Saved validation data is invalid. Use Re-scan File Info to rebuild it."
         }
     }

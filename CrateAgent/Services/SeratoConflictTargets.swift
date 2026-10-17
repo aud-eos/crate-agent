@@ -72,12 +72,6 @@ enum SeratoConflictTargets {
                 target.include(file)
             }
         }
-        if let receipt = write.cleanupReceipt {
-            for authority in [receipt.target, receipt.keeper] {
-                target.fileIDs.insert(authority.token.fileId)
-                include(authority.identity, in: &target)
-            }
-        }
         target.paths += write.originalReferencePaths + write.write.referencePaths
         includeLiveIdentities(in: &target)
         return target

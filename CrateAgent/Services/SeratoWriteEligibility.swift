@@ -19,7 +19,11 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     var originalReferencePaths: [String] = []
     var externalBaseline: SeratoMetadata?
     var requiredKeeper: FileActionAuthority?
-    var cleanupReceipt: DuplicateCleanupReceipt?
+    var queueID: Int64?
+    var queuedPayload: Data?
+    var attempts = 0
+    var lastError: String?
+    var cleanupTargetFileID: Int64?
 }
 
 enum SeratoWriteEligibility {
@@ -131,5 +135,13 @@ enum SeratoWriteEligibility {
         }
         guard file.lastProjectionInvalidationRevision == nil else { return nil }
         return FileMembershipToken(fileId: fileId, revision: file.membershipRevision)
+    }
+}
+
+extension GuardedSeratoWrite {
+    /// A cleanup step's write whose cleanup was cancelled or finished; it no
+    /// longer has the keeper authority it was queued under.
+    var isOrphanedCleanup: Bool {
+        cleanupTargetFileID != nil && requiredKeeper == nil
     }
 }

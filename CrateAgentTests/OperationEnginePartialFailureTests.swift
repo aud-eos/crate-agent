@@ -902,7 +902,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
 
         XCTAssertEqual(metadataSpy.callCount, 0, "no V2 rewrite while Serato is running")
         XCTAssertEqual(tagWriter.writtenPaths.count, 0, "no file-tag writes while Serato is running")
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 6, "3 metadata updates + 3 file-tag writes queued")
     }
 }

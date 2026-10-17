@@ -72,7 +72,8 @@ running app; it is not restored after quitting and relaunching.
 
 **Apply approved tracks (N)** applies the approved proposals through the normal
 operation engine. It checks whether files changed since review. Serato library
-and tag writes queue while Serato is running. If an external write fails after
+and tag writes queue while Serato is running; the queue is stored in the library
+database, so quitting crate-agent before Serato does not lose them. If an external write fails after
 the library transaction committed, the UI retains the recovery information;
 reapplying the same batch is not a substitute for recovery.
 

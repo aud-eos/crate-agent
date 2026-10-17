@@ -7,6 +7,7 @@ struct ReconciliationSummary: Sendable, Equatable {
     var unavailable: Int = 0
     var skippedUnsupported: Int = 0
     var supersededWrites: Int = 0
+    var interruptedWrites: Int = 0
     var pathConflictCount: Int = 0
     var conflictBlockedWriteCount: Int = 0
     var duplicateCleanupMessage: String?
@@ -153,7 +154,7 @@ actor SeratoMembershipReconciler {
             let expected = FileObservationExpectation(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)
             _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
             if readdedAfterOwnedRemoval {
-                await operationEngine.supersedeReappearedCleanup(fileID: fileID)
+                try await operationEngine.supersedeReappearedCleanup(fileID: fileID)
             }
             if membership == .retired, file.libraryMembership != .retired {
                 summary.retired += 1

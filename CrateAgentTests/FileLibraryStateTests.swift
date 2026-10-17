@@ -142,7 +142,7 @@ final class FileLibraryStateTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(summaries.first).canResync)
         let replay = try await engine.resyncSeratoForBatch("observations")
         XCTAssertEqual(replay.totalCount, 0)
-        let pendingCount = await engine.pendingSeratoWriteCount
+        let pendingCount = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(pendingCount, 0)
     }
 
