@@ -155,29 +155,8 @@ private struct ActivityStrip: View {
             showHistory.toggle()
         } label: {
             HStack(spacing: density.spacing) {
-                if let entry = activityLog.latest {
-                    categoryBadge(entry.category)
-                    Text(entry.message)
-                        .font(.callout)
-                        .lineLimit(density == .comfortable ? 2 : 1)
-                        .truncationMode(.middle)
-                        .help(entry.message)
-                    Spacer(minLength: 8)
-                    Text(entry.timestamp, style: .relative)
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    Text("ago")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Image(systemName: "moon.zzz")
-                        .foregroundStyle(.secondary)
-                    Text("Idle — actions will log here.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                Image(systemName: "chevron.up")
+                ActivityEntrySummary(entry: activityLog.latest)
+                Text(showHistory ? "Hide log" : "Show log")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -194,17 +173,6 @@ private struct ActivityStrip: View {
             ActivityHistoryPopover()
                 .environmentObject(activityLog)
         }
-    }
-
-    private func categoryBadge(_ category: ActivityLog.Category) -> some View {
-        Text(category.displayName)
-            .font(.callout)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 1)
-            .background(
-                Capsule().fill(category.tint.opacity(0.18))
-            )
-            .foregroundStyle(category.tint)
     }
 }
 
@@ -350,24 +318,5 @@ private struct ActivityHistoryPopover: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, density.rowPadding)
-    }
-}
-
-/// Color tint per activity category — single source of truth.
-/// Both `ActivityStrip` and `ActivityHistoryPopover` consume this;
-/// a duplicated `categoryTint(_:)` switch previously lived in each.
-/// Adding a new `ActivityLog.Category` case now produces an
-/// exhaustive-switch warning in one place instead of two.
-private extension ActivityLog.Category {
-    var tint: Color {
-        switch self {
-        case .hygiene: .blue
-        case .duplicate: .orange
-        case .rename: .purple
-        case .fingerprint: .pink
-        case .sync: .teal
-        case .scan: .green
-        case .general: .gray
-        }
     }
 }

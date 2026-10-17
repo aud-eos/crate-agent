@@ -65,6 +65,7 @@ struct CrateAgentApp: App {
             MenuBarStatusView()
                 .environmentObject(services)
                 .environmentObject(services.seratoWatchdog)
+                .environmentObject(services.activityLog)
         }
     }
 

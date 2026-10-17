@@ -6,6 +6,7 @@ struct MenuBarStatusView: View {
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
+    @EnvironmentObject private var activityLog: ActivityLog
     @State private var indexedFileCount: Int = 0
 
     var body: some View {
@@ -16,6 +17,8 @@ struct MenuBarStatusView: View {
                 openWindow(id: AppPresentation.mainWindowID)
                 services.reviewConflicts()
             })
+
+            ActivityEntrySummary(entry: activityLog.latest)
 
             Text("\(indexedFileCount) files indexed")
                 .font(.callout.monospacedDigit())
