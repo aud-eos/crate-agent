@@ -204,13 +204,13 @@ struct AutoTagReviewRow: View {
                 fieldEditor(field)
             }
             if ReviewField.allCases.contains(where: isUnchanged) {
-                DisclosureGroup("Show unchanged fields", isExpanded: $showUnchanged) {
+                let unchanged = ReviewField.allCases.filter(isUnchanged)
+                TextDisclosure(show: "Show unchanged fields (\(unchanged.count))", hide: "Hide unchanged fields", isExpanded: $showUnchanged) {
                     VStack(alignment: .leading, spacing: density.spacing) {
-                        ForEach(ReviewField.allCases.filter { isUnchanged($0) }) { field in
+                        ForEach(unchanged) { field in
                             fieldEditor(field)
                         }
                     }
-                    .padding(.top, density.detailSpacing)
                 }
             }
             releaseDisclosure
@@ -374,7 +374,9 @@ struct AutoTagReviewRow: View {
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
             if model.candidate.availableReleases.count > 1 {
-                DisclosureGroup("Choose release…", isExpanded: $showReleasePicker) {
+                TextDisclosure(show: "Choose release (\(model.candidate.availableReleases.count) available)", hide: "Hide releases",
+                               isExpanded: $showReleasePicker)
+                {
                     LazyVStack(alignment: .leading, spacing: density.detailSpacing) {
                         ForEach(model.candidate.availableReleases, id: \.id) { release in
                             Button {
