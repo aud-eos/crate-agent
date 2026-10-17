@@ -8,6 +8,11 @@ final class SongFamilyTests: XCTestCase {
     private var engine: OperationEngine!
     private var service: SongFamilyService!
     @MainActor private var seratoState: ProcessingTestSeratoState?
+    private let audioFixture = OwnedProcessingAudioFixture()
+
+    override func tearDownWithError() throws {
+        try audioFixture.remove()
+    }
 
     @MainActor
     override func setUp() async throws {
@@ -17,7 +22,7 @@ final class SongFamilyTests: XCTestCase {
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { state.isRunning ? ["com.serato.djpro"] : [] })
         engine = OperationEngine(database: database, seratoWatchdog: watchdog,
                                  seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
-                                 fileTagWriter: { _, _ in XCTFail("Grouping wrote audio tags") })
+                                 fileTagWriter: { _, _ in XCTFail("Grouping wrote audio tags") }, fileTagReader: { _ in AudioTags.none })
         service = SongFamilyService(engine: engine, database: database)
     }
 
@@ -249,11 +254,12 @@ final class SongFamilyTests: XCTestCase {
         nextFingerprint += 1
         let inode = Int64(nextFingerprint)
         return try await database.writer.write { connection in
-            var file = FileRecord(path: "/Music/S/\(inode).mp3", volumeUuid: "volume", inode: inode, fileSize: 10, mtime: 10,
+            var file = FileRecord(path: self.audioFixture.path("/Music/S/\(inode).mp3"), volumeUuid: "volume", inode: inode, fileSize: 10, mtime: 10,
                                   chromaprintFingerprint: fingerprint, fingerprintStatus: fingerprint == nil ? .pending : .done,
                                   trackId: trackID, title: title)
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(connection)
             return try XCTUnwrap(file.id)
         }
