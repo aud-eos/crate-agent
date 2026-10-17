@@ -1905,7 +1905,7 @@ public actor OperationEngine {
             }
             guard disposition == .eligible, !queued.isOrphanedCleanup, try await isEligible(queued) else {
                 try await supersede(queued, reported: reported)
-                run.recordSuperseded(queued)
+                run.superseded.insert(queued.eventId)
                 continue
             }
             ready.append(SeratoWriteSegment.Entry(write: queued, dependency: dependency))
@@ -1955,17 +1955,7 @@ public actor OperationEngine {
         /// A batched segment that failed failed on its store, so later
         /// segments of that kind in the pass would fail the same way.
         var failedBatchKinds = Set<SeratoWriteSegment.Kind>()
-        /// Old paths of renames dropped this pass: the record there never moved,
-        /// so a later rename into one of them would land on top of it.
-        var unvacatedPaths = Set<String>()
         var stopped = false
-
-        mutating func recordSuperseded(_ write: GuardedSeratoWrite) {
-            superseded.insert(write.eventId)
-            if case let .rename(rename) = write.write {
-                unvacatedPaths.insert(rename.oldAbsolutePath)
-            }
-        }
 
         mutating func block(_ write: GuardedSeratoWrite, dependency: SeratoQueueDependency) {
             blocked.formUnion(dependency)
@@ -2021,7 +2011,6 @@ public actor OperationEngine {
         }
         var rows = try await eligibleWrites(candidates)
         try await supersedeMissing(from: candidates, keeping: rows, reported: reported, run: &run)
-        rows = try await supersedingArrivals(in: rows, reported: reported, run: &run)
         let claimed = claim(Set(rows.compactMap(\.queueID)), owner: owner)
         defer {
             release(claimed, owner: owner)
@@ -2059,12 +2048,11 @@ public actor OperationEngine {
                 let survivors = rows.filter { write in write.queueID.map(rejected.contains) != true }
                 for write in rows where write.queueID.map(rejected.contains) == true {
                     try await supersede(write, reported: reported)
-                    run.recordSuperseded(write)
+                    run.superseded.insert(write.eventId)
                 }
                 rows = try await eligibleWrites(survivors)
                 try await supersedeMissing(from: survivors, keeping: rows, reported: reported, run: &run)
-                rows = try await supersedingArrivals(in: rows, reported: reported, run: &run)
-            } catch let ExternalWriteInterruption.stale(stale) {
+                    } catch let ExternalWriteInterruption.stale(stale) {
                 rows = holdingBack(stale, from: rows, run: &run)
             } catch let ExternalWriteInterruption.conflicted(conflicted) {
                 var survivors: [GuardedSeratoWrite] = []
@@ -2102,26 +2090,11 @@ public actor OperationEngine {
         return []
     }
 
-    /// Drops each rename into a path whose rename was dropped this pass, in
-    /// queue order so the drop carries along a chain or swap (#199).
-    private func supersedingArrivals(in rows: [GuardedSeratoWrite], reported: Bool, run: inout SegmentRun) async throws -> [GuardedSeratoWrite] {
-        var kept: [GuardedSeratoWrite] = []
-        for write in rows {
-            if case let .rename(rename) = write.write, run.unvacatedPaths.contains(rename.newAbsolutePath) {
-                try await supersede(write, reported: reported)
-                run.recordSuperseded(write)
-            } else {
-                kept.append(write)
-            }
-        }
-        return kept
-    }
-
     private func supersedeMissing(from candidates: [GuardedSeratoWrite], keeping kept: [GuardedSeratoWrite], reported: Bool, run: inout SegmentRun) async throws {
         let keptIDs = Set(kept.compactMap(\.queueID))
         for write in candidates where write.queueID.map(keptIDs.contains) != true {
             try await supersede(write, reported: reported)
-            run.recordSuperseded(write)
+            run.superseded.insert(write.eventId)
         }
     }
 
@@ -2217,6 +2190,23 @@ public actor OperationEngine {
         let attemptedAudioWrite = write.attempts > 0 && [SeratoWriteKind.fileTagWrite, .trashFile].contains(write.write.kind)
         try SeratoWriteDispositions.record(eventID: write.eventId, kind: write.write.kind, disposition: attemptedAudioWrite ? .interrupted : disposition,
                                            detail: detail ?? write.lastError, reported: reported, in: database)
+        if case let .rename(rename) = write.write, let queueID = write.queueID {
+            try dropRenames(into: rename.oldAbsolutePath, after: queueID, leftBy: write, reported: reported, in: database)
+        }
+    }
+
+    /// A dropped rename never moved the record at its old path, so a later
+    /// queued rename into that path would land on top of it (#199). Each
+    /// rename dropped here carries the drop on along its own chain. A path the
+    /// file's own earlier, also dropped, rename never reached holds no record.
+    private static func dropRenames(into path: String, after queueID: Int64, leftBy dropped: GuardedSeratoWrite, reported: Bool,
+                                    in database: GRDB.Database) throws
+    {
+        guard try !SeratoWriteQueue.renameNeverArrived(fileID: dropped.token.fileId, at: path, before: dropped.eventId, in: database) else { return }
+        for arrival in try SeratoWriteQueue.queuedRenames(into: path, after: queueID, in: database) {
+            try dropQueuedWrite(arrival, disposition: .superseded, detail: SeratoWriteDispositionMessages.unmovedOccupant(at: path),
+                                reported: reported, in: database)
+        }
     }
 
     private func recordAttempt(_ writes: [GuardedSeratoWrite]) async throws {
@@ -2472,7 +2462,7 @@ public actor OperationEngine {
         var run = SegmentRun()
         for write in partition.superseded {
             try await supersede(write, reported: true)
-            run.recordSuperseded(write)
+            run.superseded.insert(write.eventId)
         }
         let blockedEvents = Set(partition.blocked.map(\.eventId))
         let owner = UUID()

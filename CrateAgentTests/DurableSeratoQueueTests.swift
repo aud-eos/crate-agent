@@ -409,6 +409,64 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
     }
 
+    func testARenameIntoAPathWhoseDepartureWasDroppedInAnEarlierPassDoesNotLand() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let (one, two, three) = try await chainFixture(fixture)
+        let other = try await fixture.add("other.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 3))
+        try setV2(fixture, path: other.path, title: "Other")
+        let chain = try chainRenames(one: one, two: two, three: three)
+        setRunning(fixture, true)
+        // The metadata edit between them puts the chain's two renames in separate segments.
+        try await fixture.engine.applyBatch([
+            chain[0],
+            .commitMetadataToSerato(.init(fileId: XCTUnwrap(other.id), metadata: .init(title: "Other edit"))),
+            chain[1],
+        ], batchId: "chain")
+        setRunning(fixture, false)
+        try FinalRemovalIntegrationTests.wav(sample: 9, durationSeconds: 2).write(to: URL(fileURLWithPath: three))
+        // Serato starts once the departure is dropped, so the pass stops before the arrival's segment.
+        let lifecycle = fixture.lifecycle
+        let watchdog = fixture.watchdog
+        let launched = LockedTestFlag()
+        try await fixture.database.writer.write { connection in
+            connection.trace { event in
+                guard event.expandedDescription.hasPrefix("INSERT INTO serato_write_dispositions"), launched.setOnce() else { return }
+                lifecycle.running = true
+                Task { @MainActor in watchdog.refresh() }
+            }
+        }
+        _ = try await fixture.engine.drainPendingSeratoUpdates()
+        try await fixture.database.writer.write { connection in connection.trace(nil) }
+        XCTAssertFalse(launched.setOnce(), "The departure was never dropped")
+        setRunning(fixture, false)
+        _ = try await fixture.engine.drainPendingSeratoUpdates()
+
+        let paths = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).map { record in SeratoPath.normalized(record.path) }
+        XCTAssertEqual(paths.count, Set(paths).count, "Database V2 holds two records at one path")
+        XCTAssertEqual(try titlesByPath(fixture)[two.path], "Two")
+        XCTAssertEqual(try titlesByPath(fixture)[one.path], "One")
+    }
+
+    func testARenameIntoAPathADroppedRenameNeverReachedStillLands() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let (one, two, three) = try await chainFixture(fixture)
+        let hop = fixture.directory.appendingPathComponent("hop.wav").path
+        setRunning(fixture, true)
+        try await fixture.engine.applyBatch([
+            .renameFile(RenameFilePayload(fileId: XCTUnwrap(one.id), newPath: hop, previousPath: one.path, physicalMove: true)),
+            .renameFile(RenameFilePayload(fileId: XCTUnwrap(one.id), newPath: three, previousPath: hop, physicalMove: true)),
+            .renameFile(RenameFilePayload(fileId: XCTUnwrap(two.id), newPath: hop, previousPath: two.path, physicalMove: true)),
+        ], batchId: "renames")
+        setRunning(fixture, false)
+        // The first file's renames are dropped, so its record never reached the hop path.
+        try FinalRemovalIntegrationTests.wav(sample: 9, durationSeconds: 2).write(to: URL(fileURLWithPath: three))
+        _ = try await fixture.engine.drainPendingSeratoUpdates()
+
+        XCTAssertEqual(try titlesByPath(fixture), [one.path: "One", hop: "Two"])
+    }
+
     func testAPartlyLandedChainRenameFinishesAfterItsArrivalIsSuperseded() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
@@ -419,7 +477,7 @@ final class DurableSeratoQueueTests: XCTestCase {
         let subcrates = fixture.locator.subcratesDirectoryUrl.path
         try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: subcrates)
         do { _ = try await fixture.engine.drainPendingSeratoUpdates(); XCTFail("The read-only crate accepted the renames") }
-        catch {}
+        catch let OperationEngineError.seratoRewriteFailed(path, _) { XCTAssertEqual(URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent, "Subcrates", path) }
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: subcrates)
         // The file that moved in becomes inaccessible, so its rename is dropped
         // before the next pass, and the departure no longer has a later arrival.

@@ -166,6 +166,27 @@ enum SeratoWriteQueue {
         try Row.fetchOne(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE queue_id = ?", arguments: [queueID]).map(decode)
     }
 
+    /// Queued renames after `queueID` that move a file into `path`, in queue order.
+    static func queuedRenames(into path: String, after queueID: Int64, in database: Database) throws -> [GuardedSeratoWrite] {
+        try Row.fetchAll(database, sql: """
+        SELECT \(columns) FROM serato_write_queue
+        WHERE kind = ? AND queue_id > ? AND json_extract(CAST(payload AS TEXT), '$.write.value.newAbsolutePath') = ?
+        ORDER BY queue_id
+        """, arguments: [SeratoWriteKind.rename.rawValue, queueID, path]).map(decode)
+    }
+
+    /// Whether the file's latest rename into `path` before `eventID` was
+    /// itself not applied, so its record never reached that path.
+    static func renameNeverArrived(fileID: Int64, at path: String, before eventID: Int64, in database: Database) throws -> Bool {
+        guard let arrival = try Int64.fetchOne(database, sql: """
+        SELECT event_id FROM events
+        WHERE file_id = ? AND event_type = ? AND event_id < ? AND json_extract(payload_json, '$.newPath') = ?
+        ORDER BY event_id DESC LIMIT 1
+        """, arguments: [fileID, EventType.fileRenamed.rawValue, eventID, path]) else { return false }
+        return try Bool.fetchOne(database, sql: "SELECT EXISTS (SELECT 1 FROM serato_write_dispositions WHERE event_id = ? AND kind = ?)",
+                                 arguments: [arrival, SeratoWriteKind.rename.rawValue]) == true
+    }
+
     /// Later queued V2 edits for the same file revision captured their
     /// baseline before `completed` was written. Its written fields are now
     /// the saved values those edits replace.

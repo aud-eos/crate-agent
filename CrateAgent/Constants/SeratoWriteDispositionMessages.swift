@@ -13,6 +13,10 @@ enum SeratoWriteDispositionMessages {
         }
     }
 
+    static func unmovedOccupant(at path: String) -> String {
+        "Not applied: the rename that would have moved the track already at \((path as NSString).lastPathComponent) was not applied."
+    }
+
     static func unrecognizedSummary(count: Int) -> String {
         "\(changes(count, "queued")) not applied for a reason this version does not recognize"
     }
