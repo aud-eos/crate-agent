@@ -22,6 +22,20 @@ detection still blocks live services, but those configurations share the normal
 app's AppKit preferences domain. The host-isolation regression test rejects that
 configuration.
 
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`.
+A newer push to the same PR cancels the older run.
+
+- **Ubuntu:** `make format-check`, `make lint` and `make test-rust`. SwiftFormat
+  is pinned by `SWIFTFORMAT_VERSION`; bump it together with a local reformat.
+- **macOS 26 with Xcode 26.6:** `make build-rust`, `make xcodeproj` and the full
+  Swift suite in the Test configuration. It mounts the disposable APFS volume
+  described below first, so the volume-dependent tests run instead of skipping.
+
+Cargo builds and SPM checkouts are cached. A failing Swift run uploads its
+`.xcresult` bundle as an artifact.
+
 ## Adding tests
 
 - Exercise launcher transitions through `ApplicationLauncher`, injecting a
