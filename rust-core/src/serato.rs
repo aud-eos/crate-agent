@@ -38,6 +38,7 @@ use std::io::{Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 const TAG_OTRK: &[u8; 4] = b"otrk";
 const TAG_PTRK: &[u8; 4] = b"ptrk";
@@ -327,53 +328,93 @@ fn track_paths_in_otrks(records: &[TlvRecord], path_tag: &[u8; 4]) -> Vec<String
         .collect()
 }
 
-/// Walks an `otrk` payload's nested TLV headers in place, without
-/// allocating, and reports whether any `path_tag` field's raw payload is
-/// one of `encoded_paths`. UTF-16 encoding is unique, so matching the
-/// encoded bytes is exactly equivalent to decoding and comparing strings.
-/// The walk follows real field boundaries: target bytes inside another
-/// field's payload, or straddling two fields, never match. A `true`
-/// result is only a candidate — callers still full-parse it, so an otrk
-/// with a malformed tail keeps its unparseable-otrk handling.
-fn otrk_has_path_in(
-    otrk_payload: &[u8],
-    path_tag: &[u8; 4],
-    encoded_paths: &HashSet<Vec<u8>>,
-) -> bool {
+/// The form track paths are compared in: NFC, as Swift's `SeratoPath.normalized`.
+/// Finder can store a name decomposed while SQLite holds it composed, or the reverse.
+fn path_key(path: &str) -> String {
+    if path.is_ascii() {
+        path.to_owned()
+    } else {
+        path.nfc().collect()
+    }
+}
+
+/// Requested track paths, matched against stored path fields by NFC form. A field is
+/// decoded only when its bytes miss and it holds non-ASCII text, since ASCII is its own
+/// NFC form; a stored field's bytes are never rewritten by matching.
+struct PathKeys {
+    keys: HashSet<String>,
+    encoded_keys: HashSet<Vec<u8>>,
+}
+
+impl PathKeys {
+    fn new<'path>(paths: impl IntoIterator<Item = &'path str>) -> Self {
+        let keys: HashSet<String> = paths.into_iter().map(path_key).collect();
+        let encoded_keys = keys.iter().map(|key| encode_utf16be(key)).collect();
+        Self { keys, encoded_keys }
+    }
+
+    fn matches_field(&self, field: &[u8]) -> bool {
+        if self.encoded_keys.contains(field) {
+            return true;
+        }
+        let ascii = field
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|[high, low]| *high == 0 && low.is_ascii());
+        !ascii && decode_utf16be(field).is_some_and(|path| self.keys.contains(&path_key(&path)))
+    }
+}
+
+/// Walks an `otrk` payload's nested TLV headers in place and reports whether
+/// any `path_tag` field matches one of `paths`. The walk follows real field
+/// boundaries: target bytes inside another field's payload, or straddling two
+/// fields, never match. A `true` result is only a candidate — callers still
+/// full-parse it, so an otrk with a malformed tail keeps its unparseable-otrk
+/// handling.
+fn otrk_has_path_in(otrk_payload: &[u8], path_tag: &[u8; 4], paths: &PathKeys) -> bool {
     let mut found = false;
     walk_nested_fields(otrk_payload, |tag, payload| {
-        if tag == path_tag && encoded_paths.contains(payload) {
+        if tag == path_tag && paths.matches_field(payload) {
             found = true;
         }
     });
     found
 }
 
-/// The path an `otrk` is keyed by: its first `path_tag` field that decodes.
-fn first_decodable_path(nested: &[TlvRecord], path_tag: &[u8; 4]) -> Option<String> {
+/// The NFC key of the path an `otrk` is keyed by: its first `path_tag` field
+/// that decodes.
+fn first_path_key(nested: &[TlvRecord], path_tag: &[u8; 4]) -> Option<String> {
     nested
         .iter()
         .filter(|field| &field.tag == path_tag)
         .find_map(|field| decode_utf16be(&field.payload))
+        .map(|path| path_key(&path))
 }
 
 /// Which of `paths` some `otrk` is keyed by, under the metadata writer's
-/// rule (`first_decodable_path` of a well-formed record). Only records
-/// holding a requested path are parsed.
+/// rule (`first_path_key` of a well-formed record). Only records holding a
+/// requested path are parsed.
 fn held_paths_in_otrks<'path>(
     records: &[TlvRecord],
     path_tag: &[u8; 4],
     paths: impl IntoIterator<Item = &'path str>,
 ) -> HashSet<String> {
-    let encoded_paths: HashSet<Vec<u8>> = paths.into_iter().map(encode_utf16be).collect();
-    records
+    let requested: Vec<&str> = paths.into_iter().collect();
+    let keys = PathKeys::new(requested.iter().copied());
+    let held_keys: HashSet<String> = records
         .iter()
         .filter(|record| {
-            &record.tag == TAG_OTRK && otrk_has_path_in(&record.payload, path_tag, &encoded_paths)
+            &record.tag == TAG_OTRK && otrk_has_path_in(&record.payload, path_tag, &keys)
         })
         .filter_map(|record| TlvRecord::parse_all(&record.payload).ok())
-        .filter_map(|nested| first_decodable_path(&nested, path_tag))
-        .filter(|path| encoded_paths.contains(&encode_utf16be(path)))
+        .filter_map(|nested| first_path_key(&nested, path_tag))
+        .filter(|key| keys.keys.contains(key))
+        .collect();
+    requested
+        .into_iter()
+        .filter(|path| held_keys.contains(&path_key(path)))
+        .map(str::to_owned)
         .collect()
 }
 
@@ -409,7 +450,7 @@ fn walk_nested_fields<'payload>(
 }
 
 /// Drop every top-level `otrk` whose path field (`pfil` for
-/// database V2, `ptrk` for `.crate`) matches `target_path`.
+/// database V2, `ptrk` for `.crate`) matches `target_path` by NFC form.
 /// Non-otrk records and otrks pointing elsewhere are preserved
 /// byte-exact. Returns the count of otrks removed.
 fn remove_otrks_referencing_path(
@@ -417,11 +458,10 @@ fn remove_otrks_referencing_path(
     path_tag: &[u8; 4],
     target_path: &str,
 ) -> usize {
-    let encoded_target = HashSet::from([encode_utf16be(target_path)]);
+    let target = PathKeys::new([target_path]);
     let original_len = records.len();
     records.retain(|record| {
-        if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &encoded_target)
-        {
+        if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &target) {
             return true;
         }
         let Ok(nested) = TlvRecord::parse_all(&record.payload) else {
@@ -431,10 +471,7 @@ fn remove_otrks_referencing_path(
             return true;
         };
         let matches = nested.iter().any(|nested_record| {
-            if nested_record.tag != *path_tag {
-                return false;
-            }
-            decode_utf16be(&nested_record.payload).as_deref() == Some(target_path)
+            nested_record.tag == *path_tag && target.matches_field(&nested_record.payload)
         });
         !matches
     });
@@ -453,7 +490,8 @@ fn rewrite_path_in_otrks(
 }
 
 /// Multi-rename variant: rewrite every otrk whose path field matches
-/// any key in `renames`, replacing it with the mapped value. One pass
+/// any key in `renames` (exactly, else by NFC form), replacing it with the
+/// mapped value. One pass
 /// over the records; only otrks holding a rename source are parsed.
 ///
 /// Every matching path field is rewritten, while `held_paths_in_otrks`
@@ -468,14 +506,14 @@ fn rewrite_paths_in_otrks(
     if renames.is_empty() {
         return 0;
     }
-    let encoded_sources: HashSet<Vec<u8>> = renames
-        .keys()
-        .map(|old_path| encode_utf16be(old_path))
+    let sources = PathKeys::new(renames.keys().map(String::as_str));
+    let renames_by_key: HashMap<String, &String> = renames
+        .iter()
+        .map(|(old_path, new_path)| (path_key(old_path), new_path))
         .collect();
     let mut count: usize = 0;
     for record in records.iter_mut() {
-        if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &encoded_sources)
-        {
+        if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &sources) {
             continue;
         }
         let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
@@ -489,7 +527,10 @@ fn rewrite_paths_in_otrks(
             let Some(current) = decode_utf16be(&nested_record.payload) else {
                 continue;
             };
-            if let Some(new_path) = renames.get(&current) {
+            let destination = renames
+                .get(&current)
+                .or_else(|| renames_by_key.get(&path_key(&current)).copied());
+            if let Some(new_path) = destination {
                 nested_record.payload = encode_utf16be(new_path);
                 changed = true;
             }
@@ -747,7 +788,7 @@ impl DatabaseV2 {
     ///
     /// Returns one flag per addition: `true` if it was appended, `false`
     /// if Serato (or an earlier addition in this batch) already has the
-    /// path — Serato dedupes itself, and mirroring that keeps the file
+    /// path (by NFC form) — Serato dedupes itself, and mirroring that keeps the file
     /// from growing on repeated imports. As with the per-path matchers,
     /// an otrk that does not fully parse does not count as holding its path.
     ///
@@ -755,31 +796,35 @@ impl DatabaseV2 {
     /// Serato is NOT running. The Swift caller gates via
     /// SeratoWatchdog.
     pub fn add_tracks(&mut self, additions: &[(String, SeratoMetadataUpdate)]) -> Vec<bool> {
-        let mut present: HashSet<Vec<u8>> =
-            HashSet::with_capacity(self.records.len() + additions.len());
+        let requested = PathKeys::new(additions.iter().map(|(track_path, _)| track_path.as_str()));
+        let mut present: HashSet<String> = HashSet::with_capacity(additions.len());
         let mut otrk_paths: Vec<&[u8]> = Vec::new();
         for record in self.records.iter().filter(|record| &record.tag == TAG_OTRK) {
             otrk_paths.clear();
             let well_formed = walk_nested_fields(&record.payload, |tag, payload| {
-                if tag == TAG_PFIL {
+                if tag == TAG_PFIL && requested.matches_field(payload) {
                     otrk_paths.push(payload);
                 }
             });
             if well_formed {
-                present.extend(otrk_paths.iter().map(|payload| payload.to_vec()));
+                present.extend(
+                    otrk_paths
+                        .iter()
+                        .filter_map(|payload| decode_utf16be(payload))
+                        .map(|path| path_key(&path)),
+                );
             }
         }
 
         additions
             .iter()
             .map(|(track_path, metadata)| {
-                let encoded_path = encode_utf16be(track_path);
-                if !present.insert(encoded_path.clone()) {
+                if !present.insert(path_key(track_path)) {
                     return false;
                 }
                 let mut nested = vec![TlvRecord {
                     tag: *TAG_PFIL,
-                    payload: encoded_path,
+                    payload: encode_utf16be(track_path),
                 }];
                 // A fresh otrk starts empty, so every supplied field is new.
                 let _ = apply_metadata_update_to_nested(&mut nested, metadata);
@@ -796,8 +841,8 @@ impl DatabaseV2 {
             .collect()
     }
 
-    /// Update Serato's metadata for the track whose `pfil` equals
-    /// `track_path`. For each `Some(...)` field in `update`, the
+    /// Update Serato's metadata for the track whose `pfil` matches
+    /// `track_path` by NFC form. For each `Some(...)` field in `update`, the
     /// corresponding `t*` record is set (creating it if absent);
     /// `None` fields leave the existing record unchanged. Returns 1
     /// if a matching `otrk` was found and updated, 0 otherwise.
@@ -817,6 +862,7 @@ impl DatabaseV2 {
         track_path: &str,
         update: &SeratoMetadataUpdate,
     ) -> usize {
+        let target = PathKeys::new([track_path]);
         for record in self.records.iter_mut() {
             if &record.tag != TAG_OTRK {
                 continue;
@@ -824,10 +870,9 @@ impl DatabaseV2 {
             let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
                 continue;
             };
-            let path_matches = nested.iter().any(|field| {
-                &field.tag == TAG_PFIL
-                    && decode_utf16be(&field.payload).as_deref() == Some(track_path)
-            });
+            let path_matches = nested
+                .iter()
+                .any(|field| &field.tag == TAG_PFIL && target.matches_field(&field.payload));
             if !path_matches {
                 continue;
             }
@@ -869,6 +914,10 @@ impl DatabaseV2 {
         if updates.is_empty() {
             return 0;
         }
+        let updates_by_key: HashMap<String, &SeratoMetadataUpdate> = updates
+            .iter()
+            .map(|(track_path, update)| (path_key(track_path), update))
+            .collect();
         let mut changed_tracks = 0;
         for record in self.records.iter_mut() {
             if &record.tag != TAG_OTRK {
@@ -877,10 +926,10 @@ impl DatabaseV2 {
             let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
                 continue;
             };
-            let Some(track_path) = first_decodable_path(&nested, TAG_PFIL) else {
+            let Some(key) = first_path_key(&nested, TAG_PFIL) else {
                 continue;
             };
-            let Some(update) = updates.get(&track_path) else {
+            let Some(update) = updates_by_key.get(&key) else {
                 continue;
             };
             if !apply_metadata_update_to_nested(&mut nested, update) {
@@ -1858,6 +1907,108 @@ mod tests {
     const PREFILTER_PREFIX: &str = "Music/Caf\u{e9}/";
     const PREFILTER_RENAMED: &str = "Music/Renamed.mp3";
 
+    const COMPOSED_PATH: &str = "Music/Caf\u{e9}.mp3";
+    const DECOMPOSED_PATH: &str = "Music/Cafe\u{301}.mp3";
+    const UNRELATED_PATH: &str = "Music/Other.mp3";
+
+    fn title(value: &str) -> SeratoMetadataUpdate {
+        SeratoMetadataUpdate {
+            title: Some(value.to_owned()),
+            ..SeratoMetadataUpdate::default()
+        }
+    }
+
+    fn unicode_library(path_tag: &[u8; 4], stored: &str) -> Vec<u8> {
+        synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            path_tag,
+            &[stored, UNRELATED_PATH],
+        )
+    }
+
+    /// Swift compares paths by NFC form (`SeratoPath.normalized`), so a request in either
+    /// normalization reaches a record stored in the other, and the stored bytes of a path
+    /// the write does not rename stay as Serato wrote them.
+    #[test]
+    fn database_writers_match_paths_by_nfc_form() {
+        for (stored, requested) in [
+            (DECOMPOSED_PATH, COMPOSED_PATH),
+            (COMPOSED_PATH, DECOMPOSED_PATH),
+        ] {
+            let original = DatabaseV2::from_bytes(&unicode_library(TAG_PFIL, stored)).unwrap();
+            let unrelated = original.records[2].clone();
+
+            let mut database = original.clone();
+            assert_eq!(
+                database.held_paths([requested]),
+                HashSet::from([requested.to_owned()])
+            );
+            assert_eq!(database.update_track_metadata(requested, &title("One")), 1);
+            assert_eq!(
+                database.batch_update_track_metadata(&HashMap::from([(
+                    requested.to_owned(),
+                    title("Two")
+                )])),
+                1
+            );
+            assert_eq!(
+                database.add_tracks(&[(requested.to_owned(), title("Duplicate"))]),
+                vec![false]
+            );
+            let records = database.track_records();
+            assert_eq!(records.len(), 2);
+            assert_eq!(
+                records[0].path, stored,
+                "a metadata write keeps the stored path bytes"
+            );
+            assert_eq!(records[0].title.as_deref(), Some("Two"));
+            assert_eq!(database.records[2], unrelated);
+
+            assert_eq!(
+                database.rewrite_paths(&HashMap::from([(
+                    requested.to_owned(),
+                    PREFILTER_RENAMED.to_owned()
+                )])),
+                1
+            );
+            assert_eq!(
+                database.track_paths(),
+                vec![PREFILTER_RENAMED, UNRELATED_PATH]
+            );
+
+            let mut removed = original.clone();
+            assert_eq!(removed.remove_track(requested), 1);
+            assert_eq!(
+                removed.records,
+                vec![original.records[0].clone(), unrelated.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn crate_writers_match_paths_by_nfc_form() {
+        for (stored, requested) in [
+            (DECOMPOSED_PATH, COMPOSED_PATH),
+            (COMPOSED_PATH, DECOMPOSED_PATH),
+        ] {
+            let original = CrateFile::from_bytes(&unicode_library(TAG_PTRK, stored)).unwrap();
+            let mut crate_file = original.clone();
+            assert_eq!(
+                crate_file.held_paths([requested]),
+                HashSet::from([requested.to_owned()])
+            );
+            assert_eq!(crate_file.rewrite_path(requested, PREFILTER_RENAMED), 1);
+            assert_eq!(
+                crate_file.track_paths(),
+                vec![PREFILTER_RENAMED, UNRELATED_PATH]
+            );
+
+            let mut removed = original.clone();
+            assert_eq!(removed.remove_track(requested), 1);
+            assert_eq!(removed.track_paths(), vec![UNRELATED_PATH]);
+        }
+    }
+
     fn raw_field(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut bytes = tag.to_vec();
         bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
@@ -1914,10 +2065,6 @@ mod tests {
                 path_tag,
                 &PREFILTER_TARGET[..PREFILTER_TARGET.len() - 1],
             )]),
-            otrk_from_fields(&[raw_path(
-                path_tag,
-                &PREFILTER_TARGET.replace('\u{e9}', "e\u{301}"),
-            )]),
             otrk_from_fields(&[other.clone(), raw_field(b"tcom", &target)]),
             otrk_from_fields(&[other.clone(), raw_field(b"tcom", &fake_header)]),
             otrk_from_fields(&[
@@ -1954,7 +2101,7 @@ mod tests {
         for path_tag in [TAG_PFIL, TAG_PTRK] {
             let records = prefilter_library(path_tag, PREFILTER_TARGET);
             let target = encode_utf16be(PREFILTER_TARGET);
-            let straddling = &non_matching_records(path_tag)[8].payload;
+            let straddling = &non_matching_records(path_tag)[7].payload;
             assert!(
                 straddling
                     .windows(target.len())
