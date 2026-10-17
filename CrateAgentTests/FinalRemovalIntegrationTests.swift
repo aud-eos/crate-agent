@@ -199,6 +199,8 @@ final class FinalRemovalIntegrationTests: XCTestCase {
                 current.fingerprintStatus = .done
                 current.fingerprintedSize = current.fileSize
                 current.fingerprintedMtime = current.mtime
+                current.fingerprintedMtimeNanoseconds = current.mtimeNanoseconds
+                current.fingerprintedInode = current.inode
                 try current.update(database)
             }
             return try XCTUnwrap(track.id)
@@ -522,6 +524,8 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             current.fingerprintStatus = .done
             current.fingerprintedSize = current.fileSize
             current.fingerprintedMtime = current.mtime
+            current.fingerprintedMtimeNanoseconds = current.mtimeNanoseconds
+            current.fingerprintedInode = current.inode
             try current.update(database)
             return current
         }
