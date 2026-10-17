@@ -3,11 +3,14 @@ import GRDB
 
 public enum FileLibraryStateMutationError: LocalizedError, Equatable {
     case staleRevision(fileId: Int64, expected: Int64, actual: Int64)
+    case trashLocationWithoutTrash(fileId: Int64)
 
     public var errorDescription: String? {
         switch self {
         case let .staleRevision(fileId, expected, actual):
             "File \(fileId) membership changed: expected revision \(expected), found \(actual). Refresh before retrying."
+        case let .trashLocationWithoutTrash(fileId):
+            "File \(fileId) cannot record a Trash location unless it is in Trash."
         }
     }
 }
@@ -28,8 +31,10 @@ enum FileLibraryStateMutation {
             throw FileLibraryStateMutationError.staleRevision(fileId: payload.fileId, expected: payload.expectedRevision, actual: file.membershipRevision)
         }
         let previousState = file.libraryState
+        let previousTrashLocation = try FileTrashLocation.load(fileID: payload.fileId, in: database)
+        let trashLocation = try nextTrashLocation(payload, previous: previousTrashLocation)
         let readded = payload.observedReadditionAfterOwnedRemoval == true
-        guard startsImportIntent || readded || previousState != payload.state else { return nil }
+        guard startsImportIntent || readded || previousState != payload.state || previousTrashLocation != trashLocation else { return nil }
 
         if startsImportIntent || readded || file.libraryMembership != payload.state.membership {
             file.membershipRevision += 1
@@ -43,8 +48,23 @@ enum FileLibraryStateMutation {
         file.seratoLibraryId = payload.state.libraryID
         file.retiredAt = payload.state.retiredAt
         try file.update(database)
+        try FileTrashLocation.store(trashLocation, fileID: payload.fileId, in: database)
 
-        let inverse = SetFileLibraryStatePayload(fileId: payload.fileId, expectedRevision: file.membershipRevision, state: previousState)
+        let inverse = SetFileLibraryStatePayload(fileId: payload.fileId, expectedRevision: file.membershipRevision, state: previousState,
+                                                 trashLocation: previousTrashLocation)
         return try OperationEngine.insertEvent(batchId: batchId, timestamp: timestamp, fileId: file.id, trackId: file.trackId, eventType: eventType, forwardPayload: forwardPayload, inversePayload: inverse, in: database)
+    }
+
+    /// A recorded Trash item belongs only to a trashed row, so every other state clears it.
+    private static func nextTrashLocation(_ payload: SetFileLibraryStatePayload, previous: FileMetadata?) throws -> FileMetadata? {
+        guard payload.state.availability == .trashed else {
+            guard payload.trashLocation == nil else { throw FileLibraryStateMutationError.trashLocationWithoutTrash(fileId: payload.fileId) }
+            return nil
+        }
+        guard let location = payload.trashLocation else { return previous }
+        guard try FileTrashLocation.availability(of: location, resolver: FileAvailabilityResolver()) == .trashed else {
+            throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+        }
+        return location
     }
 }

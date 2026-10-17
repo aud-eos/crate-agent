@@ -112,7 +112,8 @@ actor SeratoMembershipReconciler {
                 summary.skippedUnsupported += 1
             }
             if observed == .missing, file.fileAvailability == .trashed {
-                observed = .trashed
+                let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
+                observed = try FileTrashLocation.availability(of: location, resolver: availability)
             }
             let saved = savedPaths.contains(SeratoPath.normalized(path))
             let ownedRemoval = try await operationEngine.pendingCleanupOwnsRemoval(of: file)

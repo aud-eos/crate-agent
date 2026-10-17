@@ -88,14 +88,11 @@ public actor FilesystemSyncCoordinator {
             if try await resolvePendingMove(for: knownPath, batchID: batchID) {
                 return
             }
-            var availability = try inspectKnownIdentity(knownPath)
-            // An old-path removal is not evidence that a positively identified Trash item disappeared.
-            if availability == .missing, knownPath.fileAvailability == .trashed {
-                availability = .trashed
-            }
+            let availability = try await currentAvailability(of: knownPath)
             try await observe(file: knownPath, availability: availability, metadata: nil, batchID: batchID)
             return
         }
+        try await revalidateTrashLocation(at: observation.path, batchID: batchID)
         guard observation.wasRenamed || observation.wasCreated else { return }
         guard let metadata = FileMetadataCollector.collect(at: observation.path) else {
             // Unknown old-side events have no tracked row to observe. Never infer deletion from stat failure.
@@ -147,7 +144,38 @@ public actor FilesystemSyncCoordinator {
             return
         }
         let availability = try availabilityResolver.inspect(path: observation.path, volumeID: metadata.volumeUuid)
-        try await observe(file: existing, availability: availability, metadata: metadata, batchID: batchID)
+        var trashLocation: FileMetadata?
+        if availability == .trashed {
+            let location = try FileMetadataCollector.collectVerified(at: observation.path)
+            guard FileIdentityObservationMutation.matchesContent(existing, identity: location) else {
+                requiresReconciliation = true
+                return
+            }
+            trashLocation = location
+        }
+        try await observe(file: existing, availability: availability, metadata: metadata, trashLocation: trashLocation, batchID: batchID)
+    }
+
+    /// A trashed row keeps its indexed path, so only its recorded Trash item proves the audio still exists.
+    private func currentAvailability(of file: FileRecord) async throws -> FileAvailability {
+        let availability = try inspectKnownIdentity(file)
+        guard availability == .missing, file.fileAvailability == .trashed, let fileID = file.id else { return availability }
+        let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
+        return try FileTrashLocation.availability(of: location, resolver: availabilityResolver)
+    }
+
+    /// Removing or emptying a Trash item reports only its Trash path, never the indexed path.
+    private func revalidateTrashLocation(at path: String, batchID: String) async throws {
+        let trashedFiles = try await database.writer.read { connection in
+            try FileTrashLocation.fileIDs(at: path, in: connection)
+                .compactMap { fileID in try FileRecord.fetchOne(connection, key: fileID) }
+        }
+        for file in trashedFiles where file.fileAvailability == .trashed {
+            try await operationEngine.requireUnconflicted(.file(file))
+            let availability = try await currentAvailability(of: file)
+            guard availability != .trashed else { continue }
+            try await observe(file: file, availability: availability, metadata: nil, batchID: batchID)
+        }
     }
 
     private func rememberDestination(at path: String, for file: FileRecord) throws {
@@ -279,14 +307,15 @@ public actor FilesystemSyncCoordinator {
         return availability
     }
 
-    private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, batchID: String,
-                         moveExpectation: FilesystemMoveExpectation? = nil) async throws
+    private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, trashLocation: FileMetadata? = nil,
+                         batchID: String, moveExpectation: FilesystemMoveExpectation? = nil) async throws
     {
         guard let fileId = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
         var mutations: [TrackMutation] = [.setFileLibraryState(.init(
             fileId: fileId, expectedRevision: file.membershipRevision,
             state: FileLibraryState(membership: file.libraryMembership, availability: availability,
-                                    libraryID: file.seratoLibraryId, retiredAt: file.retiredAt)
+                                    libraryID: file.seratoLibraryId, retiredAt: file.retiredAt),
+            trashLocation: trashLocation
         ))]
         if availability == .available, let metadata,
            file.path != metadata.path || file.inode != metadata.inode || file.volumeUuid != metadata.volumeUuid

@@ -147,7 +147,14 @@ directory once, creating that directory if necessary, and watches the normalized
 deduplicated music and Trash paths in one stream. This captures native Trash
 destinations without enumerating Trash or scanning it per missing row. A verified
 Trash destination marks the indexed original path as trashed; it never becomes a
-V2 rename target. Root derivation and stream creation/start failures fail startup
+V2 rename target. The verified Trash item (path, volume, inode, size, mtime and sampled
+content hash) is persisted in `file_trash_locations` by the same journaled
+library-state mutation, which clears it whenever the row leaves `.trashed`
+(restore, re-import, replacement, missing). A removal event at that Trash path, or
+any reconciliation that finds the indexed path missing, keeps the row trashed only
+while that exact item still verifies; otherwise it becomes missing. A trashed row
+without a persisted item (recorded before this table existed) cannot be verified
+and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
 first checkpoint for that set, the old music-root cursor is a conservative replay
 fallback; checkpoints advance only after the combined batch succeeds. Watch roots
