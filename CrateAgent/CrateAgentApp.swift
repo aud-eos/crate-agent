@@ -9,7 +9,7 @@ struct CrateAgentApp: App {
         WindowGroup(id: AppPresentation.mainWindowID) {
             rootView
         }
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
@@ -22,6 +22,7 @@ struct CrateAgentApp: App {
         Settings {
             settingsContent
         }
+        .windowResizability(.contentMinSize)
     }
 
     @ViewBuilder
@@ -81,7 +82,7 @@ struct CrateAgentApp: App {
                     .font(.body)
                     .foregroundStyle(.secondary)
             }
-            .frame(width: 360, height: 200)
+            .frame(minWidth: 360, maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
         case let .ready(services):
             SettingsView()
                 .environmentObject(services)

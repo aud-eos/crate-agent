@@ -38,7 +38,7 @@ struct OnboardingView: View {
             footer
         }
         .padding(density.pagePadding)
-        .frame(width: 680, height: 660)
+        .frame(minWidth: 680, idealWidth: 680, minHeight: 660, idealHeight: 660)
         .appPresentation()
     }
 

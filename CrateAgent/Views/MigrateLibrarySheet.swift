@@ -51,7 +51,7 @@ struct MigrateLibrarySheet: View {
             Divider()
             footer
         }
-        .frame(width: 760, height: 600)
+        .frame(minWidth: 640, idealWidth: 760, minHeight: 480, idealHeight: 600)
         .appPresentation()
         .task { await rescan() }
         .alert(

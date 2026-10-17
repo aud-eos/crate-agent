@@ -78,7 +78,7 @@ struct RenameDialogView: View {
             }
         }
         .padding(density.pagePadding)
-        .frame(width: 680)
+        .frame(minWidth: 560, idealWidth: 680)
         .appPresentation()
     }
 
