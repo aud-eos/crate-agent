@@ -48,9 +48,9 @@ public actor OperationEngine {
     /// one file write covering every track in the batch); tests inject
     /// a counter to assert that an N-row apply coalesces into ONE V2
     /// rewrite rather than N (issue C2b / #3998713590). Returns the
-    /// number of otrks actually changed.
+    /// number of otrks actually changed and the paths no record matched.
     public typealias SeratoMetadataBatchWriter =
-        @Sendable (_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> UInt32
+        @Sendable (_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> SeratoBatchWriteResult
 
     /// Injectable database-V2 add writer. Production wires in the Rust
     /// `batchAddTracksToDatabase` FFI, which registers every queued
@@ -1119,7 +1119,8 @@ public actor OperationEngine {
         } else {
             let routed = try await processScopedRows(Set(queued.compactMap(\.queueID)))
             outcome = ResyncOutcome(appliedCount: routed.appliedCount, queuedCount: routed.queuedCount,
-                                    supersededCount: supersededCount + routed.supersededCount, conflictBlockedCount: routed.conflictBlockedCount)
+                                    supersededCount: supersededCount + routed.supersededCount, conflictBlockedCount: routed.conflictBlockedCount,
+                                    missingTargetCount: routed.missingTargetCount)
         }
         await note(outcome.summaryMessage)
         return outcome
@@ -1921,7 +1922,8 @@ public actor OperationEngine {
         let remaining = try await database.writer.read { database in try SeratoWriteQueue.pendingEventCount(in: database) }
         try await refreshQueueDepth()
         let outcome = ResyncOutcome(appliedCount: run.applied.count, queuedCount: remaining, supersededCount: run.superseded.count,
-                                    conflictBlockedCount: run.blockedEvents.count, blockedQueueIDs: run.blockedQueueIDs)
+                                    conflictBlockedCount: run.blockedEvents.count, missingTargetCount: run.missingTarget.count,
+                                    blockedQueueIDs: run.blockedQueueIDs)
         await note(outcome.summaryMessage)
         if let failure = Self.combinedFailure(run.failures) {
             throw failure
@@ -1942,6 +1944,7 @@ public actor OperationEngine {
     /// for readiness.
     private struct SegmentRun {
         var applied = Set<Int64>()
+        var missingTarget = Set<Int64>()
         var superseded = Set<Int64>()
         var blocked = SeratoQueueDependency()
         var waiting = SeratoQueueDependency()
@@ -2025,9 +2028,11 @@ public actor OperationEngine {
             do {
                 try await requireExternalWriteEligibility(rows)
                 try await recordAttempt(rows)
-                try await applyConsecutiveSeratoWrites(rows)
-                try await completeQueuedWrites(rows)
-                run.applied.formUnion(rows.map(\.eventId))
+                let missing = try await applyConsecutiveSeratoWrites(rows, reported: reported)
+                let unmatched = rows.filter { write in write.queueID.map(missing.contains) == true }
+                try await completeQueuedWrites(rows, missingTarget: missing, reported: reported)
+                run.applied.formUnion(rows.filter { write in write.queueID.map(missing.contains) != true }.map(\.eventId))
+                run.missingTarget.formUnion(unmatched.map(\.eventId))
                 return rows
             } catch let ExternalWriteInterruption.superseded(rejected) {
                 let survivors = rows.filter { write in write.queueID.map(rejected.contains) != true }
@@ -2199,22 +2204,43 @@ public actor OperationEngine {
 
     /// Deletes rows whose effects all landed. Writers that must make their
     /// completion atomic with I/O already did so; this finishes the rest.
-    private func completeQueuedWrites(_ writes: [GuardedSeratoWrite]) async throws {
+    private func completeQueuedWrites(_ writes: [GuardedSeratoWrite], missingTarget: Set<Int64>, reported: Bool) async throws {
         let locator = seratoLocator
-        try await database.writer.write { database in try Self.completeQueuedWrites(writes, locator: locator, in: database) }
+        try await database.writer.write { database in
+            try Self.completeQueuedWrites(writes, missingTarget: missingTarget, reported: reported, locator: locator, in: database)
+        }
     }
 
-    private static func completeQueuedWrites(_ writes: [GuardedSeratoWrite], locator: SeratoLibraryLocator, in database: GRDB.Database) throws {
+    /// A row whose write found no entry at its path is recorded visibly and
+    /// leaves the external baseline alone, since nothing was written.
+    private static func completeQueuedWrites(_ writes: [GuardedSeratoWrite], missingTarget: Set<Int64> = [], reported: Bool = false,
+                                             locator: SeratoLibraryLocator, in database: GRDB.Database) throws
+    {
         for write in writes {
             guard try SeratoWriteQueue.delete(write, in: database) else { continue }
-            if case let .metadataUpdate(update) = write.write,
-               let previous = try SeratoExternalBaselines.load(token: write.token, identity: write.originalIdentity, locator: locator, in: database)
+            if write.queueID.map(missingTarget.contains) == true {
+                try SeratoWriteDispositions.record(eventID: write.eventId, kind: write.write.kind, disposition: .noSeratoRecord,
+                                                   detail: missingTargetDetail(write.write), reported: reported, in: database)
+            } else if case let .metadataUpdate(update) = write.write,
+                      let previous = try SeratoExternalBaselines.load(token: write.token, identity: write.originalIdentity, locator: locator, in: database)
             {
                 try SeratoExternalBaselines.save(update.metadata.overlaid(on: previous), token: write.token, in: database)
             }
-            try SeratoWriteQueue.rebaseMetadata(after: write, in: database)
+            if write.queueID.map(missingTarget.contains) != true {
+                try SeratoWriteQueue.rebaseMetadata(after: write, in: database)
+            }
             try DuplicateCleanupStore.completeEffect(of: write, in: database)
         }
+    }
+
+    private static func missingTargetDetail(_ write: SeratoPendingWrite) -> String {
+        let path = switch write {
+        case let .rename(rename): rename.oldAbsolutePath
+        case let .metadataUpdate(update): update.absolutePath
+        case .addTrack, .fileTagWrite, .removeFromDatabase, .removeFromCrates, .trashFile:
+            preconditionFailure("Only renames and metadata updates report a path with no Serato entry")
+        }
+        return "Serato's database has no entry at this path: \((path as NSString).lastPathComponent)."
     }
 
     private func isEligible(_ write: GuardedSeratoWrite) async throws -> Bool {
@@ -2291,7 +2317,15 @@ public actor OperationEngine {
                 try SeratoWriteQueue.clearIOStarted(unwritten, in: database)
                 return .failure(interruption)
             }
-            let result = try operation(database, progress)
+            let result: Output
+            do { result = try operation(database, progress) }
+            catch let error as CoreError {
+                // The file was replaced; only its directory flush failed.
+                if case .LandedNotDurable = error {
+                    progress.recordReturned()
+                }
+                throw error
+            }
             if completing {
                 try Self.completeQueuedWrites(writes, locator: locator, in: database)
             }
@@ -2416,15 +2450,16 @@ public actor OperationEngine {
         }
         let blocked = blockedEvents.union(run.blockedEvents)
         return ResyncOutcome(appliedCount: run.applied.count, queuedCount: run.queuedEvents.union(blocked).subtracting(run.applied).count,
-                             supersededCount: run.superseded.count, conflictBlockedCount: blocked.count)
+                             supersededCount: run.superseded.count, conflictBlockedCount: blocked.count, missingTargetCount: run.missingTarget.count)
     }
 
-    private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
+    /// Returns the queue IDs of rows whose write found no Serato entry at its path.
+    private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite], reported: Bool) async throws -> Set<Int64> {
         switch write {
-        case let .rename(rename):
-            try await applySeratoRename(rename, guardedWrites: guardedWrites)
+        case .rename:
+            preconditionFailure("Queued renames are applied by applySeratoRenameBatch, never one row at a time")
         case let .metadataUpdate(update):
-            try await applySeratoMetadataUpdate(update, guardedWrites: guardedWrites)
+            return try await applySeratoMetadataUpdateBatch([update], guardedWrites: guardedWrites, reported: reported)
         case .addTrack:
             preconditionFailure("Queued adds are registered by applySeratoAddTracks, never one row at a time")
         case let .fileTagWrite(write):
@@ -2436,6 +2471,7 @@ public actor OperationEngine {
         case let .trashFile(trash):
             try await applyTrashFileOperation(trash, guardedWrites: guardedWrites)
         }
+        return []
     }
 
     private func applyTrashFileOperation(_ trash: SeratoPendingTrash, guardedWrites: [GuardedSeratoWrite]) async throws {
@@ -2625,13 +2661,16 @@ public actor OperationEngine {
                 var pending = additions
                 if !FileManager.default.fileExists(atPath: databaseV2Path) {
                     try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
-                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path), options: .atomic)
                     io.recordReturned()
                     pending.removeFirst()
                 }
                 if !pending.isEmpty {
                     _ = try addWriter(databaseV2Path, pending)
                 }
+            } catch let CoreError.LandedNotDurable(message) {
+                io.recordReturned()
+                throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: message)
             } catch {
                 throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: String(describing: error))
             }
@@ -2732,102 +2771,21 @@ public actor OperationEngine {
         ]
     }
 
-    private func applySeratoRename(_ rename: SeratoPendingRename, guardedWrites: [GuardedSeratoWrite]) async throws {
-        let oldSeratoPath = SeratoLibraryLocator.seratoRelativePath(
-            fromAbsolute: rename.oldAbsolutePath
-        )
-        let newSeratoPath = SeratoLibraryLocator.seratoRelativePath(
-            fromAbsolute: rename.newAbsolutePath
-        )
-        let displayFilename = (rename.newAbsolutePath as NSString).lastPathComponent
-
-        // Database V2 first, then crates. Database V2 is the source
-        // of truth for Serato's "All" view — the thing the user
-        // actually sees and drags from. If a single corrupted
-        // .crate file throws (rare but real on user libraries
-        // that have accumulated cruft), we still need V2 updated;
-        // otherwise tracks move on disk and Serato keeps the old
-        // path forever (the bug PR fixed).
-        var databaseV2Rewrites: UInt32 = 0
-        var databaseV2Error: Error?
-        let databaseV2Path = seratoLocator.databaseV2Url.path
-        if FileManager.default.fileExists(atPath: databaseV2Path) {
-            do {
-                databaseV2Rewrites = try await performExternalWrite(guardedWrites) { _ in try rewriteDatabasePath(
-                    databasePath: databaseV2Path,
-                    oldPath: oldSeratoPath,
-                    newPath: newSeratoPath
-                ) }
-                if databaseV2Rewrites == 0 {
-                    // Old path wasn't in database V2. Surprising —
-                    // surface so the user can see something is off
-                    // (e.g., Unicode normalization mismatch, prior
-                    // failed sync, or the track was never in
-                    // Serato to begin with).
-                    await note("⚠️ database V2 had no entry for \(oldSeratoPath) — \(displayFilename) won't appear in Serato until re-imported.")
-                }
-            } catch let error as ExternalWriteInterruption {
-                throw error
-            } catch {
-                databaseV2Error = error
-                await note("Failed to update database V2 for \(displayFilename): \(error.localizedDescription)")
-            }
+    /// One Rust FFI call rewrites the `database V2` file for every rename,
+    /// then one call per crate file. Database V2 goes first: it is the
+    /// source of truth for Serato's "All" view, so one corrupted crate
+    /// cannot leave a moved track at its old path there. Every store is
+    /// attempted; any failure keeps the batch visibly incomplete for
+    /// re-sync. Returns the queue IDs of renames whose track neither the
+    /// parsed database V2 nor any crate holds at its final path, which
+    /// therefore did not land; without a database V2 there is nothing to
+    /// compare, so none.
+    private func applySeratoRenameBatch(_ renameRows: [GuardedSeratoWrite], guardedWrites: [GuardedSeratoWrite]) async throws -> Set<Int64> {
+        let renames = renameRows.compactMap { row -> SeratoPendingRename? in
+            guard case let .rename(rename) = row.write else { return nil }
+            return rename
         }
-
-        let crateFiles: [URL]
-        do {
-            crateFiles = try seratoLocator.enumerateCrateFiles()
-        } catch {
-            // Enumeration failure is symmetric with the V2 failure
-            // — both surface, neither stops the other.
-            await note("Failed to enumerate Subcrates directory: \(error.localizedDescription)")
-            throw OperationEngineError.seratoEnumerationFailed(
-                directory: seratoLocator.subcratesDirectoryUrl.path,
-                underlying: String(describing: error)
-            )
-        }
-
-        var perCrateFailures: [(URL, Error)] = []
-        for crateFile in crateFiles {
-            try await requireExternalWriteEligibility(guardedWrites)
-            do {
-                _ = try await performExternalWrite(guardedWrites) { _ in try rewriteCratePath(
-                    cratePath: crateFile.path,
-                    oldPath: oldSeratoPath,
-                    newPath: newSeratoPath
-                ) }
-            } catch let error as ExternalWriteInterruption {
-                throw error
-            } catch {
-                // Per-crate fault tolerance: log and continue. A
-                // single bad crate file can't poison the entire
-                // sync for the rest of the user's library.
-                perCrateFailures.append((crateFile, error))
-                let crateName = crateFile.lastPathComponent
-                await note("Skipped crate \(crateName) while renaming \(displayFilename): \(error.localizedDescription)")
-            }
-        }
-
-        try requireSuccessfulSeratoRenames(databaseError: databaseV2Error, crateFailures: perCrateFailures)
-    }
-
-    /// Bulk variant of `applySeratoRename`. One Rust FFI call to
-    /// rewrite the `database V2` file for every rename in the batch,
-    /// then one FFI call per crate file. Every store is attempted;
-    /// any failure keeps the batch visibly incomplete for re-sync.
-    ///
-    /// Falls back to the per-rename path for batches of size 1 to
-    /// preserve the more granular "⚠️ no entry for X" diagnostic
-    /// (the batch FFI returns a single aggregate count and can't
-    /// distinguish "0 renames applied" from "all renames missed").
-    private func applySeratoRenameBatch(_ renames: [SeratoPendingRename], guardedWrites: [GuardedSeratoWrite]) async throws {
-        guard renames.count > 1 else {
-            if let single = renames.first {
-                try await applySeratoRename(single, guardedWrites: guardedWrites)
-            }
-            return
-        }
-
+        guard !renames.isEmpty else { return [] }
         let pairs = renames.map { rename in
             SeratoPathRename(
                 oldPath: SeratoLibraryLocator.seratoRelativePath(
@@ -2840,13 +2798,15 @@ public actor OperationEngine {
         }
 
         var databaseV2Error: Error?
+        var missingFromDatabase = Set<UInt32>()
         let databaseV2Path = seratoLocator.databaseV2Url.path
         if FileManager.default.fileExists(atPath: databaseV2Path) {
             do {
-                _ = try await performExternalWrite(guardedWrites) { _ in try batchRewriteDatabasePaths(
+                let result = try await performExternalWrite(guardedWrites) { _ in try batchRewriteDatabasePaths(
                     databasePath: databaseV2Path,
                     renames: pairs
                 ) }
+                missingFromDatabase = Set(result.unmatchedIndices)
             } catch let error as ExternalWriteInterruption {
                 throw error
             } catch {
@@ -2866,14 +2826,16 @@ public actor OperationEngine {
             )
         }
 
+        var missingEverywhere = missingFromDatabase
         var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
             try await requireExternalWriteEligibility(guardedWrites)
             do {
-                _ = try await performExternalWrite(guardedWrites) { _ in try batchRewriteCratePaths(
+                let result = try await performExternalWrite(guardedWrites) { _ in try batchRewriteCratePaths(
                     cratePath: crateFile.path,
                     renames: pairs
                 ) }
+                missingEverywhere.formIntersection(result.unmatchedIndices)
             } catch let error as ExternalWriteInterruption {
                 throw error
             } catch {
@@ -2883,6 +2845,17 @@ public actor OperationEngine {
         }
 
         try requireSuccessfulSeratoRenames(databaseError: databaseV2Error, crateFailures: perCrateFailures)
+        for index in missingFromDatabase.sorted() {
+            let oldPath = pairs[Int(index)].oldPath
+            await note(missingEverywhere.contains(index)
+                ? "Serato's database and crates have no entry at \(oldPath); the rename was not applied there."
+                : "Serato's database has no entry at \(oldPath); only its crates were updated.")
+        }
+        return Set(missingEverywhere.compactMap { index in renameRows[Int(index)].queueID })
+    }
+
+    private static func queueIDs(of writes: [GuardedSeratoWrite], where matches: (SeratoPendingWrite) -> Bool) -> Set<Int64> {
+        Set(writes.filter { write in matches(write.write) }.compactMap(\.queueID))
     }
 
     private func requireSuccessfulSeratoRenames(databaseError: Error?, crateFailures: [(URL, Error)]) throws {
@@ -2908,7 +2881,9 @@ public actor OperationEngine {
     ///
     /// Without this, a 200-row Auto-Tag apply would trigger 200 serial
     /// full-library `database V2` rewrites.
-    private func applyConsecutiveSeratoWrites(_ guardedWrites: [GuardedSeratoWrite]) async throws {
+    ///
+    /// Returns the queue IDs of rows whose write found no Serato entry at its path.
+    private func applyConsecutiveSeratoWrites(_ guardedWrites: [GuardedSeratoWrite], reported: Bool) async throws -> Set<Int64> {
         var metadataUpdates: [SeratoPendingMetadataUpdate] = []
         var remaining: [GuardedSeratoWrite] = []
         for row in guardedWrites {
@@ -2919,20 +2894,21 @@ public actor OperationEngine {
             }
         }
 
+        var missingTarget = Set<Int64>()
         if !metadataUpdates.isEmpty {
-            try await applySeratoMetadataUpdateBatch(metadataUpdates, guardedWrites: guardedWrites)
+            try await missingTarget.formUnion(applySeratoMetadataUpdateBatch(metadataUpdates, guardedWrites: guardedWrites, reported: reported))
         }
 
         var index = 0
         while index < remaining.count {
             switch remaining[index].write {
             case .rename:
-                var renames: [SeratoPendingRename] = []
-                while index < remaining.count, case let .rename(rename) = remaining[index].write {
-                    renames.append(rename)
+                var renameRows: [GuardedSeratoWrite] = []
+                while index < remaining.count, case .rename = remaining[index].write {
+                    renameRows.append(remaining[index])
                     index += 1
                 }
-                try await applySeratoRenameBatch(renames, guardedWrites: guardedWrites)
+                try await missingTarget.formUnion(applySeratoRenameBatch(renameRows, guardedWrites: guardedWrites))
             case .addTrack:
                 var adds: [GuardedSeratoWrite] = []
                 while index < remaining.count, case .addTrack = remaining[index].write {
@@ -2941,31 +2917,24 @@ public actor OperationEngine {
                 }
                 try await applySeratoAddTracks(adds)
             default:
-                try await applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites)
+                try await missingTarget.formUnion(applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites, reported: reported))
                 index += 1
             }
         }
-    }
-
-    /// Single-update entry point — used by the queued-write drain path
-    /// (`drainPendingSeratoUpdates` → `applySeratoWrite`), which
-    /// processes one queued write at a time. Delegates to the batch
-    /// writer so every `database V2` metadata write goes through one
-    /// seam.
-    private func applySeratoMetadataUpdate(_ update: SeratoPendingMetadataUpdate, guardedWrites: [GuardedSeratoWrite]) async throws {
-        try await applySeratoMetadataUpdateBatch([update], guardedWrites: guardedWrites)
+        return missingTarget
     }
 
     /// Write every metadata update in one `database V2` read+rewrite
-    /// pass via the injected `seratoMetadataBatchWriter`. Tolerant of a
-    /// missing `database V2` (Serato never ran here) the same way the
-    /// single-update path always was — nothing for Serato to "see" yet.
+    /// pass via the injected `seratoMetadataBatchWriter`. Returns the queue
+    /// IDs of updates whose track the parsed database V2 does not hold. A
+    /// missing database V2 (Serato never ran here) is not evidence that a
+    /// track is absent, so it is tolerated as before and reports none.
     private func applySeratoMetadataUpdateBatch(
-        _ updates: [SeratoPendingMetadataUpdate], guardedWrites: [GuardedSeratoWrite]
-    ) async throws {
-        guard !updates.isEmpty else { return }
+        _ updates: [SeratoPendingMetadataUpdate], guardedWrites: [GuardedSeratoWrite], reported: Bool
+    ) async throws -> Set<Int64> {
+        guard !updates.isEmpty else { return [] }
         let databaseV2Path = seratoLocator.databaseV2Url.path
-        guard FileManager.default.fileExists(atPath: databaseV2Path) else { return }
+        guard FileManager.default.fileExists(atPath: databaseV2Path) else { return [] }
 
         // The batch writer keys updates by path and keeps only the last one, so
         // queued edits of the same record are merged in queue order first.
@@ -3001,8 +2970,23 @@ public actor OperationEngine {
         }
 
         let metadataWriter = seratoMetadataBatchWriter
+        let locator = seratoLocator
         do {
-            _ = try await performExternalWrite(guardedWrites, completing: true) { _ in try metadataWriter(databaseV2Path, trackUpdates) }
+            let (missing, unmatchedPaths) = try await performExternalWrite(guardedWrites) { database, io in
+                let result = try metadataWriter(databaseV2Path, trackUpdates)
+                io.recordReturned()
+                let unmatched = Set(result.unmatchedIndices.map { index in SeratoPath.normalized(merged[Int(index)].absolutePath) })
+                let missing = Self.queueIDs(of: guardedWrites) { write in
+                    guard case let .metadataUpdate(update) = write else { return false }
+                    return unmatched.contains(SeratoPath.normalized(update.absolutePath))
+                }
+                try Self.completeQueuedWrites(guardedWrites, missingTarget: missing, reported: reported, locator: locator, in: database)
+                return (missing, result.unmatchedIndices.map { index in trackUpdates[Int(index)].trackPath })
+            }
+            for path in unmatchedPaths {
+                await note("Serato's database has no entry at \(path); its metadata update was not applied.")
+            }
+            return missing
         } catch let error as ExternalWriteInterruption {
             throw error
         } catch {
@@ -4173,20 +4157,26 @@ public struct ResyncOutcome: Sendable, Equatable {
     public let queuedCount: Int
     public let supersededCount: Int
     public let conflictBlockedCount: Int
+    /// Changes whose write found no Serato entry at their path, so nothing
+    /// landed (#105).
+    public let missingTargetCount: Int
     /// Queue rows a drain left in place only because a path conflict blocks
     /// them; readiness may open around exactly these.
     let blockedQueueIDs: Set<Int64>
 
-    public init(appliedCount: Int, queuedCount: Int, supersededCount: Int = 0, conflictBlockedCount: Int = 0) {
+    public init(appliedCount: Int, queuedCount: Int, supersededCount: Int = 0, conflictBlockedCount: Int = 0, missingTargetCount: Int = 0) {
         self.init(appliedCount: appliedCount, queuedCount: queuedCount, supersededCount: supersededCount,
-                  conflictBlockedCount: conflictBlockedCount, blockedQueueIDs: [])
+                  conflictBlockedCount: conflictBlockedCount, missingTargetCount: missingTargetCount, blockedQueueIDs: [])
     }
 
-    init(appliedCount: Int, queuedCount: Int, supersededCount: Int, conflictBlockedCount: Int, blockedQueueIDs: Set<Int64>) {
+    init(appliedCount: Int, queuedCount: Int, supersededCount: Int, conflictBlockedCount: Int, missingTargetCount: Int,
+         blockedQueueIDs: Set<Int64>)
+    {
         self.appliedCount = appliedCount
         self.queuedCount = queuedCount
         self.supersededCount = supersededCount
         self.conflictBlockedCount = conflictBlockedCount
+        self.missingTargetCount = missingTargetCount
         self.blockedQueueIDs = blockedQueueIDs
     }
 
@@ -4195,8 +4185,10 @@ public struct ResyncOutcome: Sendable, Equatable {
     }
 
     public var summaryMessage: String {
-        if conflictBlockedCount > 0 {
-            return "Re-sync wrote \(appliedCount), queued \(queuedCount), including \(conflictBlockedCount) changes waiting for path-conflict repair; \(supersededCount) superseded."
+        if conflictBlockedCount > 0 || missingTargetCount > 0 {
+            let waiting = conflictBlockedCount > 0 ? ", including \(conflictBlockedCount) changes waiting for path-conflict repair" : ""
+            let missing = missingTargetCount > 0 ? "; " + SeratoWriteDispositionMessages.summary(.noSeratoRecord, count: missingTargetCount) : ""
+            return "Re-sync wrote \(appliedCount), queued \(queuedCount)\(waiting); \(supersededCount) superseded\(missing)."
         }
         if supersededCount > 0 {
             return "Re-sync wrote \(appliedCount), queued \(queuedCount), superseded \(supersededCount) changes whose original file or saved-field authority changed or could not be verified."

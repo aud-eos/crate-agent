@@ -276,6 +276,34 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
     }
 
+    func testResyncReportsChangesWhoseTrackSeratoNoLongerHolds() async throws {
+        for (change, missing) in [("metadata", 1), ("rename", 1), ("crate-only rename", 0)] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("held.wav", bytes: FinalRemovalIntegrationTests.wav())
+            try save(fixture, paths: [file.path])
+            try await makeSession(fixture, engine: fixture.engine).synchronize()
+            let fileID = try XCTUnwrap(file.id)
+            if change == "metadata" {
+                try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: "Committed"), isSeratoAuthoritative: false)), batchId: "replayed")
+                try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: "Committed"))), batchId: "replayed")
+            } else {
+                let renamed = fixture.directory.appendingPathComponent("renamed.wav").path
+                try await fixture.engine.apply(.renameFile(.init(fileId: fileID, newPath: renamed, previousPath: file.path, physicalMove: true)), batchId: "replayed")
+            }
+            try save(fixture, paths: [])
+            if change == "crate-only rename" {
+                _ = try saveCrates(fixture, paths: [file.path])
+            }
+
+            let outcome = try await fixture.engine.resyncSeratoForBatch("replayed")
+
+            XCTAssertEqual(outcome.appliedCount, 1 - missing, "\(change): written only when some Serato file held the path")
+            XCTAssertEqual(outcome.missingTargetCount, missing, change)
+            XCTAssertEqual(outcome.queuedCount, 0, change)
+        }
+    }
+
     func testAnAttemptStoppedBeforeItsWriteDoesNotLookLandedAfterAFailedRetry() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }

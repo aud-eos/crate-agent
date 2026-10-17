@@ -33,8 +33,9 @@
 //   https://github.com/Holzhaus/serato-tags   (per-track GEOB tags inside audio files — relevant to Pillar F)
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{Cursor, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -52,6 +53,78 @@ pub enum SeratoError {
     InvalidUtf16 { tag: String },
     #[error("invalid Serato file: {0}")]
     InvalidFile(String),
+    /// The new bytes replaced the file, but its directory could not be
+    /// flushed, so the rename may not survive a power loss. The write landed.
+    #[error("{path} was replaced but may not be durable: {source}")]
+    LandedNotDurable {
+        path: String,
+        source: std::io::Error,
+    },
+}
+
+/// Replaces `path` with what `write` produces, all or nothing: the bytes go
+/// to a temporary file in the same directory, which is flushed to disk and
+/// then renamed over the target. A failure before the rename leaves the
+/// target's previous bytes in place, so a thrown write never landed. The
+/// target keeps its permissions; a symlinked target is replaced at the file
+/// it points to. A failure to flush the directory after the rename is
+/// `LandedNotDurable`, since the new bytes are already in place.
+fn replace_file(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<(), SeratoError> {
+    let target = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error.into()),
+    };
+    let directory = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    remove_stale_temporary_files(&directory)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(TEMPORARY_PREFIX)
+        .suffix(TEMPORARY_SUFFIX)
+        .tempfile_in(&directory)?;
+    match fs::metadata(&target) {
+        Ok(metadata) => temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&target).map_err(|error| error.error)?;
+    File::open(&directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|source| SeratoError::LandedNotDurable {
+            path: target.display().to_string(),
+            source,
+        })
+}
+
+const TEMPORARY_PREFIX: &str = ".crate-agent-";
+const TEMPORARY_SUFFIX: &str = ".tmp";
+
+/// Removes temporary files a crashed rewrite left in `directory`. Writes to
+/// one library are serialized, so none of these belongs to a live write.
+fn remove_stale_temporary_files(directory: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() > TEMPORARY_PREFIX.len() + TEMPORARY_SUFFIX.len()
+            && name.starts_with(TEMPORARY_PREFIX)
+            && name.ends_with(TEMPORARY_SUFFIX)
+            && entry.file_type()?.is_file()
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// A single TLV record: 4-byte tag, 4-byte big-endian length, payload.
@@ -275,6 +348,34 @@ fn otrk_has_path_in(
     found
 }
 
+/// The path an `otrk` is keyed by: its first `path_tag` field that decodes.
+fn first_decodable_path(nested: &[TlvRecord], path_tag: &[u8; 4]) -> Option<String> {
+    nested
+        .iter()
+        .filter(|field| &field.tag == path_tag)
+        .find_map(|field| decode_utf16be(&field.payload))
+}
+
+/// Which of `paths` some `otrk` is keyed by, under the metadata writer's
+/// rule (`first_decodable_path` of a well-formed record). Only records
+/// holding a requested path are parsed.
+fn held_paths_in_otrks<'path>(
+    records: &[TlvRecord],
+    path_tag: &[u8; 4],
+    paths: impl IntoIterator<Item = &'path str>,
+) -> HashSet<String> {
+    let encoded_paths: HashSet<Vec<u8>> = paths.into_iter().map(encode_utf16be).collect();
+    records
+        .iter()
+        .filter(|record| {
+            &record.tag == TAG_OTRK && otrk_has_path_in(&record.payload, path_tag, &encoded_paths)
+        })
+        .filter_map(|record| TlvRecord::parse_all(&record.payload).ok())
+        .filter_map(|nested| first_decodable_path(&nested, path_tag))
+        .filter(|path| encoded_paths.contains(&encode_utf16be(path)))
+        .collect()
+}
+
 /// Visits each well-formed nested field in order and returns whether the
 /// whole payload parsed cleanly — the same acceptance as
 /// `TlvRecord::parse_all`.
@@ -353,6 +454,11 @@ fn rewrite_path_in_otrks(
 /// Multi-rename variant: rewrite every otrk whose path field matches
 /// any key in `renames`, replacing it with the mapped value. One pass
 /// over the records; only otrks holding a rename source are parsed.
+///
+/// Every matching path field is rewritten, while `held_paths_in_otrks`
+/// reads only the first decodable one. They differ only for an otrk with
+/// several path fields, which Serato does not write; rewriting all of them
+/// keeps such a record from pointing at the old path anywhere.
 fn rewrite_paths_in_otrks(
     records: &mut [TlvRecord],
     path_tag: &[u8; 4],
@@ -432,7 +538,7 @@ impl CrateFile {
 
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), SeratoError> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path.as_ref(), bytes)?;
+        replace_file(path.as_ref(), |file| file.write_all(&bytes))?;
         Ok(())
     }
 
@@ -442,6 +548,14 @@ impl CrateFile {
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
         rewrite_path_in_otrks(&mut self.records, TAG_PTRK, old_path, new_path)
+    }
+
+    /// Which of `paths` this crate holds a track at.
+    pub fn held_paths<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path str>,
+    ) -> HashSet<String> {
+        held_paths_in_otrks(&self.records, TAG_PTRK, paths)
     }
 
     /// Multi-rename variant: rewrite every matching `ptrk` in one pass.
@@ -498,7 +612,7 @@ impl DatabaseV2 {
 
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), SeratoError> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path.as_ref(), bytes)?;
+        replace_file(path.as_ref(), |file| file.write_all(&bytes))?;
         Ok(())
     }
 
@@ -605,6 +719,14 @@ impl DatabaseV2 {
     /// The Swift caller gates via `SeratoWatchdog`.
     pub fn remove_track(&mut self, target_path: &str) -> usize {
         remove_otrks_referencing_path(&mut self.records, TAG_PFIL, target_path)
+    }
+
+    /// Which of `paths` this database holds a track at.
+    pub fn held_paths<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path str>,
+    ) -> HashSet<String> {
+        held_paths_in_otrks(&self.records, TAG_PFIL, paths)
     }
 
     /// Number of `otrk` track entries in the database. Useful for
@@ -754,14 +876,7 @@ impl DatabaseV2 {
             let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
                 continue;
             };
-            let track_path = nested.iter().find_map(|field| {
-                if &field.tag == TAG_PFIL {
-                    decode_utf16be(&field.payload)
-                } else {
-                    None
-                }
-            });
-            let Some(track_path) = track_path else {
+            let Some(track_path) = first_decodable_path(&nested, TAG_PFIL) else {
                 continue;
             };
             let Some(update) = updates.get(&track_path) else {
@@ -1185,6 +1300,38 @@ mod tests {
             CrateFile::from_bytes(&bytes),
             Err(SeratoError::UnexpectedEof { .. })
         ));
+    }
+
+    #[test]
+    fn a_write_that_fails_before_the_rename_leaves_the_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database V2");
+        fs::write(&path, b"original library").unwrap();
+        let unrelated = directory.path().join(".crate-agent-notes.txt");
+        fs::write(&unrelated, b"not ours").unwrap();
+        fs::write(
+            directory.path().join(".crate-agent-Ab12Cd.tmp"),
+            b"crashed rewrite",
+        )
+        .unwrap();
+
+        let result = replace_file(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("disk full"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original library");
+        let mut remaining: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            [".crate-agent-notes.txt", "database V2"],
+            "a temporary file was left behind, or an unrelated file was removed"
+        );
     }
 
     #[test]
