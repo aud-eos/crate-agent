@@ -3,6 +3,7 @@ import SwiftUI
 struct AutoTaggerView: View {
     @ObservedObject var session: AutoTagSession
     let player: TrackPlayer
+    let opener: FileOpener
     var readiness: LibrarySyncReadiness?
     var conflictRevision: UInt64 = 0
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
@@ -224,7 +225,13 @@ struct AutoTaggerView: View {
                 TrackPlayButton(player: player, track: PlayerTrack(file), isAvailable: file.fileAvailability == .available)
             }
             reviewDetails(fileID, file: file, path: path, isFocused: isFocused)
-        }.padding(.vertical, density.rowPadding)
+        }
+        .padding(.vertical, density.rowPadding)
+        .contextMenu {
+            if let file {
+                FileOpenMenuItems(opener: opener, path: file.path)
+            }
+        }
     }
 
     private func reviewDetails(_ fileID: Int64, file: BrowserRow?, path: String, isFocused: Bool) -> some View {

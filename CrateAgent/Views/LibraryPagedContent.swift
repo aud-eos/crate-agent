@@ -1,10 +1,12 @@
 import AppKit
 import SwiftUI
 
-enum LibraryBrowserAction: String, CaseIterable {
-    case rename = "Rename…"
-    case history = "Show History"
-    case finder = "Show in Finder"
+enum LibraryBrowserAction: Equatable {
+    case rename
+    case history
+    /// Opens the file in the given application, or its default one when nil.
+    case open(OpenApplication?)
+    case reveal
 }
 
 struct LibraryPagedContent: View {
@@ -13,6 +15,7 @@ struct LibraryPagedContent: View {
     let showsFilenames: Bool
     var readiness: LibrarySyncReadiness?
     var player: TrackPlayer?
+    var opener: FileOpener?
     let onAction: (Int64, LibraryBrowserAction) -> Void
 
     private var enabled: Bool {
@@ -90,21 +93,40 @@ struct LibraryPagedContent: View {
                        query.sort = .init(column: column, ascending: ascending)
                        model.setQuery(query)
                    }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, contentRevision: readiness?.scopeRevision ?? 0, onFocus: { identifier, index in model.focus(id: identifier, index: index) },
-                   onSpace: player.map { player in { row in player.toggle(PlayerTrack(row)) } })
+                   onSpace: player.map { player in { row in player.toggle(PlayerTrack(row)) } },
+                   onOpen: opener.map { _ in { row in onAction(row.id, .open(nil)) } })
     }
 
     private func menu(for identifier: Int64) -> NSMenu? {
         guard !model.isRefreshing else { return nil }
         let menu = NSMenu()
         menu.autoenablesItems = false
-        for action in LibraryBrowserAction.allCases {
-            let item = LibraryActionMenuItem(title: action.rawValue) { onAction(identifier, action) }
-            if action == .rename {
-                item.isEnabled = model.results.cachedRows.first { row in row.id == identifier }?.applyingConflictScope(readiness).canProcess == true
-                item.toolTip = model.results.cachedRows.first { row in row.id == identifier }?.applyingConflictScope(readiness).processingBlockReason
+        let row = model.results.cachedRows.first { row in row.id == identifier }
+        let rename = LibraryActionMenuItem(title: "Rename…") { onAction(identifier, .rename) }
+        rename.isEnabled = row?.applyingConflictScope(readiness).canProcess == true
+        rename.toolTip = row?.applyingConflictScope(readiness).processingBlockReason
+        menu.addItem(rename)
+        menu.addItem(LibraryActionMenuItem(title: "Show History") { onAction(identifier, .history) })
+        if let opener, let path = row?.path {
+            menu.addItem(.separator())
+            let defaultApplication = opener.defaultApplication(for: path)
+            let open = LibraryActionMenuItem(title: FileOpenerMessages.open(in: defaultApplication?.name ?? FileOpenerMessages.defaultApplication)) {
+                onAction(identifier, .open(nil))
             }
-            menu.addItem(item)
+            open.keyEquivalent = "o"
+            open.keyEquivalentModifierMask = .command
+            open.isEnabled = defaultApplication != nil
+            menu.addItem(open)
+            let others = opener.otherApplications(for: path)
+            if !others.isEmpty {
+                menu.addItem(.sectionHeader(title: FileOpenerMessages.openWith))
+                for application in others {
+                    menu.addItem(LibraryActionMenuItem(title: application.name) { onAction(identifier, .open(application)) })
+                }
+            }
         }
+        menu.addItem(.separator())
+        menu.addItem(LibraryActionMenuItem(title: FileOpenerMessages.reveal) { onAction(identifier, .reveal) })
         return menu
     }
 

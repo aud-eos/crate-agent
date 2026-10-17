@@ -28,6 +28,7 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
     var contentRevision: UInt64 = 0
     var onFocus: (Snapshot.Row.ID?, Int) -> Void = { _, _ in }
     var onSpace: ((Snapshot.Row) -> Void)?
+    var onOpen: ((Snapshot.Row) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -100,6 +101,11 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
                 if let row = configuration.controller.row(at: index) {
                     onSpace(row)
                 }
+                return true
+            }
+            table.openAction = { [weak self] index in
+                guard let self, let onOpen = configuration.onOpen, let row = configuration.controller.row(at: index) else { return false }
+                onOpen(row)
                 return true
             }
             table.focusChanged = { [weak self] index in

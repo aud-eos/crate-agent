@@ -339,9 +339,7 @@ struct DuplicatesPanel: View {
             }
             Spacer()
             Button {
-                NSWorkspace.shared.activateFileViewerSelecting(
-                    [URL(fileURLWithPath: file.path)]
-                )
+                services.fileOpener.reveal(file.path)
             } label: {
                 Label("Reveal", systemImage: "magnifyingglass")
                     .labelStyle(.iconOnly)
@@ -350,6 +348,7 @@ struct DuplicatesPanel: View {
             .help("Show this file in Finder so you can review or delete it manually.")
         }
         .padding(.vertical, density.rowPadding)
+        .contextMenu { FileOpenMenuItems(opener: services.fileOpener, path: file.path) }
     }
 
     @ViewBuilder

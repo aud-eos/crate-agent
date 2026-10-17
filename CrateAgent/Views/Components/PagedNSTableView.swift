@@ -20,6 +20,8 @@ final class PagedNSTableView: NSTableView {
     var focusChanged: ((Int) -> Void)?
     /// Handles Space for the focused row instead of toggling its selection.
     var spaceAction: ((Int) -> Bool)?
+    /// Handles Command-O for the focused row.
+    var openAction: ((Int) -> Bool)?
 
     func focusRow(_ index: Int, modifiers: NSEvent.ModifierFlags, selecting: Bool) {
         guard index >= 0, index < numberOfRows else { return }
@@ -58,6 +60,14 @@ final class PagedNSTableView: NSTableView {
             return
         }
         focusRow(next, modifiers: event.modifierFlags, selecting: true)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let isOpen = event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command && event.charactersIgnoringModifiers == "o"
+        if isOpen, window?.firstResponder === self, selectedRow >= 0, openAction?(selectedRow) == true {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     override func selectAll(_: Any?) {

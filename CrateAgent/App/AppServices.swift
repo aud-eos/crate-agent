@@ -32,6 +32,7 @@ public final class AppServices: ObservableObject {
     public let fingerprintWorker: FingerprintWorker
     public let activityLog: ActivityLog
     let trackPlayer = TrackPlayer()
+    let fileOpener = FileOpener()
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
