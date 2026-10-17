@@ -35,14 +35,18 @@ rules:
    recording, and they cannot yet be grouped as separate versions.
 2. **Each grouping link is its own per-file event**
    (`song_family_recording_linked`, with `file_id` set). It shows in the file's
-   History. Its undo and redo check the link itself (rule 3) instead of the
-   general retired and replaced-file guard.
+   History, and records the file's membership revision. Its undo checks the
+   link itself (rule 3) instead of the general retired and replaced-file guard.
+   Its redo takes that general guard.
 3. **Undo removes a grouping link only while grouping still owns it.** That is,
    while the file is still linked to that recording and the recording is still
    unclaimed. Once a later match claims it, undo keeps the link (the match owns
    it now) and still undoes the membership. A retired file also keeps its link,
    as retirement keeps every file's link, so undoing a group never waits for a
-   file to return. Redo re-creates a link only under rule 1.
+   file to return. Redo re-creates a link only while the file is in the library
+   at the revision undo recorded, so a file retired or replaced since is
+   refused, and only under rule 1: the file's current fingerprint must still
+   identify that recording, and the recording must still be unclaimed.
 4. **Live members.** A member counts only while at least one non-retired file is
    linked to it. A member whose last file is retired, replaced, or re-matched to
    another recording keeps its assignment silently, so undoing that change
@@ -55,9 +59,11 @@ rules:
 5. **Membership never moves silently.** Adding a recording that is already in
    the family is a no-op. A recording in another family with two or more live
    members is refused with `memberAlreadyInFamily`, which names that family's
-   versions, and the client offers `merge` instead. A recording whose family has
+   other versions, and the client offers `merge` instead. A recording whose family has
    fewer than two live members is taken over: the change dissolves that family
-   in the same journaled event, so undo restores it.
+   in the same journaled event, so undo restores it. Liveness is measured before
+   the change's own grouping links, so linking a file back to its recording
+   doesn't revive the family the user is regrouping it out of.
 
 Refusals name files and recordings by title, or by file name when a file has
 no title.
