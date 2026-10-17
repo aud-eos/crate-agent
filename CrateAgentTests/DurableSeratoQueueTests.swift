@@ -494,6 +494,65 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertEqual(first.artist, "Second edit artist")
     }
 
+    func testALargeQueuedBacklogIsWrittenInBoundedRewrites() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        var files: [FileRecord] = []
+        for index in 0 ... SeratoWriteSegmenter.maximumEntriesPerSegment {
+            try await files.append(fixture.add("track-\(index).wav", bytes: FinalRemovalIntegrationTests.wav(sample: UInt8(index % 250))))
+        }
+        try save(fixture, paths: files.map(\.path))
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        setRunning(fixture, true)
+        for file in files {
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .init(title: "Edited \(file.id ?? 0)"))))
+        }
+        setRunning(fixture, false)
+
+        let rewriteSizes = LockedRewriteSizes()
+        let relaunched = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                         seratoMetadataBatchWriter: { databasePath, updates in
+                                             rewriteSizes.append(updates.count)
+                                             return try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+                                         })
+        _ = try await relaunched.drainPendingSeratoUpdates()
+
+        XCTAssertGreaterThan(rewriteSizes.values.count, 1, "One writer transaction held every queued row")
+        XCTAssertTrue(rewriteSizes.values.allSatisfy { size in size <= SeratoWriteSegmenter.maximumEntriesPerSegment })
+        let titles = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).reduce(into: [String: String]()) { titles, record in
+            titles[SeratoPath.normalized(record.path)] = record.title
+        }
+        for file in files {
+            XCTAssertEqual(titles[file.path], "Edited \(file.id ?? 0)")
+        }
+        let remaining = try await relaunched.pendingSeratoWriteCount
+        XCTAssertEqual(remaining, 0)
+
+        // A failing store fails the pass once; later segments for it stay queued for Retry Sync.
+        setRunning(fixture, true)
+        for file in files {
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .init(title: "Retitled \(file.id ?? 0)"))))
+        }
+        setRunning(fixture, false)
+        let failedRewrites = LockedRewriteSizes()
+        let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                      seratoMetadataBatchWriter: { _, updates in
+                                          failedRewrites.append(updates.count)
+                                          throw CocoaError(.fileWriteNoPermission)
+                                      })
+        do {
+            _ = try await failing.drainPendingSeratoUpdates()
+            XCTFail("The failing store accepted the edits")
+        } catch {
+            let message = error.localizedDescription
+            let failure = CocoaError(.fileWriteNoPermission).localizedDescription
+            XCTAssertEqual(message.components(separatedBy: failure).count - 1, 1, "The same store failure was reported per segment: \(message)")
+        }
+        XCTAssertEqual(failedRewrites.values.count, 1, "The pass kept retrying a store that already failed")
+        let retained = try await failing.pendingSeratoWriteCount
+        XCTAssertEqual(retained, files.count)
+    }
+
     func testImmediateBatchAppliesMetadataAfterItsFilesRename() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
@@ -1060,5 +1119,18 @@ private final class BoundaryRecorder: @unchecked Sendable {
 
     func recordTrash(_ path: String) {
         lock.withLock { trashedPaths.append(path) }
+    }
+}
+
+private final class LockedRewriteSizes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [Int] = []
+
+    var values: [Int] {
+        lock.withLock { stored }
+    }
+
+    func append(_ size: Int) {
+        lock.withLock { stored.append(size) }
     }
 }

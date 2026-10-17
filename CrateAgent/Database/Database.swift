@@ -123,6 +123,7 @@ public final class LibraryDatabase {
         AddDurableSeratoQueueMigration.register(in: &migrator)
         AddSeratoWriteLandedMarkerMigration.register(in: &migrator)
         AddFileTrashLocationsMigration.register(in: &migrator)
+        AddFingerprintFailureReasonMigration.register(in: &migrator)
         AddSeratoRenameProgressMigration.register(in: &migrator)
         return migrator
     }

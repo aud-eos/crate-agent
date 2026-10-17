@@ -212,8 +212,9 @@ OperationEngine.swift, SeratoWriteEligibility.swift, SyncCheckpointStore.swift, 
 - A row counts as possibly landed once a write for it returned from its I/O,
   even if a later validation in the same transaction threw (`io_started`); `may_have_landed` keeps that
   across a later failed retry, and an attempt stopped before I/O never sets it.
-  Migration 016 sets `may_have_landed` for rows attempted without a recorded
-  error, the rule rows were read by before the marker existed.
+  Migration 016 only adds the columns, so rows queued before it start with the
+  marker unset. That is acceptable because no install had a populated queue when
+  016 shipped.
 - Undo refuses to remove an indexed row once its membership changed, so only
   `removeFile` (duplicate cleanup) removes a row with queued work; the file ID is
   `AUTOINCREMENT`, so a re-indexed row never matches the removed row's tokens.
