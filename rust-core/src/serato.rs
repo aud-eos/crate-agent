@@ -358,8 +358,10 @@ impl PathKeys {
             return true;
         }
         let ascii = field
-            .chunks_exact(2)
-            .all(|unit| unit[0] == 0 && unit[1].is_ascii());
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|[high, low]| *high == 0 && low.is_ascii());
         !ascii && decode_utf16be(field).is_some_and(|path| self.keys.contains(&path_key(&path)))
     }
 }
