@@ -338,6 +338,7 @@ enum SeratoWriteDisposition: String, Sendable, CaseIterable {
     case interrupted
     case legacyUnrecoverable
     case malformed
+    case noSeratoRecord
 }
 
 /// Not-applied queued changes by disposition, each counted once per event.

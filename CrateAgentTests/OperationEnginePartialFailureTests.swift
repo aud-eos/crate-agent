@@ -141,7 +141,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         private let lock = NSLock()
         private(set) var callCount = 0
 
-        func write(_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> UInt32 {
+        func write(_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> SeratoBatchWriteResult {
             lock.lock(); callCount += 1; lock.unlock()
             return try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
         }
