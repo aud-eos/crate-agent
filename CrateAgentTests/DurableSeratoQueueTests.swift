@@ -160,6 +160,8 @@ final class DurableSeratoQueueTests: XCTestCase {
         let cases: [(interruption: String, renameBetween: Bool, baselineKnown: Bool)] = [
             ("crash during one coalesced rewrite", false, true),
             ("crash before commit", true, true),
+            ("crash before commit, then a failed retry", true, true),
+            ("crash before commit, then a retry that failed before its fold", true, true),
             ("Serato relaunched", true, true),
             ("Serato relaunched, baseline unknown", true, false),
             ("Serato saved B itself", false, true),
@@ -218,7 +220,28 @@ final class DurableSeratoQueueTests: XCTestCase {
                 catch {}
                 try await fixture.database.writer.write { database in
                     try database.execute(sql: "DROP TRIGGER crash_after_io")
-                    try database.execute(sql: "UPDATE serato_write_queue SET last_error = NULL")
+                }
+                if label.hasSuffix("failed retry") {
+                    // The retry's error must not erase that the crashed attempt may have landed B.
+                    let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                                  seratoMetadataBatchWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+                    do { _ = try await failing.drainPendingSeratoUpdates(); XCTFail("\(label): the failing writer accepted the edits") }
+                    catch {}
+                } else if label.hasSuffix("before its fold") {
+                    // A failure before the retry folds the crashed attempt's mark must not erase it.
+                    try await fixture.database.writer.write { database in
+                        try database.execute(sql: """
+                        CREATE TEMP TRIGGER fail_before_fold BEFORE UPDATE ON serato_write_queue WHEN NEW.attempts = OLD.attempts + 1
+                        BEGIN SELECT RAISE(ABORT, 'the attempt failed before folding the earlier mark'); END
+                        """)
+                    }
+                    let relaunched = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator)
+                    _ = try? await relaunched.drainPendingSeratoUpdates()
+                    let failedBeforeFold = try await fixture.database.writer.write { database in
+                        try database.execute(sql: "DROP TRIGGER fail_before_fold")
+                        return try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM serato_write_queue WHERE last_error LIKE '%before folding%'") ?? 0
+                    }
+                    XCTAssertGreaterThan(failedBeforeFold, 0, "\(label): the retry did not fail before its fold")
                 }
             } else {
                 let relaunched = LockedTestFlag()
@@ -253,6 +276,51 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
     }
 
+    func testAnAttemptStoppedBeforeItsWriteDoesNotLookLandedAfterAFailedRetry() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let sibling = try await fixture.add("sibling.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 1))
+        try save(fixture, paths: [file.path, sibling.path])
+        try setV2(fixture, path: file.path, title: "Original A")
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        setRunning(fixture, true)
+        for (target, title) in [(file, "Queued B"), (file, "Newest C"), (sibling, "Sibling edit")] {
+            let fileID = try XCTUnwrap(target.id)
+            try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: title), isSeratoAuthoritative: false)))
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: title))))
+        }
+        setRunning(fixture, false)
+        // The sibling's audio changes once the attempt starts, so the writer
+        // boundary supersedes it and the pass retries before any write ran.
+        let siblingChanged = LockedTestFlag()
+        let siblingPath = sibling.path
+        let changedSibling = FinalRemovalIntegrationTests.wav(sample: 9, durationSeconds: 2)
+        try await fixture.database.writer.write { connection in
+            connection.trace { event in
+                guard event.expandedDescription.hasPrefix("UPDATE serato_write_queue SET"), event.expandedDescription.contains("attempts = attempts + 1"),
+                      siblingChanged.setOnce() else { return }
+                do { try changedSibling.write(to: URL(fileURLWithPath: siblingPath)) }
+                catch { XCTFail("Could not change the sibling: \(error)") }
+            }
+        }
+        let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                      seratoMetadataBatchWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+        do { _ = try await failing.drainPendingSeratoUpdates(); XCTFail("The failing writer accepted the edits") }
+        catch {}
+        try await fixture.database.writer.write { connection in connection.trace(nil) }
+        XCTAssertTrue(siblingChanged.setOnce() == false, "The sibling was never changed at the boundary")
+        try setV2(fixture, path: file.path, title: "Queued B")
+
+        let restarted = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator)
+        try await makeSession(fixture, engine: restarted).synchronize()
+
+        let record = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first { record in
+            SeratoPath.normalized(record.path) == file.path
+        }
+        XCTAssertEqual(record?.title, "Queued B", "A queued edit that never reached Serato was taken for our own write")
+    }
+
     func testCleanupFinishesOnRestartOnlyWhenTrashActuallyRan() async throws {
         for trashSucceeded in [true, false] {
             let fixture = try SeratoRemovalFixture()
@@ -268,19 +336,16 @@ final class DurableSeratoQueueTests: XCTestCase {
             if trashSucceeded {
                 try await fixture.database.writer.write { database in
                     try database.execute(sql: """
-                    CREATE TEMP TRIGGER crash_after_trash BEFORE DELETE ON serato_write_queue WHEN OLD.kind = 'trashFile'
-                    BEGIN SELECT RAISE(ABORT, 'process exited after moving audio to Trash'); END
+                    CREATE TEMP TRIGGER fail_after_trash BEFORE DELETE ON duplicate_cleanup_intents
+                    BEGIN SELECT RAISE(ABORT, 'the Trash transaction failed after moving audio to Trash'); END
                     """)
                 }
             }
             let group = DuplicateFinder.DuplicateGroup(groupKey: "interrupted", mode: .byteLevel, files: [keeper, target])
             _ = try await DuplicateResolver(operationEngine: first, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "interrupted-trash")
             if trashSucceeded {
-                // A process that exits inside the Trash transaction never records a failure.
-                try await fixture.database.writer.write { database in
-                    try database.execute(sql: "DROP TRIGGER crash_after_trash")
-                    try database.execute(sql: "UPDATE serato_write_queue SET last_error = NULL")
-                }
+                // A throw after the Trash, inside its transaction, does not prove the audio stayed put.
+                try await fixture.database.writer.write { database in try database.execute(sql: "DROP TRIGGER fail_after_trash") }
                 XCTAssertEqual(recorder.trashed, [target.path])
             } else {
                 try FileManager.default.moveItem(atPath: target.path, toPath: fixture.directory.appendingPathComponent("moved-by-user.wav").path)

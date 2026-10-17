@@ -187,6 +187,10 @@ final class MusicBrainzMutationTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             storedCalls.append(Call(path: path, update: update))
         }
+
+        func tags(at path: String) -> AudioTags {
+            AudioTags.none.applying(calls.filter { $0.path == path }.map(\.update))
+        }
     }
 
     private let sampleFingerprintBytes = Data("chromaprint-sample-fingerprint".utf8)
@@ -212,7 +216,8 @@ final class MusicBrainzMutationTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { path, update in recorder.record(path, update) }
+            fileTagWriter: { path, update in recorder.record(path, update) },
+            fileTagReader: { path in recorder.tags(at: path) }
         )
         return (engine, database)
     }
@@ -561,11 +566,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -642,11 +648,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -704,11 +711,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -984,11 +992,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -1040,11 +1049,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -1112,16 +1122,18 @@ final class MusicBrainzMutationTests: XCTestCase {
         // an OLDER file that already references the shared row.
         let (fileB, fileOld) = try await database.writer.write { db -> (Int64, Int64) in
             var sibling = FileRecord(
-                path: "/Music/A/b.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/b.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a", title: "t", album: "al"
             )
             sibling.libraryMembership = .active
             sibling.fileAvailability = .available
+            try self.audioFixture.prepare(&sibling)
             try sibling.insert(db)
             var older = FileRecord(
-                path: "/Music/A/old.mp3", volumeUuid: "v1", inode: 3,
+                path: self.audioFixture.path("/Music/A/old.mp3"), volumeUuid: "v1", inode: 3,
                 fileSize: 1, mtime: 1, artist: "a", title: "t", album: "al"
             )
+            try self.audioFixture.prepare(&older)
             try older.insert(db)
             return (sibling.id!, older.id!)
         }
@@ -1411,11 +1423,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -1468,11 +1481,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -1570,11 +1584,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -1631,11 +1646,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
         let file2 = try await database.writer.write { db -> Int64 in
             var file = FileRecord(
-                path: "/Music/A/two.flac", volumeUuid: "v1", inode: 2,
+                path: self.audioFixture.path("/Music/A/two.flac"), volumeUuid: "v1", inode: 2,
                 fileSize: 1, mtime: 1, artist: "a2", title: "t2", album: "al2"
             )
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
@@ -1835,18 +1851,20 @@ final class MusicBrainzMutationTests: XCTestCase {
         let recorder = FileTagWriterRecorder()
         let (engine, database) = try await MainActor.run { try makeEngine(recorder: recorder) }
         let fileIdA = try await database.writer.write { db -> Int64 in
-            var file = FileRecord(path: "/Music/A/a.mp3", volumeUuid: "v1", inode: 1,
+            var file = FileRecord(path: self.audioFixture.path("/Music/A/a.mp3"), volumeUuid: "v1", inode: 1,
                                   fileSize: 1, mtime: 1, artist: "oldA", title: "oldA", album: "oldA")
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
         let fileIdB = try await database.writer.write { db -> Int64 in
-            var file = FileRecord(path: "/Music/B/b.mp3", volumeUuid: "v1", inode: 2,
+            var file = FileRecord(path: self.audioFixture.path("/Music/B/b.mp3"), volumeUuid: "v1", inode: 2,
                                   fileSize: 1, mtime: 1, artist: "oldB", title: "oldB", album: "oldB")
             file.libraryMembership = .active
             file.fileAvailability = .available
+            try self.audioFixture.prepare(&file)
             try file.insert(db)
             return file.id!
         }
