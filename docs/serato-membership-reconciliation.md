@@ -392,8 +392,8 @@ reaching it, or every I/O call threw. A writer that validates or records after
 its I/O (Trash, audio tags, V2 removal, imports) reports the moment that I/O
 returns, so a later throw keeps the mark. A later attempt keeps an earlier
 attempt's mark (`may_have_landed`), and an attempt never clears a mark it did not
-set. Upgrading keeps a row attempted without a recorded error as possibly landed,
-as it was read before the marker existed. A saved value matching an edit that
+set. Rows queued before migration 016 start with the marker unset, which is
+acceptable because no install had a populated queue when 016 shipped. A saved value matching an edit that
 never reached I/O, or whose every I/O call threw, is the user's own Serato edit
 and wins. That a thrown I/O call did not land holds because every Serato
 library write (`database V2`, Subcrates and SmartCrates) replaces its file
