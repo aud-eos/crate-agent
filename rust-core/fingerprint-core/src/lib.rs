@@ -84,7 +84,11 @@ pub fn fingerprint_file_with_extent(
         }
         FingerprintExtent::FullLength => None,
     };
-    source.decode(max_frames, |buffer| fingerprinter.consume(buffer))?;
+    source.decode(max_frames, |event| {
+        if let DecodeEvent::Buffer(buffer) = event {
+            fingerprinter.consume(buffer);
+        }
+    })?;
     Ok(fingerprinter.finish())
 }
 
@@ -92,11 +96,14 @@ pub fn fingerprint_file_with_extent(
 /// container bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedAudioDigest {
-    /// SHA-256 over `PCM_DIGEST_DOMAIN`, the sample rate (u32 LE), the
-    /// channel count (u32 LE), then every decoded sample as interleaved
-    /// 32-bit float, little-endian, at the stream's native rate. f32 holds
-    /// 16- and 24-bit integer PCM exactly, so lossless sources at those
-    /// depths never collide on quantization.
+    /// SHA-256 over `PCM_DIGEST_DOMAIN`, the sample rate (u32 LE) and the
+    /// channel count (u32 LE), then the decoded stream at the native rate,
+    /// interleaved, little-endian and lossless: integer samples widened to
+    /// i32 (symphonia's exact left-shift conversion) and float samples in
+    /// their native f32 or f64. A one-byte sample-format tag precedes the
+    /// first buffer and any change of format, so packet boundaries never
+    /// affect the digest. A packet that fails to decode adds a skip marker
+    /// and its timestamp in place of audio.
     pub pcm_sha256: [u8; 32],
     /// `<container>/<codec>` short names from symphonia, e.g.
     /// `wav/pcm_s16le` or `mp3/mp3`. Equal formats can be compared by PCM.
@@ -109,7 +116,83 @@ pub struct DecodedAudioDigest {
     pub full_fingerprint_sha256: [u8; 32],
 }
 
-pub const PCM_DIGEST_DOMAIN: &[u8] = b"crate-agent decoded pcm f32le v1\0";
+pub const PCM_DIGEST_DOMAIN: &[u8] = b"crate-agent decoded pcm v2\0";
+
+const SKIPPED_PACKET_MARKER: &[u8] = b"\0skipped packet\0";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanonicalSampleFormat {
+    Integer32 = 1,
+    Float32 = 2,
+    Float64 = 3,
+}
+
+/// Hashes decoded buffers losslessly at their native precision.
+struct PcmHasher {
+    hasher: Sha256,
+    format: Option<CanonicalSampleFormat>,
+    integers: Vec<i32>,
+    floats: Vec<f32>,
+    doubles: Vec<f64>,
+    bytes: Vec<u8>,
+}
+
+impl PcmHasher {
+    fn new(source: &AudioSource) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(PCM_DIGEST_DOMAIN);
+        hasher.update(source.sample_rate.to_le_bytes());
+        hasher.update(source.channel_count.to_le_bytes());
+        Self {
+            hasher,
+            format: None,
+            integers: Vec::new(),
+            floats: Vec::new(),
+            doubles: Vec::new(),
+            bytes: Vec::new(),
+        }
+    }
+
+    fn consume(&mut self, buffer: &GenericAudioBufferRef<'_>) {
+        let length = buffer.samples_interleaved();
+        let format = match buffer {
+            GenericAudioBufferRef::F32(_) => CanonicalSampleFormat::Float32,
+            GenericAudioBufferRef::F64(_) => CanonicalSampleFormat::Float64,
+            _ => CanonicalSampleFormat::Integer32,
+        };
+        if self.format != Some(format) {
+            self.hasher.update([format as u8]);
+            self.format = Some(format);
+        }
+        self.bytes.clear();
+        match format {
+            CanonicalSampleFormat::Integer32 => {
+                resize_for(&mut self.integers, length);
+                buffer.copy_to_slice_interleaved(&mut self.integers);
+                self.bytes
+                    .extend(self.integers.iter().flat_map(|sample| sample.to_le_bytes()));
+            }
+            CanonicalSampleFormat::Float32 => {
+                resize_for(&mut self.floats, length);
+                buffer.copy_to_slice_interleaved(&mut self.floats);
+                self.bytes
+                    .extend(self.floats.iter().flat_map(|sample| sample.to_le_bytes()));
+            }
+            CanonicalSampleFormat::Float64 => {
+                resize_for(&mut self.doubles, length);
+                buffer.copy_to_slice_interleaved(&mut self.doubles);
+                self.bytes
+                    .extend(self.doubles.iter().flat_map(|sample| sample.to_le_bytes()));
+            }
+        }
+        self.hasher.update(&self.bytes);
+    }
+
+    fn skipped(&mut self, packet_timestamp: i64) {
+        self.hasher.update(SKIPPED_PACKET_MARKER);
+        self.hasher.update(packet_timestamp.to_le_bytes());
+    }
+}
 
 /// Decode the whole file once, hashing its PCM and fingerprinting its full
 /// length in the same pass.
@@ -118,26 +201,20 @@ pub fn decoded_audio_digest(
 ) -> Result<DecodedAudioDigest, FingerprintError> {
     let mut source = AudioSource::open(path.as_ref())?;
     let mut fingerprinter = ChromaprintSink::start(&source)?;
-    let mut hasher = Sha256::new();
-    hasher.update(PCM_DIGEST_DOMAIN);
-    hasher.update(source.sample_rate.to_le_bytes());
-    hasher.update(source.channel_count.to_le_bytes());
-    let mut floats: Vec<f32> = Vec::new();
-    let mut bytes: Vec<u8> = Vec::new();
-    let frame_count = source.decode(None, |buffer| {
-        resize_for(&mut floats, buffer.samples_interleaved());
-        buffer.copy_to_slice_interleaved(&mut floats);
-        bytes.clear();
-        bytes.extend(floats.iter().flat_map(|sample| sample.to_le_bytes()));
-        hasher.update(&bytes);
-        fingerprinter.consume(buffer);
+    let mut pcm = PcmHasher::new(&source);
+    let frame_count = source.decode(None, |event| match event {
+        DecodeEvent::Buffer(buffer) => {
+            pcm.consume(buffer);
+            fingerprinter.consume(buffer);
+        }
+        DecodeEvent::Skipped { packet_timestamp } => pcm.skipped(packet_timestamp),
     })?;
     let mut fingerprint_hasher = Sha256::new();
     for value in fingerprinter.finish() {
         fingerprint_hasher.update(value.to_le_bytes());
     }
     Ok(DecodedAudioDigest {
-        pcm_sha256: hasher.finalize().into(),
+        pcm_sha256: pcm.hasher.finalize().into(),
         format: source.format_name,
         sample_rate: source.sample_rate,
         channel_count: source.channel_count,
@@ -154,6 +231,11 @@ fn resize_for<Sample: Copy + Default>(buffer: &mut Vec<Sample>, length: usize) {
     } else {
         buffer.truncate(length);
     }
+}
+
+enum DecodeEvent<'buffer, 'samples> {
+    Buffer(&'buffer GenericAudioBufferRef<'samples>),
+    Skipped { packet_timestamp: i64 },
 }
 
 struct AudioSource {
@@ -232,12 +314,12 @@ impl AudioSource {
 
     /// Feeds each decoded buffer of the default track to `sink`, stopping
     /// once `max_frames` have been delivered, and returns the frame count.
-    /// A packet that fails to decode is skipped, as the same bad frame
-    /// should not abort reading an entire track.
+    /// A packet that fails to decode is reported as `Skipped` and otherwise
+    /// skipped, as one bad frame should not abort reading an entire track.
     fn decode(
         &mut self,
         max_frames: Option<u64>,
-        mut sink: impl FnMut(&GenericAudioBufferRef<'_>),
+        mut sink: impl FnMut(DecodeEvent<'_, '_>),
     ) -> Result<u64, FingerprintError> {
         let mut frames_decoded: u64 = 0;
         while let Some(packet) = self
@@ -250,13 +332,15 @@ impl AudioSource {
             }
             match self.decoder.decode(&packet) {
                 Ok(buffer) => {
-                    sink(&buffer);
+                    sink(DecodeEvent::Buffer(&buffer));
                     frames_decoded += buffer.frames() as u64;
                     if max_frames.is_some_and(|limit| frames_decoded >= limit) {
                         break;
                     }
                 }
-                Err(SymphoniaError::DecodeError(_)) => continue,
+                Err(SymphoniaError::DecodeError(_)) => sink(DecodeEvent::Skipped {
+                    packet_timestamp: packet.pts.get(),
+                }),
                 Err(other) => return Err(FingerprintError::Decode(other.to_string())),
             }
         }
@@ -538,7 +622,7 @@ mod tests {
         let retagged = write("retagged.wav", 440.0, Some("Song (Dirty)"));
         let different = write("different.wav", 660.0, Some("Song (Clean)"));
 
-        let digests = [&clean, &retagged, &different].map(|path| decoded_audio_digest(path));
+        let digests = [&clean, &retagged, &different].map(decoded_audio_digest);
         std::fs::remove_dir_all(&tmpdir).ok();
         let [clean, retagged, different] = digests.map(|digest| digest.unwrap());
 

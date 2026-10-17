@@ -50,8 +50,8 @@ struct DuplicatesPanel: View {
     /// Bumped by every rescan so a slower, older scan can't overwrite
     /// the results of a newer one (live updates and Rescan overlap).
     @State private var scanGeneration = 0
-    /// The running decoded-audio check for perceptual clusters, if any.
-    @State private var audioCheckTask: Task<Void, Never>?
+    /// The running digest check for the shown mode, if any.
+    @State private var checkTask: (mode: DuplicateFinder.Mode, task: Task<Void, Never>)?
     /// Coalesces bursts of fingerprint writes into one rescan.
     private static let liveRescanInterval: Duration = .milliseconds(1500)
 
@@ -93,8 +93,8 @@ struct DuplicatesPanel: View {
         .task { await rescanAsLibraryChanges() }
         .onDisappear {
             services.audioPreview.stop()
-            audioCheckTask?.cancel()
-            audioCheckTask = nil
+            checkTask?.task.cancel()
+            checkTask = nil
         }
         .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
         // Cache invalidation: when the group set changes (after a
@@ -187,11 +187,13 @@ struct DuplicatesPanel: View {
                 Task { await rescan() }
             }
             Spacer()
-            if mode == .perceptual, checkingAudioFileCount > 0 {
-                Text("Checking audio of \(checkingAudioFileCount) file\(checkingAudioFileCount == 1 ? "" : "s")")
+            if uncheckedFileCount > 0 {
+                Text("Checking \(uncheckedFileCount) file\(uncheckedFileCount == 1 ? "" : "s")")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .help("Files that share a fingerprint are decoded to confirm their audio is the same before any can be moved to Trash.")
+                    .help(mode == .byteLevel
+                        ? "Files sharing a size and partial hash are read in full to confirm every byte matches before any can be moved to Trash."
+                        : "Files that share a fingerprint are decoded to confirm their audio is the same before any can be moved to Trash.")
             }
             if mode == .perceptual {
                 Text("\(fingerprintCoverage.done) of \(fingerprintCoverage.total) fingerprinted")
@@ -248,19 +250,20 @@ struct DuplicatesPanel: View {
     /// Files a resolve of `group` would move to Trash: every non-keeper,
     /// or in a group needing listening only the ones the user checked.
     private func trashCount(for group: ScannedGroup) -> Int {
-        group.audioCheck == .needsListening ? explicitSelection(for: group).count : max(0, group.size - 1)
+        group.check == .needsListening ? explicitSelection(for: group).count : max(0, group.size - 1)
     }
 
     private func explicitSelection(for group: ScannedGroup) -> Set<Int64> {
         guard let keeper = group.files.first(where: { file in file.id == effectiveKeeperId(for: group) }) else { return [] }
         return (listeningSelections[group.id] ?? []).filter { identifier in
             guard identifier != keeper.id, let file = group.files.first(where: { file in file.id == identifier }) else { return false }
-            return group.audioRelation(of: file, toKeeper: keeper) != .different
+            let relation = group.relation(of: file, toKeeper: keeper)
+            return relation == .identical || relation == .fingerprintMatch
         }
     }
 
-    private var checkingAudioFileCount: Int {
-        groups.reduce(0) { total, group in group.audioCheck == .checking ? total + group.size : total }
+    private var uncheckedFileCount: Int {
+        groups.reduce(0) { total, group in total + group.uncheckedFileCount }
     }
 
     private func groupCard(_ group: ScannedGroup) -> some View {
@@ -279,7 +282,7 @@ struct DuplicatesPanel: View {
                     Button {
                         pendingResolveGroup = group
                     } label: {
-                        Label(group.audioCheck == .needsListening ? "Trash \(trashCount(for: group)) selected" : "Trash \(trashCount(for: group)) copies",
+                        Label(group.check == .needsListening ? "Trash \(trashCount(for: group)) selected" : "Trash \(trashCount(for: group)) copies",
                               systemImage: "trash")
                             .labelStyle(.titleAndIcon)
                     }
@@ -292,15 +295,17 @@ struct DuplicatesPanel: View {
             if let reason = conflictReason(group) {
                 Text(reason).font(.callout).foregroundStyle(.orange)
             }
-            if group.audioCheck == .needsListening {
+            if group.check == .needsListening {
                 Text("These files sound alike but their audio isn't identical. Listen before removing. Nothing here is selected for Trash until you check it.")
                     .font(.callout)
                     .foregroundStyle(.orange)
             }
-            if group.audioCheck == .checking {
+            if group.check == .checking {
                 HStack(spacing: density.spacing) {
                     ProgressView().controlSize(.small)
-                    Text("Checking audio. These files can't be moved to Trash until their decoded audio is confirmed the same.")
+                    Text(group.mode == .byteLevel
+                        ? "Checking contents. These files can't be moved to Trash until every byte is confirmed the same."
+                        : "Checking audio. These files can't be moved to Trash until their decoded audio is confirmed the same.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -313,7 +318,7 @@ struct DuplicatesPanel: View {
                 }
             }
             if !group.keptFiles.isEmpty {
-                keptSection(group.keptFiles)
+                keptSection(group.keptFiles, mode: group.mode)
             }
         }
         .padding(.horizontal, density.pagePadding)
@@ -338,27 +343,29 @@ struct DuplicatesPanel: View {
     }
 
     private func groupHeader(for group: ScannedGroup) -> String {
-        switch group.audioCheck {
-        case .notRequired:
-            let size = group.files.first.map { Self.byteCountFormatter.string(fromByteCount: $0.fileSize) } ?? ""
-            return "\(group.size) copies · byte-level, \(size) each"
+        let match = group.mode == .byteLevel
+            ? "byte-level, \(group.files.first.map { file in Self.byteCountFormatter.string(fromByteCount: file.fileSize) } ?? "") each"
+            : "perceptual match"
+        switch group.check {
         case .checking:
-            return "\(group.size) files · perceptual match · checking audio"
+            return "\(group.size) files · \(match) · checking \(group.mode == .byteLevel ? "contents" : "audio")"
         case .confirmed:
-            return "\(group.size) copies · perceptual match · identical audio"
+            return "\(group.size) copies · \(match) · identical \(group.mode == .byteLevel ? "contents" : "audio")"
         case .needsListening:
-            return "\(group.size) files · perceptual match · listen before removing"
+            return "\(group.size) files · \(match) · listen before removing"
         case .differs:
-            return "\(group.keptFiles.count) files · perceptual match · audio differs"
+            return "\(group.keptFiles.count) files · \(match) · \(group.mode == .byteLevel ? "contents" : "audio") differ"
         }
     }
 
-    private func keptSection(_ kept: [DuplicateFinder.KeptFile<DuplicateFileRow>]) -> some View {
-        let differing = kept.filter { entry in entry.reason == .audioDiffers }.count
+    private func keptSection(_ kept: [DuplicateFinder.KeptFile<DuplicateFileRow>], mode: DuplicateFinder.Mode) -> some View {
+        let differing = kept.filter { entry in entry.reason == .differs }.count
+        let shared = mode == .byteLevel ? "a size and partial hash" : "a fingerprint"
+        let content = mode == .byteLevel ? "contents differ" : "audio differs"
         let unreadable = kept.count - differing
         return VStack(alignment: .leading, spacing: density.detailSpacing) {
             if differing > 0 {
-                Text("\(differing) file\(differing == 1 ? "" : "s") share\(differing == 1 ? "s" : "") a fingerprint but \(differing == 1 ? "its" : "their") audio differs, so \(differing == 1 ? "it's" : "they're") kept")
+                Text("\(differing) file\(differing == 1 ? "" : "s") share\(differing == 1 ? "s" : "") \(shared) but \(differing == 1 ? "its" : "their") \(content), so \(differing == 1 ? "it's" : "they're") kept")
                     .font(.callout.weight(.medium))
             }
             if unreadable > 0 {
@@ -379,9 +386,9 @@ struct DuplicatesPanel: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .help(entry.file.path)
-                        Text(keptReason(entry.reason))
+                        Text(keptReason(entry.reason, mode: mode))
                             .font(.callout)
-                            .foregroundStyle(entry.reason == .audioDiffers ? Color.secondary : Color.orange)
+                            .foregroundStyle(entry.reason == .differs ? Color.secondary : Color.orange)
                     }
                     Spacer()
                 }
@@ -389,9 +396,9 @@ struct DuplicatesPanel: View {
         }
     }
 
-    private func keptReason(_ reason: DuplicateFinder.KeptReason) -> String {
+    private func keptReason(_ reason: DuplicateFinder.KeptReason, mode: DuplicateFinder.Mode) -> String {
         switch reason {
-        case .audioDiffers: "Kept: its decoded audio matches no other file here."
+        case .differs: mode == .byteLevel ? "Kept: its contents match no other file here." : "Kept: its decoded audio matches no other file here."
         case let .unreadable(message): "Kept: \(message)"
         }
     }
@@ -429,7 +436,7 @@ struct DuplicatesPanel: View {
                     .help(file.path)
                 if isKeeper {
                     StatusBadge(title: "Keeper", systemImage: "checkmark.circle", tint: .accentColor)
-                } else if group.audioCheck == .needsListening, let identifier = file.id {
+                } else if group.check == .needsListening, let identifier = file.id {
                     listeningChoice(file: file, fileID: identifier, group: group)
                 }
                 HStack(spacing: density.spacing) {
@@ -465,7 +472,7 @@ struct DuplicatesPanel: View {
     @ViewBuilder
     private func listeningChoice(file: DuplicateFileRow, fileID: Int64, group: ScannedGroup) -> some View {
         let keeper = group.files.first { candidate in candidate.id == effectiveKeeperId(for: group) }
-        let relation = keeper.flatMap { keeper in group.audioRelation(of: file, toKeeper: keeper) } ?? .different
+        let relation = keeper.flatMap { keeper in group.relation(of: file, toKeeper: keeper) } ?? .different
         if relation == .different {
             Text("Audio differs from the keeper, so it's kept.")
                 .font(.callout)
@@ -494,11 +501,11 @@ struct DuplicatesPanel: View {
         }
     }
 
-    private func listeningNote(relation: DuplicateAudioEvidence.Relation, fileID: Int64, keeperID: Int64?, group: ScannedGroup) -> String {
+    private func listeningNote(relation: DuplicateEvidence.Relation, fileID: Int64, keeperID: Int64?, group: ScannedGroup) -> String {
         if relation == .identical {
             return "Identical audio to the keeper."
         }
-        let sameFormat = keeperID.flatMap { identifier in group.audio[identifier]?.format } == group.audio[fileID]?.format
+        let sameFormat = keeperID.flatMap { identifier in group.evidence[identifier]?.decodedFormat } == group.evidence[fileID]?.decodedFormat
         return sameFormat
             ? "Different encoding: audio isn't identical. Listen before removing."
             : "Different formats: audio can't be compared exactly. Listen before removing."
@@ -616,32 +623,41 @@ struct DuplicatesPanel: View {
             let currentIds = Set(groups.map(\.id))
             keeperOverrides = keeperOverrides.filter { entry in currentIds.contains(entry.key) }
             listeningSelections = listeningSelections.filter { entry in currentIds.contains(entry.key) }
-            if groups.contains(where: { group in group.audioCheck == .checking }) {
-                startAudioCheck()
+            if showingProgress || groups.contains(where: { group in group.check == .checking }) {
+                startCheck(mode: mode)
             }
         } catch {
             actionError = "Couldn't scan library: \(error.localizedDescription)"
         }
     }
 
-    /// Decodes pending cluster members in the background; each saved batch
-    /// reaches the panel through the live rescan.
-    private func startAudioCheck() {
-        guard audioCheckTask == nil else { return }
-        let verifier = services.duplicateAudioVerifier
-        audioCheckTask = Task(priority: .utility) {
+    /// Checks the shown mode's pending cluster members in the background,
+    /// joining a pass already running; each saved batch reaches the panel
+    /// through the live rescan. An explicit rescan with no pass running starts
+    /// a fresh one, which revalidates cached digests and retries transient
+    /// failures.
+    private func startCheck(mode: DuplicateFinder.Mode) {
+        if let checkTask, checkTask.mode == mode {
+            return
+        }
+        checkTask?.task.cancel()
+        let verifier = services.duplicateEvidenceVerifier
+        let task = Task(priority: .utility) {
             let failure: Error?
             do {
-                try await verifier.verifyPendingFiles()
+                try await verifier.verifyPendingFiles(mode: mode)
                 failure = nil
             } catch {
                 failure = error
             }
-            audioCheckTask = nil
+            if checkTask?.mode == mode {
+                checkTask = nil
+            }
             if let failure, !(failure is CancellationError) {
-                actionError = "Audio check stopped: \(failure.localizedDescription). Use Rescan to try again."
+                actionError = "Duplicate check stopped: \(failure.localizedDescription). Use Rescan to try again."
             }
         }
+        checkTask = (mode, task)
     }
 
     /// The id of the file we'd keep for this group — user's override

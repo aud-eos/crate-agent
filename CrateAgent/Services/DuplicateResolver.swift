@@ -58,7 +58,7 @@ public actor DuplicateResolver {
     public enum ResolverError: LocalizedError, Equatable {
         case keeperNotInGroup
         case noFilesToTrash
-        case audioNotConfirmed
+        case notConfirmed
 
         public var errorDescription: String? {
             switch self {
@@ -66,8 +66,8 @@ public actor DuplicateResolver {
                 "The chosen keeper isn't a member of this duplicate group."
             case .noFilesToTrash:
                 "Nothing to do — the group has only the keeper file."
-            case .audioNotConfirmed:
-                "These files' audio hasn't been confirmed the same, so none of them were moved to Trash."
+            case .notConfirmed:
+                "These files haven't been confirmed the same, so none of them were moved to Trash."
             }
         }
     }
@@ -106,19 +106,16 @@ public actor DuplicateResolver {
         explicitlySelectedFileIDs: Set<Int64> = []
     ) async throws -> Outcome {
         guard let reviewedKeeper = group.files.first(where: { file in file.id == keeperId }) else { throw ResolverError.keeperNotInGroup }
-        let audioRequirement: DuplicateAudioRequirement
-        switch group.audioCheck {
-        case .notRequired:
-            guard group.mode == .byteLevel else { throw ResolverError.audioNotConfirmed }
-            audioRequirement = .none
-        case .confirmed: audioRequirement = .identical
-        case .needsListening: audioRequirement = .identicalOrExplicitFingerprintMatch
-        case .checking, .differs: throw ResolverError.audioNotConfirmed
+        let requirement: DuplicateEvidenceRequirement
+        switch group.check {
+        case .confirmed: requirement = .init(kind: group.mode.digestKind, allowsFingerprintMatch: false)
+        case .needsListening: requirement = .init(kind: group.mode.digestKind, allowsFingerprintMatch: true)
+        case .checking, .differs: throw ResolverError.notConfirmed
         }
 
         let reviewedTargets = group.files.compactMap { file in
             file.id.flatMap { identifier in
-                identifier == keeperId || (group.audioCheck == .needsListening && !explicitlySelectedFileIDs.contains(identifier))
+                identifier == keeperId || (group.check == .needsListening && !explicitlySelectedFileIDs.contains(identifier))
                     ? nil : (fileID: identifier, file: file)
             }
         }
@@ -149,7 +146,7 @@ public actor DuplicateResolver {
             do {
                 let result = try await operationEngine.resolveDuplicate(
                     target: current(fileId, reviewed: reviewed), keeper: current(keeperId, reviewed: reviewedKeeper), batchID: effectiveBatchId,
-                    audioRequirement: audioRequirement
+                    requirement: requirement
                 )
                 switch result {
                 case .completed: trashedCount += 1

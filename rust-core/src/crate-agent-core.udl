@@ -151,11 +151,13 @@ namespace crate_agent_core {
   string encode_fingerprint(sequence<u32> raw);
 
   // Decode the whole file once and return the identity of its decoded
-  // audio: a SHA-256 of the PCM (interleaved f32 little-endian at the
-  // native rate, prefixed by a domain tag, sample rate and channel
-  // count), the container/codec it decoded from, its length in frames,
-  // and a SHA-256 of its full-length Chromaprint fingerprint. Tags and
-  // container bytes do not affect the PCM digest.
+  // audio: a lossless SHA-256 of the PCM at the native rate (integer
+  // samples widened exactly to i32, floats at native f32/f64 precision,
+  // with sample-format tags and skipped-packet markers; see
+  // fingerprint-core's DecodedAudioDigest), the container/codec it decoded
+  // from, its length in frames, and a SHA-256 of its full-length
+  // Chromaprint fingerprint. Tags and container bytes do not affect the
+  // PCM digest.
   [Throws=CoreError]
   DecodedAudioDigest decoded_audio_digest(string file_path);
 

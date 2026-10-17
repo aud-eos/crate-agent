@@ -30,12 +30,18 @@ final class DuplicateScanPerformanceTests: XCTestCase {
                 file.libraryMembership = .active
                 file.fileAvailability = .available
                 try file.insert(connection)
+                let basis = DigestBasis(fileSize: 5_000_000, mtime: 0, inode: Int64(identifier), modifiedNanoseconds: 0, changedSeconds: 0, changedNanoseconds: 0)
+                if identifier <= Self.bytePairs * 2 {
+                    try DuplicateDigestStore.save([DigestResult(fileID: Int64(identifier), basis: basis,
+                                                                evidence: .content(Self.bytes(seed: hashSeed, count: 32)))],
+                                                  kind: .content, in: connection)
+                }
                 if identifier <= Self.perceptualPairs * 2 {
-                    try AudioDigestStore.save([AudioDigestResult(
-                        fileID: Int64(identifier), basis: AudioDigestBasis(fileSize: 5_000_000, mtime: 0, inode: Int64(identifier)),
+                    try DuplicateDigestStore.save([DigestResult(
+                        fileID: Int64(identifier), basis: basis,
                         evidence: .decoded(.init(format: "mp3/mp3", pcmDigest: Self.bytes(seed: fingerprintSeed, count: 32),
                                                  fullFingerprintDigest: Self.bytes(seed: fingerprintSeed, count: 32), durationSeconds: 240))
-                    )], in: connection)
+                    )], kind: .audio, in: connection)
                 }
             }
         }
@@ -64,7 +70,7 @@ final class DuplicateScanPerformanceTests: XCTestCase {
 
         XCTAssertEqual(scan.byteLevel.count, Self.bytePairs)
         XCTAssertEqual(scan.perceptual.count, Self.perceptualPairs)
-        XCTAssertTrue(scan.perceptual.allSatisfy { group in group.audioCheck == .confirmed })
+        XCTAssertTrue((scan.byteLevel + scan.perceptual).allSatisfy { group in group.check == .confirmed })
         XCTAssertEqual(scan.byteLevel.reduce(0) { total, group in total + group.size }, Self.bytePairs * 2,
                        "Only group members may be decoded")
         XCTAssertEqual(scan.perceptual.reduce(0) { total, group in total + group.size }, Self.perceptualPairs * 2)

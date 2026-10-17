@@ -54,8 +54,9 @@ The play button at the start of each Library row, and beside each file in
 starting another, pressing stop, or leaving the screen ends it. Previewing only
 reads the file.
 
-Perceptual duplicates are checked by decoding: only files with identical decoded
-audio are offered together. Files that share a fingerprint but differ in audio,
+Duplicates are checked in full before cleanup is offered: byte-level matches by
+hashing every byte, perceptual matches by decoding. Only files with identical
+contents or decoded audio are offered together. Files that share a fingerprint but differ in audio,
 such as Clean and Dirty edits, are listed as kept. Copies in another format or
 encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
 listen and check each one yourself.
