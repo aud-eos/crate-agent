@@ -370,6 +370,14 @@ final class AutoTagSession: ObservableObject {
         }
     }
 
+    /// Approves every reviewable row except artist/title search matches,
+    /// which carry no audio evidence and must be approved one by one.
+    func approveAllReady() {
+        for fileID in scannedFileIDs where rowModels[fileID]?.candidate.evidence.isMetadataSearch == false {
+            setApproved(true, for: fileID)
+        }
+    }
+
     func clearApprovals() {
         guard !isApplying else { return }
         confirmedFileIDs.subtract(confirmedFileIDs.filter { !pendingRecordingFileIDs.contains($0) })

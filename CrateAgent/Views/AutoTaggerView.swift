@@ -167,7 +167,7 @@ struct AutoTaggerView: View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: density.spacing) {
                 PageHeading("Review audio matches", subtitle: "Approval stages your choices. Apply approved tracks writes them in one undoable batch.")
-                Text("Audio match is the lookup’s fingerprint score; it does not verify tags, release, year or version. Multiple recording IDs may share one lookup score.")
+                Text("Audio match is the lookup’s fingerprint score; it does not verify tags, release, year or version. Multiple recording IDs may share one lookup score. Text match marks a recording found by artist/title search after the audio matched nothing.")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack(spacing: density.spacing) {
                     Picker("Review mode", selection: $session.reviewMode) {
@@ -272,11 +272,8 @@ struct AutoTaggerView: View {
             Text("Approval applies to the whole scan").font(.callout)
         } actions: {
             Button("Approve all suggested matches", action: session.approveAllSuggested)
-            Button("Approve all ready matches") {
-                for fileID in session.scannedFileIDs {
-                    session.setApproved(true, for: fileID)
-                }
-            }
+            Button("Approve all ready matches", action: session.approveAllReady)
+                .help("Approves every ready audio match. Artist/title search matches must be approved individually.")
             Button("Clear all approvals", action: session.clearApprovals)
         }.disabled(session.isApplying || session.rowModels.isEmpty)
     }

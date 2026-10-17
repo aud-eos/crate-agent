@@ -313,9 +313,19 @@ func parsedMusicBrainzDateValue(_ dateString: String) -> Int? {
 /// match-review UI and the mutation that writes tags (Tasks 9-14).
 struct MatchCandidate: Equatable {
     let fileID: Int64
-    /// AcoustID confidence, 0...1.
-    let score: Double
-    let acoustID: String?
+    /// How this recording was found; only fingerprint evidence carries an
+    /// AcoustID identifier or confidence.
+    let evidence: MatchEvidence
+    /// The evidence's own 0...1 score (AcoustID confidence, or text
+    /// similarity for a metadata search).
+    var score: Double {
+        evidence.rankingScore
+    }
+
+    var acoustID: String? {
+        evidence.acoustID
+    }
+
     let recordingMBID: String
     let artistMBID: String?
     /// SHA-256 of the file's stored Chromaprint fingerprint bytes — the

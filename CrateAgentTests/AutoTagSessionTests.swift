@@ -127,6 +127,23 @@ final class AutoTagSessionTests: XCTestCase {
         withExtendedLifetime(observer) {}
     }
 
+    func testArtistTitleMatchIsExcludedFromBulkApprovalButAppliesWithoutAcoustIDOnceApprovedIndividually() async throws {
+        let applied = PayloadRecorder()
+        let fixture = try SessionFixture(fileCount: 1, onlyMetadataMatches: true, apply: { mutations, _ in await applied.record(mutations) })
+        let fileID = fixture.fileIDs[0]
+        fixture.session.selectVisibleFileIDs(fixture.fileIDs)
+        await fixture.session.startScan()
+        XCTAssertEqual(fixture.session.rowModels[fileID]?.candidate.evidence.isMetadataSearch, true)
+        fixture.session.approveAllSuggested()
+        fixture.session.approveAllReady()
+        XCTAssertTrue(fixture.session.confirmedFileIDs.isEmpty, "Text matches carry no audio evidence")
+        fixture.session.setApproved(true, for: fileID)
+        await fixture.session.applyConfirmed()
+        let payloads = await applied.payloads
+        XCTAssertEqual(payloads.map(\.recordingMBID), ["text-match"])
+        XCTAssertEqual(payloads.map(\.acoustID), [nil])
+    }
+
     func testFocusSkipsNoMatchOnFirstEntryAndDoesNotJumpAsPendingRowsResolve() async throws {
         let unmatched = try SessionFixture(fileCount: 2, firstLookupHasNoMatch: true)
         unmatched.session.selectVisibleFileIDs(unmatched.fileIDs)
@@ -544,7 +561,8 @@ private struct SessionFixture {
     let service: AutoTaggerService
     let session: AutoTagSession
 
-    init(fileCount: Int, alternatives: Bool = false, firstLookupHasNoMatch: Bool = false, lowScoreAlternative: Bool = false, blockedRecordingID: String? = nil,
+    init(fileCount: Int, alternatives: Bool = false, firstLookupHasNoMatch: Bool = false, lowScoreAlternative: Bool = false, onlyMetadataMatches: Bool = false,
+         blockedRecordingID: String? = nil,
          started: SessionGate = SessionGate(), release: SessionGate = SessionGate(),
          fileFreshnessReader: @escaping FileFreshnessReading = { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 10) },
          apply: @escaping @Sendable ([TrackMutation], String) async throws -> Void = { _, _ in },
@@ -563,7 +581,8 @@ private struct SessionFixture {
             }
         }
         fileIDs = inserted
-        loader = SessionLookupLoader(alternatives: alternatives, firstLookupHasNoMatch: firstLookupHasNoMatch, lowScoreAlternative: lowScoreAlternative, blockedRecordingID: blockedRecordingID, started: started, release: release)
+        loader = SessionLookupLoader(alternatives: alternatives, firstLookupHasNoMatch: firstLookupHasNoMatch, lowScoreAlternative: lowScoreAlternative,
+                                     onlyMetadataMatches: onlyMetadataMatches, blockedRecordingID: blockedRecordingID, started: started, release: release)
         service = AutoTaggerService(database: database,
                                     acoustIDClient: AcoustIDClient(loader: loader, limiter: .noop, cache: .memory()),
                                     musicBrainzClient: MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory()),
@@ -624,15 +643,19 @@ private actor SessionLookupLoader: URLLoading {
     let alternatives: Bool
     let firstLookupHasNoMatch: Bool
     let lowScoreAlternative: Bool
+    let onlyMetadataMatches: Bool
     let blockedRecordingID: String?
     let started: SessionGate
     let release: SessionGate
     private(set) var lookupCount = 0
 
-    init(alternatives: Bool, firstLookupHasNoMatch: Bool, lowScoreAlternative: Bool, blockedRecordingID: String?, started: SessionGate, release: SessionGate) {
+    init(alternatives: Bool, firstLookupHasNoMatch: Bool, lowScoreAlternative: Bool, onlyMetadataMatches: Bool, blockedRecordingID: String?,
+         started: SessionGate, release: SessionGate)
+    {
         self.alternatives = alternatives
         self.firstLookupHasNoMatch = firstLookupHasNoMatch
         self.lowScoreAlternative = lowScoreAlternative
+        self.onlyMetadataMatches = onlyMetadataMatches
         self.blockedRecordingID = blockedRecordingID
         self.started = started
         self.release = release
@@ -648,13 +671,18 @@ private actor SessionLookupLoader: URLLoading {
                 recordingIDs += ["same-recording", "alternative-a", "alternative-b", "no-release"]
             }
             var results: [[String: Any]] = [["id": "source-\(lookupCount)", "score": 0.99, "recordings": recordingIDs.map { ["id": $0] }]]
-            if firstLookupHasNoMatch, lookupCount == 1 {
+            if (firstLookupHasNoMatch && lookupCount == 1) || onlyMetadataMatches {
                 results = []
             }
             if lowScoreAlternative {
                 results.append(["id": "weak-source", "score": 0.4, "recordings": [["id": "alternative-b"]]])
             }
             object = ["status": "ok", "results": results]
+        } else if url.lastPathComponent == "recording" {
+            let recordings: [[String: Any]] = onlyMetadataMatches
+                ? [["id": "text-match", "title": "Current title", "artist-credit": [["name": "Current artist", "artist": ["id": "artist", "name": "Current artist"]]]]]
+                : []
+            object = ["recordings": recordings]
         } else {
             let requestedID = url.lastPathComponent
             if requestedID == blockedRecordingID {
@@ -718,6 +746,16 @@ private actor SessionApplyRecorder {
         await release.wait()
         if failExternally {
             throw OperationEngineError.externalSyncIncomplete(batchId: batchID, underlying: "fixture failure")
+        }
+    }
+}
+
+private actor PayloadRecorder {
+    private(set) var payloads: [ApplyMusicBrainzMatchPayload] = []
+    func record(_ mutations: [TrackMutation]) {
+        payloads += mutations.compactMap { mutation in
+            guard case let .applyMusicBrainzMatch(payload) = mutation else { return nil }
+            return payload
         }
     }
 }

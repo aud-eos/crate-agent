@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Looks up full MusicBrainz recording metadata (releases, release-group
@@ -70,6 +71,69 @@ public struct MusicBrainzClient: Sendable {
         cache.store(responseData, forKey: cacheKey)
         cache.store(responseData, forKey: Self.detailsCacheKey(forMBID: details.id))
         return details
+    }
+
+    /// Searches recordings by artist and title — the Auto-Tag fallback
+    /// when AcoustID returns no recordings. Shares the rate limiter and
+    /// retry policy with every other MusicBrainz request. Non-empty
+    /// results are cached; an empty result is not, so a recording added
+    /// to MusicBrainz later is still found.
+    public func searchRecordings(artist: String, title: String) async throws -> [MBRecordingDetails] {
+        let query = "recording:\(Self.phrase(title)) AND artist:\(Self.phrase(artist))"
+        let cacheKey = Self.searchCacheKey(forQuery: query)
+        if let cached = cache.cachedValue(forKey: cacheKey, decode: Self.decodeSearch) {
+            return cached
+        }
+        var components = URLComponents(string: Self.baseURLString.trimmingCharacters(in: CharacterSet(charactersIn: "/")))!
+        // Percent-encode everything but unreserved characters: a literal
+        // `+` in a title would otherwise reach the server as a space.
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        components.percentEncodedQueryItems = [
+            URLQueryItem(name: "query", value: query.addingPercentEncoding(withAllowedCharacters: unreserved)),
+            URLQueryItem(name: "limit", value: String(Self.searchResultLimit)),
+            URLQueryItem(name: "fmt", value: "json"),
+        ]
+        var request = URLRequest(url: components.url!)
+        request.setValue(userAgentHeaderValue, forHTTPHeaderField: "User-Agent")
+        let data = try await requester.perform(request)
+        let hits = try Self.decodeSearch(from: data)
+        try Task.checkCancellation()
+        if !hits.isEmpty {
+            cache.store(data, forKey: cacheKey)
+        }
+        return hits
+    }
+
+    private static let searchResultLimit = 10
+
+    private struct SearchResponse: Decodable {
+        let recordings: [MBRecording]
+    }
+
+    private static func decodeSearch(from data: Data) throws -> [MBRecordingDetails] {
+        let response: SearchResponse
+        do {
+            response = try JSONDecoder().decode(SearchResponse.self, from: data)
+        } catch {
+            throw LookupError.transport("invalid MusicBrainz search response body: \(error.localizedDescription)")
+        }
+        return try response.recordings.map { recording in
+            guard let identifier = recording.id, !identifier.isEmpty else {
+                throw LookupError.transport("MusicBrainz search result has no recording ID")
+            }
+            return MBRecordingDetails(recording: recording, requestedID: identifier)
+        }
+    }
+
+    /// A Lucene phrase: backslashes and quotes inside a tag are escaped
+    /// so they can't end the phrase or inject query syntax.
+    private static func phrase(_ text: String) -> String {
+        let escaped = text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
+    private static func searchCacheKey(forQuery query: String) -> String {
+        "mb:search-v1:" + SHA256.hash(data: Data(query.utf8)).map { byte in String(format: "%02x", byte) }.joined()
     }
 
     private struct ReleasePage: Decodable {

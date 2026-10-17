@@ -22,6 +22,10 @@ struct AutoTagRecordingChooser: View {
         session.lookupService.recordingAlternatives[fileID]
     }
 
+    private var isMetadataSearch: Bool {
+        alternatives?.isMetadataSearch ?? false
+    }
+
     private var details: [String: MBRecordingDetails] {
         session.lookupService.recordingDetails[fileID] ?? [:]
     }
@@ -34,10 +38,14 @@ struct AutoTagRecordingChooser: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: density.spacing) {
-                PageHeading("Choose recording", subtitle: "Recordings returned by this file’s audio lookup, including lower-scoring alternatives.")
+                PageHeading("Choose recording", subtitle: isMetadataSearch
+                    ? "Recordings found by searching MusicBrainz for this file’s embedded artist and title."
+                    : "Recordings returned by this file’s audio lookup, including lower-scoring alternatives.")
                 Text("Changing recording resets field choices and the release selection, and clears approval. A failed load keeps your current proposal and edits.")
                     .font(.body)
-                Text("Audio match is the AcoustID fingerprint score, not verification of tags, release or version. IDs from the same lookup result share its score. Known aliases are combined as details load; unresolved IDs may still refer to the same recording.")
+                Text(isMetadataSearch
+                    ? AutoTagMessages.metadataScoreHelp
+                    : "Audio match is the AcoustID fingerprint score, not verification of tags, release or version. IDs from the same lookup result share its score. Known aliases are combined as details load; unresolved IDs may still refer to the same recording.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 if let error = session.selectionErrorByFileID[fileID] {
@@ -98,11 +106,20 @@ struct AutoTagRecordingChooser: View {
                 Text("Recording details unavailable").font(.headline)
                 Text(alternative.recordingID).font(.callout).textSelection(.enabled)
             }
-            Text("Audio match: \(alternative.score, format: .percent.precision(.fractionLength(0)))")
-                .font(.body.monospacedDigit())
-            Text(isPlausible(alternative) ? "Plausible by lookup score — review recording choice" : "Lower-scoring alternative — review carefully")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            switch alternative.evidence {
+            case let .fingerprint(_, score):
+                Text("Audio match: \(score, format: .percent.precision(.fractionLength(0)))")
+                    .font(.body.monospacedDigit())
+                Text(isPlausible(alternative) ? "Plausible by lookup score — review recording choice" : "Lower-scoring alternative — review carefully")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            case let .metadataSearch(textScore):
+                Text("Text match: \(textScore, format: .percent.precision(.fractionLength(0)))")
+                    .font(.body.monospacedDigit())
+                Text("Artist/title search result — no audio evidence")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             if loadingIDs.contains(alternative.recordingID) {
                 ProgressView("Loading details…")
             } else if let error = errors[alternative.recordingID] {
@@ -116,7 +133,9 @@ struct AutoTagRecordingChooser: View {
                     if let detail = details[alternative.recordingID] {
                         Text("Canonical recording: \(detail.id)")
                     }
-                    Text("AcoustID result: \(alternative.acoustID)")
+                    if let acoustID = alternative.acoustID {
+                        Text("AcoustID result: \(acoustID)")
+                    }
                 }
                 .font(.callout)
                 .textSelection(.enabled)
