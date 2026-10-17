@@ -44,6 +44,11 @@ struct DuplicatesPanel: View {
     /// radio toggle invalidated all visible rows, fanning out to
     /// hundreds of redundant picker invocations per click.
     @State private var keeperIdByGroup: [String: Int64] = [:]
+    /// Bumped by every rescan so a slower, older scan can't overwrite
+    /// the results of a newer one (live updates and Rescan overlap).
+    @State private var scanGeneration = 0
+    /// Coalesces bursts of fingerprint writes into one rescan.
+    private static let liveRescanInterval: Duration = .milliseconds(1500)
 
     private struct BatchProgress: Equatable {
         var trashed: Int
@@ -79,6 +84,7 @@ struct DuplicatesPanel: View {
             }
         }
         .task { await rescan() }
+        .task { await rescanAsLibraryChanges() }
         .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
         // Cache invalidation: when the group set changes (after a
         // rescan, or after a resolve removed files) or the user
@@ -397,16 +403,57 @@ struct DuplicatesPanel: View {
         }
     }
 
-    private func rescan() async {
-        isScanning = true
-        defer { isScanning = false }
-        actionError = nil
+    /// Rescans while the panel is visible whenever fingerprints land or
+    /// files change, at most once per `liveRescanInterval`. Resolving
+    /// rescans on completion, so changes during a resolve are covered.
+    private func rescanAsLibraryChanges() async {
+        let changes = AsyncStream<Error?>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let observation = DuplicateScanObservation.start(in: services.database, onChange: {
+            changes.continuation.yield(nil)
+        }, onError: { error in
+            changes.continuation.yield(error)
+            changes.continuation.finish()
+        })
+        defer { observation.cancel() }
+        for await failure in changes.stream {
+            if let failure {
+                actionError = "Live duplicate updates stopped: \(failure.localizedDescription). Use Rescan to refresh."
+                return
+            }
+            do {
+                try await Task.sleep(for: Self.liveRescanInterval)
+            } catch {
+                return
+            }
+            if !isResolving {
+                await rescan(showingProgress: false)
+            }
+        }
+    }
+
+    /// `showingProgress` is false for live updates, which must neither
+    /// flash the scanning state nor clear a resolve error on screen.
+    private func rescan(showingProgress: Bool = true) async {
+        scanGeneration += 1
+        let generation = scanGeneration
+        if showingProgress {
+            isScanning = true
+            actionError = nil
+        }
+        defer {
+            if showingProgress {
+                isScanning = false
+            }
+        }
         let mode = mode
         do {
             let scan = try await services.database.writer.read { database in
                 try (groups: DuplicateFinder.findDuplicates(in: database, mode: mode), coverage: DuplicateFinder.fingerprintCoverage(in: database))
             }
-            groups = scan.groups
+            guard generation == scanGeneration else { return }
+            if scan.groups != groups {
+                groups = scan.groups
+            }
             fingerprintCoverage = scan.coverage
             // Drop overrides for groups that no longer exist after
             // the rescan — preserves the user's per-group picks for
