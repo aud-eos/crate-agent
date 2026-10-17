@@ -3881,71 +3881,10 @@ public actor OperationEngine {
         }
 
         // The canonical track row keyed by this file's fingerprint (the
-        // forward created it or it pre-existed). Fetch and evaluate it BEFORE
-        // mutating anything so an out-of-order undo can be rejected cleanly.
+        // forward created it or it pre-existed).
         let track = try TrackRecord
             .filter(Column("fingerprint_hash") == applied.fingerprintHash)
             .fetchOne(db)
-
-        // Undoing batch A must never overwrite what a later batch B
-        // established on the same fingerprint-keyed row (invariant #4:
-        // FLAC+MP3 of one recording, or a re-encode, share a track row). A's
-        // undo may touch the row's identity only when A still SOLELY owns it:
-        // no other file references it (a later batch that adopted or kept the
-        // row links its own file to it) AND its identity is still exactly what
-        // A's forward wrote. Both guards are needed — when B re-matches to the
-        // SAME recording the identity doesn't drift, so the reference count is
-        // the only signal that B now owns the row.
-        let otherFilesReferenceRow = try track.map { row in
-            try FileRecord.hasOtherFilesReferencingTrack(row.id, excluding: applied.fileID, in: db)
-        } ?? false
-        let forwardIdentityStillOnRow = track.map { row in
-            row.acoustidId == applied.acoustID
-                && row.musicbrainzRecordingId == applied.recordingMBID
-                && row.musicbrainzReleaseId == applied.releaseMBID
-                && row.musicbrainzArtistId == applied.artistMBID
-                && row.isrc == applied.isrc
-        } ?? false
-        let thisForwardStillSolelyOwnsRow = !otherFilesReferenceRow && forwardIdentityStillOnRow
-
-        // Whether THIS file is the row's current identity owner. This
-        // distinguishes the two cases the reference count conflates for a
-        // PRE-EXISTING row (finding #4000261456): an OLDER file that already
-        // referenced the row before this match — whose captured state is
-        // exactly what `previousTrackIdentifiers` restores, so it must NOT
-        // block restoration — versus a LATER batch that re-owned the row with
-        // its own file's match, which must. (The out-of-order guard in
-        // `undoBatch` already rejects the case where THIS file was itself
-        // re-matched later, so a later event for this same file can't reach
-        // here.) `nil` — no live matcher for the track (e.g. a row seeded
-        // outside the match path) — falls back to the reference-count gate.
-        //
-        // The current matcher is the latest file to apply a match to this row
-        // that is STILL linked to it — filtered on the file's live `track_id`,
-        // NOT merely the latest historical apply. When two files sharing this
-        // row are undone in one batch, reverting the newer sibling first clears
-        // its row link (above, in its own inverse) but leaves its apply as the
-        // latest historical apply in the log. A bare "latest apply" query would
-        // then wrongly name that just-reverted sibling the owner, so the next
-        // inverse (the older sibling's) would skip restoring its
-        // `previousTrackIdentifiers` and leave the row's metadata changed after
-        // the whole batch was undone (finding #4001251152). Requiring the
-        // applier to still reference the row drops the reverted sibling —
-        // reverts key their event to the file's PREVIOUS track, not this row,
-        // so they can't be counted directly — and correctly names the older
-        // file. THIS file is still linked here (it is unlinked below), so it
-        // remains a candidate.
-        let thisFileIsRowLatestMatcher: Bool? = try track.flatMap { row -> Bool? in
-            guard let trackID = row.id else { return nil }
-            let latestMatcherFileId = try Int64.fetchOne(db, sql: """
-            SELECT events.file_id FROM events
-            JOIN files ON files.id = events.file_id
-            WHERE events.track_id = ? AND events.event_type = ?
-              AND files.track_id = ?
-            ORDER BY events.event_id DESC LIMIT 1
-            """, arguments: [trackID, EventType.musicBrainzMatchApplied.rawValue, trackID])
-            return latestMatcherFileId.map { $0 == applied.fileID }
-        }
 
         // The out-of-order undo guard (rejecting a revert whose file was
         // re-matched by a LATER batch) lives in `undoBatch`, keyed on the event
@@ -3955,7 +3894,7 @@ public actor OperationEngine {
         // release present identical row state (recording unchanged, release
         // drifted, no surviving reference), yet one must undo and the other
         // must be rejected (finding #3999974010). So this method assumes the
-        // revert is in-order and only gates the shared-row teardown below.
+        // revert is in-order.
 
         // Restore the file link + Serato snapshot for exactly the
         // display fields the forward changed.
@@ -3973,70 +3912,18 @@ public actor OperationEngine {
         }
         try fileRecord.update(db)
 
-        // Restore or null the canonical track row, gated by the ownership
-        // predicate computed above; the file itself has already been
-        // unlinked. It always exists here in practice — the forward created
-        // it or it pre-existed.
+        // Undoing batch A must never overwrite what a later batch B
+        // established on the same fingerprint-keyed row (invariant #4:
+        // FLAC+MP3 of one recording, or a re-encode, share a track row). This
+        // runs before the revert is journaled, while A's apply is still live.
         if var track {
-            if applied.createdTrackRow {
-                // The forward created this row. Null what it set and leave
-                // the now-orphaned row in place — but only while A solely
-                // owns it; otherwise a later batch's match would be wiped.
-                if thisForwardStillSolelyOwnsRow {
-                    track.acoustidId = nil
-                    track.musicbrainzRecordingId = nil
-                    track.musicbrainzReleaseId = nil
-                    track.musicbrainzArtistId = nil
-                    track.isrc = nil
-                    track.artist = nil
-                    track.title = nil
-                    track.album = nil
-                    track.year = nil
-                    try track.update(db)
-                }
-            } else if let previous = applied.previousTrackIdentifiers {
-                // Restore the pre-existing row's captured identity — but only
-                // while THIS file is still the row's latest matcher. If a later
-                // batch re-owned the row with a different file's match,
-                // restoring A's `previous` would clobber the identity that
-                // later batch relies on; leave the row alone in that case. An
-                // OLDER file that merely still references the row does NOT block
-                // restoration — its state is precisely what `previous` restores
-                // (finding #4000261456).
-                //
-                // OR-ed with the original sole-owner gate so a LIFO undo of two
-                // batches that both adopted a pre-existing row still restores on
-                // the SECOND undo: after the later batch is undone the row is
-                // unlinked and back at this forward's identity, but the latest
-                // `musicBrainzMatchApplied` still points at the (now-reverted)
-                // later file, so the latest-matcher test alone would wrongly
-                // block it. `thisForwardStillSolelyOwnsRow` (no surviving
-                // reference AND identity intact) safely covers that case and
-                // can't fire while a later owner is live, so it never
-                // reintroduces the clobber it originally guarded against.
-                if thisFileIsRowLatestMatcher == true || thisForwardStillSolelyOwnsRow {
-                    track.acoustidId = previous.acoustID
-                    track.musicbrainzRecordingId = previous.recordingMBID
-                    track.musicbrainzReleaseId = previous.releaseMBID
-                    track.musicbrainzArtistId = previous.artistMBID
-                    track.isrc = previous.isrc
-                    track.artist = previous.artist
-                    track.title = previous.title
-                    track.album = previous.album
-                    track.year = previous.year
-                    try track.update(db)
-                }
-            } else {
-                // Unreachable: a pre-existing track row (createdTrackRow
-                // == false) always captures previousTrackIdentifiers in
-                // the forward apply. If this ever fires, the forward's
-                // invariant broke silently, and no-oping here would
-                // leave the row's identifiers unchanged instead of
-                // restored — fail loudly instead.
-                assertionFailure(
-                    "applyRevertMusicBrainzMatch: pre-existing track row for file \(applied.fileID) has no previousTrackIdentifiers to restore"
-                )
+            guard applied.createdTrackRow || applied.previousTrackIdentifiers != nil else {
                 throw OperationEngineError.missingPreviousTrackIdentifiers(fileId: applied.fileID)
+            }
+            let original = track
+            try CanonicalTrackOwnership.restoreFields(of: &track, revertingMatchOf: applied.fileID, in: db)
+            if track != original {
+                try track.update(db)
             }
         }
 
@@ -4781,6 +4668,9 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case batchNotFound(batchId: String)
     case undoNotSupported(eventType: EventType)
     case missingPreviousTrackIdentifiers(fileId: Int64)
+    /// Undo found no live MusicBrainz match by this file on its canonical
+    /// track row, so it can't tell which row fields the match still owns.
+    case matchOwnershipNotFound(fileId: Int64)
     /// A 120s-capped Chromaprint fingerprint collided across two DIFFERENT
     /// recordings: an existing `tracks` row for this fingerprint already
     /// carries a non-nil recording MBID that other files depend on, and the
@@ -4842,6 +4732,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Events of type \(eventType.rawValue) can't be undone yet."
         case let .missingPreviousTrackIdentifiers(fileId):
             "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
+        case let .matchOwnershipNotFound(fileId):
+            "Cannot revert MusicBrainz match for file id \(fileId): no live match by this file was found on its track row."
         case let .fingerprintRecordingConflict(fileId, existingMBID, incomingMBID):
             "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
