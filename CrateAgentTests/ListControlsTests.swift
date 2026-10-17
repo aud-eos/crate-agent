@@ -97,7 +97,7 @@ final class ListControlsTests: XCTestCase {
         XCTAssertEqual(results.selectedRows.map(\.fileId), [1])
     }
 
-    func testLibraryAndAutoTagSearchShareUnicodeAlbumAndLiteralMatching() throws {
+    func testLibraryAndAutoTagSearchShareCaseAndDiacriticFoldingAndLiteralMatching() throws {
         let database = try LibraryDatabase.openInMemory()
         try database.writer.write { connection in
             var file = FileRecord(id: 1, path: "/Music/50%.mp3", volumeUuid: "fixture", inode: 1, fileSize: 1, mtime: 0, artist: "Bjo\u{308}rk", title: "Song", album: "DÉBUT")
@@ -106,7 +106,7 @@ final class ListControlsTests: XCTestCase {
             try other.insert(connection)
         }
         try database.writer.read { connection in
-            for query in ["BJÖRK", "début", "50%"] {
+            for query in ["BJÖRK", "bjork", "début", "DEBUT", "50%"] {
                 XCTAssertEqual(try LibraryStatusBrowse.fetch(connection, search: query).rows.map(\.id), [1])
                 XCTAssertEqual(try AutoTagFileSearch.search(query: query, in: connection).matches.map(\.id), [1])
             }
