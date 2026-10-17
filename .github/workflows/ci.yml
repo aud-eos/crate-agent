@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SWIFTFORMAT_VERSION: "0.64.0"
+
+jobs:
+  rust-and-format:
+    name: Format, lint and Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust components
+        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-core -> target
+
+      - name: Install SwiftFormat
+        run: |
+          curl --fail --silent --show-error --location --output "$RUNNER_TEMP/swiftformat.zip" \
+            "https://github.com/nicklockwood/SwiftFormat/releases/download/${SWIFTFORMAT_VERSION}/swiftformat_linux.zip"
+          unzip -o "$RUNNER_TEMP/swiftformat.zip" -d "$RUNNER_TEMP/swiftformat"
+          install -m 0755 "$RUNNER_TEMP/swiftformat/swiftformat_linux" /usr/local/bin/swiftformat
+          swiftformat --version
+
+      - name: Format check
+        run: make format-check
+
+      - name: Lint
+        run: make lint
+
+      - name: Rust tests
+        run: make test-rust
+
+  swift:
+    name: Rust build and Swift tests
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      TASK6_MOUNT: /private/tmp/crate-agent-task6-volume
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show toolchain
+        run: xcodebuild -version && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-core -> target
+          key: universal-apple-darwin
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build Rust core
+        run: make build-rust
+
+      - name: Generate Xcode project
+        run: make xcodeproj
+
+      - uses: actions/cache@v6
+        with:
+          path: build-output/SourcePackages
+          key: spm-${{ runner.os }}-${{ hashFiles('project.yml') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Mount the disposable APFS test volume
+        run: |
+          hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE "$RUNNER_TEMP/task6.sparseimage"
+          mkdir -p "$TASK6_MOUNT"
+          hdiutil attach "$RUNNER_TEMP/task6.sparseimage" -mountpoint "$TASK6_MOUNT" -nobrowse
+          touch "$TASK6_MOUNT/.task6-test-volume"
+
+      - name: Swift tests
+        run: |
+          set -o pipefail
+          xcodebuild -project CrateAgent.xcodeproj -scheme CrateAgent \
+            -configuration Test -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build-output/DerivedData \
+            -clonedSourcePackagesDirPath build-output/SourcePackages \
+            -resultBundlePath build-output/TestResults.xcresult \
+            test
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-test-results
+          path: build-output/TestResults.xcresult
+          retention-days: 7
+
