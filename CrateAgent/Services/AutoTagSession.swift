@@ -60,7 +60,7 @@ final class AutoTagSession: ObservableObject {
     @Published private(set) var isApplying = false
     @Published private(set) var actionError: String?
     @Published private(set) var lastResult: String?
-    @Published private(set) var fatalError: String?
+    @Published private(set) var haltReason: String?
     @Published private(set) var pendingResyncBatchId: String?
     @Published private(set) var focusedFileID: Int64?
     @Published private(set) var focusNotice: String?
@@ -121,7 +121,7 @@ final class AutoTagSession: ObservableObject {
             reviewMode = mode
         }
         lookupService.$rows.sink { [weak self] publishedRows in self?.receive(publishedRows) }.store(in: &subscriptions)
-        lookupService.$fatalError.sink { [weak self] error in self?.fatalError = error }.store(in: &subscriptions)
+        lookupService.$haltReason.sink { [weak self] error in self?.haltReason = error }.store(in: &subscriptions)
         lookupService.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
     }
 
@@ -203,7 +203,7 @@ final class AutoTagSession: ObservableObject {
         focusNotice = nil
         actionError = nil
         lastResult = nil
-        fatalError = nil
+        haltReason = nil
         isScanning = true
         let task = Task { [self] in
             do {

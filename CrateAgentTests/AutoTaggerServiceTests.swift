@@ -24,7 +24,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         guard case let .failed(message) = try service.rows[XCTUnwrap(protected.id)] else { return XCTFail("Conflict reason is missing") }
         XCTAssertTrue(message.localizedCaseInsensitiveContains("conflict"))
         XCTAssertEqual(try service.rows[XCTUnwrap(independent.id)], .noMatch)
-        XCTAssertNil(service.fatalError)
+        XCTAssertNil(service.haltReason)
         let unchanged = try await fixture.row(protected)
         XCTAssertEqual(unchanged, protected)
     }
@@ -86,7 +86,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertNil(current.chromaprintFingerprint)
         XCTAssertEqual(current.fingerprintStatus, .pending)
         guard case .stopped = try service.rows[XCTUnwrap(file.id)] else { return XCTFail("Expected superseded pass to stop") }
-        XCTAssertNil(service.fatalError)
+        XCTAssertNil(service.haltReason)
     }
 
     func testThrowingDecoderAfterEpochInvalidationStopsWithoutFailure() async throws {
@@ -111,7 +111,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertEqual(current.fingerprintStatus, .pending)
         XCTAssertNil(current.chromaprintFingerprint)
         guard case .stopped = try service.rows[XCTUnwrap(file.id)] else { return XCTFail("Superseded decoder failure was not stopped") }
-        XCTAssertNil(service.fatalError)
+        XCTAssertNil(service.haltReason)
     }
 
     func testAutoTagInvalidationDuringSuccessAndFailureUpdatesRollsBack() async throws {
@@ -142,7 +142,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             XCTAssertEqual(current.fingerprintStatus, .pending)
             XCTAssertNil(current.chromaprintFingerprint)
             guard case .stopped = try service.rows[XCTUnwrap(file.id)] else { XCTFail("Invalidated persistence was not stopped"); continue }
-            XCTAssertNil(service.fatalError)
+            XCTAssertNil(service.haltReason)
         }
     }
 
@@ -427,7 +427,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertEqual(weakCandidate.score, 0.7)
 
         XCTAssertEqual(service.rows[noMatchFileID], .noMatch)
-        XCTAssertNil(service.fatalError)
+        XCTAssertNil(service.haltReason)
     }
 
     /// A 401 from the KEYLESS MusicBrainz request must not be reported as a
@@ -461,7 +461,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             "a MusicBrainz 401 must not blame the AcoustID key; reason was: \(reason)"
         )
         XCTAssertTrue(reason.contains("MusicBrainz"), "the reason should name MusicBrainz; was: \(reason)")
-        XCTAssertNil(service.fatalError, "a MusicBrainz 401 must not halt the whole pass")
+        XCTAssertNil(service.haltReason, "a MusicBrainz 401 must not halt the whole pass")
     }
 
     /// A cancelled lookup (New Scan / left Auto-Tag) now propagates
@@ -490,7 +490,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         if case .failed = service.rows[fileID] {
             XCTFail("a cancelled lookup must not stamp a .failed row; got \(String(describing: service.rows[fileID]))")
         }
-        XCTAssertNil(service.fatalError, "cancellation is not a fatal pass error")
+        XCTAssertNil(service.haltReason, "cancellation is not a fatal pass error")
     }
 
     // MARK: - E-A: an empty ASSEMBLED artist name is nil, not just an empty credit array
@@ -581,7 +581,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         guard case .strong = service.rows[goodFileID] else {
             return XCTFail("expected the other row to still resolve, got \(String(describing: service.rows[goodFileID]))")
         }
-        XCTAssertNil(service.fatalError)
+        XCTAssertNil(service.haltReason)
     }
 
     // MARK: - Fatal halts
@@ -607,7 +607,7 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         await service.run(fileIDs: [fileA, fileB])
 
-        let fatalMessage = try XCTUnwrap(service.fatalError)
+        let fatalMessage = try XCTUnwrap(service.haltReason)
         XCTAssertTrue(fatalMessage.lowercased().contains("unauthorized"), "message was: \(fatalMessage)")
         // The pass stops at the first file — the second is never attempted
         // — but neither row is left looking permanently "Looking up…":
@@ -655,7 +655,7 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         await service.run(fileIDs: [fileA, fileB])
 
-        let fatalMessage = try XCTUnwrap(service.fatalError)
+        let fatalMessage = try XCTUnwrap(service.haltReason)
         XCTAssertTrue(fatalMessage.lowercased().contains("network"), "message was: \(fatalMessage)")
         XCTAssertEqual(lookupCount.value, 1, "the pass halts at the first offline failure, not once per file")
         guard case .stopped = service.rows[fileA] else {
@@ -685,7 +685,7 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         await service.run(fileIDs: [fileID])
 
-        let fatalMessage = try XCTUnwrap(service.fatalError)
+        let fatalMessage = try XCTUnwrap(service.haltReason)
         XCTAssertTrue(fatalMessage.lowercased().contains("key"), "message was: \(fatalMessage)")
         guard case let .stopped(reason) = service.rows[fileID] else {
             return XCTFail("expected .stopped so the row doesn't look permanently pending, got \(String(describing: service.rows[fileID]))")
@@ -766,7 +766,7 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         await service.run(fileIDs: [fileID])
 
-        let fatalMessage = try XCTUnwrap(service.fatalError)
+        let fatalMessage = try XCTUnwrap(service.haltReason)
         XCTAssertTrue(fatalMessage.lowercased().contains("keychain"), "message was: \(fatalMessage)")
         XCTAssertFalse(
             fatalMessage.contains("No AcoustID API key is configured"),

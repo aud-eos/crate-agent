@@ -2423,6 +2423,12 @@ public actor OperationEngine {
     }
 
     private func applyFileTagWrite(_ write: SeratoPendingFileTagWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
+        let year = try write.year.map { requested in
+            guard let year = UInt32(exactly: requested) else {
+                throw OperationEngineError.fileTagWriteFailed(path: write.absolutePath, underlying: "year \(requested) is outside the writable range")
+            }
+            return year
+        }
         let update = AudioTagUpdate(
             artist: write.metadata.artist,
             title: write.metadata.title,
@@ -2436,7 +2442,7 @@ public actor OperationEngine {
             // Serato's database V2 has no year field, so the MusicBrainz
             // match routes year to the file tags only. `writeFileTags`
             // leaves it nil.
-            year: write.year.flatMap { $0 >= 0 ? UInt32($0) : nil },
+            year: year,
             clearYear: write.clearYear
         )
         let tagWriter = fileTagWriter

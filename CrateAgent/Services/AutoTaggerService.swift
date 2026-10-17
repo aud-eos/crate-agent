@@ -21,7 +21,7 @@ import GRDB
 /// is visible in `rows`, not swallowed). An `.unauthorized`, `.server`, or
 /// `.offline` `LookupError` is different in kind — it means every remaining
 /// lookup in this pass would fail too — so it halts the whole pass and
-/// surfaces `fatalError` instead of failing every remaining row individually.
+/// surfaces `haltReason` instead of failing every remaining row individually.
 @MainActor
 final class AutoTaggerService: ObservableObject {
     enum RowState: Equatable {
@@ -30,7 +30,7 @@ final class AutoTaggerService: ObservableObject {
         case weak(MatchCandidate)
         case noMatch
         case failed(String)
-        /// Terminal: the whole pass halted (`fatalError` was set) before
+        /// Terminal: the whole pass halted (`haltReason` was set) before
         /// this row got a chance to resolve. Distinct from `.pending`
         /// (still queued, the pass is still running) so the view never
         /// renders an abandoned row as "Looking up…" forever.
@@ -63,7 +63,7 @@ final class AutoTaggerService: ObservableObject {
     /// Set only when the whole pass has been halted (bad API key, or the
     /// lookup server itself is down) — as opposed to a single row's
     /// `.failed`, which leaves the rest of the pass running.
-    @Published private(set) var fatalError: String?
+    @Published private(set) var haltReason: String?
 
     private let readiness: LibrarySyncReadiness?
     private var syncAuthorization: LibrarySyncReadiness.Authorization?
@@ -77,7 +77,7 @@ final class AutoTaggerService: ObservableObject {
 
     private var runTask: Task<Void, Never>?
     /// Bumped on every `run`. A pass captures the value at start; before it
-    /// mutates shared state (`rows`/`fatalError`) after any `await`, it
+    /// mutates shared state (`rows`/`haltReason`) after any `await`, it
     /// confirms it's still the current generation. Cooperative cancellation
     /// is checked only between rows, so an in-flight fingerprint/lookup can
     /// finish and publish after a New Scan has already reset or resolved the
@@ -218,7 +218,7 @@ final class AutoTaggerService: ObservableObject {
         recordingAlternatives = [:]
         recordingDetails = [:]
         lookupBaselines = [:]
-        fatalError = nil
+        haltReason = nil
     }
 
     /// Runs the lookup pipeline for `fileIDs`, publishing each row's result
@@ -227,7 +227,7 @@ final class AutoTaggerService: ObservableObject {
         runTask?.cancel()
         runGeneration += 1
         let generation = runGeneration
-        fatalError = nil
+        haltReason = nil
         recordingAlternatives = [:]
         recordingDetails = [:]
         lookupBaselines = [:]
@@ -244,7 +244,7 @@ final class AutoTaggerService: ObservableObject {
 
         do { syncAuthorization = try readiness?.capture() }
         catch {
-            fatalError = error.localizedDescription
+            haltReason = error.localizedDescription
             stopUnresolvedRows(among: fileIDs, message: error.localizedDescription, generation: generation)
             return
         }
@@ -252,14 +252,14 @@ final class AutoTaggerService: ObservableObject {
         let apiKey: String
         do {
             guard let loadedKey = try keyStore.load(), !loadedKey.isEmpty else {
-                fatalError = Self.noAPIKeyConfiguredMessage
+                haltReason = Self.noAPIKeyConfiguredMessage
                 stopUnresolvedRows(among: fileIDs, message: Self.noAPIKeyConfiguredMessage, generation: generation)
                 return
             }
             apiKey = loadedKey
         } catch {
             let message = "Could not read the AcoustID API key from the Keychain: \(error)"
-            fatalError = message
+            haltReason = message
             stopUnresolvedRows(among: fileIDs, message: message, generation: generation)
             return
         }
@@ -293,7 +293,7 @@ final class AutoTaggerService: ObservableObject {
                 // with "Stopped — ".
                 guard generation == runGeneration else { return }
                 let reason = Self.describe(lookupError)
-                fatalError = "Auto-tag pass stopped: \(reason)"
+                haltReason = "Auto-tag pass stopped: \(reason)"
                 stopUnresolvedRows(among: fileIDs, message: reason, generation: generation)
                 return
             } catch let conflict as SeratoPathConflictError {

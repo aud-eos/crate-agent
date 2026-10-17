@@ -14,8 +14,8 @@ struct AutoTaggerView: View {
     var body: some View {
         VStack(spacing: 0) {
             SeratoRunningBanner(message: "Serato is running — applied library and tag writes queue until you quit Serato.")
-            if let fatalError = session.fatalError {
-                ActionErrorMessage(message: fatalError).padding(density.pagePadding)
+            if let haltReason = session.haltReason {
+                ActionErrorMessage(message: haltReason).padding(density.pagePadding)
                 Divider()
             }
             if session.scannedFileIDs.isEmpty {
