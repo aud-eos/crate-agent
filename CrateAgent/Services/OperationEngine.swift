@@ -2625,7 +2625,7 @@ public actor OperationEngine {
                 var pending = additions
                 if !FileManager.default.fileExists(atPath: databaseV2Path) {
                     try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
-                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path), options: .atomic)
                     io.recordReturned()
                     pending.removeFirst()
                 }

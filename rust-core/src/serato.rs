@@ -33,8 +33,9 @@
 //   https://github.com/Holzhaus/serato-tags   (per-track GEOB tags inside audio files — relevant to Pillar F)
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{Cursor, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -52,6 +53,43 @@ pub enum SeratoError {
     InvalidUtf16 { tag: String },
     #[error("invalid Serato file: {0}")]
     InvalidFile(String),
+}
+
+/// Replaces `path` with what `write` produces, all or nothing: the bytes go
+/// to a temporary file in the same directory, which is flushed to disk and
+/// then renamed over the target. A failure before the rename leaves the
+/// target's previous bytes in place, so a thrown write never landed. The
+/// target keeps its permissions; a symlinked target is replaced at the file
+/// it points to.
+fn replace_file(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let target = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let directory = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".crate-agent-")
+        .suffix(".tmp")
+        .tempfile_in(&directory)?;
+    match fs::metadata(&target) {
+        Ok(metadata) => temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&target).map_err(|error| error.error)?;
+    File::open(&directory)?.sync_all()
 }
 
 /// A single TLV record: 4-byte tag, 4-byte big-endian length, payload.
@@ -432,7 +470,7 @@ impl CrateFile {
 
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), SeratoError> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path.as_ref(), bytes)?;
+        replace_file(path.as_ref(), |file| file.write_all(&bytes))?;
         Ok(())
     }
 
@@ -498,7 +536,7 @@ impl DatabaseV2 {
 
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), SeratoError> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path.as_ref(), bytes)?;
+        replace_file(path.as_ref(), |file| file.write_all(&bytes))?;
         Ok(())
     }
 
@@ -1185,6 +1223,26 @@ mod tests {
             CrateFile::from_bytes(&bytes),
             Err(SeratoError::UnexpectedEof { .. })
         ));
+    }
+
+    #[test]
+    fn a_write_that_fails_before_the_rename_leaves_the_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database V2");
+        fs::write(&path, b"original library").unwrap();
+
+        let result = replace_file(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("disk full"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original library");
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "the temporary file was left behind"
+        );
     }
 
     #[test]
