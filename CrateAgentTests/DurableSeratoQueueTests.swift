@@ -254,7 +254,7 @@ final class DurableSeratoQueueTests: XCTestCase {
     }
 
     func testResyncReportsChangesWhoseTrackSeratoNoLongerHolds() async throws {
-        for change in ["metadata", "rename"] {
+        for (change, missing) in [("metadata", 1), ("rename", 1), ("crate-only rename", 0)] {
             let fixture = try SeratoRemovalFixture()
             defer { fixture.cleanup() }
             let file = try await fixture.add("held.wav", bytes: FinalRemovalIntegrationTests.wav())
@@ -269,11 +269,14 @@ final class DurableSeratoQueueTests: XCTestCase {
                 try await fixture.engine.apply(.renameFile(.init(fileId: fileID, newPath: renamed, previousPath: file.path, physicalMove: true)), batchId: "replayed")
             }
             try save(fixture, paths: [])
+            if change == "crate-only rename" {
+                _ = try saveCrates(fixture, paths: [file.path])
+            }
 
             let outcome = try await fixture.engine.resyncSeratoForBatch("replayed")
 
-            XCTAssertEqual(outcome.appliedCount, 0, "\(change): a write that matched no Serato record was reported as written")
-            XCTAssertEqual(outcome.missingTargetCount, 1, change)
+            XCTAssertEqual(outcome.appliedCount, 1 - missing, "\(change): written only when some Serato file held the path")
+            XCTAssertEqual(outcome.missingTargetCount, missing, change)
             XCTAssertEqual(outcome.queuedCount, 0, change)
         }
     }

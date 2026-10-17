@@ -359,15 +359,17 @@ edit whose baseline is still unknown learns the fields of an earlier edit of our
 once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its last
 attempt left no error; a failed Trash attempt is not proof the audio moved.
 
-A metadata update or rename whose track the parsed `database V2` does not hold
-(for a rename, at its final path afterwards) completes as `noSeratoRecord`: the
-Rust batch writers report each unmatched path, so a write with nothing to change
-is told apart from one with no record, and Re-sync counts it as not written
-(#105). A missing `database V2` is not evidence that a track is absent and keeps
-its tolerant behavior.
+A metadata update whose path the parsed `database V2` has no entry at, or a
+rename whose track neither `database V2` nor any crate holds at its final path
+afterwards, completes as `noSeratoRecord` in the transaction that removes its
+row, and does not advance the external baseline: the Rust batch writers report
+each unmatched path, so a write with nothing to change is told apart from one
+with no entry, and Re-sync counts it as not written (#105). A missing
+`database V2` is not evidence that a track is absent and keeps its tolerant
+behavior.
 
 The ready summary reports each dropped change by disposition (superseded,
-uncertain, interrupted, malformed, legacy unrecoverable, or no Serato record) once, and turns to a
+uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
 warning. An outcome this version does not recognize, such as one recorded by a
 newer build, is counted as not applied rather than blocking readiness. History marks a batch with the number of its changes that were not
 applied.

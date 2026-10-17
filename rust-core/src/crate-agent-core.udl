@@ -49,9 +49,9 @@ namespace crate_agent_core {
 
   // Bulk variant of `rewrite_crate_path`. Same semantics applied
   // per-crate-file — one read + one write of the crate file regardless
-  // of how many renames apply within it.
+  // of how many renames apply within it — and the same unmatched report.
   [Throws=CoreError]
-  u32 batch_rewrite_crate_paths(
+  SeratoBatchWriteResult batch_rewrite_crate_paths(
     string crate_path,
     sequence<SeratoPathRename> renames
   );

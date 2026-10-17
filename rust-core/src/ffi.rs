@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -46,18 +46,31 @@ impl SeratoBatchWriteResult {
     }
 }
 
-/// The requested paths whose track `database` does not hold, in request order.
+/// The requested paths whose track is not held at their `held_at` path,
+/// in request order. `held_paths` reports which `held_at` paths are held.
 fn unmatched<'a>(
-    database: &serato::DatabaseV2,
     requested: impl IntoIterator<Item = (&'a str, &'a str)>,
+    held_paths: impl FnOnce(Vec<&'a str>) -> HashSet<String>,
 ) -> Vec<String> {
     let requested: Vec<(&str, &str)> = requested.into_iter().collect();
-    let held = database.held_paths(requested.iter().map(|(_, held_at)| *held_at));
+    let held = held_paths(requested.iter().map(|(_, held_at)| *held_at).collect());
     requested
         .into_iter()
         .filter(|(_, held_at)| !held.contains(*held_at))
         .map(|(requested_path, _)| requested_path.to_owned())
         .collect()
+}
+
+/// Each rename's old path with where its record ends up. A rename missing
+/// from `map` belongs to a chain that ends where it started.
+fn rename_destinations<'a>(
+    renames: &'a [SeratoPathRename],
+    map: &'a HashMap<String, String>,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    renames.iter().map(|rename| {
+        let destination = map.get(&rename.old_path).unwrap_or(&rename.old_path);
+        (rename.old_path.as_str(), destination.as_str())
+    })
 }
 
 /// One track in a `batch_add_tracks_to_database` call.
@@ -229,32 +242,34 @@ pub fn batch_rewrite_database_paths(
     if count > 0 {
         database.write_to_path(&path)?;
     }
-    let destinations = renames.iter().map(|rename| {
-        let destination = map.get(&rename.old_path).unwrap_or(&rename.new_path);
-        (rename.old_path.as_str(), destination.as_str())
+    let unmatched_paths = unmatched(rename_destinations(&renames, &map), |paths| {
+        database.held_paths(paths)
     });
-    let unmatched_paths = unmatched(&database, destinations);
     Ok(SeratoBatchWriteResult::new(count, unmatched_paths))
 }
 
 /// Bulk variant of `rewrite_crate_path`. One file read + one file
 /// write per crate file, regardless of how many renames apply within
 /// that crate. Symmetric counterpart to `batch_rewrite_database_paths`.
+/// Matching follows `batch_rewrite_database_paths`.
 pub fn batch_rewrite_crate_paths(
     crate_path: String,
     renames: Vec<SeratoPathRename>,
-) -> Result<u32, CoreError> {
-    let map = rename_map(&renames);
-    if map.is_empty() {
-        return Ok(0);
+) -> Result<SeratoBatchWriteResult, CoreError> {
+    if renames.is_empty() {
+        return Ok(SeratoBatchWriteResult::new(0, Vec::new()));
     }
+    let map = rename_map(&renames);
     let path = PathBuf::from(crate_path);
     let mut crate_file = serato::CrateFile::read_from_path(&path)?;
     let count = crate_file.rewrite_paths(&map);
     if count > 0 {
         crate_file.write_to_path(&path)?;
     }
-    Ok(u32::try_from(count).expect("rewrite count exceeded u32"))
+    let unmatched_paths = unmatched(rename_destinations(&renames, &map), |paths| {
+        crate_file.held_paths(paths)
+    });
+    Ok(SeratoBatchWriteResult::new(count, unmatched_paths))
 }
 
 pub fn remove_track_from_database(
@@ -340,10 +355,10 @@ pub fn batch_update_database_records(
         database.write_to_path(&path)?;
     }
     let unmatched_paths = unmatched(
-        &database,
         requested
             .iter()
             .map(|track_path| (track_path.as_str(), track_path.as_str())),
+        |paths| database.held_paths(paths),
     );
     Ok(SeratoBatchWriteResult::new(count, unmatched_paths))
 }
@@ -407,7 +422,7 @@ mod batch_write_result_tests {
 
     fn library(paths: &[&str]) -> std::path::PathBuf {
         let mut bytes = Vec::new();
-        let mut record = |tag: &[u8; 4], payload: &[u8]| {
+        let record = |tag: &[u8; 4], payload: &[u8]| {
             let mut encoded = tag.to_vec();
             encoded.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
             encoded.extend_from_slice(payload);
@@ -438,7 +453,12 @@ mod batch_write_result_tests {
 
     #[test]
     fn renames_report_only_those_whose_track_is_not_at_its_final_path() {
-        let file = library(&["Music/A.mp3", "Music/Moved.mp3"]);
+        let file = library(&[
+            "Music/A.mp3",
+            "Music/Moved.mp3",
+            "Music/Loop.mp3",
+            "Music/Back.mp3",
+        ]);
         let result = batch_rewrite_database_paths(
             file.to_str().unwrap().into(),
             vec![
@@ -446,11 +466,16 @@ mod batch_write_result_tests {
                 rename("Music/B.mp3", "Music/C.mp3"),
                 rename("Music/Earlier.mp3", "Music/Moved.mp3"),
                 rename("Music/Gone.mp3", "Music/Nowhere.mp3"),
+                rename("Music/Loop.mp3", "Music/Away.mp3"),
+                rename("Music/Away.mp3", "Music/Loop.mp3"),
+                rename("Music/Back.mp3", "Music/Forth.mp3"),
+                rename("Music/Forth.mp3", "Music/Back.mp3"),
+                rename("Music/Back.mp3", "Music/Forth.mp3"),
             ],
         )
         .unwrap();
         fs::remove_file(&file).unwrap();
-        assert_eq!(result.rewritten_count, 1);
+        assert_eq!(result.rewritten_count, 2);
         assert_eq!(result.unmatched_paths, vec!["Music/Gone.mp3".to_owned()]);
     }
 }

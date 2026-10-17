@@ -275,6 +275,34 @@ fn otrk_has_path_in(
     found
 }
 
+/// The path an `otrk` is keyed by: its first `path_tag` field that decodes.
+fn first_decodable_path(nested: &[TlvRecord], path_tag: &[u8; 4]) -> Option<String> {
+    nested
+        .iter()
+        .filter(|field| &field.tag == path_tag)
+        .find_map(|field| decode_utf16be(&field.payload))
+}
+
+/// Which of `paths` some `otrk` is keyed by, under the metadata writer's
+/// rule (`first_decodable_path` of a well-formed record). Only records
+/// holding a requested path are parsed.
+fn held_paths_in_otrks<'path>(
+    records: &[TlvRecord],
+    path_tag: &[u8; 4],
+    paths: impl IntoIterator<Item = &'path str>,
+) -> HashSet<String> {
+    let encoded_paths: HashSet<Vec<u8>> = paths.into_iter().map(encode_utf16be).collect();
+    records
+        .iter()
+        .filter(|record| {
+            &record.tag == TAG_OTRK && otrk_has_path_in(&record.payload, path_tag, &encoded_paths)
+        })
+        .filter_map(|record| TlvRecord::parse_all(&record.payload).ok())
+        .filter_map(|nested| first_decodable_path(&nested, path_tag))
+        .filter(|path| encoded_paths.contains(&encode_utf16be(path)))
+        .collect()
+}
+
 /// Visits each well-formed nested field in order and returns whether the
 /// whole payload parsed cleanly — the same acceptance as
 /// `TlvRecord::parse_all`.
@@ -444,6 +472,14 @@ impl CrateFile {
         rewrite_path_in_otrks(&mut self.records, TAG_PTRK, old_path, new_path)
     }
 
+    /// Which of `paths` this crate holds a track at.
+    pub fn held_paths<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path str>,
+    ) -> HashSet<String> {
+        held_paths_in_otrks(&self.records, TAG_PTRK, paths)
+    }
+
     /// Multi-rename variant: rewrite every matching `ptrk` in one pass.
     /// Caller layer pairs this with one read + one write of the
     /// crate file regardless of how many renames are batched.
@@ -607,36 +643,16 @@ impl DatabaseV2 {
         remove_otrks_referencing_path(&mut self.records, TAG_PFIL, target_path)
     }
 
-    /// Number of `otrk` track entries in the database. Useful for
-    /// progress reporting on full library scans.
-    /// Which of `paths` a well-formed `otrk` holds, matched on encoded
-    /// bytes without decoding every record.
+    /// Which of `paths` this database holds a track at.
     pub fn held_paths<'path>(
         &self,
         paths: impl IntoIterator<Item = &'path str>,
     ) -> HashSet<String> {
-        let requested: HashMap<Vec<u8>, &str> = paths
-            .into_iter()
-            .map(|path| (encode_utf16be(path), path))
-            .collect();
-        let mut held = HashSet::new();
-        let mut matched: Vec<&str> = Vec::new();
-        for record in self.records.iter().filter(|record| &record.tag == TAG_OTRK) {
-            matched.clear();
-            let well_formed = walk_nested_fields(&record.payload, |tag, payload| {
-                if tag == TAG_PFIL {
-                    if let Some(path) = requested.get(payload) {
-                        matched.push(path);
-                    }
-                }
-            });
-            if well_formed {
-                held.extend(matched.iter().map(|path| (*path).to_owned()));
-            }
-        }
-        held
+        held_paths_in_otrks(&self.records, TAG_PFIL, paths)
     }
 
+    /// Number of `otrk` track entries in the database. Useful for
+    /// progress reporting on full library scans.
     pub fn track_count(&self) -> usize {
         self.records
             .iter()
@@ -782,14 +798,7 @@ impl DatabaseV2 {
             let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
                 continue;
             };
-            let track_path = nested.iter().find_map(|field| {
-                if &field.tag == TAG_PFIL {
-                    decode_utf16be(&field.payload)
-                } else {
-                    None
-                }
-            });
-            let Some(track_path) = track_path else {
+            let Some(track_path) = first_decodable_path(&nested, TAG_PFIL) else {
                 continue;
             };
             let Some(update) = updates.get(&track_path) else {
