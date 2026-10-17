@@ -1933,7 +1933,8 @@ public actor OperationEngine {
     private static func combinedFailure(_ failures: [Error]) -> Error? {
         guard let first = failures.first else { return nil }
         guard failures.count > 1 else { return first }
-        let details = failures.map(\.localizedDescription).joined(separator: "; ")
+        var seen = Set<String>()
+        let details = failures.map(\.localizedDescription).filter { detail in seen.insert(detail).inserted }.joined(separator: "; ")
         return OperationEngineError.externalSyncIncomplete(batchId: "queued-changes", underlying: "\(details). Fix the causes, then choose Retry Sync.")
     }
 
@@ -1951,6 +1952,9 @@ public actor OperationEngine {
         var blockedQueueIDs = Set<Int64>()
         var queuedEvents = Set<Int64>()
         var failures: [Error] = []
+        /// A batched segment that failed failed on its store, so later
+        /// segments of that kind in the pass would fail the same way.
+        var failedBatchKinds = Set<SeratoWriteSegment.Kind>()
         var stopped = false
 
         mutating func block(_ write: GuardedSeratoWrite, dependency: SeratoQueueDependency) {
@@ -1972,6 +1976,12 @@ public actor OperationEngine {
     /// rebase their baseline. Rows rejected at the writer boundary leave their
     /// siblings coalesced.
     private func runSegment(_ segment: SeratoWriteSegment, owner: UUID, reported: Bool, run: inout SegmentRun) async throws -> [GuardedSeratoWrite] {
+        guard !run.failedBatchKinds.contains(segment.kind) else {
+            for entry in segment.entries {
+                run.wait(entry.write, dependency: entry.dependency)
+            }
+            return []
+        }
         let stored = try await database.writer.read { database in
             try segment.entries.map { entry -> SeratoWriteSegment.Entry? in
                 guard let queueID = entry.write.queueID, var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
@@ -2070,6 +2080,9 @@ public actor OperationEngine {
                     run.wait(write, dependency: dependency(of: write))
                 }
                 run.failures.append(error)
+                if segment.kind != .single {
+                    run.failedBatchKinds.insert(segment.kind)
+                }
                 return []
             }
         }

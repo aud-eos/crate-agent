@@ -381,7 +381,10 @@ a rename of an earlier rename's destination (old → middle → new) lands the r
 at the final path. Consecutive adds of different files share one registration:
 Serato's existing paths are read once, every add lands in one V2 rewrite, and
 each import is confirmed in the same transaction; a second add of the same file
-starts a new registration. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
+starts a new registration. Every other write is its own segment. A batched
+segment holds at most 200 rows, since its I/O, verification and confirmations
+share one writer transaction; a larger backlog continues in the next segment
+(#189). Edits to the same record are merged in queue order before the batch
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
