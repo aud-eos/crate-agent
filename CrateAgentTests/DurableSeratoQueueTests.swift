@@ -349,6 +349,72 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertEqual(record?.title, "Queued B", "A queued edit that never reached Serato was taken for our own write")
     }
 
+    func testARenameIntoAPathAnotherRenameVacatedLandsBothRecords() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let (one, two, three) = try await chainFixture(fixture)
+        try await fixture.engine.applyBatch(chainRenames(one: one, two: two, three: three), batchId: "chain")
+
+        XCTAssertEqual(try titlesByPath(fixture), [two.path: "One", three: "Two"])
+        for crate in try fixture.locator.enumerateCrateFiles() {
+            XCTAssertEqual(try readCratePaths(cratePath: crate.path).map(SeratoPath.normalized).sorted(), [three, two.path].sorted(), crate.lastPathComponent)
+        }
+    }
+
+    func testAChainAcrossTwoSegmentsLandsBothRecords() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let (one, two, three) = try await chainFixture(fixture)
+        var fillers: [TrackMutation] = []
+        for index in 1 ..< SeratoWriteSegmenter.maximumEntriesPerSegment {
+            let filler = try await fixture.add("filler-\(index).wav", bytes: FinalRemovalIntegrationTests.wav(sample: UInt8(index % 250)))
+            let renamed = fixture.directory.appendingPathComponent("filler-\(index) renamed.wav").path
+            try fillers.append(.renameFile(RenameFilePayload(fileId: XCTUnwrap(filler.id), newPath: renamed, previousPath: filler.path, physicalMove: true)))
+        }
+        setRunning(fixture, true)
+        try await fixture.engine.applyBatch(fillers + chainRenames(one: one, two: two, three: three), batchId: "chain")
+        setRunning(fixture, false)
+        _ = try await fixture.engine.drainPendingSeratoUpdates()
+
+        let titles = try titlesByPath(fixture)
+        XCTAssertEqual(titles[two.path], "One")
+        XCTAssertEqual(titles[three], "Two")
+    }
+
+    func testRetryAfterASupersededSiblingDoesNotReapplyALandedChain() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let (one, two, three) = try await chainFixture(fixture)
+        let sibling = try await fixture.add("sibling.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 2))
+        let renamedSibling = fixture.directory.appendingPathComponent("sibling renamed.wav").path
+        setRunning(fixture, true)
+        try await fixture.engine.applyBatch(chainRenames(one: one, two: two, three: three) + [
+            .renameFile(RenameFilePayload(fileId: XCTUnwrap(sibling.id), newPath: renamedSibling, previousPath: sibling.path, physicalMove: true)),
+        ], batchId: "chain")
+        setRunning(fixture, false)
+        // Once database V2 is rewritten, the sibling's audio changes, so its
+        // rename is superseded at the crate write and the chain retries.
+        let databasePath = fixture.locator.databaseV2Url.path
+        let originalDatabase = try Data(contentsOf: URL(fileURLWithPath: databasePath))
+        let siblingChanged = LockedTestFlag()
+        let changedSibling = FinalRemovalIntegrationTests.wav(sample: 9, durationSeconds: 2)
+        try await fixture.database.writer.write { connection in
+            connection.trace { _ in
+                guard (try? Data(contentsOf: URL(fileURLWithPath: databasePath))) != originalDatabase, siblingChanged.setOnce() else { return }
+                do { try changedSibling.write(to: URL(fileURLWithPath: renamedSibling)) }
+                catch { XCTFail("Could not change the sibling: \(error)") }
+            }
+        }
+        let outcome = try await fixture.engine.drainPendingSeratoUpdates()
+        try await fixture.database.writer.write { connection in connection.trace(nil) }
+        XCTAssertFalse(siblingChanged.setOnce(), "The sibling was never changed after the database V2 write")
+
+        XCTAssertEqual(outcome.appliedCount, 2)
+        XCTAssertEqual(outcome.supersededCount, 1)
+        XCTAssertEqual(outcome.missingTargetCount, 0)
+        XCTAssertEqual(try titlesByPath(fixture), [two.path: "One", three: "Two"], "The retry applied the landed chain to database V2 a second time")
+    }
+
     func testCleanupFinishesOnRestartOnlyWhenTrashActuallyRan() async throws {
         for trashSucceeded in [true, false] {
             let fixture = try SeratoRemovalFixture()
@@ -816,6 +882,32 @@ final class DurableSeratoQueueTests: XCTestCase {
 
         guard case let .ready(summary) = session.state else { return XCTFail("Sync did not reach ready: \(session.state)") }
         XCTAssertEqual(summary.notAppliedWrites.total, 1)
+    }
+
+    /// Two tracks in database V2 and every crate, plus the free path the
+    /// second one moves to before the first takes its place.
+    private func chainFixture(_ fixture: SeratoRemovalFixture) async throws -> (FileRecord, FileRecord, String) {
+        let one = try await fixture.add("one.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let two = try await fixture.add("two.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 1))
+        try save(fixture, paths: [one.path, two.path])
+        try setV2(fixture, path: one.path, title: "One")
+        try setV2(fixture, path: two.path, title: "Two")
+        _ = try saveCrates(fixture, paths: [one.path, two.path])
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        return (one, two, fixture.directory.appendingPathComponent("three.wav").path)
+    }
+
+    private func chainRenames(one: FileRecord, two: FileRecord, three: String) throws -> [TrackMutation] {
+        try [
+            .renameFile(RenameFilePayload(fileId: XCTUnwrap(two.id), newPath: three, previousPath: two.path, physicalMove: true)),
+            .renameFile(RenameFilePayload(fileId: XCTUnwrap(one.id), newPath: two.path, previousPath: one.path, physicalMove: true)),
+        ]
+    }
+
+    private func titlesByPath(_ fixture: SeratoRemovalFixture) throws -> [String: String] {
+        try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).reduce(into: [:]) { titles, record in
+            titles[SeratoPath.normalized(record.path)] = record.title
+        }
     }
 
     private func setRunning(_ fixture: SeratoRemovalFixture, _ running: Bool) {

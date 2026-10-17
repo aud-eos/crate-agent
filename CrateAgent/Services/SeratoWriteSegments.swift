@@ -12,7 +12,7 @@ struct SeratoWriteSegment: Sendable {
     }
 
     struct Entry: Sendable {
-        let write: GuardedSeratoWrite
+        var write: GuardedSeratoWrite
         let dependency: SeratoQueueDependency
     }
 
@@ -27,7 +27,14 @@ enum SeratoWriteSegmenter {
     /// group opened shares its file or path: moving it ahead of that row would
     /// write the record at a path that does not hold it yet, so it starts a new
     /// group after that row instead.
-    static func segments(_ entries: [SeratoWriteSegment.Entry]) -> [SeratoWriteSegment] {
+    static func segments(_ passEntries: [SeratoWriteSegment.Entry]) -> [SeratoWriteSegment] {
+        // Across the whole pass, since a chain's rows can fall in different segments.
+        let refilled = SeratoWriteEligibility.renamesWithRefilledOldPaths(passEntries.map(\.write))
+        let entries = passEntries.map { passEntry in
+            var entry = passEntry
+            entry.write.oldPathRefilled = entry.write.queueID.map(refilled.contains) == true
+            return entry
+        }
         var segments: [SeratoWriteSegment] = []
         var openMetadata: Int?
         var pathEffectsSinceOpen = SeratoQueueDependency()

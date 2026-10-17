@@ -21,6 +21,10 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     /// The fields `externalBaseline` actually knows; nil means all of them.
     var baselineKnownFields: Set<String>?
     var requiredKeeper: FileActionAuthority?
+    /// Set for one drain pass: a later rename in it moves a different file
+    /// into this rename's old path, as in a chain or swap, so that file sitting
+    /// there does not mean the path stopped naming this track.
+    var oldPathRefilled = false
     var queueID: Int64?
     var queuedPayload: Data?
     var attempts = 0
@@ -101,7 +105,9 @@ enum SeratoWriteEligibility {
         case let .removeFromDatabase(write): try requireReference(write.absolutePath, file: file)
         case let .removeFromCrates(write): try requireReference(write.absolutePath, file: file)
         case let .rename(write):
-            try requireReference(write.oldAbsolutePath, file: file)
+            if !guarded.oldPathRefilled {
+                try requireReference(write.oldAbsolutePath, file: file)
+            }
             if write.newAbsolutePath != file.path, FileManager.default.fileExists(atPath: write.newAbsolutePath) {
                 throw FileProcessingEligibilityError.superseded(fileId: guarded.token.fileId)
             }
@@ -124,6 +130,28 @@ enum SeratoWriteEligibility {
     private static func sameContent(_ original: FileMetadata, _ current: FileMetadata) -> Bool {
         original.fileSize == current.fileSize && original.mtime == current.mtime
             && (original.lightweightHash == nil || original.lightweightHash == current.lightweightHash)
+    }
+
+    /// Queue IDs of renames whose old path a later rename in `writes`, given in
+    /// queue order, fills with a different file, with no rename leaving that
+    /// path after it.
+    static func renamesWithRefilledOldPaths(_ writes: [GuardedSeratoWrite]) -> Set<Int64> {
+        var lastArrival: [String: (position: Int, fileID: Int64)] = [:]
+        var lastDeparture: [String: Int] = [:]
+        for (position, write) in writes.enumerated() {
+            guard case let .rename(rename) = write.write else { continue }
+            lastArrival[rename.newAbsolutePath] = (position, write.token.fileId)
+            lastDeparture[rename.oldAbsolutePath] = position
+        }
+        var refilled = Set<Int64>()
+        for (position, write) in writes.enumerated() {
+            guard case let .rename(rename) = write.write, let queueID = write.queueID,
+                  let arrival = lastArrival[rename.oldAbsolutePath], arrival.fileID != write.token.fileId,
+                  arrival.position > position, arrival.position > lastDeparture[rename.oldAbsolutePath, default: position]
+            else { continue }
+            refilled.insert(queueID)
+        }
+        return refilled
     }
 
     static func permits(_ write: GuardedSeratoWrite, file: FileRecord?) -> Bool {

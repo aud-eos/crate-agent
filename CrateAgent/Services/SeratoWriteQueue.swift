@@ -227,8 +227,29 @@ enum SeratoWriteQueue {
         var stored = write
         let payload = try encode(write)
         try database.execute(sql: "UPDATE serato_write_queue SET payload = ? WHERE queue_id = ?", arguments: [payload, queueID])
+        try database.execute(sql: "DELETE FROM serato_rename_progress WHERE queue_id = ?", arguments: [queueID])
         stored.queuedPayload = payload
         return stored
+    }
+
+    /// For each queued rename, the Serato files it already rewrote, keyed by
+    /// path, and whether that file held its record.
+    /// Progress exists only for renames still queued, so the table is read whole.
+    static func renameProgress(of queueIDs: [Int64], in database: Database) throws -> [Int64: [String: Bool]] {
+        let wanted = Set(queueIDs)
+        return try Row.fetchAll(database, sql: "SELECT queue_id, store, matched FROM serato_rename_progress").reduce(into: [:]) { progress, row in
+            let queueID: Int64 = row["queue_id"]
+            if wanted.contains(queueID) {
+                progress[queueID, default: [:]][row["store"]] = row["matched"]
+            }
+        }
+    }
+
+    static func recordRenameProgress(_ outcomes: [(queueID: Int64, matched: Bool)], store: String, in database: Database) throws {
+        for outcome in outcomes {
+            try database.execute(sql: "INSERT INTO serato_rename_progress (queue_id, store, matched) VALUES (?, ?, ?)",
+                                 arguments: [outcome.queueID, store, outcome.matched])
+        }
     }
 
     @discardableResult

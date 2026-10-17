@@ -1968,6 +1968,7 @@ public actor OperationEngine {
             try segment.entries.map { entry -> SeratoWriteSegment.Entry? in
                 guard let queueID = entry.write.queueID, var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
                 current.requiredKeeper = entry.write.requiredKeeper
+                current.oldPathRefilled = entry.write.oldPathRefilled
                 return SeratoWriteSegment.Entry(write: current, dependency: entry.dependency)
             }
         }
@@ -2444,13 +2445,12 @@ public actor OperationEngine {
                              supersededCount: run.superseded.count, conflictBlockedCount: blocked.count, missingTargetCount: run.missingTarget.count)
     }
 
-    /// Returns the queue IDs of rows whose write found no Serato entry at its path.
-    private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite], reported: Bool) async throws -> Set<Int64> {
+    private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
         switch write {
         case .rename:
             preconditionFailure("Queued renames are applied by applySeratoRenameBatch, never one row at a time")
-        case let .metadataUpdate(update):
-            return try await applySeratoMetadataUpdateBatch([update], guardedWrites: guardedWrites, reported: reported)
+        case .metadataUpdate:
+            preconditionFailure("Queued metadata updates are applied by applySeratoMetadataUpdateBatch, never one row at a time")
         case .addTrack:
             preconditionFailure("Queued adds are registered by applySeratoAddTracks, never one row at a time")
         case let .fileTagWrite(write):
@@ -2462,7 +2462,6 @@ public actor OperationEngine {
         case let .trashFile(trash):
             try await applyTrashFileOperation(trash, guardedWrites: guardedWrites)
         }
-        return []
     }
 
     private func applyTrashFileOperation(_ trash: SeratoPendingTrash, guardedWrites: [GuardedSeratoWrite]) async throws {
@@ -2772,32 +2771,27 @@ public actor OperationEngine {
     /// therefore did not land; without a database V2 there is nothing to
     /// compare, so none.
     private func applySeratoRenameBatch(_ renameRows: [GuardedSeratoWrite], guardedWrites: [GuardedSeratoWrite]) async throws -> Set<Int64> {
-        let renames = renameRows.compactMap { row -> SeratoPendingRename? in
-            guard case let .rename(rename) = row.write else { return nil }
-            return rename
+        let renames = try renameRows.map { row -> QueuedRename in
+            guard case let .rename(rename) = row.write else { preconditionFailure("A rename batch holds only rename rows") }
+            guard let queueID = row.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
+            return QueuedRename(queueID: queueID, pair: SeratoPathRename(
+                oldPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: rename.oldAbsolutePath),
+                newPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: rename.newAbsolutePath)
+            ))
         }
         guard !renames.isEmpty else { return [] }
-        let pairs = renames.map { rename in
-            SeratoPathRename(
-                oldPath: SeratoLibraryLocator.seratoRelativePath(
-                    fromAbsolute: rename.oldAbsolutePath
-                ),
-                newPath: SeratoLibraryLocator.seratoRelativePath(
-                    fromAbsolute: rename.newAbsolutePath
-                )
-            )
+        var progress = try await database.writer.read { database in
+            try SeratoWriteQueue.renameProgress(of: renames.map(\.queueID), in: database)
         }
 
         var databaseV2Error: Error?
-        var missingFromDatabase = Set<UInt32>()
         let databaseV2Path = seratoLocator.databaseV2Url.path
-        if FileManager.default.fileExists(atPath: databaseV2Path) {
+        let hasDatabaseV2 = FileManager.default.fileExists(atPath: databaseV2Path)
+        if hasDatabaseV2 {
             do {
-                let result = try await performExternalWrite(guardedWrites) { _ in try batchRewriteDatabasePaths(
-                    databasePath: databaseV2Path,
-                    renames: pairs
-                ) }
-                missingFromDatabase = Set(result.unmatchedIndices)
+                try await rewriteRenames(renames, in: databaseV2Path, progress: &progress, guardedWrites: guardedWrites) { store, pairs in
+                    try batchRewriteDatabasePaths(databasePath: store, renames: pairs)
+                }
             } catch let error as ExternalWriteInterruption {
                 throw error
             } catch {
@@ -2817,16 +2811,12 @@ public actor OperationEngine {
             )
         }
 
-        var missingEverywhere = missingFromDatabase
         var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
-            try await requireExternalWriteEligibility(guardedWrites)
             do {
-                let result = try await performExternalWrite(guardedWrites) { _ in try batchRewriteCratePaths(
-                    cratePath: crateFile.path,
-                    renames: pairs
-                ) }
-                missingEverywhere.formIntersection(result.unmatchedIndices)
+                try await rewriteRenames(renames, in: crateFile.path, progress: &progress, guardedWrites: guardedWrites) { store, pairs in
+                    try batchRewriteCratePaths(cratePath: store, renames: pairs)
+                }
             } catch let error as ExternalWriteInterruption {
                 throw error
             } catch {
@@ -2836,13 +2826,66 @@ public actor OperationEngine {
         }
 
         try requireSuccessfulSeratoRenames(databaseError: databaseV2Error, crateFailures: perCrateFailures)
-        for index in missingFromDatabase.sorted() {
-            let oldPath = pairs[Int(index)].oldPath
-            await note(missingEverywhere.contains(index)
-                ? "Serato's database and crates have no entry at \(oldPath); the rename was not applied there."
-                : "Serato's database has no entry at \(oldPath); only its crates were updated.")
+        func unmatched(_ rename: QueuedRename, in store: String) -> Bool {
+            progress[rename.queueID]?[store] == false
         }
-        return Set(missingEverywhere.compactMap { index in renameRows[Int(index)].queueID })
+        let missingFromDatabase = hasDatabaseV2 ? renames.filter { rename in unmatched(rename, in: databaseV2Path) } : []
+        var missingEverywhere = Set<Int64>()
+        for rename in missingFromDatabase {
+            let everywhere = crateFiles.allSatisfy { crateFile in unmatched(rename, in: crateFile.path) }
+            if everywhere {
+                missingEverywhere.insert(rename.queueID)
+            }
+            await note(everywhere
+                ? "Serato's database and crates have no entry at \(rename.pair.oldPath); the rename was not applied there."
+                : "Serato's database has no entry at \(rename.pair.oldPath); only its crates were updated.")
+        }
+        return missingEverywhere
+    }
+
+    private struct QueuedRename: Sendable {
+        let queueID: Int64
+        let pair: SeratoPathRename
+    }
+
+    /// Rewrites one Serato file for the renames it has not yet taken and
+    /// records them in the same transaction. A retry after a supersession,
+    /// failure or restart then skips the files a rename already reached:
+    /// rewriting a landed chain or swap again would move its records twice.
+    private func rewriteRenames(_ renames: [QueuedRename], in store: String, progress: inout [Int64: [String: Bool]],
+                                guardedWrites: [GuardedSeratoWrite],
+                                rewrite: @escaping @Sendable (String, [SeratoPathRename]) throws -> SeratoBatchWriteResult) async throws
+    {
+        let pending = renames.filter { rename in progress[rename.queueID]?[store] == nil }
+        guard !pending.isEmpty else { return }
+        try await requireExternalWriteEligibility(guardedWrites)
+        let written = try await performExternalWrite(guardedWrites) { database, io -> RenameStoreWrite in
+            let outcomes: [(queueID: Int64, matched: Bool)]
+            var landedNotDurable: CoreError?
+            do {
+                let unmatched = try Set(rewrite(store, pending.map(\.pair)).unmatchedIndices)
+                outcomes = pending.enumerated().map { position, rename in (rename.queueID, !unmatched.contains(UInt32(position))) }
+            } catch let error as CoreError {
+                guard case .LandedNotDurable = error else { throw error }
+                // The file was replaced, so its renames must not run again; which records it held is unknown.
+                landedNotDurable = error
+                outcomes = pending.map { rename in (rename.queueID, true) }
+            }
+            io.recordReturned()
+            try SeratoWriteQueue.recordRenameProgress(outcomes, store: store, in: database)
+            return RenameStoreWrite(matched: outcomes.map(\.matched), landedNotDurable: landedNotDurable)
+        }
+        for (rename, matched) in zip(pending, written.matched) {
+            progress[rename.queueID, default: [:]][store] = matched
+        }
+        if let landedNotDurable = written.landedNotDurable {
+            throw landedNotDurable
+        }
+    }
+
+    private struct RenameStoreWrite: Sendable {
+        let matched: [Bool]
+        let landedNotDurable: CoreError?
     }
 
     private static func queueIDs(of writes: [GuardedSeratoWrite], where matches: (SeratoPendingWrite) -> Bool) -> Set<Int64> {
@@ -2908,7 +2951,7 @@ public actor OperationEngine {
                 }
                 try await applySeratoAddTracks(adds)
             default:
-                try await missingTarget.formUnion(applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites, reported: reported))
+                try await applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites)
                 index += 1
             }
         }
