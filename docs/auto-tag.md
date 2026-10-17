@@ -57,6 +57,25 @@ including lower-scoring alternatives. Details load a page at a time. A failed
 detail request remains visible and can be retried. This is not a search of the
 entire MusicBrainz database.
 
+### Artist/title matches
+
+When AcoustID answers but returns no recordings, a common case for DJ edits
+and rare releases, Auto-Tag searches MusicBrainz for the file's embedded
+artist and title. Both tags must be present; it never guesses from the
+filename. Version labels such as `(Intro)` or `- Radio Edit` are left out of the
+search and only used to rank the results, so the base recording can still be
+suggested for an edit. A failed AcoustID lookup stays a failure and does not
+start a search.
+
+These rows show **Text match: N%** with a note that the row was found by
+artist/title search. The percentage measures how closely the text agrees;
+nothing confirms the audio. They are always weak suggestions. **Approve all
+suggested matches** and **Approve all ready matches** skip them, so each one
+must be approved on its own. **Choose recording** lists the other search
+results. The title choice (**Keep current**, **Merge**, **Use suggestion**)
+still decides whether your version label survives. Applying one stores the
+recording link without an AcoustID identifier.
+
 Choosing another recording replaces the proposal and resets its field/release
 choices and approval. If its metadata cannot be loaded, the existing proposal
 stays intact. **Choose release** instead picks an album or edition of the current

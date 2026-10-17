@@ -36,8 +36,7 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         let release = chosenRelease ?? makeRelease()
         return MatchCandidate(
             fileID: 1,
-            score: 0.95,
-            acoustID: "acoustid-1",
+            evidence: .fingerprint(acoustID: "acoustid-1", score: 0.95),
             recordingMBID: "recording-1",
             artistMBID: "artist-1",
             fingerprintHash: Data([0xAB, 0xCD, 0xEF]),
