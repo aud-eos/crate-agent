@@ -2,14 +2,15 @@ import GRDB
 import SwiftUI
 
 struct DuplicatesPanel: View {
+    private typealias ScannedGroup = DuplicateFinder.DuplicateGroup<DuplicateFileRow>
+
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
 
     @State private var mode: DuplicateFinder.Mode = .byteLevel
-    @State private var files: [FileRecord] = []
-    @State private var results = ListResultSelection<DuplicateFinder.DuplicateGroup>()
-    private var groups: [DuplicateFinder.DuplicateGroup] {
+    @State private var results = ListResultSelection<ScannedGroup>()
+    private var groups: [ScannedGroup] {
         get { results.rows }
         nonmutating set {
             results.replace(newValue, context: mode.rawValue, searchText: { group in
@@ -28,11 +29,10 @@ struct DuplicatesPanel: View {
     @State private var isResolving: Bool = false
     @State private var actionError: String?
     @State private var lastResolution: String?
-    @State private var pendingResolveGroup: DuplicateFinder.DuplicateGroup?
+    @State private var pendingResolveGroup: ScannedGroup?
     @State private var pendingResolveAll: Bool = false
-    /// Cached fingerprint coverage so the modeBar's "X of Y
-    /// fingerprinted" label doesn't recompute over 32k rows on
-    /// every render. Refreshed in `rescan()` alongside `groups`.
+    /// Fingerprint coverage for the modeBar's "X of Y fingerprinted"
+    /// label, counted in SQL by `rescan()` alongside `groups`.
     @State private var fingerprintCoverage: (done: Int, total: Int) = (done: 0, total: 0)
     /// While a batch resolve-all is in flight, how many files of the
     /// planned total have made it to Trash so far. Drives the
@@ -170,7 +170,7 @@ struct DuplicatesPanel: View {
             .pickerStyle(.segmented)
             .frame(maxWidth: 320)
             .onChange(of: mode) { _, _ in
-                groups = DuplicateFinder.findDuplicates(in: files, mode: mode)
+                Task { await rescan() }
             }
             Spacer()
             if mode == .perceptual {
@@ -217,7 +217,7 @@ struct DuplicatesPanel: View {
         }
     }
 
-    private func conflictReason(_ group: DuplicateFinder.DuplicateGroup) -> String? {
+    private func conflictReason(_ group: ScannedGroup) -> String? {
         group.files.compactMap { file in services.readiness.conflictPath(for: .file(file)) }.first.map(SeratoConflictMessages.blocked)
     }
 
@@ -225,7 +225,7 @@ struct DuplicatesPanel: View {
         results.setBlockedIDs(Set(groups.filter { group in conflictReason(group) != nil }.map(\.id)))
     }
 
-    private func groupCard(_ group: DuplicateFinder.DuplicateGroup) -> some View {
+    private func groupCard(_ group: ScannedGroup) -> some View {
         VStack(alignment: .leading, spacing: density.spacing) {
             HStack(spacing: density.spacing) {
                 Toggle("Select group", isOn: Binding(get: { results.selectedIDs.contains(group.id) }, set: { results.setSelected($0, id: group.id) }))
@@ -277,7 +277,7 @@ struct DuplicatesPanel: View {
         }
     }
 
-    private func modeHeader(for group: DuplicateFinder.DuplicateGroup) -> String {
+    private func modeHeader(for group: ScannedGroup) -> String {
         switch group.mode {
         case .byteLevel:
             let first = group.files.first
@@ -290,8 +290,8 @@ struct DuplicatesPanel: View {
 
     @ViewBuilder
     private func duplicateRow(
-        file: FileRecord,
-        group: DuplicateFinder.DuplicateGroup
+        file: DuplicateFileRow,
+        group: ScannedGroup
     ) -> some View {
         let keeperId = effectiveKeeperId(for: group)
         let isKeeper = file.id == keeperId
@@ -407,15 +407,13 @@ struct DuplicatesPanel: View {
         isScanning = true
         defer { isScanning = false }
         actionError = nil
+        let mode = mode
         do {
-            files = try await services.database.writer.read { db in
-                try FileRecord.all().processableInLibrary().fetchAll(db)
+            let scan = try await services.database.writer.read { database in
+                try (groups: DuplicateFinder.findDuplicates(in: database, mode: mode), coverage: DuplicateFinder.fingerprintCoverage(in: database))
             }
-            groups = DuplicateFinder.findDuplicates(in: files, mode: mode)
-            // Refresh the cached perceptual-coverage tuple here so
-            // the modeBar can read it without iterating `files`
-            // on every SwiftUI redraw.
-            fingerprintCoverage = DuplicateFinder.fingerprintCoverage(in: files)
+            groups = scan.groups
+            fingerprintCoverage = scan.coverage
             // Drop overrides for groups that no longer exist after
             // the rescan — preserves the user's per-group picks for
             // surviving groups while pruning stale ones.
@@ -432,7 +430,7 @@ struct DuplicatesPanel: View {
     /// already excludes. Reads from the precomputed cache; callers
     /// must have called `rebuildKeeperCache()` after any mutation
     /// to `groups` or `keeperOverrides`.
-    private func effectiveKeeperId(for group: DuplicateFinder.DuplicateGroup) -> Int64? {
+    private func effectiveKeeperId(for group: ScannedGroup) -> Int64? {
         keeperIdByGroup[group.id]
     }
 
@@ -457,7 +455,7 @@ struct DuplicatesPanel: View {
         keeperIdByGroup = refreshed
     }
 
-    private func resolve(group: DuplicateFinder.DuplicateGroup) async {
+    private func resolve(group: ScannedGroup) async {
         guard let keeperId = effectiveKeeperId(for: group) else {
             actionError = "No keeper could be determined for this group."
             return
@@ -467,7 +465,7 @@ struct DuplicatesPanel: View {
         actionError = nil
         lastResolution = nil
 
-        let resolver = DuplicateResolver(operationEngine: services.operationEngine, activityLog: services.activityLog)
+        let resolver = DuplicateResolver(operationEngine: services.operationEngine, database: services.database, activityLog: services.activityLog)
         do {
             let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
             if outcome.failureCount == 0 {
@@ -489,7 +487,7 @@ struct DuplicatesPanel: View {
     /// resolved stay resolved (Finder's Trash is the recovery path
     /// per group), and the user can rescan to see what's left.
     private func resolveAll() async {
-        let resolvable: [(group: DuplicateFinder.DuplicateGroup, keeperId: Int64)] =
+        let resolvable: [(group: ScannedGroup, keeperId: Int64)] =
             results.selectedRows.compactMap { group in
                 guard let keeperId = effectiveKeeperId(for: group) else { return nil }
                 return (group, keeperId)
@@ -511,7 +509,7 @@ struct DuplicatesPanel: View {
         batchProgress = BatchProgress(trashed: 0, total: plannedTotal)
 
         let sharedBatchId = "duplicate-resolve-all-\(UUID().uuidString)"
-        let resolver = DuplicateResolver(operationEngine: services.operationEngine, activityLog: services.activityLog)
+        let resolver = DuplicateResolver(operationEngine: services.operationEngine, database: services.database, activityLog: services.activityLog)
 
         var trashedSoFar = 0
         var pendingSoFar = 0

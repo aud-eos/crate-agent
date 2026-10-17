@@ -70,7 +70,7 @@ extension FileRecord {
         }
     }
 
-    var identity: FileMetadata {
+    public var identity: FileMetadata {
         FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, lightweightHash: lightweightHash)
     }
 }

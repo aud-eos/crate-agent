@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import GRDB
 
 /// SP-1.5 audit tool: detects duplicate audio files in the library.
 /// Read-only — does not delete, move, or modify anything. The user
@@ -38,10 +40,16 @@ public enum DuplicateFinder {
     /// One cluster of files that match each other under the current
     /// detection mode. `files` is sorted by path for deterministic
     /// UI rendering.
-    public struct DuplicateGroup: Sendable, Equatable, Identifiable {
+    public struct DuplicateGroup<File: DuplicateFileSource>: Sendable, Equatable, Identifiable {
         public let groupKey: String
         public let mode: Mode
-        public let files: [FileRecord]
+        public let files: [File]
+
+        public init(groupKey: String, mode: Mode, files: [File]) {
+            self.groupKey = groupKey
+            self.mode = mode
+            self.files = files
+        }
 
         public var id: String {
             "\(mode.rawValue):\(groupKey)"
@@ -52,33 +60,22 @@ public enum DuplicateFinder {
         }
     }
 
-    /// Find groups according to `mode`. Files that don't have the
-    /// necessary fields populated (e.g., no lightweight_hash, or no
-    /// chromaprint_fingerprint in perceptual mode) are silently
-    /// excluded from grouping — they simply can't be matched, so
-    /// listing them as "non-duplicates" would be misleading.
-    /// Singleton groups (one file with a key no other shares) are
-    /// dropped from the result.
-    public static func findDuplicates(
-        in files: [FileRecord],
-        mode: Mode
-    ) -> [DuplicateGroup] {
-        var bucketed: [String: [FileRecord]] = [:]
-        for file in files {
-            guard let key = groupKey(for: file, mode: mode) else { continue }
-            bucketed[key, default: []].append(file)
+    /// Find groups according to `mode`. SQLite does the grouping, so
+    /// only rows that belong to a group of two or more are decoded,
+    /// and the Chromaprint BLOB is read only for those rows. Files
+    /// lacking the mode's key (no lightweight hash; no finished
+    /// fingerprint) can't be matched and are excluded, as are files
+    /// that aren't processable library members. Groups are ordered
+    /// biggest first, then by key.
+    public static func findDuplicates(in database: Database, mode: Mode) throws -> [DuplicateGroup<DuplicateFileRow>] {
+        var membersByKey: [String: [DuplicateFileRow]] = [:]
+        let rows = try Row.fetchCursor(database, sql: memberSQL(for: mode))
+        while let row = try rows.next() {
+            let member = try DuplicateFileRow(row: row)
+            membersByKey[groupKey(mode: mode, fileSize: member.fileSize, keyBytes: row["group_blob"]), default: []].append(member)
         }
-        return bucketed
-            .filter { $0.value.count >= 2 }
-            .map { key, members in
-                DuplicateGroup(
-                    groupKey: key,
-                    mode: mode,
-                    files: members.sorted { $0.path < $1.path }
-                )
-            }
-            // Sort groups by descending size then by groupKey for
-            // a deterministic, "biggest issues first" layout.
+        return membersByKey
+            .map { key, members in DuplicateGroup(groupKey: key, mode: mode, files: members) }
             .sorted { lhs, rhs in
                 if lhs.size != rhs.size {
                     return lhs.size > rhs.size
@@ -87,37 +84,55 @@ public enum DuplicateFinder {
             }
     }
 
-    /// How many files in `files` could in principle participate in
-    /// perceptual matching. Useful for the UI's "X of Y
-    /// fingerprinted" status badge so the user understands a low
-    /// duplicate count might mean fingerprinting is still in
-    /// progress rather than zero duplicates.
-    public static func fingerprintCoverage(in files: [FileRecord]) -> (done: Int, total: Int) {
-        let total = files.count
-        let done = files.reduce(into: 0) { count, file in
-            if file.fingerprintStatus == .done, file.chromaprintFingerprint != nil {
-                count += 1
-            }
-        }
-        return (done: done, total: total)
+    /// How many processable files have a finished fingerprint, for the
+    /// UI's "X of Y fingerprinted" badge: a low perceptual count may
+    /// mean fingerprinting is still in progress, not zero duplicates.
+    public static func fingerprintCoverage(in database: Database) throws -> (done: Int, total: Int) {
+        let row = try Row.fetchOne(database, sql: """
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(files.fingerprint_status = ? AND files.chromaprint_fingerprint IS NOT NULL), 0) AS done
+        FROM files WHERE \(FileProcessingEligibility.processableSQL)
+        """, arguments: [FingerprintStatus.done.rawValue])
+        return (done: row?["done"] ?? 0, total: row?["total"] ?? 0)
     }
 
-    // MARK: - Internals (testable)
-
-    /// Per-mode group key for a single file. Returns nil when the
-    /// file lacks the data needed to participate in the mode.
-    static func groupKey(for file: FileRecord, mode: Mode) -> String? {
+    private static func memberSQL(for mode: Mode) -> String {
+        let keyColumns: String
+        let keyBlobColumn: String
+        let keyCondition: String
         switch mode {
         case .byteLevel:
-            guard let hash = file.lightweightHash else { return nil }
-            // file_size goes in the key so the same hash across
-            // different sizes (effectively impossible but cheap
-            // belt-and-braces) doesn't false-positive.
-            return "\(file.fileSize):\(hash.base64EncodedString())"
+            keyBlobColumn = "files.lightweight_hash"
+            keyColumns = "files.file_size, \(keyBlobColumn)"
+            keyCondition = "\(keyBlobColumn) IS NOT NULL"
         case .perceptual:
-            guard file.fingerprintStatus == .done,
-                  let fingerprint = file.chromaprintFingerprint else { return nil }
-            return fingerprint.base64EncodedString()
+            keyBlobColumn = "files.chromaprint_fingerprint"
+            keyColumns = keyBlobColumn
+            keyCondition = "files.fingerprint_status = '\(FingerprintStatus.done.rawValue)' AND \(keyBlobColumn) IS NOT NULL"
+        }
+        let eligibleSQL = "\(FileProcessingEligibility.processableSQL) AND \(keyCondition)"
+        return """
+        SELECT \(DuplicateFileRow.columnsSQL), \(keyBlobColumn) AS group_blob
+        FROM files
+        WHERE \(eligibleSQL)
+          AND (\(keyColumns)) IN (
+            SELECT \(keyColumns) FROM files WHERE \(eligibleSQL)
+            GROUP BY \(keyColumns) HAVING COUNT(*) > 1
+          )
+        ORDER BY files.path
+        """
+    }
+
+    /// Byte-level keys keep the size alongside the 32-byte hash, as a
+    /// guard against a cross-size hash collision. Perceptual keys
+    /// digest the multi-kilobyte fingerprint so group identifiers stay
+    /// short and stable while fingerprints land.
+    private static func groupKey(mode: Mode, fileSize: Int64, keyBytes: Data) -> String {
+        switch mode {
+        case .byteLevel:
+            "\(fileSize):\(keyBytes.base64EncodedString())"
+        case .perceptual:
+            SHA256.hash(data: keyBytes).map { byte in String(format: "%02x", byte) }.joined()
         }
     }
 }

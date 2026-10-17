@@ -67,7 +67,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         fixture.lifecycle.running = true
         fixture.watchdog.refresh()
         let group = DuplicateFinder.DuplicateGroup(groupKey: "unstarted", mode: .byteLevel, files: [keeper, target])
-        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.pendingCount, 1)
         try save(fixture, paths: [keeper.path])
         fixture.lifecycle.running = false
@@ -92,7 +92,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: broken, withIntermediateDirectories: false)
         let engine = cleanupEngine(fixture)
         let group = DuplicateFinder.DuplicateGroup(groupKey: "failed-readdition", mode: .byteLevel, files: [keeper, target])
-        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.failureCount, 1)
         try FileManager.default.removeItem(at: broken)
         try save(fixture, paths: [keeper.path, target.path])
@@ -234,7 +234,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: fixture.locator.smartCratesDirectoryUrl.appendingPathComponent("broken.scrate"), withIntermediateDirectories: false)
         let engine = cleanupEngine(fixture)
         let group = DuplicateFinder.DuplicateGroup(groupKey: "partial-crates", mode: .byteLevel, files: [keeper, target])
-        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.trashedCount, 0)
         XCTAssertEqual(outcome.failureCount, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
@@ -274,7 +274,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             }
         }
         let group = DuplicateFinder.DuplicateGroup(groupKey: "original", mode: .byteLevel, files: [keeper, target])
-        let pending = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
+        let pending = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(pending.pendingCount, 1)
         try await fixture.database.writer.write { $0.trace(nil) }
         try save(fixture, paths: [keeper.path, target.path])
@@ -291,7 +291,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         let legacy = try await engine.resyncSeratoForBatch("legacy-owner")
         XCTAssertEqual(legacy.supersededCount, 1)
         for keeperID in try [XCTUnwrap(keeper.id), targetID] {
-            let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: keeperID)
+            let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: keeperID)
             XCTAssertEqual(outcome.failureCount, 1)
             XCTAssertEqual(outcome.trashedCount, 0)
         }
@@ -315,7 +315,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             try replacement.write(to: URL(fileURLWithPath: path))
         })
         let group = DuplicateFinder.DuplicateGroup(groupKey: "final-delete", mode: .byteLevel, files: [keeper, target])
-        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.failureCount, 1)
         XCTAssertEqual(outcome.trashedCount, 0)
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: target.path)), replacement)
@@ -457,7 +457,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             let sourceBytes = try Data(contentsOf: URL(fileURLWithPath: target.path))
             let v2Bytes = try Data(contentsOf: fixture.locator.databaseV2Url)
             let eventsBefore = try await fixture.events()
-            let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "stale-cleanup")
+            let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "stale-cleanup")
             XCTAssertEqual(outcome.trashedCount, 0, change)
             XCTAssertEqual(outcome.failureCount, 1, change)
             XCTAssertTrue(outcome.errors.joined().contains("superseded"), "\(change): \(outcome.errors)")
@@ -497,7 +497,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             }
         }
         let group = DuplicateFinder.DuplicateGroup(groupKey: "pending", mode: .byteLevel, files: [keeper, target])
-        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "pending-cleanup")
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "pending-cleanup")
         XCTAssertTrue(fixture.lifecycle.running, "The real mutation boundary must restart Serato")
         XCTAssertEqual(outcome.trashedCount, 0)
         let pendingOwner = try await fixture.database.writer.read { try FileRecord.fetchOne($0, key: target.id) }
