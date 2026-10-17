@@ -14,7 +14,7 @@
 
 - **Invariant #1:** all state changes go through `OperationEngine.applyMutation`/`applyBatch`. SP-2 adds one mutation case; no parallel write path.
 - **Invariant #2:** every mutation writes `payload_json` + `inverse_payload_json`; undo must round-trip.
-- **Invariant #3:** never write Serato library files while Serato is running — route through `OperationEngine` (the watchdog queues Serato-DB writes; file-tag and app-DB writes proceed).
+- **Invariant #3:** never write Serato library files while Serato is running — route through `OperationEngine` (app-DB writes proceed; the watchdog queues Serato-DB writes and audio file-tag writes until Serato quits — #106).
 - **Invariant #4:** track identity is the Chromaprint fingerprint, stored on `tracks`; `files.path` is a label.
 - **No silent failures:** every lookup/apply failure surfaces in the UI (per-row reason chip or panel banner); never `log + continue`.
 - **Secrets:** the AcoustID API key lives in the macOS Keychain only — never in SQLite, the event log, or logs.

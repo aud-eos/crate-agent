@@ -348,9 +348,9 @@ One row per track:
 
 "Confirm all strong matches", select-all/none, and **Apply** → a single
 `applyBatch` of `applyMusicBrainzMatch` mutations for confirmed rows under one
-`batchId`. `SeratoRunningBanner` shows when the Serato-DB portion will queue
-(file-tag writes still proceed; artist/title/album Serato-DB updates defer, per
-Invariant #3).
+`batchId`. `SeratoRunningBanner` shows when external writes will queue (audio file-tag
+writes and artist/title/album Serato-DB updates both defer until Serato quits,
+per Invariant #3 and #106).
 
 ### Out of scope for the v1 panel (YAGNI)
 
@@ -446,8 +446,9 @@ Every failure surfaces in the UI; never a `log + continue`.
 
 ## Edge cases
 
-- **Serato running:** file-tag + `tracks`/`files` DB writes proceed; the
-  artist/title/album Serato-DB portion queues via the watchdog (Invariant #3).
+- **Serato running:** `tracks`/`files` DB writes proceed; audio file-tag writes
+  and the artist/title/album Serato-DB portion queue via the watchdog
+  (Invariant #3, #106).
 - **Track already matched** (has an MBID): re-matching is allowed and overwrites,
   as a normal undoable mutation; the diff shows against current.
 - **File with no stored fingerprint:** routed through `FingerprintWorker` first;
@@ -489,8 +490,8 @@ Every failure surfaces in the UI; never a `log + continue`.
   tags, `files` metadata, `files.track_id`, and Serato snapshot are byte-for-byte
   back to prior state — for both the new-track-row and pre-existing-track-row
   cases, and with partial (cherry-picked) field sets.
-- **Serato gating** (Invariant #3): with Serato "running", the Serato-DB write
-  queues while file-tag/DB writes proceed; drains on "quit".
+- **Serato gating** (Invariant #3): with Serato "running", the Serato-DB and
+  file-tag writes queue while app-DB writes proceed; drains on "quit".
 - `applyBatch` of N confirms = one `batchId` = one Undo unit.
 
 ### No end-to-end network test in CI

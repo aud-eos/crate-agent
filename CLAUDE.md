@@ -36,7 +36,7 @@ How to apply: when writing a new mutation, the inverse computation is part of th
 
 ### 3. Serato library files are never written while Serato is running
 
-`SeratoWatchdog` observes Serato's running state. When Serato is running, writes to Serato's library files MUST queue, not proceed. Filesystem-level operations (moving files) can still proceed; only the Serato library update is deferred.
+`SeratoWatchdog` observes Serato's running state. When Serato is running, writes to Serato's library files MUST queue, not proceed. Filesystem-level operations (moving files) can still proceed. Serato library updates **and audio file-tag writes** are deferred: Serato keeps its own copy of each track's tags and writes its analysis, cues, and edited fields back into the audio files, so a tag written while it runs can be silently reverted (#106; asserted by `testWriteFileTagsQueuesWhileSeratoIsRunning`).
 
 **The full set of Serato library files this rule applies to** — any new mutation that touches Serato MUST round-trip every file in this list, not just the first one or two. (`SeratoLibraryLocator.enumerateCrateFiles` already enumerates the crate-shaped ones together.)
 
