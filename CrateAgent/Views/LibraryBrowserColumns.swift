@@ -5,6 +5,7 @@ struct LibraryFamilyControls {
     let state: (Int64) -> LibraryFamilyState?
     let setExpanded: (Bool, Int64) -> Void
     let setAlternatesSelected: (Bool, Int64) -> Void
+    let setHiddenSelected: (Bool, Int64) -> Void
 }
 
 enum LibraryBrowserColumns {
@@ -32,7 +33,7 @@ enum LibraryBrowserColumns {
                                                  guard let cell = view as? LibraryFamilyDisclosureCell else { preconditionFailure("Unexpected versions cell") }
                                                  cell.update(row: row, controls: controls, density: density)
                                              }, sortable: false),
-                PagedTableColumn<BrowserRow>(identifier: alternatesIdentifier, title: LibraryFamilyMessages.includeAlternates, width: 150,
+                PagedTableColumn<BrowserRow>(identifier: alternatesIdentifier, title: LibraryFamilyMessages.includeAlternates, width: 260,
                                              makeCell: { LibraryFamilyInclusionCell() }, updateCell: { view, row in
                                                  guard let cell = view as? LibraryFamilyInclusionCell else { preconditionFailure("Unexpected alternates cell") }
                                                  cell.update(row: row, controls: controls, density: density)
@@ -186,7 +187,8 @@ private final class LibraryFamilyDisclosureCell: NSTableCellView {
             summary.stringValue = LibraryFamilyMessages.alternate
         case .main:
             let state = controls.state(familyID)
-            summary.stringValue = LibraryFamilyMessages.versions(row.familyVersions ?? 1, selected: state?.selectedCount ?? 0)
+            summary.stringValue = state?.summary(versions: row.familyVersions ?? 1)
+                ?? LibraryFamilyMessages.versions(row.familyVersions ?? 1, selected: 0, of: 0, hidden: 0, selectedHidden: 0)
             summary.toolTip = LibraryFamilyMessages.versionsHelp
             summary.textColor = .labelColor
             guard let state, state.alternateCount > 0 || state.isRevealedBySearch else { return }
@@ -207,11 +209,15 @@ private final class LibraryFamilyDisclosureCell: NSTableCellView {
     }
 }
 
-/// The per-family Include alternates checkbox, mixed when some eligible alternates are selected.
+/// The per-family Include alternates checkbox, mixed when some eligible
+/// alternates are selected, and the text button that extends a selection to
+/// the members a search hides.
 private final class LibraryFamilyInclusionCell: NSTableCellView {
     private let checkbox = NSButton(checkboxWithTitle: LibraryFamilyMessages.includeAlternates, target: nil, action: nil)
+    private let hiddenButton = NSButton(title: "", target: nil, action: nil)
     private var familyID: Int64?
     private var coverage = BatchSelection.Coverage.none
+    private var selectsHidden = true
     private var controls: LibraryFamilyControls?
 
     init() {
@@ -220,7 +226,12 @@ private final class LibraryFamilyInclusionCell: NSTableCellView {
         checkbox.target = self
         checkbox.action = #selector(toggleAlternates)
         checkbox.toolTip = LibraryFamilyMessages.familyIncludeAlternatesHelp
+        hiddenButton.bezelStyle = .inline
+        hiddenButton.target = self
+        hiddenButton.action = #selector(toggleHidden)
+        hiddenButton.toolTip = LibraryFamilyMessages.hiddenSelectionHelp
         addSubview(checkbox)
+        addSubview(hiddenButton)
     }
 
     @available(*, unavailable)
@@ -230,31 +241,53 @@ private final class LibraryFamilyInclusionCell: NSTableCellView {
 
     override func layout() {
         super.layout()
-        checkbox.frame = bounds.insetBy(dx: 4, dy: 1)
+        let content = bounds.insetBy(dx: 4, dy: 1)
+        let buttonWidth = hiddenButton.isHidden ? 0 : min(content.width / 2, hiddenButton.intrinsicContentSize.width)
+        hiddenButton.frame = NSRect(x: content.maxX - buttonWidth, y: content.midY - 9, width: buttonWidth, height: 18)
+        checkbox.frame = NSRect(x: content.minX, y: content.minY, width: max(0, content.width - buttonWidth - 4), height: content.height)
     }
 
     func update(row: BrowserRow?, controls: LibraryFamilyControls, density: AppDensity) {
         self.controls = controls
+        needsLayout = true
         checkbox.font = .systemFont(ofSize: density == .compact ? 11 : 13)
-        guard let row, row.familyRole == .main, let familyID = row.familyId, let state = controls.state(familyID), state.alternateCount > 0 else {
+        hiddenButton.font = checkbox.font
+        guard let row, row.familyRole == .main, let familyID = row.familyId, let state = controls.state(familyID),
+              state.alternateCount > 0 || state.hiddenSelection != nil
+        else {
             checkbox.isHidden = true
+            hiddenButton.isHidden = true
             familyID = nil
             return
         }
         self.familyID = familyID
+        let title = row.title ?? row.filenameOnly
+        if let hidden = state.hiddenSelection {
+            hiddenButton.isHidden = false
+            hiddenButton.title = hidden.label
+            hiddenButton.setAccessibilityLabel(LibraryFamilyMessages.hiddenSelectionAccessibility(hidden.label, title: title))
+            selectsHidden = hidden.selects
+        } else {
+            hiddenButton.isHidden = true
+        }
         coverage = state.alternatesCoverage
-        checkbox.isHidden = false
+        checkbox.isHidden = state.alternateCount == 0
         checkbox.isEnabled = !state.eligibleAlternates.isEmpty
         checkbox.state = switch coverage {
         case .none: .off
         case .partial: .mixed
         case .all: .on
         }
-        checkbox.setAccessibilityLabel("\(LibraryFamilyMessages.includeAlternates) for \(row.title ?? row.filenameOnly)")
+        checkbox.setAccessibilityLabel("\(LibraryFamilyMessages.includeAlternates) for \(title)")
     }
 
     @objc private func toggleAlternates() {
         guard let familyID else { return }
         controls?.setAlternatesSelected(coverage != .all, familyID)
+    }
+
+    @objc private func toggleHidden() {
+        guard let familyID else { return }
+        controls?.setHiddenSelected(selectsHidden, familyID)
     }
 }

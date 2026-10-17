@@ -212,6 +212,38 @@ final class SongFamilyTests: XCTestCase {
         XCTAssertEqual(missing?.savedRepresentativeTrackId, remix)
     }
 
+    func testRecordingsSharingAMusicBrainzRecordingAreOneVersion() async throws {
+        let recording = UUID().uuidString
+        let flac = try await addTrack(title: "Song", musicBrainzMatched: true, recordingMBID: recording)
+        let instrumental = try await addTrack(title: "Song (Instrumental)", musicBrainzMatched: false)
+        let mp3 = try await addTrack(title: "Song", musicBrainzMatched: true, recordingMBID: recording)
+        let created = try await service.create([.track(flac), .track(instrumental), .track(mp3)])
+        let familyID = try XCTUnwrap(created.familyId)
+        let family = try await service.family(id: familyID)
+        XCTAssertEqual(family?.versionCount, 2)
+        XCTAssertEqual(family?.members.map(\.trackId), [flac, mp3, instrumental])
+
+        _ = try await service.detach([instrumental], from: familyID)
+        let oneVersion = try await service.family(id: familyID)
+        XCTAssertNil(oneVersion)
+    }
+
+    func testAutomaticMainVersionTiersAMainLabelThenABareTitleThenADirtyOnlyEditAboveAMusicBrainzMatch() async throws {
+        let remix = try await addTrack(title: "Song (Remix)", musicBrainzMatched: true)
+        let dirty = try await addTrack(title: "Song (Dirty)", musicBrainzMatched: false)
+        let plain = try await addTrack(title: "Song", musicBrainzMatched: false)
+        let album = try await addTrack(title: "Song (Album Version)", musicBrainzMatched: false)
+        let created = try await service.create([.track(remix), .track(dirty), .track(plain), .track(album)])
+        let familyID = try XCTUnwrap(created.familyId)
+        var chosen: [Int64?] = []
+        for detached in [album, plain] {
+            try await chosen.append(service.family(id: familyID)?.representativeTrackId)
+            _ = try await service.detach([detached], from: familyID)
+        }
+        try await chosen.append(service.family(id: familyID)?.representativeTrackId)
+        XCTAssertEqual(chosen, [album, plain, dirty])
+    }
+
     func testARecordingLeftAloneInItsFamilyCanBeRegroupedAndUndoRestoresThatFamily() async throws {
         let tracks = try await addTracks(count: 3)
         let first = try await service.create([.track(tracks[0]), .track(tracks[1])])
@@ -303,11 +335,14 @@ final class SongFamilyTests: XCTestCase {
         return tracks
     }
 
-    private func addTrack(title: String, musicBrainzMatched: Bool, fingerprintHash: Data? = nil, withFile: Bool = true) async throws -> Int64 {
+    private func addTrack(title: String, musicBrainzMatched: Bool, recordingMBID: String? = nil, fingerprintHash: Data? = nil,
+                          withFile: Bool = true) async throws -> Int64
+    {
         nextFingerprint += 1
         let hash = fingerprintHash ?? Data("track-\(nextFingerprint)".utf8)
+        let mbid = recordingMBID ?? (musicBrainzMatched ? UUID().uuidString : nil)
         let trackID = try await database.writer.write { connection in
-            var track = TrackRecord(fingerprintHash: hash, musicbrainzRecordingId: musicBrainzMatched ? UUID().uuidString : nil, title: title)
+            var track = TrackRecord(fingerprintHash: hash, musicbrainzRecordingId: mbid, title: title)
             try track.insert(connection)
             return try XCTUnwrap(track.id)
         }

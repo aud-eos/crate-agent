@@ -50,7 +50,8 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
         return try reader.read { database in try signature.index(of: id, in: database) }
     }
 
-    /// Every counted file, including alternates of collapsed families, so hidden selections stay in scope.
+    /// Every counted file, including alternates of collapsed families and
+    /// shown families' members a search hides, so those selections stay in scope.
     func identities(after id: Int64?, limit: Int) throws -> [PagedIdentity<Int64>] {
         try slice(placements(), after: id, limit: limit)
     }
@@ -60,7 +61,7 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
         if cachedSelectAll == nil {
             let includeAlternates = signature.includeAlternates
             cachedSelectAll = try placements().filter { placement in
-                placement.role != .alternate || (includeAlternates && placement.isEligible)
+                !placement.isHiddenBySearch && (placement.role != .alternate || (includeAlternates && placement.isEligible))
             }
         }
         return try slice(cachedSelectAll ?? [], after: id, limit: limit)

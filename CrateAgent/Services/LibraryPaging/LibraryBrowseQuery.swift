@@ -107,7 +107,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
             SELECT \(BrowserRow.browserColumnsSQL), heads.family_id, files.track_id AS recording_id, \(familyColumns),
                    COALESCE(heads.head_id, files.id) AS group_id,
                    CASE WHEN heads.head_id IS NULL THEN 0 WHEN heads.head_id = files.id THEN 1 ELSE 2 END AS family_role,
-                   families.versions AS family_versions,
+                   families.versions AS family_versions, COALESCE(families.matched, 0) AS family_matched,
                    CASE WHEN heads.head_id = files.id THEN families.matched ELSE (\(matches)) END AS in_scope,
                    COALESCE(heads.head_key, \(sortKey)) AS group_key, \(sortKey) AS sort_key
             FROM files LEFT JOIN tracks ON tracks.id = files.track_id LEFT JOIN works ON works.id = tracks.work_id
@@ -179,25 +179,30 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         return try GRDB.Row.fetchAll(database, sql: """
         \(placedSQL)
         SELECT family_files.id, family_files.membership_revision, family_files.family_id, family_files.available,
-               family_files.id = heads.head_id AS is_head
+               family_files.id = heads.head_id AS is_head, family_files.matches
         FROM family_files JOIN heads ON heads.family_id = family_files.family_id JOIN families ON families.family_id = family_files.family_id
         WHERE family_files.family_id IN (SELECT value FROM json_each(:families))
-          AND CASE WHEN family_files.id = heads.head_id THEN families.matched ELSE family_files.matches END
+          AND families.matched
         ORDER BY family_files.id
         """, arguments: lookup).map { row in
             LibraryFamilyPlacement(identity: .init(id: row["id"], revision: row["membership_revision"]), familyId: row["family_id"],
-                                   role: row["is_head"] ? .main : .alternate, isEligible: row["available"])
+                                   role: row["is_head"] ? .main : .alternate, isEligible: row["available"],
+                                   isHiddenBySearch: !(row["is_head"] as Bool) && !(row["matches"] as Bool))
         }
     }
 
-    /// Every counted file's family placement, in id order.
+    /// Every counted file's family placement, in id order, with the members
+    /// of shown families that the search hides, so a selection of them stays
+    /// in scope for family commands.
     func placements(in database: GRDB.Database) throws -> [LibraryFamilyPlacement] {
         try GRDB.Row.fetchAll(database, sql: """
         \(placedSQL)
-        SELECT id, membership_revision, family_id, family_role, available FROM placed WHERE in_scope ORDER BY id
+        SELECT id, membership_revision, family_id, family_role, available, NOT in_scope AS hidden_by_search FROM placed
+        WHERE in_scope OR (family_role = \(LibraryFamilyRole.alternate.rawValue) AND family_matched) ORDER BY id
         """, arguments: arguments).map { row in
             try LibraryFamilyPlacement(identity: .init(id: row["id"], revision: row["membership_revision"]), familyId: row["family_id"],
-                                       role: LibraryFamilyRole.decode(row["family_role"]), isEligible: row["available"])
+                                       role: LibraryFamilyRole.decode(row["family_role"]), isEligible: row["available"],
+                                       isHiddenBySearch: row["hidden_by_search"])
         }
     }
 }
@@ -217,4 +222,7 @@ struct LibraryFamilyPlacement: Equatable, Sendable {
     let role: LibraryFamilyRole
     /// Processable now. Only eligible alternates join a selection through a family control or Select all.
     let isEligible: Bool
+    /// A member of a shown family that the search doesn't match. Only "Also
+    /// select N hidden" selects it, never the checkbox or Select all.
+    let isHiddenBySearch: Bool
 }

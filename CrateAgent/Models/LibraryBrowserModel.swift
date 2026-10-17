@@ -164,6 +164,12 @@ final class LibraryBrowserModel: ObservableObject {
         selection.set(state.eligibleAlternates, selected: selected)
     }
 
+    /// Selects or deselects the processable members of the family that the search hides.
+    func setHiddenMembersSelected(_ selected: Bool, family familyID: Int64) {
+        guard let state = familyStates[familyID] else { return }
+        selection.set(state.hiddenEligible, selected: selected)
+    }
+
     func start() async {
         guard !active else { return }
         active = true

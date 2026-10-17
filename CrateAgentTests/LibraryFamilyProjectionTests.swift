@@ -123,6 +123,44 @@ final class LibraryFamilyProjectionTests: XCTestCase {
     }
 
     @MainActor
+    func testASearchHidesFamilyMembersFromTheCheckboxUntilTheUserAlsoSelectsThemAndCommandsThenIncludeThem() async throws {
+        let dub = try await pool.write { connection in
+            var track = TrackRecord(fingerprintHash: Data("Song (Dub)".utf8), title: "Song (Dub)", workId: self.familyID)
+            try track.insert(connection)
+            var file = FileRecord(path: "/Music/Song (Dub).mp3", volumeUuid: "volume", inode: 99, fileSize: 1, mtime: 1, trackId: track.id,
+                                  artist: "Zed", title: "Song (Dub)")
+            file.libraryMembership = .active
+            file.fileAvailability = .available
+            try file.insert(connection)
+            return try XCTUnwrap(file.id)
+        }
+        let model = try LibraryBrowserModel(database: database)
+        defer { model.stop() }
+        await model.start()
+        var searching = model.query
+        searching.search = "Instrumental"
+        model.setQuery(searching)
+        await pagingEventually { model.results.totalCount == 2 && model.familyStates[self.familyID] != nil }
+        let snapshot = try XCTUnwrap(model.results.snapshot)
+        let mainRow = try XCTUnwrap(model.results.cachedRows.first { row in row.id == main })
+
+        model.setAlternatesSelected(true, family: familyID)
+        model.selection.set([snapshot.identity(for: mainRow)], selected: true)
+        await pagingEventually { model.familyStates[self.familyID]?.selectedCount == 2 && !model.selection.isBusy }
+        let visibleOnly = try XCTUnwrap(model.familyStates[familyID])
+        XCTAssertEqual(visibleOnly.selectedHiddenCount, 0)
+        XCTAssertEqual(visibleOnly.hiddenSelection?.selects, true)
+        let visibleTarget = try await model.familyActionTarget(for: mainRow)
+        XCTAssertEqual(Set(visibleTarget.files.map(\.id)), [main, instrumental])
+
+        model.setHiddenMembersSelected(true, family: familyID)
+        await pagingEventually { model.familyStates[self.familyID]?.selectedHiddenCount == 1 && !model.selection.isBusy }
+        XCTAssertEqual(model.familyStates[familyID]?.hiddenSelection?.selects, false)
+        let withHidden = try await model.familyActionTarget(for: mainRow)
+        XCTAssertEqual(Set(withHidden.files.map(\.id)), [main, instrumental, dub])
+    }
+
+    @MainActor
     func testAFileThatChangedAfterItWasShownRefusesTheFamilyCommand() async throws {
         let engine = OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
                                      seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))

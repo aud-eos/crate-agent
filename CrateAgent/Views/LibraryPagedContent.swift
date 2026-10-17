@@ -107,7 +107,8 @@ struct LibraryPagedContent: View {
     private var familyControls: LibraryFamilyControls {
         LibraryFamilyControls(state: { familyID in model.familyStates[familyID] },
                               setExpanded: { expanded, familyID in model.setExpanded(expanded, family: familyID) },
-                              setAlternatesSelected: { selected, familyID in model.setAlternatesSelected(selected, family: familyID) })
+                              setAlternatesSelected: { selected, familyID in model.setAlternatesSelected(selected, family: familyID) },
+                              setHiddenSelected: { selected, familyID in model.setHiddenMembersSelected(selected, family: familyID) })
     }
 
     private func menu(for identifier: Int64) -> NSMenu? {
@@ -142,6 +143,11 @@ struct LibraryPagedContent: View {
                 let item = LibraryActionMenuItem(title: selectsAll ? LibraryFamilyMessages.selectAlternates : LibraryFamilyMessages.deselectAlternates) {
                     model.setAlternatesSelected(selectsAll, family: familyID)
                 }
+                item.isEnabled = !model.selection.isBusy
+                menu.addItem(item)
+            }
+            if let hidden = state.hiddenSelection {
+                let item = LibraryActionMenuItem(title: hidden.label) { model.setHiddenMembersSelected(hidden.selects, family: familyID) }
                 item.isEnabled = !model.selection.isBusy
                 menu.addItem(item)
             }
