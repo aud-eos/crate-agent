@@ -92,6 +92,9 @@ public final class AppServices: ObservableObject {
     private var retryTask: Task<Void, Never>?
     let readiness: LibrarySyncReadiness
     private var filesystemDeliveryStopped = false
+    private var fingerprintMilestones = FingerprintActivityMilestones()
+    private var scanMilestones = ScanActivityMilestones()
+    private var scanActivitySubscription: AnyCancellable?
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -244,6 +247,10 @@ public final class AppServices: ObservableObject {
         session.$state.assign(to: &$syncState)
         session.$initialSyncComplete.assign(to: &$initialScanComplete)
         session.$scanProgress.assign(to: &$scanProgress)
+        scanActivitySubscription = session.$scanProgress.sink { [weak self] progress in
+            guard let self else { return }
+            logActivity(scanMilestones.entries(for: progress), category: .scan)
+        }
         session.$phase.assign(to: &$syncPhase)
         session.$fileInfoFailures.assign(to: &$syncFileInfoFailures)
 
@@ -308,12 +315,17 @@ public final class AppServices: ObservableObject {
             guard let self else { return }
             await worker.start { progress in
                 Task { @MainActor [weak self] in
-                    self?.fingerprintProgress = progress
-                    if let error = progress.error {
-                        self?.activityLog.log(error, category: .fingerprint)
-                    }
+                    guard let self else { return }
+                    fingerprintProgress = progress
+                    logActivity(fingerprintMilestones.entries(for: progress), category: .fingerprint)
                 }
             }
+        }
+    }
+
+    private func logActivity(_ entries: [String], category: ActivityLog.Category) {
+        for entry in entries {
+            activityLog.log(entry, category: category)
         }
     }
 }
