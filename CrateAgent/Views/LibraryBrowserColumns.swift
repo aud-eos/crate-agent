@@ -173,6 +173,7 @@ private final class LibraryFamilyDisclosureCell: NSTableCellView {
         summary.font = .systemFont(ofSize: density == .compact ? 11 : 13)
         summary.textColor = .secondaryLabelColor
         toggle.isHidden = true
+        summary.toolTip = nil
         familyID = nil
         guard let row, let familyID = row.familyId, let role = row.familyRole else {
             summary.stringValue = ""
@@ -186,15 +187,17 @@ private final class LibraryFamilyDisclosureCell: NSTableCellView {
         case .main:
             let state = controls.state(familyID)
             summary.stringValue = LibraryFamilyMessages.versions(row.familyVersions ?? 1, selected: state?.selectedCount ?? 0)
+            summary.toolTip = LibraryFamilyMessages.versionsHelp
             summary.textColor = .labelColor
-            guard let state, state.alternateCount > 0 else { return }
+            guard let state, state.alternateCount > 0 || state.isRevealedBySearch else { return }
             self.familyID = familyID
             expanded = state.isExpanded
             toggle.isHidden = false
-            toggle.title = LibraryFamilyMessages.disclosure(expanded: expanded, alternates: state.alternateCount)
-            toggle.setAccessibilityLabel(LibraryFamilyMessages.disclosureAccessibility(expanded: expanded, alternates: state.alternateCount,
-                                                                                       title: row.title ?? row.filenameOnly))
-            toggle.setAccessibilityExpanded(expanded)
+            toggle.isEnabled = !state.isRevealedBySearch
+            toggle.title = state.disclosureLabel
+            toggle.toolTip = state.isRevealedBySearch ? LibraryFamilyMessages.searchRevealHelp : LibraryFamilyMessages.versionsHelp
+            toggle.setAccessibilityLabel(LibraryFamilyMessages.disclosureAccessibility(state.disclosureLabel, title: row.title ?? row.filenameOnly))
+            toggle.setAccessibilityExpanded(state.isShowingAlternates)
         }
     }
 

@@ -59,33 +59,35 @@ public struct SongFamilyService: Sendable {
     /// `SongFamilyError.memberAlreadyInFamily` instead of reassigning a member
     /// (offer `merge`), and `fingerprintCollision` instead of sharing a
     /// recording another file or MusicBrainz already claims.
-    public func create(_ members: [SongFamilyMember], representative: SongFamilyMember? = nil) async throws -> SongFamilyResult {
-        try await apply(.create(members: members, representative: representative), linking: members, familyId: nil)
+    public func create(_ members: [SongFamilyMember], representative: SongFamilyMember? = nil,
+                       authority: [FileMembershipToken] = []) async throws -> SongFamilyResult
+    {
+        try await apply(.create(members: members, representative: representative), linking: members, familyId: nil, authority: authority)
     }
 
     /// Adds recordings; ones already in this family are left as they are.
-    public func attach(_ members: [SongFamilyMember], to familyId: Int64) async throws -> SongFamilyResult {
-        try await apply(.attach(familyId: familyId, members: members), linking: members, familyId: familyId)
+    public func attach(_ members: [SongFamilyMember], to familyId: Int64, authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
+        try await apply(.attach(familyId: familyId, members: members), linking: members, familyId: familyId, authority: authority)
     }
 
     /// Removing members that leaves fewer than two recordings dissolves the family.
-    public func detach(_ trackIds: [Int64], from familyId: Int64) async throws -> SongFamilyResult {
-        try await apply(.detach(familyId: familyId, trackIds: trackIds), familyId: familyId)
+    public func detach(_ trackIds: [Int64], from familyId: Int64, authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
+        try await apply(.detach(familyId: familyId, trackIds: trackIds), familyId: familyId, authority: authority)
     }
 
     /// Moves every member of `familyIds` into `familyId`, keeping its main version.
-    public func merge(_ familyIds: [Int64], into familyId: Int64) async throws -> SongFamilyResult {
-        try await apply(.merge(familyId: familyId, mergedFamilyIds: familyIds), familyId: familyId)
+    public func merge(_ familyIds: [Int64], into familyId: Int64, authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
+        try await apply(.merge(familyId: familyId, mergedFamilyIds: familyIds), familyId: familyId, authority: authority)
     }
 
     /// Moves at least two members into a new family; the result names the new family.
-    public func split(_ trackIds: [Int64], from familyId: Int64) async throws -> SongFamilyResult {
-        try await apply(.split(familyId: familyId, trackIds: trackIds), familyId: nil)
+    public func split(_ trackIds: [Int64], from familyId: Int64, authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
+        try await apply(.split(familyId: familyId, trackIds: trackIds), familyId: nil, authority: authority)
     }
 
     /// Saves a manual main version, or clears it with nil to use the automatic choice.
-    public func setRepresentative(_ trackId: Int64?, of familyId: Int64) async throws -> SongFamilyResult {
-        try await apply(.setRepresentative(familyId: familyId, trackId: trackId), familyId: familyId)
+    public func setRepresentative(_ trackId: Int64?, of familyId: Int64, authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
+        try await apply(.setRepresentative(familyId: familyId, trackId: trackId), familyId: familyId, authority: authority)
     }
 
     public func family(id: Int64) async throws -> SongFamily? {
@@ -112,14 +114,18 @@ public struct SongFamilyService: Sendable {
     }
 
     /// Runs the file links and the membership change as one batch, so one
-    /// undo reverses both and a refused change leaves no link behind.
-    private func apply(_ operation: SongFamilyOperation, linking members: [SongFamilyMember] = [], familyId: Int64?) async throws -> SongFamilyResult {
+    /// undo reverses both and a refused change leaves no link behind. Every
+    /// `authority` token must still be current inside that transaction.
+    private func apply(_ operation: SongFamilyOperation, linking members: [SongFamilyMember] = [], familyId: Int64?,
+                       authority: [FileMembershipToken]) async throws -> SongFamilyResult
+    {
         let batchID = UUID().uuidString
         let links = members.compactMap { member -> TrackMutation? in
             guard case let .file(fileID) = member else { return nil }
             return .songFamily(.linkRecording(fileId: fileID))
         }
-        _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID)
+        let tokens = Dictionary(authority.map { token in (token.fileId, token) }) { first, _ in first }
+        _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID, expectedMembershipTokens: tokens)
         let change = try await database.writer.read { database in
             try EventRecord.filter(Column("batch_id") == batchID && Column("event_type") == operation.eventType.rawValue).fetchOne(database)
                 .map { event in try JSONDecoder().decode(SongFamilyChange.self, from: Data(event.payloadJson.utf8)) }

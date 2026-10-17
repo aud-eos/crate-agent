@@ -7,14 +7,20 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
     private let reader: DatabaseSnapshot
     private let total: Int
     private let selectAllTotal: Int
+    /// Whether any family main row is in scope; Library hides the family columns otherwise.
+    nonisolated let hasFamilies: Bool
     /// Loaded once per snapshot so selection scopes and family counts don't re-run the projection per batch.
     private var cachedPlacements: [LibraryFamilyPlacement]?
+    private var cachedSelectAll: [LibraryFamilyPlacement]?
+    /// The snapshot never changes, so each family's members are read at most once.
+    private var cachedFamilyMembers: [Int64: [LibraryFamilyPlacement]] = [:]
 
-    private init(reader: DatabaseSnapshot, query: LibraryBrowseQuery, total: Int, selectAllTotal: Int) {
+    private init(reader: DatabaseSnapshot, query: LibraryBrowseQuery, total: Int, selectAllTotal: Int, hasFamilies: Bool) {
         self.reader = reader
         signature = query
         self.total = total
         self.selectAllTotal = selectAllTotal
+        self.hasFamilies = hasFamilies
     }
 
     static func open(pool: DatabasePool, query: LibraryBrowseQuery) async throws -> LibraryPagedSnapshot {
@@ -22,7 +28,7 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
         let reader = try pool.makeSnapshot()
         let counts = try reader.read { database in try query.counts(in: database) }
         try Task.checkCancellation()
-        return LibraryPagedSnapshot(reader: reader, query: query, total: counts.visible, selectAllTotal: counts.selectAll)
+        return LibraryPagedSnapshot(reader: reader, query: query, total: counts.visible, selectAllTotal: counts.selectAll, hasFamilies: counts.hasFamilies)
     }
 
     func count() -> Int {
@@ -51,22 +57,30 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
 
     /// The files Select all selects: main and standalone rows, plus eligible alternates when the query includes them.
     func selectAllIdentities(after id: Int64?, limit: Int) throws -> [PagedIdentity<Int64>] {
-        let includeAlternates = signature.includeAlternates
-        return try slice(placements().filter { placement in
-            placement.role != .alternate || (includeAlternates && placement.isEligible)
-        }, after: id, limit: limit)
+        if cachedSelectAll == nil {
+            let includeAlternates = signature.includeAlternates
+            cachedSelectAll = try placements().filter { placement in
+                placement.role != .alternate || (includeAlternates && placement.isEligible)
+            }
+        }
+        return try slice(cachedSelectAll ?? [], after: id, limit: limit)
     }
 
     func familyMembers(_ familyIds: Set<Int64>) throws -> [Int64: [LibraryFamilyPlacement]] {
-        guard !familyIds.isEmpty else { return [:] }
-        try Task.checkCancellation()
-        var members: [Int64: [LibraryFamilyPlacement]] = [:]
-        for placement in try reader.read({ database in try signature.familyPlacements(familyIds, in: database) }) {
-            if let familyID = placement.familyId, familyIds.contains(familyID) {
-                members[familyID, default: []].append(placement)
+        let missing = familyIds.subtracting(cachedFamilyMembers.keys)
+        if !missing.isEmpty {
+            try Task.checkCancellation()
+            let loaded = try reader.read { database in try signature.familyPlacements(missing, in: database) }
+            for familyID in missing {
+                cachedFamilyMembers[familyID] = []
+            }
+            for placement in loaded {
+                if let familyID = placement.familyId, missing.contains(familyID) {
+                    cachedFamilyMembers[familyID, default: []].append(placement)
+                }
             }
         }
-        return members
+        return cachedFamilyMembers.filter { familyID, _ in familyIds.contains(familyID) }
     }
 
     func identities(in range: Range<Int>) throws -> [PagedIdentity<Int64>] {

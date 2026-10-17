@@ -16,6 +16,7 @@ final class LibraryBrowserModel: ObservableObject {
     private let selectionStore: LibrarySelectionStore
     private var familyMembers: [Int64: [LibraryFamilyPlacement]] = [:]
     private var familyTask: Task<Void, Never>?
+    private var loadedFamilies: (snapshot: LibraryPagedSnapshot, familyIDs: Set<Int64>)?
     private let database: LibraryDatabase
     private let pool: DatabasePool
     private var observation: AnyDatabaseCancellable?
@@ -58,6 +59,10 @@ final class LibraryBrowserModel: ObservableObject {
     private func loadFamilyMembers() {
         guard let snapshot = results.snapshot else { return }
         let familyIDs = Set(results.cachedRows.compactMap { row in row.familyRole == .main ? row.familyId : nil })
+        if let loadedFamilies, loadedFamilies.snapshot === snapshot, loadedFamilies.familyIDs == familyIDs {
+            return
+        }
+        loadedFamilies = (snapshot, familyIDs)
         familyTask?.cancel()
         familyTask = Task { [weak self] in
             do {
@@ -69,6 +74,7 @@ final class LibraryBrowserModel: ObservableObject {
             } catch is CancellationError {
             } catch {
                 guard let self, !Task.isCancelled else { return }
+                loadedFamilies = nil
                 self.error = error.localizedDescription
             }
         }
@@ -77,7 +83,8 @@ final class LibraryBrowserModel: ObservableObject {
     private func updateFamilyStates(selected: Set<Int64>) {
         var states: [Int64: LibraryFamilyState] = [:]
         for (familyID, members) in familyMembers {
-            states[familyID] = LibraryFamilyState(members: members, selected: selected, isExpanded: query.expandedFamilies.contains(familyID))
+            states[familyID] = LibraryFamilyState(members: members, selected: selected, isExpanded: query.expandedFamilies.contains(familyID),
+                                                  isSearching: query.isSearching)
         }
         guard states != familyStates else { return }
         familyStates = states
@@ -95,6 +102,56 @@ final class LibraryBrowserModel: ObservableObject {
         updateFamilyStates(selected: selection.visibleSelectedIDs)
     }
 
+    /// Right and Left Arrow on a row: expands or collapses a main row, and Left on an
+    /// alternate collapses its family onto the main row. Returns false when nothing
+    /// changes, so the key keeps its usual meaning.
+    func disclose(_ expand: Bool, row rowID: Int64) -> Bool {
+        guard !query.isSearching, let row = results.cachedRows.first(where: { row in row.id == rowID }),
+              let familyID = row.familyId, let state = familyStates[familyID]
+        else { return false }
+        switch row.familyRole {
+        case .main:
+            guard state.alternateCount > 0, state.isExpanded != expand else { return false }
+        case .alternate:
+            guard !expand, let mainID = state.mainID else { return false }
+            focusedID = mainID
+        case .standalone, nil:
+            return false
+        }
+        setExpanded(expand, family: familyID)
+        return true
+    }
+
+    /// Whether Library shows the family columns: only when a family is in view.
+    var showsFamilies: Bool {
+        results.snapshot?.hasFamilies == true
+    }
+
+    /// How many files a family command on `row` acts on.
+    func familyTargetCount(for row: BrowserRow) -> Int {
+        selection.visibleSelectedIDs.contains(row.id) ? selection.summary?.inScope ?? 1 : 1
+    }
+
+    /// The clicked row alone, or the selection when the row is selected. Selected
+    /// files the view no longer shows, or that changed since they were selected,
+    /// are left out.
+    func familyActionTarget(for row: BrowserRow) async throws -> LibraryFamilyActionTarget {
+        guard let snapshot = results.snapshot else { throw PagingError.unavailableDatabase }
+        guard selection.visibleSelectedIDs.contains(row.id) else {
+            return LibraryFamilyActionTarget(clicked: row, files: [snapshot.identity(for: row)])
+        }
+        let files = try await selectionStore.selectedIdentities(in: snapshot, limit: LibraryFamilyMessages.selectionLimit)
+        return LibraryFamilyActionTarget(clicked: row, files: files)
+    }
+
+    func performFamilyAction(_ action: LibraryFamilyAction, on row: BrowserRow, using actions: LibraryFamilyActions) async {
+        do {
+            try await actions.perform(action, on: familyActionTarget(for: row))
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
     func setIncludeAlternates(_ include: Bool) {
         var updated = query
         updated.includeAlternates = include
@@ -105,11 +162,6 @@ final class LibraryBrowserModel: ObservableObject {
     func setAlternatesSelected(_ selected: Bool, family familyID: Int64) {
         guard let state = familyStates[familyID] else { return }
         selection.set(state.eligibleAlternates, selected: selected)
-    }
-
-    /// The explicit selection, for batch actions. Throws when it exceeds `limit`.
-    func selectedFileIDs(limit: Int) async throws -> [Int64] {
-        try await selectionStore.selectedIDs(limit: limit)
     }
 
     func start() async {
@@ -192,6 +244,7 @@ final class LibraryBrowserModel: ObservableObject {
         familyTask?.cancel()
         familyTask = nil
         familyMembers = [:]
+        loadedFamilies = nil
         dirty = false
         results.stop()
         selection.stop()

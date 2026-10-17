@@ -8,34 +8,6 @@ enum LibraryBrowserAction: String, CaseIterable {
 }
 
 /// Song-family changes offered from a Library row's context menu.
-enum LibraryFamilyAction: CaseIterable {
-    case groupSelected, addSelected, mergeSelected, splitSelected, setMain, automaticMain, remove
-
-    var title: String {
-        switch self {
-        case .groupSelected: LibraryFamilyMessages.groupSelected
-        case .addSelected: LibraryFamilyMessages.addSelected
-        case .mergeSelected: LibraryFamilyMessages.mergeSelected
-        case .splitSelected: LibraryFamilyMessages.splitSelected
-        case .setMain: LibraryFamilyMessages.setMain
-        case .automaticMain: LibraryFamilyMessages.automaticMain
-        case .remove: LibraryFamilyMessages.remove
-        }
-    }
-
-    /// Whether the action applies to `row`, given how many files are selected.
-    func applies(to row: BrowserRow, selectedCount: Int) -> Bool {
-        let inFamily = row.familyId != nil && row.recordingId != nil
-        return switch self {
-        case .groupSelected: selectedCount >= 2
-        case .addSelected, .mergeSelected, .splitSelected: inFamily && selectedCount >= 1
-        case .setMain: inFamily && row.savedMain != true
-        case .automaticMain: inFamily && row.savedMain == true
-        case .remove: inFamily
-        }
-    }
-}
-
 struct LibraryPagedContent: View {
     @ObservedObject var model: LibraryBrowserModel
     let density: AppDensity
@@ -69,9 +41,11 @@ struct LibraryPagedContent: View {
                 let summary = model.selection.summary
                 ListResultSummary(results: model.results.totalCount, selected: summary?.total ?? 0, hidden: summary?.hidden ?? 0)
                 Spacer()
-                Toggle(LibraryFamilyMessages.includeAlternates, isOn: Binding(get: { model.query.includeAlternates },
-                                                                              set: { include in model.setIncludeAlternates(include) }))
-                    .toggleStyle(.checkbox).help(LibraryFamilyMessages.includeAlternatesHelp).disabled(!enabled)
+                if model.showsFamilies {
+                    Toggle(LibraryFamilyMessages.includeAlternates, isOn: Binding(get: { model.query.includeAlternates },
+                                                                                  set: { include in model.setIncludeAlternates(include) }))
+                        .toggleStyle(.checkbox).help(LibraryFamilyMessages.includeAlternatesHelp).disabled(!enabled)
+                }
                 let scopeCount = model.selection.summary?.scopeCount ?? model.results.totalCount
                 BatchSelectionToggle(title: "Select all \(scopeCount.formatted()) matches", coverage: coverage,
                                      enabled: enabled && scopeCount > 0)
@@ -105,7 +79,7 @@ struct LibraryPagedContent: View {
 
     private var table: some View {
         PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, preview: preview,
-                                                                                  families: familyControls),
+                                                                                  families: model.showsFamilies ? familyControls : nil),
                    accessibilityLabel: "Library files", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
                    isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
                    onSelect: { rows, selected in
@@ -127,13 +101,7 @@ struct LibraryPagedContent: View {
                    }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled,
                    contentRevision: (readiness?.scopeRevision ?? 0) &+ model.familyRevision,
                    onFocus: { identifier, index in model.focus(id: identifier, index: index) },
-                   onDisclose: { identifier, expanded in
-                       guard let row = model.results.cachedRows.first(where: { row in row.id == identifier }),
-                             row.familyRole == .main, let familyID = row.familyId,
-                             model.familyStates[familyID].map({ state in state.alternateCount > 0 }) == true else { return false }
-                       model.setExpanded(expanded, family: familyID)
-                       return true
-                   })
+                   onDisclose: { identifier, expanded in model.disclose(expanded, row: identifier) })
     }
 
     private var familyControls: LibraryFamilyControls {
@@ -155,8 +123,8 @@ struct LibraryPagedContent: View {
             menu.addItem(item)
         }
         guard let row = model.results.cachedRows.first(where: { row in row.id == identifier }) else { return menu }
-        let selectedCount = model.selection.summary?.total ?? 0
-        let familyActions = LibraryFamilyAction.allCases.filter { action in action.applies(to: row, selectedCount: selectedCount) }
+        let targetCount = model.familyTargetCount(for: row)
+        let familyActions = LibraryFamilyAction.allCases.filter { action in action.applies(to: row, targetCount: targetCount) }
         if !familyActions.isEmpty {
             menu.addItem(.separator())
         }
@@ -165,11 +133,18 @@ struct LibraryPagedContent: View {
             item.isEnabled = !model.selection.isBusy
             menu.addItem(item)
         }
-        if row.familyRole == .main, let familyID = row.familyId, let state = model.familyStates[familyID], state.alternateCount > 0 {
-            let expanded = state.isExpanded
-            menu.addItem(LibraryActionMenuItem(title: LibraryFamilyMessages.disclosure(expanded: expanded, alternates: state.alternateCount)) {
-                model.setExpanded(!expanded, family: familyID)
-            })
+        if row.familyRole == .main, let familyID = row.familyId, let state = model.familyStates[familyID] {
+            if state.alternateCount > 0, !state.isRevealedBySearch {
+                menu.addItem(LibraryActionMenuItem(title: state.disclosureLabel) { model.setExpanded(!state.isExpanded, family: familyID) })
+            }
+            if !state.eligibleAlternates.isEmpty {
+                let selectsAll = state.alternatesCoverage != .all
+                let item = LibraryActionMenuItem(title: selectsAll ? LibraryFamilyMessages.selectAlternates : LibraryFamilyMessages.deselectAlternates) {
+                    model.setAlternatesSelected(selectsAll, family: familyID)
+                }
+                item.isEnabled = !model.selection.isBusy
+                menu.addItem(item)
+            }
         }
         return menu
     }

@@ -238,40 +238,7 @@ struct LibraryBrowserView: View {
     }
 
     private func perform(_ action: LibraryFamilyAction, on row: BrowserRow) async {
-        guard let model else { return }
-        let families = services.songFamilies
-        do {
-            let familyID = row.familyId
-            switch action {
-            case .groupSelected:
-                let selected = try await model.selectedFileIDs(limit: LibraryFamilyMessages.selectionLimit)
-                _ = try await families.create(selected.map(SongFamilyMember.file))
-            case .addSelected:
-                guard let familyID else { return }
-                let outside = try await selectedMemberships(model).filter { membership in membership.familyId != familyID }
-                guard !outside.isEmpty else { throw LibraryFamilyActionError.nothingToChange }
-                _ = try await families.attach(outside.map { membership in SongFamilyMember.file(membership.fileId) }, to: familyID)
-            case .mergeSelected:
-                guard let familyID else { return }
-                let others = try await Set(selectedMemberships(model).compactMap(\.familyId)).subtracting([familyID])
-                guard !others.isEmpty else { throw LibraryFamilyActionError.nothingToChange }
-                _ = try await families.merge(others.sorted(), into: familyID)
-            case .splitSelected:
-                guard let familyID else { return }
-                let recordings = try await Set(selectedMemberships(model).filter { membership in membership.familyId == familyID }.compactMap(\.trackId))
-                _ = try await families.split(recordings.sorted(), from: familyID)
-            case .setMain, .automaticMain:
-                guard let familyID, let recording = row.recordingId else { return }
-                _ = try await families.setRepresentative(action == .setMain ? recording : nil, of: familyID)
-            case .remove:
-                guard let familyID, let recording = row.recordingId else { return }
-                _ = try await families.detach([recording], from: familyID)
-            }
-        } catch { model.error = error.localizedDescription }
-    }
-
-    private func selectedMemberships(_ model: LibraryBrowserModel) async throws -> [SongFamilyFileMembership] {
-        try await services.songFamilies.memberships(ofFiles: model.selectedFileIDs(limit: LibraryFamilyMessages.selectionLimit))
+        await model?.performFamilyAction(action, on: row, using: LibraryFamilyActions(families: services.songFamilies))
     }
 
     private var footer: some View {
@@ -319,13 +286,5 @@ struct LibraryFileStatusView: View {
             .foregroundStyle(file.canProcess ? Color.secondary : Color.orange)
             .lineLimit(2)
             .help(file.statusText)
-    }
-}
-
-private enum LibraryFamilyActionError: LocalizedError {
-    case nothingToChange
-
-    var errorDescription: String? {
-        LibraryFamilyMessages.nothingToChange
     }
 }

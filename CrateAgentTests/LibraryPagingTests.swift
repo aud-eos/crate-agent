@@ -84,7 +84,7 @@ final class LibraryPagingTests: XCTestCase {
             _ = try await snapshot.selectAllIdentities(after: nil, limit: 200)
             let placements = ContinuousClock.now
             for duration in [opened - start, firstPage - opened, distantPage - firstPage, placements - distantPage] {
-                XCTAssertLessThan(duration, .seconds(1))
+                XCTAssertLessThan(duration, .milliseconds(500))
             }
             return "\(label)_rows=\(total) \(label)_count_ms=\((opened - start).milliseconds) \(label)_first_page_ms=\((firstPage - opened).milliseconds) "
                 + "\(label)_distant_page_ms=\((distantPage - firstPage).milliseconds) \(label)_placements_ms=\((placements - distantPage).milliseconds)"
@@ -106,7 +106,28 @@ final class LibraryPagingTests: XCTestCase {
         let snapshot = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: fixture.query)
         let visible = await snapshot.count()
         XCTAssertEqual(visible, 26000)
-        let metrics = "\(ungrouped) \(grouped)"
+
+        // One interaction is what the screen waits for: the new snapshot, its first page,
+        // the members of the families on it, and the selection summary over every placement.
+        let store = try LibrarySelectionStore(database: fixture.database)
+        try await store.setScope(snapshot, selected: true)
+        func interaction(_ label: String, _ query: LibraryBrowseQuery) async throws -> String {
+            let start = ContinuousClock.now
+            let opened = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: query)
+            let page = try await opened.rows(in: 0 ..< 200)
+            _ = try await opened.familyMembers(Set(page.compactMap { row in row.familyRole == .main ? row.familyId : nil }))
+            _ = try await store.summary(in: opened)
+            let elapsed = ContinuousClock.now - start
+            XCTAssertLessThan(elapsed, .milliseconds(500), label)
+            return "\(label)_ms=\(elapsed.milliseconds)"
+        }
+        let firstPage = try await snapshot.rows(in: 0 ..< 200)
+        let firstFamily = try XCTUnwrap(firstPage.first { row in row.familyRole == .main }?.familyId)
+        let expanded = try await interaction("expand", LibraryBrowseQuery(sort: fixture.query.sort, expandedFamilies: [firstFamily]))
+        let collapsed = try await interaction("collapse", fixture.query)
+        let included = try await interaction("include_alternates", LibraryBrowseQuery(sort: fixture.query.sort, includeAlternates: true))
+        await store.close()
+        let metrics = "\(ungrouped) \(grouped) \(expanded) \(collapsed) \(included)"
         print("SONG_FAMILY_PAGING_METRICS \(metrics)")
         let attachment = XCTAttachment(string: metrics)
         attachment.lifetime = .keepAlways
@@ -151,7 +172,7 @@ final class LibraryPagingTests: XCTestCase {
 
     func testPartialCaptureFailureRollsBackWithoutChangingCommittedSelection() async throws {
         let fixture = try fixture
-        let store = try LibrarySelectionStore(database: fixture.database, readIdentities: { snapshot, after, limit in
+        let store = try LibrarySelectionStore(database: fixture.database, readIdentities: { snapshot, _, after, limit in
             if after != nil {
                 throw PagingFixtureError.unavailable
             }

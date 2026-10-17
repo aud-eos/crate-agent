@@ -512,6 +512,14 @@ public actor OperationEngine {
                     throw OperationEngineError.metadataChanged(fileId: fileID)
                 }
             }
+            // A token for a file no mutation names still authorizes the batch (a family
+            // change acting on a selected row), so it must be current too.
+            let mutationFileIDs = Set(mutations.compactMap(\.tokenFileID))
+            for token in (expectedMembershipTokens ?? [:]).values where !mutationFileIDs.contains(token.fileId) {
+                guard try FileRecord.fetchOne(db, key: token.fileId)?.membershipRevision == token.revision else {
+                    throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
+                }
+            }
             let results = try mutations.map { mutation in
                 if let expectedMembershipTokens, let fileID = mutation.tokenFileID {
                     guard let token = expectedMembershipTokens[fileID] else {

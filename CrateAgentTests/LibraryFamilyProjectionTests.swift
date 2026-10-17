@@ -24,14 +24,16 @@ final class LibraryFamilyProjectionTests: XCTestCase {
             var family = SongFamilyRecord()
             try family.insert(connection)
             let familyID = try XCTUnwrap(family.id)
+            var nextInode: Int64 = 0
             func add(_ title: String, artist: String, family: Int64?, availability: FileAvailability = .available) throws -> Int64 {
+                nextInode += 1
                 var trackID: Int64?
                 if let family {
                     var track = TrackRecord(fingerprintHash: Data(title.utf8), title: title, workId: family)
                     try track.insert(connection)
                     trackID = track.id
                 }
-                var file = FileRecord(path: "/Music/\(title).mp3", volumeUuid: "volume", inode: Int64(title.hashValue), fileSize: 1, mtime: 1,
+                var file = FileRecord(path: "/Music/\(title).mp3", volumeUuid: "volume", inode: nextInode, fileSize: 1, mtime: 1,
                                       trackId: trackID, artist: artist, title: title)
                 file.libraryMembership = .active
                 file.fileAvailability = availability
@@ -75,17 +77,68 @@ final class LibraryFamilyProjectionTests: XCTestCase {
         let store = try LibrarySelectionStore(database: database)
         let mainRows = try await LibraryPagedSnapshot.open(pool: pool, query: LibraryBrowseQuery())
         try await store.setScope(mainRows, selected: true)
-        let mainSelection = try await store.selectedIDs(limit: 10)
-        XCTAssertEqual(Set(mainSelection), [main, standalone])
+        let mainSelection = try await store.selectedIdentities(in: mainRows, limit: 10)
+        XCTAssertEqual(Set(mainSelection.map(\.id)), [main, standalone])
 
         let withAlternates = try await LibraryPagedSnapshot.open(pool: pool, query: LibraryBrowseQuery(includeAlternates: true))
         try await store.setScope(withAlternates, selected: true)
-        let all = try await store.selectedIDs(limit: 10)
-        XCTAssertEqual(Set(all), [main, standalone, instrumental])
+        let all = try await store.selectedIdentities(in: mainRows, limit: 10)
+        XCTAssertEqual(Set(all.map(\.id)), [main, standalone, instrumental])
         let summary = try await store.summary(in: mainRows)
         XCTAssertEqual(summary.hidden, 0)
         XCTAssertEqual(summary.scopeSelected, summary.scopeCount)
+
+        try await store.setScope(mainRows, selected: false)
+        let cleared = try await store.selectedIdentities(in: mainRows, limit: 10)
+        XCTAssertEqual(cleared, [])
         await store.close()
+    }
+
+    @MainActor
+    func testFamilyCommandsTargetTheClickedRowUnlessItIsSelectedThenTheShownSelection() async throws {
+        let model = try LibraryBrowserModel(database: database)
+        defer { model.stop() }
+        await model.start()
+        await pagingEventually { model.results.row(at: 0) != nil }
+        let snapshot = try XCTUnwrap(model.results.snapshot)
+        let mainRow = try XCTUnwrap(model.results.cachedRows.first { row in row.id == main })
+        model.selection.set([snapshot.identity(for: mainRow), .init(id: instrumental, revision: 0), .init(id: standalone, revision: 0)], selected: true)
+        await pagingEventually { model.selection.summary?.total == 3 && !model.selection.isBusy }
+
+        model.selection.set([snapshot.identity(for: mainRow)], selected: false)
+        await pagingEventually { !model.selection.visibleSelectedIDs.contains(self.main) }
+        let unselected = try await model.familyActionTarget(for: mainRow)
+        XCTAssertEqual(unselected.files.map(\.id), [main])
+
+        model.selection.set([snapshot.identity(for: mainRow)], selected: true)
+        var searching = model.query
+        searching.search = "Song"
+        model.setQuery(searching)
+        await pagingEventually {
+            model.results.totalCount == 3 && model.results.row(at: 0) != nil && model.selection.visibleSelectedIDs.contains(self.main)
+        }
+        let shownMain = try XCTUnwrap(model.results.cachedRows.first { row in row.id == main })
+        let selected = try await model.familyActionTarget(for: shownMain)
+        XCTAssertEqual(Set(selected.files.map(\.id)), [main, instrumental])
+    }
+
+    @MainActor
+    func testAFileThatChangedAfterItWasShownRefusesTheFamilyCommand() async throws {
+        let engine = OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
+        let actions = LibraryFamilyActions(families: SongFamilyService(engine: engine, database: database))
+        let shown = try await rows(LibraryBrowseQuery(expandedFamilies: [familyID]))
+        let mainRow = try XCTUnwrap(shown.first { row in row.id == main })
+        let target = LibraryFamilyActionTarget(clicked: mainRow, files: [.init(id: main, revision: 0), .init(id: instrumental, revision: 0)])
+        try await pool.write { connection in
+            try connection.execute(sql: "UPDATE files SET membership_revision = membership_revision + 1 WHERE id = ?", arguments: [self.instrumental])
+        }
+
+        await XCTAssertThrowsErrorAsync(try await actions.perform(.remove, on: target)) { error in
+            guard case FileProcessingEligibilityError.superseded(self.instrumental) = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let family = try await pool.read { connection in try Int64.fetchAll(connection, sql: "SELECT id FROM tracks WHERE work_id = ?", arguments: [self.familyID]) }
+        XCTAssertEqual(family.count, 3)
     }
 
     private func rows(_ query: LibraryBrowseQuery) async throws -> [BrowserRow] {

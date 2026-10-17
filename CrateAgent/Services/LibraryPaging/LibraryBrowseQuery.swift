@@ -56,13 +56,18 @@ struct LibraryBrowseQuery: Hashable, Sendable {
     /// Whether Select all also selects the eligible alternates of in-scope families.
     var includeAlternates = false
 
+    private var trimmedSearch: String {
+        search.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// While searching, every matching alternate is shown, whatever the saved disclosure.
     var isSearching: Bool {
-        !search.isEmpty
+        !trimmedSearch.isEmpty
     }
 
     private var arguments: StatementArguments {
         let expanded = expandedFamilies.sorted().map(String.init).joined(separator: ",")
-        return ["search": search.trimmingCharacters(in: .whitespacesAndNewlines), "expanded": "[\(expanded)]"]
+        return ["search": trimmedSearch, "expanded": "[\(expanded)]"]
     }
 
     /// Family files are ranked in small CTEs; the outer pass over `files` only joins their results,
@@ -91,7 +96,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         heads AS (
             SELECT family_id, id AS head_id, sort_key AS head_key FROM (
                 SELECT family_id, id, sort_key, ROW_NUMBER() OVER (PARTITION BY family_id ORDER BY \(order)) AS position FROM family_files
-            ) WHERE position = 1
+            ) WHERE position = 1 AND family_id IN (SELECT family_id FROM families WHERE versions >= 2)
         ),
         placed AS (
             SELECT \(BrowserRow.browserColumnsSQL), tracks.work_id AS family_id, files.track_id AS recording_id, \(familyColumns),
@@ -130,18 +135,19 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         return page
     }
 
-    /// Visible rows, and the rows Select all would select, in one pass.
-    func counts(in database: GRDB.Database) throws -> (visible: Int, selectAll: Int) {
+    /// Visible rows, the rows Select all would select, and whether any family is shown, in one pass.
+    func counts(in database: GRDB.Database) throws -> (visible: Int, selectAll: Int, hasFamilies: Bool) {
         let alternates = includeAlternates ? "placed.available" : "0"
         guard let row = try GRDB.Row.fetchOne(database, sql: """
         \(placedSQL)
         SELECT COUNT(*) FILTER (WHERE \(visibleSQL)) AS visible,
-               COUNT(*) FILTER (WHERE placed.in_scope AND (placed.family_role != \(LibraryFamilyRole.alternate.rawValue) OR \(alternates))) AS select_all
+               COUNT(*) FILTER (WHERE placed.in_scope AND (placed.family_role != \(LibraryFamilyRole.alternate.rawValue) OR \(alternates))) AS select_all,
+               COUNT(*) FILTER (WHERE placed.in_scope AND placed.family_role = \(LibraryFamilyRole.main.rawValue)) > 0 AS has_families
         FROM placed
         """, arguments: arguments) else {
             throw PagingError.incompletePage
         }
-        return (row["visible"], row["select_all"])
+        return (row["visible"], row["select_all"], row["has_families"])
     }
 
     func rows(in database: GRDB.Database, range: Range<Int>) throws -> [BrowserRow] {

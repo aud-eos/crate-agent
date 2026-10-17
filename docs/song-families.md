@@ -81,32 +81,70 @@ replaced, and returns when it is available again.
 
 ## Library
 
-- Each family shows one main row: the displayed representative's file, with
-  **5 versions** (distinct recordings in the current status scope) and, when any
-  member is selected, **5 versions · 2 selected**. Families sort by the main
-  row's values; alternates stay directly beneath it.
-- **Show N alternates** / **Hide alternates** (or Right and Left Arrow on the
-  focused row, or the context menu) changes disclosure only. Selecting the main
-  row never expands it, and collapsing keeps every selection.
-- A search matches every member. A family appears when any member matches;
-  matching alternates are shown while the search is active without changing
-  the saved disclosure state, and nothing is selected automatically.
-- **Select all** selects main and standalone rows. With **Include alternates**
-  checked beside it, it also selects each in-scope family's processable
-  alternates. Each main row's **Include alternates** checkbox selects or
-  deselects that family's processable alternates without expanding it, and is
-  mixed when only some are selected. Unavailable or retired alternates remain
-  visible and selectable by hand, but never through these controls.
-- The context menu groups the selection, adds selected files to the clicked
-  family, merges the selected files' families into it, splits selected members
-  into a new family, sets or clears the main version, and removes a member.
-  Each is one History entry.
+- **Main row.** A family with at least two versions in the current status scope
+  shows one main row: the displayed representative's file.
+  - **Versions** counts the family's different recordings, as in **5 versions**,
+    or **5 versions · 2 selected** when members are selected.
+  - The files beneath the main row also include other encodings of the main
+    version, so the disclosure counts files instead: **Show 4 files** /
+    **Hide 4 files**.
+  - Families sort by the main row's values, and their files stay directly
+    beneath it.
+- **Disclosure.** It changes only what is shown. Use the button, the context
+  menu, or Right and Left Arrow on the focused row.
+  - Left Arrow on a file beneath a main row collapses the family and focuses the
+    main row.
+  - Arrow keys that would change nothing keep their usual meaning.
+  - Selecting a main row never expands it, and collapsing keeps every selection.
+- **Search.** A search matches every member, and a family appears when any
+  member matches.
+  - While searching, the matching files are always shown beneath their main
+    row, and the button reads **2 matching files shown** and is disabled.
+  - Clearing the search returns to the saved disclosure. Nothing is selected
+    automatically.
+- **Select all and Include alternates.**
+  - **Select all** selects main and standalone rows.
+  - With **Include alternates** checked beside it, Select all also selects each
+    in-scope family's processable alternate files.
+  - Each main row's **Include alternates** checkbox selects or deselects that
+    family's processable alternates without expanding it. It is mixed when only
+    some are selected. The context menu offers the same command as **Select
+    Alternate Files** / **Deselect Alternate Files**.
+  - Turning Select all off clears every in-scope file, including alternates it
+    or a family checkbox added.
+  - Unavailable alternates remain visible and selectable by hand, but these
+    controls never select them.
+- **Context menu commands.** The menu offers grouping the targeted files,
+  adding them to the clicked family, merging their families into it, splitting
+  them into a new family, setting or clearing the main version, and removing
+  them from the family. Each is one History entry.
+  - A command acts on the clicked row alone unless that row is selected. Then it
+    acts on the selection, limited to files the view shows (including collapsed
+    alternates) at the revision they were selected at.
+  - Each targeted file is passed to `SongFamilyService` as authority, so a file
+    whose membership changes before the transaction refuses the whole change.
+  - `LibraryFamilyActions` and `LibraryBrowserModel.familyActionTarget(for:)`
+    are the API the view calls.
+- **Empty libraries.** The family columns and the global Include alternates
+  toggle appear only when a family is in view.
 
-The projection runs in SQL (`LibraryBrowseQuery`): family files are ranked in
+The projection runs in SQL (`LibraryBrowseQuery`). Family files are ranked in
 small CTEs using the same `SongFamilyRepresentative` ordering as the service,
-and the outer pass over `files` joins only their results. On the 30,000-file
-paging fixture with 6,000 files in 2,000 families, count and page queries stay
-under the 1 s hard budget in `LibraryPagingTests`, which attaches the timings.
+and the outer pass over `files` joins only their results. Each snapshot reads a
+family's members at most once.
+
+`LibraryPagingTests` holds the 30,000-file paging fixture, with 6,000 files in
+2,000 families, to the 500 ms interaction budget and attaches the timings. Each
+step is under that budget:
+
+- count;
+- first and distant pages;
+- the select-all scope;
+- expand and collapse;
+- the Include alternates toggle.
+
+Each interaction includes the new snapshot, its first page, its families'
+members, and the selection summary.
 
 ## History and undo
 
