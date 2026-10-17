@@ -109,15 +109,20 @@ final class OperationEnginePartialFailureTests: XCTestCase {
     private final class ThrowingTagWriter: @unchecked Sendable {
         private let lock = NSLock()
         private var callCount = 0
-        private var storedPaths: [String] = []
+        private var storedWrites: [(path: String, update: AudioTagUpdate)] = []
         var throwOnCall: Int?
 
         var writtenPaths: [String] {
             lock.lock(); defer { lock.unlock() }
-            return storedPaths
+            return storedWrites.map(\.path)
         }
 
-        func write(_ path: String) throws {
+        func tags(at path: String) -> AudioTags {
+            lock.lock(); defer { lock.unlock() }
+            return AudioTags.none.applying(storedWrites.filter { $0.path == path }.map(\.update))
+        }
+
+        func write(_ path: String, _ update: AudioTagUpdate) throws {
             lock.lock(); defer { lock.unlock() }
             callCount += 1
             if let target = throwOnCall, callCount == target {
@@ -125,7 +130,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
                     NSLocalizedDescriptionKey: "simulated read-only file",
                 ])
             }
-            storedPaths.append(path)
+            storedWrites.append((path, update))
         }
     }
 
@@ -136,7 +141,7 @@ final class OperationEnginePartialFailureTests: XCTestCase {
         private let lock = NSLock()
         private(set) var callCount = 0
 
-        func write(_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> UInt32 {
+        func write(_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> SeratoBatchWriteResult {
             lock.lock(); callCount += 1; lock.unlock()
             return try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
         }
@@ -185,7 +190,8 @@ final class OperationEnginePartialFailureTests: XCTestCase {
             database: database,
             seratoWatchdog: watchdog,
             seratoLocator: locator,
-            fileTagWriter: { path, _ in try tagWriter.write(path) },
+            fileTagWriter: { path, update in try tagWriter.write(path, update) },
+            fileTagReader: { path in tagWriter.tags(at: path) },
             seratoMetadataBatchWriter: metadataWriter
         )
 

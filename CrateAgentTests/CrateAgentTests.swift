@@ -4319,6 +4319,10 @@ final class WriteFileTagsMutationTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             _calls.append(Call(path: path, update: update))
         }
+
+        func tags(at path: String) -> AudioTags {
+            AudioTags.none.applying(calls.filter { $0.path == path }.map(\.update))
+        }
     }
 
     @MainActor
@@ -4337,7 +4341,8 @@ final class WriteFileTagsMutationTests: XCTestCase {
             seratoLocator: locator,
             fileTagWriter: { path, update in
                 recorder.record(path, update)
-            }
+            },
+            fileTagReader: { path in recorder.tags(at: path) }
         )
         return (engine, database, recorder)
     }

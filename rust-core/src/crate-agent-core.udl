@@ -36,21 +36,22 @@ namespace crate_agent_core {
   u32 rewrite_database_path(string database_path, string old_path, string new_path);
 
   // Bulk variant: apply every rename in `renames` to `database V2` in
-  // one read + one write. Returns the total number of otrks rewritten
-  // (an otrk matching a rename in the batch counts once). For an
+  // one read + one write. Reports the number of otrks rewritten (an
+  // otrk matching a rename in the batch counts once) and each rename
+  // whose record is not at its final path afterwards. For an
   // Organize batch moving N tracks, this collapses N full reads + N
   // full writes of a multi-MB file into one of each.
   [Throws=CoreError]
-  u32 batch_rewrite_database_paths(
+  SeratoBatchWriteResult batch_rewrite_database_paths(
     string database_path,
     sequence<SeratoPathRename> renames
   );
 
   // Bulk variant of `rewrite_crate_path`. Same semantics applied
   // per-crate-file — one read + one write of the crate file regardless
-  // of how many renames apply within it.
+  // of how many renames apply within it — and the same unmatched report.
   [Throws=CoreError]
-  u32 batch_rewrite_crate_paths(
+  SeratoBatchWriteResult batch_rewrite_crate_paths(
     string crate_path,
     sequence<SeratoPathRename> renames
   );
@@ -112,27 +113,29 @@ namespace crate_agent_core {
   // side twin of `batch_rewrite_database_paths`. Used by the SP-2
   // Auto-Tag apply, which confirms many MusicBrainz matches at once;
   // each would otherwise read+rewrite the multi-MB file on its own.
-  // Returns the number of otrks actually changed.
+  // Reports the number of otrks actually changed and each requested
+  // path with no record.
   //
   // Same SeratoWatchdog gating as update_database_record.
   [Throws=CoreError]
-  u32 batch_update_database_records(
+  SeratoBatchWriteResult batch_update_database_records(
     string database_path,
     sequence<SeratoTrackMetadataUpdate> updates
   );
 
-  // Append a new track to Serato's `database V2`. Used by crate-
-  // agent's drag-drop import flow to register a file with Serato
-  // without going through Serato's own UI. Returns 1 if the track
-  // was added, 0 if Serato already has it. Writes the file back if
-  // an add happened.
+  // Append tracks to Serato's `database V2`. Used by crate-agent's
+  // import flow to register files with Serato without going through
+  // Serato's own UI. Serato's existing paths are collected once, so a
+  // batch costs one pass and one read + write of the file however many
+  // tracks it adds. Additions Serato already holds (or that repeat an
+  // earlier addition) are skipped. Returns the number appended; writes
+  // the file back only if that is non-zero.
   //
   // Same SeratoWatchdog gating as update_database_record.
   [Throws=CoreError]
-  u32 add_track_to_database(
+  u32 batch_add_tracks_to_database(
     string database_path,
-    string track_path,
-    SeratoMetadataUpdate metadata
+    sequence<SeratoTrackAddition> additions
   );
 
   // Decode an audio file and return its Chromaprint perceptual
@@ -178,6 +181,15 @@ dictionary SeratoPathRename {
   string new_path;
 };
 
+// What a Serato batch write did. `unmatched_indices` lists, in order, the
+// position of each request whose track the file does not hold afterwards
+// (for a rename, at its final path), so "nothing to change" is
+// distinguishable from "no such track" (#105).
+dictionary SeratoBatchWriteResult {
+  u32 rewritten_count;
+  sequence<u32> unmatched_indices;
+};
+
 // One track's metadata update in a `batch_update_database_records`
 // call. `track_path` is the Serato-relative `pfil` path to match;
 // `update` carries the field-by-field patch. The batch twin of
@@ -185,6 +197,13 @@ dictionary SeratoPathRename {
 dictionary SeratoTrackMetadataUpdate {
   string track_path;
   SeratoMetadataUpdate update;
+};
+
+// One track in a `batch_add_tracks_to_database` call: the
+// Serato-relative `pfil` path and the metadata its new otrk carries.
+dictionary SeratoTrackAddition {
+  string track_path;
+  SeratoMetadataUpdate metadata;
 };
 
 // Full track-level metadata extracted from a Serato `database V2`
@@ -277,4 +296,7 @@ interface CoreError {
   SeratoFormat(string message);
   Fingerprint(string message);
   Tag(string message);
+  // A Serato library file was replaced, but the rename may not be durable.
+  // The write landed; retrying rewrites the same bytes.
+  LandedNotDurable(string message);
 };

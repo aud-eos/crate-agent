@@ -101,6 +101,15 @@ its verified physical identity and fingerprint basis, preserving revision,
 recording links, and Serato-mirrored metadata. Genuine replacements still invalidate
 the prior association.
 
+Because owned tag writes leave the mirrored columns alone, undo and redo of a
+MusicBrainz match guard their audio-tag inverse by the file itself
+(`MatchUndoTagGuard`). Before the transaction, each matched file's tags are read
+under an `AudioFileReadIdentity`. Every field the match wrote must still hold the
+matched value or the pre-match value; any other value is a later edit, and the undo
+is refused for those fields only. The transaction rechecks that identity, so a file
+that changes after the read fails the undo, and nothing commits. A queued apply that
+never reached the file still undoes, because its file holds the pre-match value.
+
 `reader.authorization(for:)` captures source identity, the reader's latest
 generation, and the watchdog's closed lifecycle revision. The engine's
 `applyObservedBatch` checks this authorization inside its serialized transaction
@@ -147,7 +156,42 @@ directory once, creating that directory if necessary, and watches the normalized
 deduplicated music and Trash paths in one stream. This captures native Trash
 destinations without enumerating Trash or scanning it per missing row. A verified
 Trash destination marks the indexed original path as trashed; it never becomes a
-V2 rename target. Root derivation and stream creation/start failures fail startup
+V2 rename target. The verified Trash item (path, volume, inode, size, mtime and sampled
+content hash) is persisted in `file_trash_locations` by the same journaled
+library-state mutation. Without Full Disk Access a Trash item can be stat-able but
+unreadable; it is then recorded by its stat identity alone, and later checks compare
+only the fields that were captured, so a permission failure never reads as an
+emptied Trash. Verification lives in `FileTrashLocation`: stat identity (volume,
+inode, size, mtime) is compared first, so a replaced or emptied item is `missing`
+without being read. Content is compared only when a hash was recorded and the item
+can be opened, and it is hashed through that open descriptor after confirming the
+descriptor is the stat-checked item, so a replacement between stat and read is
+never hashed in its place; an item that vanishes mid-check is `missing`. Only `EACCES`/`EPERM` fall back to stat identity; any other read
+failure is an error. An item whose identity cannot be read reports `inaccessible`,
+never `missing`. Stat-only identity relies on APFS/HFS+ file IDs, which are not
+reused. The mutation clears the item when the row becomes available or missing
+(restore, re-import, replacement). It keeps the item through offline and
+inaccessible, which say nothing about whether the item still exists, and accepts a
+location with those states so every logged inverse can be applied. A write that
+repeats the row's state and supplies no new location is a no-op and verifies
+nothing. A change to `.trashed` rechecks existence and stat identity inside the
+transaction, because Trash can be emptied while the caller awaits the commit. A
+row whose own indexed path is in Trash counts as trashed only while that path holds
+the row's volume and inode, both when reconciling and under the lock; otherwise the
+recorded item, if any, decides. Callers pass the
+item they verified, so the event records which item justified it. A failed recheck
+is row-level staleness (`FileTrashLocationError.itemChanged`): the filesystem
+coordinator requests reconciliation, and the reconciler counts the row in the sync
+summary ("changed in Trash, checked next sync") and leaves it out of the published
+checkpoint evidence, so the next sync re-checks it instead of taking the fast path;
+neither fails its batch. A known path that now holds a
+different file requests reconciliation; a missing or trashed row keeps its state
+until then, and an available row becomes `unknown`. A removal
+event at that Trash path, or any reconciliation that finds the indexed path
+missing, keeps the row trashed only while that exact item still verifies;
+otherwise it becomes missing. A trashed row
+without a persisted item (recorded before this table existed) cannot be verified
+and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
 first checkpoint for that set, the old music-root cursor is a conservative replay
 fallback; checkpoints advance only after the combined batch succeeds. Watch roots
@@ -334,12 +378,32 @@ edit joins one rewrite unless a rename, add, or V2 removal queued since that
 rewrite opened touches the same file or path; then it starts a new rewrite after
 that row. Consecutive renames share one path batch, which applies them in order:
 a rename of an earlier rename's destination (old → middle → new) lands the record
-at the final path. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
+at the final path. Consecutive adds of different files share one registration:
+Serato's existing paths are read once, every add lands in one V2 rewrite, and
+each import is confirmed in the same transaction; a second add of the same file
+starts a new registration. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
-to rows whose last attempt recorded no error: a saved value matching an unsent
-edit, or one whose write threw, is the user's own Serato edit and wins. A failed segment fails all of its rows together
+to rows whose write may have landed. The writer boundary commits an `io_started`
+mark before its I/O transaction. It clears the mark only when no write for the
+row returned from its I/O: the attempt stopped at the boundary, failed before
+reaching it, or every I/O call threw. A writer that validates or records after
+its I/O (Trash, audio tags, V2 removal, imports) reports the moment that I/O
+returns, so a later throw keeps the mark. A later attempt keeps an earlier
+attempt's mark (`may_have_landed`), and an attempt never clears a mark it did not
+set. Upgrading keeps a row attempted without a recorded error as possibly landed,
+as it was read before the marker existed. A saved value matching an edit that
+never reached I/O, or whose every I/O call threw, is the user's own Serato edit
+and wins. That a thrown I/O call did not land holds because every Serato
+library write (`database V2`, Subcrates and SmartCrates) replaces its file
+atomically: the bytes go to a temporary file in the same directory, which is
+flushed and then renamed over the target, so a write that throws before the
+rename leaves the previous bytes in place (#193). If only the directory flush
+after the rename fails, the writer throws `LandedNotDurable`: the new bytes are
+in place, so the engine records the I/O as returned before rethrowing, and the
+row stays visible and retries the same bytes. Each rewrite first removes
+`.crate-agent-*.tmp` files a crashed rewrite left in that directory. A failed segment fails all of its rows together
 and blocks their dependents; a row whose target becomes conflicted at the write
 boundary is blocked alone with its dependents, and the rest of the segment applies.
 
@@ -353,11 +417,20 @@ When no baseline was observed, a queued edit takes the pre-edit values its event
 journaled (`previousMetadata`) as the baseline for the fields it writes; a field
 an earlier queued edit still owes takes that edit's baseline instead. A queued
 edit whose baseline is still unknown learns the fields of an earlier edit of ours
-once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its last
-attempt left no error; a failed Trash attempt is not proof the audio moved.
+once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its
+write may have landed by that rule; a failed Trash attempt is not proof the audio moved.
+
+A metadata update whose path the parsed `database V2` has no entry at, or a
+rename whose track neither `database V2` nor any crate holds at its final path
+afterwards, completes as `noSeratoRecord` in the transaction that removes its
+row, and does not advance the external baseline: the Rust batch writers report
+each unmatched path, so a write with nothing to change is told apart from one
+with no entry, and Re-sync counts it as not written (#105). A missing
+`database V2` is not evidence that a track is absent and keeps its tolerant
+behavior.
 
 The ready summary reports each dropped change by disposition (superseded,
-uncertain, interrupted, malformed, or legacy unrecoverable) once, and turns to a
+uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
 warning. An outcome this version does not recognize, such as one recorded by a
 newer build, is counted as not applied rather than blocking readiness. History marks a batch with the number of its changes that were not
 applied.
