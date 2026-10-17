@@ -2516,6 +2516,9 @@ final class FingerprintWorkerTests: XCTestCase {
         XCTAssertEqual(bad.fingerprintStatus, .failed)
         XCTAssertNil(bad.chromaprintFingerprint,
                      "failed rows must not carry a stale hash blob")
+        let failures = try await database.writer.read { db in try WorkerCoverageQuery.files(in: .failed, database: db) }
+        XCTAssertEqual(failures.map(\.path), ["/Music/A/bad.mp3"])
+        XCTAssertEqual(failures.first?.detail, FingerprintError().localizedDescription, "the decoder's reason is kept for Workers")
     }
 
     func testWorkerSkipsAlreadyDoneRows() async throws {

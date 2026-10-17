@@ -53,6 +53,29 @@ public final class AppServices: ObservableObject {
         _ = try await NSWorkspace.shared.openApplication(at: application, configuration: NSWorkspace.OpenConfiguration())
     }, retrySync: { [weak self] in self?.retrySync() })
 
+    @Published private(set) var sectionRequest: MainWindowView.Section?
+    @Published private(set) var librarySearchRequest: String?
+    lazy var workersModel = WorkersModel(database: database, restartFingerprinting: { [weak self] in self?.resumeFingerprinting() })
+
+    func open(_ section: MainWindowView.Section) {
+        sectionRequest = section
+    }
+
+    func consumeSectionRequest() {
+        sectionRequest = nil
+    }
+
+    /// Library search also matches paths, so a full path narrows the list to that file.
+    func showInLibrary(path: String) {
+        librarySearchRequest = path
+        open(.library)
+    }
+
+    func consumeLibrarySearchRequest() -> String? {
+        defer { librarySearchRequest = nil }
+        return librarySearchRequest
+    }
+
     func consumeConflictNavigation() {
         conflictNavigationRequest = nil
     }
@@ -299,6 +322,15 @@ public final class AppServices: ObservableObject {
 
     func stopLibraryRescan() {
         startupCoordinator.stop()
+    }
+
+    /// Requeued files are picked up by a running worker's next poll; a worker that stopped on an
+    /// error is started again.
+    func resumeFingerprinting() {
+        if fingerprintProgress?.error != nil {
+            fingerprintProgress = nil
+        }
+        startFingerprinting()
     }
 
     func retryFingerprinting() {

@@ -12,6 +12,7 @@ struct MainWindowView: View {
         case cleanup
         case autoTag
         case history
+        case workers
         case conflicts
 
         var id: String {
@@ -25,6 +26,7 @@ struct MainWindowView: View {
             case .cleanup: "Library Cleanup"
             case .autoTag: "Auto-Tag"
             case .history: "History"
+            case .workers: WorkerMessages.sectionTitle
             case .conflicts: SeratoConflictMessages.review
             }
         }
@@ -36,6 +38,7 @@ struct MainWindowView: View {
             case .cleanup: "sparkles"
             case .autoTag: "wand.and.stars"
             case .history: "clock.arrow.circlepath"
+            case .workers: "gearshape.2"
             case .conflicts: "exclamationmark.triangle"
             }
         }
@@ -64,6 +67,11 @@ struct MainWindowView: View {
         .appPresentation()
         .onAppear { handleConflictNavigation() }
         .onChange(of: services.conflictNavigationRequest) { _, _ in handleConflictNavigation() }
+        .onChange(of: services.sectionRequest) { _, request in
+            guard let request else { return }
+            selection = request
+            services.consumeSectionRequest()
+        }
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 DensityPicker()
@@ -92,6 +100,8 @@ struct MainWindowView: View {
             AutoTaggerView(session: services.autoTagSession, readiness: services.readiness, conflictRevision: services.readiness.scopeRevision)
         case .history:
             HistoryView()
+        case .workers:
+            WorkersView(model: services.workersModel)
         case .conflicts:
             SeratoConflictReviewView(model: services.conflictReviewModel)
         }
