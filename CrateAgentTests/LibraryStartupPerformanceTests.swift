@@ -113,6 +113,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         await barrier.release()
         try await syncing.value
         let slowPath = resumed.duration(to: .now)
+        XCTAssertLessThan(slowPath, .seconds(30))
         XCTAssertEqual(counters.snapshot().snapshotParses, 1)
         XCTAssertEqual(counters.snapshot().audioTagReads, 0)
         XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
