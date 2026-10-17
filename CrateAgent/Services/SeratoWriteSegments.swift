@@ -1,11 +1,13 @@
 import Foundation
 
 /// One external pass over queued rows: every `database V2` metadata update in
-/// one rewrite, consecutive renames in one path batch, or a single other write.
+/// one rewrite, consecutive renames in one path batch, consecutive adds of
+/// distinct files in one registration, or a single other write.
 struct SeratoWriteSegment: Sendable {
     enum Kind: Sendable {
         case metadata
         case renames
+        case adds
         case single
     }
 
@@ -29,6 +31,7 @@ enum SeratoWriteSegmenter {
         var segments: [SeratoWriteSegment] = []
         var openMetadata: Int?
         var pathEffectsSinceOpen = SeratoQueueDependency()
+        var openAddTargets = SeratoQueueDependency()
         for entry in entries {
             switch entry.write.write {
             case .metadataUpdate:
@@ -46,7 +49,18 @@ enum SeratoWriteSegmenter {
                     segments.append(SeratoWriteSegment(kind: .renames, entries: [entry]))
                 }
                 pathEffectsSinceOpen.formUnion(entry.dependency)
-            case .addTrack, .removeFromDatabase:
+            case .addTrack:
+                // A second add of the same file must see the first one's
+                // confirmation, so it starts a new registration.
+                if let last = segments.indices.last, segments[last].kind == .adds, !entry.dependency.intersects(openAddTargets) {
+                    segments[last].entries.append(entry)
+                } else {
+                    segments.append(SeratoWriteSegment(kind: .adds, entries: [entry]))
+                    openAddTargets = SeratoQueueDependency()
+                }
+                openAddTargets.formUnion(entry.dependency)
+                pathEffectsSinceOpen.formUnion(entry.dependency)
+            case .removeFromDatabase:
                 segments.append(SeratoWriteSegment(kind: .single, entries: [entry]))
                 pathEffectsSinceOpen.formUnion(entry.dependency)
             case .fileTagWrite, .removeFromCrates, .trashFile:
