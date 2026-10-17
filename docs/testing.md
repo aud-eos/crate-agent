@@ -44,6 +44,23 @@ isolated fixtures. A green suite alone is not evidence that new test code respec
 that contract.
 
 
+## Owned APFS volume fixture
+
+Native Trash, cross-volume and case-alias tests skip unless a disposable APFS
+volume is mounted at `/private/tmp/crate-agent-task6-volume` with a
+`.task6-test-volume` marker. It must be case-insensitive (plain `APFS`):
+
+```sh
+hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE /path/to/task6.sparseimage
+mkdir -p /private/tmp/crate-agent-task6-volume
+hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume -nobrowse
+touch /private/tmp/crate-agent-task6-volume/.task6-test-volume
+```
+
+Tests trash files only into that volume's own `.Trashes`, never the user's Trash.
+The mount is machine-wide, so it un-skips these tests for every concurrent suite;
+detach it (`hdiutil detach /private/tmp/crate-agent-task6-volume`) when done.
+
 ## Paged Library fixture
 
 `LibraryPagingTests` creates one temporary WAL database with 30,000 synthetic

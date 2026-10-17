@@ -156,7 +156,42 @@ directory once, creating that directory if necessary, and watches the normalized
 deduplicated music and Trash paths in one stream. This captures native Trash
 destinations without enumerating Trash or scanning it per missing row. A verified
 Trash destination marks the indexed original path as trashed; it never becomes a
-V2 rename target. Root derivation and stream creation/start failures fail startup
+V2 rename target. The verified Trash item (path, volume, inode, size, mtime and sampled
+content hash) is persisted in `file_trash_locations` by the same journaled
+library-state mutation. Without Full Disk Access a Trash item can be stat-able but
+unreadable; it is then recorded by its stat identity alone, and later checks compare
+only the fields that were captured, so a permission failure never reads as an
+emptied Trash. Verification lives in `FileTrashLocation`: stat identity (volume,
+inode, size, mtime) is compared first, so a replaced or emptied item is `missing`
+without being read. Content is compared only when a hash was recorded and the item
+can be opened, and it is hashed through that open descriptor after confirming the
+descriptor is the stat-checked item, so a replacement between stat and read is
+never hashed in its place; an item that vanishes mid-check is `missing`. Only `EACCES`/`EPERM` fall back to stat identity; any other read
+failure is an error. An item whose identity cannot be read reports `inaccessible`,
+never `missing`. Stat-only identity relies on APFS/HFS+ file IDs, which are not
+reused. The mutation clears the item when the row becomes available or missing
+(restore, re-import, replacement). It keeps the item through offline and
+inaccessible, which say nothing about whether the item still exists, and accepts a
+location with those states so every logged inverse can be applied. A write that
+repeats the row's state and supplies no new location is a no-op and verifies
+nothing. A change to `.trashed` rechecks existence and stat identity inside the
+transaction, because Trash can be emptied while the caller awaits the commit. A
+row whose own indexed path is in Trash counts as trashed only while that path holds
+the row's volume and inode, both when reconciling and under the lock; otherwise the
+recorded item, if any, decides. Callers pass the
+item they verified, so the event records which item justified it. A failed recheck
+is row-level staleness (`FileTrashLocationError.itemChanged`): the filesystem
+coordinator requests reconciliation, and the reconciler counts the row in the sync
+summary ("changed in Trash, checked next sync") and leaves it out of the published
+checkpoint evidence, so the next sync re-checks it instead of taking the fast path;
+neither fails its batch. A known path that now holds a
+different file requests reconciliation; a missing or trashed row keeps its state
+until then, and an available row becomes `unknown`. A removal
+event at that Trash path, or any reconciliation that finds the indexed path
+missing, keeps the row trashed only while that exact item still verifies;
+otherwise it becomes missing. A trashed row
+without a persisted item (recorded before this table existed) cannot be verified
+and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
 first checkpoint for that set, the old music-root cursor is a conservative replay
 fallback; checkpoints advance only after the combined batch succeeds. Watch roots

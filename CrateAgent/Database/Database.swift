@@ -122,6 +122,7 @@ public final class LibraryDatabase {
         AddSyncStatProjectionMigration.register(in: &migrator)
         AddDurableSeratoQueueMigration.register(in: &migrator)
         AddSeratoWriteLandedMarkerMigration.register(in: &migrator)
+        AddFileTrashLocationsMigration.register(in: &migrator)
         return migrator
     }
 }

@@ -72,6 +72,7 @@ struct LibrarySyncStatusView: View {
                 + SeratoWriteDisposition.allCases.filter { disposition in summary.notAppliedWrites[disposition] > 0 }
                 .map { disposition in " · " + SeratoWriteDispositionMessages.summary(disposition, count: summary.notAppliedWrites[disposition]) }.joined()
                 + (summary.notAppliedWrites.unrecognized > 0 ? " · " + SeratoWriteDispositionMessages.unrecognizedSummary(count: summary.notAppliedWrites.unrecognized) : "")
+                + (summary.trashChangedFileIDs.isEmpty ? "" : " · \(summary.trashChangedFileIDs.count) changed in Trash, checked next sync")
                 + (summary.duplicateCleanupMessage.map { " · " + $0 } ?? "")
         }
     }

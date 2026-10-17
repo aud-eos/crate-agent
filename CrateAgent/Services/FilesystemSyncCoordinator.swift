@@ -88,14 +88,11 @@ public actor FilesystemSyncCoordinator {
             if try await resolvePendingMove(for: knownPath, batchID: batchID) {
                 return
             }
-            var availability = try inspectKnownIdentity(knownPath)
-            // An old-path removal is not evidence that a positively identified Trash item disappeared.
-            if availability == .missing, knownPath.fileAvailability == .trashed {
-                availability = .trashed
-            }
-            try await observe(file: knownPath, availability: availability, metadata: nil, batchID: batchID)
+            guard let current = try await currentAvailability(of: knownPath) else { return }
+            try await observe(file: knownPath, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
             return
         }
+        try await revalidateTrashLocation(at: observation.path, batchID: batchID)
         guard observation.wasRenamed || observation.wasCreated else { return }
         guard let metadata = FileMetadataCollector.collect(at: observation.path) else {
             // Unknown old-side events have no tracked row to observe. Never infer deletion from stat failure.
@@ -147,7 +144,41 @@ public actor FilesystemSyncCoordinator {
             return
         }
         let availability = try availabilityResolver.inspect(path: observation.path, volumeID: metadata.volumeUuid)
-        try await observe(file: existing, availability: availability, metadata: metadata, batchID: batchID)
+        var trashLocation: FileMetadata?
+        if availability == .trashed {
+            guard let location = try FileTrashLocation.capture(at: observation.path, for: existing) else {
+                requiresReconciliation = true
+                return
+            }
+            trashLocation = location
+        }
+        try await observe(file: existing, availability: availability, metadata: metadata, trashLocation: trashLocation, batchID: batchID)
+    }
+
+    /// A trashed row keeps its indexed path, so only its recorded Trash item proves the audio still exists.
+    /// When the indexed path holds a different file, reconciliation is requested: an available row
+    /// loses eligibility (`unknown`), while a missing or trashed row keeps its state (nil, no write).
+    private func currentAvailability(of file: FileRecord) async throws -> (availability: FileAvailability, trashLocation: FileMetadata?)? {
+        guard let availability = try identityAvailability(file) else {
+            return file.fileAvailability == .missing || file.fileAvailability == .trashed ? nil : (.unknown, nil)
+        }
+        guard availability == .missing, let fileID = file.id else { return (availability, nil) }
+        let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
+        let observed = try FileTrashLocation.availability(of: location, resolver: availabilityResolver)
+        return (observed, observed == .trashed ? location : nil)
+    }
+
+    /// Removing or emptying a Trash item reports only its Trash path, never the indexed path.
+    private func revalidateTrashLocation(at path: String, batchID: String) async throws {
+        let trashedFiles = try await database.writer.read { connection in
+            try FileTrashLocation.fileIDs(at: path, in: connection)
+                .compactMap { fileID in try FileRecord.fetchOne(connection, key: fileID) }
+        }
+        for file in trashedFiles {
+            try await operationEngine.requireUnconflicted(.file(file))
+            guard let current = try await currentAvailability(of: file), current.availability != file.fileAvailability else { continue }
+            try await observe(file: file, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
+        }
     }
 
     private func rememberDestination(at path: String, for file: FileRecord) throws {
@@ -267,26 +298,34 @@ public actor FilesystemSyncCoordinator {
         return true
     }
 
+    /// For move resolution, a path now holding a different file still counts as the row's
+    /// previous missing or trashed state.
     private func inspectKnownIdentity(_ file: FileRecord) throws -> FileAvailability {
+        try identityAvailability(file) ?? (file.fileAvailability == .missing || file.fileAvailability == .trashed ? file.fileAvailability : .unknown)
+    }
+
+    /// Nil when the indexed path holds a different file; reconciliation is requested.
+    private func identityAvailability(_ file: FileRecord) throws -> FileAvailability? {
         let availability = try availabilityResolver.inspect(path: file.path, volumeID: file.volumeUuid)
         guard availability == .available || availability == .trashed else { return availability }
         guard let metadata = FileMetadataCollector.collect(at: file.path),
               metadata.inode == file.inode, metadata.volumeUuid == file.volumeUuid
         else {
             requiresReconciliation = true
-            return file.fileAvailability == .missing || file.fileAvailability == .trashed ? file.fileAvailability : .unknown
+            return nil
         }
         return availability
     }
 
-    private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, batchID: String,
-                         moveExpectation: FilesystemMoveExpectation? = nil) async throws
+    private func observe(file: FileRecord, availability: FileAvailability, metadata: FileMetadata?, trashLocation: FileMetadata? = nil,
+                         batchID: String, moveExpectation: FilesystemMoveExpectation? = nil) async throws
     {
         guard let fileId = file.id else { throw OperationEngineError.insertDidNotReturnRowId }
         var mutations: [TrackMutation] = [.setFileLibraryState(.init(
             fileId: fileId, expectedRevision: file.membershipRevision,
             state: FileLibraryState(membership: file.libraryMembership, availability: availability,
-                                    libraryID: file.seratoLibraryId, retiredAt: file.retiredAt)
+                                    libraryID: file.seratoLibraryId, retiredAt: file.retiredAt),
+            trashLocation: trashLocation
         ))]
         if availability == .available, let metadata,
            file.path != metadata.path || file.inode != metadata.inode || file.volumeUuid != metadata.volumeUuid
@@ -299,7 +338,11 @@ public actor FilesystemSyncCoordinator {
                                                             path: metadata.path, volumeUuid: metadata.volumeUuid, inode: metadata.inode)))
             }
         }
-        _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID, moveExpectation: moveExpectation)
+        do {
+            _ = try await operationEngine.applyFilesystemObservations(mutations, batchId: batchID, moveExpectation: moveExpectation)
+        } catch FileTrashLocationError.itemChanged {
+            requiresReconciliation = true
+        }
     }
 }
 
