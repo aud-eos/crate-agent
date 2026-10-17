@@ -3666,7 +3666,7 @@ public actor OperationEngine {
         album: String?,
         year: Int?,
         clearFileYear: Bool = false,
-        omittingFileTagFields omitted: Set<String> = []
+        omittingFileTagFields omitted: Set<MatchFileTagField> = []
     ) -> [SeratoPendingWrite] {
         let metadata = SeratoMetadata(artist: artist, title: title, album: album)
         // An identity-only confirmation (the user kept every display field:
@@ -3679,7 +3679,7 @@ public actor OperationEngine {
         // when it actually carries a change.
         let hasSeratoMetadataFields = artist != nil || title != nil || album != nil
         let fileMetadata = omittingFields(omitted, from: metadata)
-        let fileYear = omitted.contains(fileYearField) ? nil : year
+        let fileYear = omitted.contains(.year) ? nil : year
         let fileTagNeedsWrite = !metadataFieldMap(fileMetadata).isEmpty || fileYear != nil || clearFileYear
 
         var writes: [SeratoPendingWrite] = []
@@ -3699,19 +3699,19 @@ public actor OperationEngine {
         return writes
     }
 
-    /// The audio-tag key for year, alongside `metadataFieldMap`'s text fields.
-    static let fileYearField = "year"
-
-    private static func omittingFields(_ omitted: Set<String>, from metadata: SeratoMetadata) -> SeratoMetadata {
-        reducedMetadata(metadata, keeping: Set(metadataFieldMap(metadata).keys).subtracting(omitted))
+    private static func omittingFields(_ omitted: Set<MatchFileTagField>, from metadata: SeratoMetadata) -> SeratoMetadata {
+        reducedMetadata(metadata, keeping: Set(metadataFieldMap(metadata).keys).subtracting(omitted.map(\.rawValue)))
     }
 
     /// The match fields whose value the file already holds on disk, per the
     /// review's capture. Rewriting them would save the file (with
     /// `remove_others`) for no change, so the file-tag write leaves them out
     /// while the event still owns them. A tag write still queued for the file
-    /// will change it first, so then nothing is left out.
-    private static func fileTagFieldsAlreadyOnDisk(_ payload: ApplyMusicBrainzMatchPayload, in db: GRDB.Database) throws -> Set<String> {
+    /// will change it first, and a file whose journaled identity moved since
+    /// review was rewritten after the capture (a tag write that landed while
+    /// apply was suspended), so then nothing is left out.
+    private static func fileTagFieldsAlreadyOnDisk(_ payload: ApplyMusicBrainzMatchPayload, file: FileRecord, in db: GRDB.Database) throws -> Set<MatchFileTagField> {
+        guard payload.expectedFileSize == file.fileSize, payload.expectedMtime == file.mtime else { return [] }
         let queuedTagWrite = try SeratoWriteQueue.fetch(fileID: payload.fileID, in: db).contains { queued in queued.write.kind == .fileTagWrite }
         guard !queuedTagWrite else { return [] }
         let unchanged = SeratoMetadata(
@@ -3719,9 +3719,9 @@ public actor OperationEngine {
             title: payload.title.flatMap { title in title == payload.currentFileTitle ? title : nil },
             album: payload.album.flatMap { album in album == payload.currentFileAlbum ? album : nil }
         )
-        var fields = Set(metadataFieldMap(unchanged).keys)
+        var fields = Set(metadataFieldMap(unchanged).keys.compactMap(MatchFileTagField.init(rawValue:)))
         if let year = payload.year, year == payload.currentFileYear {
-            fields.insert(fileYearField)
+            fields.insert(.year)
         }
         return fields
     }
@@ -3883,7 +3883,7 @@ public actor OperationEngine {
         forwardPayload.previousFileYear = payload.currentFileYear
         forwardPayload.previousTrackIdentifiers = previousTrackIdentifiers
         forwardPayload.createdTrackRow = createdTrackRow
-        forwardPayload.fileTagFieldsAlreadyOnDisk = try fileTagFieldsAlreadyOnDisk(payload, in: db)
+        forwardPayload.fileTagFieldsAlreadyOnDisk = try fileTagFieldsAlreadyOnDisk(payload, file: fileRecord, in: db)
 
         let inversePayload = RevertMusicBrainzMatchPayload(applied: forwardPayload)
 
@@ -4114,7 +4114,7 @@ public actor OperationEngine {
     private static func musicBrainzRevertSeratoWrites(
         applied: ApplyMusicBrainzMatchPayload,
         absolutePath: String,
-        omittingFileTagFields omitted: Set<String>
+        omittingFileTagFields omitted: Set<MatchFileTagField>
     ) -> [SeratoPendingWrite] {
         // The two external targets restore from DIFFERENT snapshots: Serato's
         // database V2 (and the SQLite `files` row, already restored in
@@ -4138,7 +4138,7 @@ public actor OperationEngine {
             title: applied.title != nil ? (fileSnapshot.title ?? "") : nil,
             album: applied.album != nil ? (fileSnapshot.album ?? "") : nil
         ))
-        let forwardWroteYear = applied.year != nil && !omitted.contains(fileYearField)
+        let forwardWroteYear = applied.year != nil && !omitted.contains(.year)
         let fileYear = forwardWroteYear ? applied.previousFileYear : nil
         let clearFileYear = forwardWroteYear && applied.previousFileYear == nil
 
@@ -4378,6 +4378,12 @@ public struct TrackIdentifiers: Codable, Sendable, Equatable {
 /// The `previous…` fields are populated by the engine at apply time to
 /// make the event fully undoable (invariant #2). Callers leave them at
 /// their defaults.
+/// An audio-tag field a MusicBrainz match can apply. Journaled, so an
+/// unknown value fails decoding rather than being silently ignored.
+public enum MatchFileTagField: String, Codable, Sendable, CaseIterable {
+    case artist, title, album, year
+}
+
 public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public let fileID: Int64
     // Identity — always applied:
@@ -4440,7 +4446,7 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     /// out of its audio-tag write because the file already held that value.
     /// The event still owns them for re-sync; undo and replay skip them. Nil
     /// for events journaled before #114, which wrote every applied field.
-    public var fileTagFieldsAlreadyOnDisk: Set<String>?
+    public var fileTagFieldsAlreadyOnDisk: Set<MatchFileTagField>?
 
     public init(
         fileID: Int64,

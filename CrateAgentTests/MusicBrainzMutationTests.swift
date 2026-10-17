@@ -1623,6 +1623,82 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(recorder.calls.last?.update.title, "Same Title")
     }
 
+    func testExactConfirmOfValuesAlreadyOnDiskWritesNoTags() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: "Nas", title: "Halftime", album: "Illmatic", year: 1994,
+                currentFileYear: 1994, currentFileArtist: "Nas", currentFileTitle: "Halftime", currentFileAlbum: "Illmatic"
+            )),
+            batchId: "exact-confirm"
+        )
+        XCTAssertTrue(recorder.calls.isEmpty)
+    }
+
+    func testAFileRewrittenSinceReviewGetsEveryAppliedField() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: nil, title: "Halftime", album: nil, year: nil, currentFileTitle: "Halftime", expectedMtime: 2
+            )),
+            batchId: "rewritten-since-review"
+        )
+        XCTAssertEqual(recorder.calls.last?.update.title, "Halftime")
+    }
+
+    func testRedoRefusesALaterEditToAFieldTheMatchDidNotRewrite() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
+        }
+        try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(artist: "Disk Artist", title: "Same Title"))), batchId: "on-disk")
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: "New Artist", title: "Same Title", album: nil, year: nil,
+                currentFileArtist: "Disk Artist", currentFileTitle: "Same Title"
+            )),
+            batchId: "match"
+        )
+        let undoBatchID = try await engine.undoBatch("match")
+        try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(title: "Later Edit"))), batchId: "edit")
+
+        do {
+            try await engine.undoBatch(undoBatchID)
+            XCTFail("expected the redo to be refused")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .undoWouldOverwriteFileTags(fileId: fileId, fields: ["title"], direction: .redo))
+        }
+        XCTAssertEqual(recorder.tags(at: recorder.calls[0].path).title, "Later Edit")
+    }
+
+    func testResyncOfAnEarlierTagEditLeavesAFieldALaterMatchOwnsWithoutRewriting() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(title: "Edited"))), batchId: "edit")
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: nil, title: "Edited", album: nil, year: nil, currentFileTitle: "Edited"
+            )),
+            batchId: "match"
+        )
+        let writesBeforeResync = recorder.calls.count
+
+        try await engine.resyncSeratoForBatch("edit")
+        XCTAssertEqual(recorder.calls.count, writesBeforeResync)
+    }
+
     // MARK: - D-A: legacy event decode (fields added mid-branch)
 
     /// An event JOURNALED by an earlier build of this branch — before D-A
