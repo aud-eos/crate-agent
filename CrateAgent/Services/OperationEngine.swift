@@ -4264,6 +4264,7 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         guard let expectedFileSize, let expectedMtime else { return nil }
         return FileFreshnessSnapshot(fileSize: expectedFileSize, inode: expectedInode, mtime: expectedMtime, mtimeNanoseconds: expectedMtimeNanoseconds)
     }
+
     // Cherry-picked display fields — absent (nil) means not applied:
     public let artist: String?
     public let title: String?

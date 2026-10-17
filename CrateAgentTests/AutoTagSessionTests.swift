@@ -581,15 +581,15 @@ final class AutoTagSessionTests: XCTestCase {
 
 @MainActor
 private struct SessionFixture {
-    private static let trackPathPrefix = "/fixture/track-"
-    private static let trackPathSuffix = ".mp3"
+    private nonisolated static let trackPathPrefix = "/fixture/track-"
+    private nonisolated static let trackPathSuffix = ".mp3"
 
-    static func path(ofTrack index: Int) -> String {
+    nonisolated static func path(ofTrack index: Int) -> String {
         trackPathPrefix + String(index) + trackPathSuffix
     }
 
     /// A fixture track's live stat while unchanged: indexed size, time and inode (its index).
-    static func unchangedStat(of path: String) -> FileFreshnessSnapshot {
+    nonisolated static func unchangedStat(of path: String) -> FileFreshnessSnapshot {
         let index = Int64(path.dropFirst(trackPathPrefix.count).dropLast(trackPathSuffix.count))
         return FileFreshnessSnapshot(fileSize: 1000, inode: index, mtime: 10, mtimeNanoseconds: 0)
     }

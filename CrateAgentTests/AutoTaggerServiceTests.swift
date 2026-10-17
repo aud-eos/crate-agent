@@ -921,7 +921,6 @@ final class AutoTaggerServiceTests: XCTestCase {
         let database = try makeDatabase()
         // insertFile stores fingerprint [1,2,3] with indexed fileSize 1000/mtime 0.
         let fileID = try insertFile(in: database, path: "/music/edited.mp3")
-        let inode = try indexedInode(of: fileID, in: database)
 
         let recomputedHashes: [UInt32] = [40, 41, 42]
         let recomputedBase64 = fingerprintBase64(for: recomputedHashes)
@@ -1269,6 +1268,7 @@ final class AutoTaggerServiceTests: XCTestCase {
     func testStaleFileIDsFlagsFileChangedSinceLookup() async throws {
         let database = try makeDatabase()
         let fileID = try insertFile(in: database, path: "/music/edited.mp3")
+        let inode = try indexedInode(of: fileID, in: database)
         // Current on-disk (2000, 999) differs from the lookup snapshot (1000, 0).
         let service = makeService(database: database, fileFreshnessReader: liveStat(in: database, fileSize: 2000, mtime: 999))
         let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0, expectedInode: inode)
