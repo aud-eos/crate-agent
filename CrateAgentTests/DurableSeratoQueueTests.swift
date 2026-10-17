@@ -461,6 +461,30 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
         let remaining = try await relaunched.pendingSeratoWriteCount
         XCTAssertEqual(remaining, 0)
+
+        // A failing store fails the pass once; later segments for it stay queued for Retry Sync.
+        setRunning(fixture, true)
+        for file in files {
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .init(title: "Retitled \(file.id ?? 0)"))))
+        }
+        setRunning(fixture, false)
+        let failedRewrites = LockedRewriteSizes()
+        let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                      seratoMetadataBatchWriter: { _, updates in
+                                          failedRewrites.append(updates.count)
+                                          throw CocoaError(.fileWriteNoPermission)
+                                      })
+        do {
+            _ = try await failing.drainPendingSeratoUpdates()
+            XCTFail("The failing store accepted the edits")
+        } catch {
+            let message = error.localizedDescription
+            let failure = CocoaError(.fileWriteNoPermission).localizedDescription
+            XCTAssertEqual(message.components(separatedBy: failure).count - 1, 1, "The same store failure was reported per segment: \(message)")
+        }
+        XCTAssertEqual(failedRewrites.values.count, 1, "The pass kept retrying a store that already failed")
+        let retained = try await failing.pendingSeratoWriteCount
+        XCTAssertEqual(retained, files.count)
     }
 
     func testImmediateBatchAppliesMetadataAfterItsFilesRename() async throws {
