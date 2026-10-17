@@ -86,7 +86,7 @@ enum MatchUndoTagGuard {
             throw OperationEngineError.undoFileUnreadable(fileId: fileID, path: path, reason: reason, direction: direction)
         }
         try requireUnchanged(read)
-        let conflicts = conflictingFields(live: live, applied: request.applied)
+        let conflicts = conflictingFields(live: live, applied: request.applied, direction: direction)
         guard conflicts.isEmpty else {
             throw OperationEngineError.undoWouldOverwriteFileTags(fileId: fileID, fields: conflicts, direction: direction)
         }
@@ -130,22 +130,26 @@ enum MatchUndoTagGuard {
 
     /// The fields the inverse would rewrite whose live value is neither end
     /// of the match's change. Absent and empty text are the same tag value.
-    static func conflictingFields(live: AudioTags, applied: ApplyMusicBrainzMatchPayload) -> [String] {
+    static func conflictingFields(live: AudioTags, applied: ApplyMusicBrainzMatchPayload, direction: MatchHistoryDirection) -> [String] {
         let restored = applied.fileTagRestoreSnapshot
-        let textFields: [(name: String, written: String?, restored: String?, live: String?)] = [
-            ("artist", applied.artist, restored.artist, live.artist),
-            ("title", applied.title, restored.title, live.title),
-            ("album", applied.album, restored.album, live.album),
+        // Undo does not rewrite a field the match left untouched on disk, so a
+        // later edit to it is safe. Redo re-applies the match, which may write
+        // that field again, so a later edit to it conflicts like any other.
+        let untouched = direction == .undo ? applied.fileTagFieldsAlreadyOnDisk ?? [] : []
+        let textFields: [(field: MatchFileTagField, written: String?, restored: String?, live: String?)] = [
+            (.artist, applied.artist, restored.artist, live.artist),
+            (.title, applied.title, restored.title, live.title),
+            (.album, applied.album, restored.album, live.album),
         ]
         var conflicts = textFields.compactMap { field -> String? in
-            guard let written = field.written else { return nil }
+            guard let written = field.written, !untouched.contains(field.field) else { return nil }
             let ends = Set([written, field.restored ?? ""])
-            return ends.contains(field.live ?? "") ? nil : field.name
+            return ends.contains(field.live ?? "") ? nil : field.field.rawValue
         }
-        if let year = applied.year {
+        if let year = applied.year, !untouched.contains(.year) {
             let ends: Set<Int?> = [year, applied.previousFileYear]
             if !ends.contains(live.year.map(Int.init)) {
-                conflicts.append("year")
+                conflicts.append(MatchFileTagField.year.rawValue)
             }
         }
         return conflicts

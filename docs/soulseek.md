@@ -17,9 +17,13 @@ Drive Soulseek downloads from a tracklist via Claude, routed through a local [sl
 
 Typical flow: `ingest_list` → `plan_acquisition` (auto-accepted entries are enqueued here) → `review_candidates` / `confirm_download` for proposed entries → `acquisition_status` (poll until complete).
 
-`acquisition_status` writes a `<filename>.json` manifest into the staging dir for each confirmed download. The manifest includes the Chromaprint fingerprint that Phase 2 uses to match the download to a crate-agent placeholder. Anything that cannot be confirmed (decode failure, duration mismatch, file not yet in staging dir) lands in the returned `needs_review` list.
+`acquisition_status` writes a `<filename>.json` manifest into the staging dir for each confirmed download. The manifest includes the Chromaprint fingerprint Phase 2 will use to identify the download (see [Phase 2 design](#phase-2-design)). Anything that cannot be confirmed (decode failure, duration mismatch, file not yet in staging dir) lands in the returned `needs_review` list.
 
-**Phase 2** (syncing the confirmed download into crate-agent via the staging manifest's `fingerprint`) is gated on Pillar C and out of scope for Phase 1.
+## Phase 2 design
+
+Phase 2 (issue #92, gated on Pillar C placeholder tracks) adds no new write path. A filesystem observation of a staged file plus its `AcquisitionRecord` produces one `FillPlaceholder` mutation through `OperationEngine`. Forward: link the file to the placeholder track, clear `is_placeholder`, move the file into its artist bucket (Invariant 5), and add it to Serato through the watchdog-guarded queue. Inverse: remove it from Serato, move it back to `staging/`, and set `is_placeholder` again. Writing crate-agent's SQLite or `_Serato_` files directly from `soulseek-core`/`soulseek-mcp` was rejected because it bypasses Invariants 1 and 3.
+
+The join key needs redesign before implementation. The manifest stores the raw Chromaprint `fingerprint`, but `tracks.fingerprint_hash` is the exact SHA-256 of one file's fingerprint bytes and is `NOT NULL UNIQUE`. A placeholder has no audio, so it has no fingerprint, and a downloaded encode will not byte-match an existing one. Workable joins are an AcoustID lookup of the manifest fingerprint compared against the placeholder's `musicbrainz_recording_id`, or explicit confirmation. Placeholder rows also need a schema change to `fingerprint_hash`.
 
 ## Prerequisites
 
