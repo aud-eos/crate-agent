@@ -248,8 +248,8 @@ blocked while any other notified or observed Serato application remains running.
 
 Main window and menu bar share waiting, reconciliation, result, and failure status
 with Retry Sync. Missing or corrupt source errors retain queued writes. Fingerprint
-worker database errors appear in the Library header and activity log without changing
-file-info scan state; **Retry Fingerprinting** restarts only that worker. Initial
+worker database errors appear in the Library header, Workers, and activity log without
+changing file-info scan state; **Retry Fingerprinting** in Workers restarts only that worker. Initial
 completion becomes true only after the whole scan sequence succeeds.
 
 Synchronization acknowledgements belong to the latest requested generation, not
@@ -381,7 +381,10 @@ a rename of an earlier rename's destination (old → middle → new) lands the r
 at the final path. Consecutive adds of different files share one registration:
 Serato's existing paths are read once, every add lands in one V2 rewrite, and
 each import is confirmed in the same transaction; a second add of the same file
-starts a new registration. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
+starts a new registration. Every other write is its own segment. A batched
+segment holds at most 200 rows, since its I/O, verification and confirmations
+share one writer transaction; a larger backlog continues in the next segment
+(#189). Edits to the same record are merged in queue order before the batch
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
@@ -392,8 +395,8 @@ reaching it, or every I/O call threw. A writer that validates or records after
 its I/O (Trash, audio tags, V2 removal, imports) reports the moment that I/O
 returns, so a later throw keeps the mark. A later attempt keeps an earlier
 attempt's mark (`may_have_landed`), and an attempt never clears a mark it did not
-set. Upgrading keeps a row attempted without a recorded error as possibly landed,
-as it was read before the marker existed. A saved value matching an edit that
+set. Rows queued before migration 016 start with the marker unset, which is
+acceptable because no install had a populated queue when 016 shipped. A saved value matching an edit that
 never reached I/O, or whose every I/O call threw, is the user's own Serato edit
 and wins. That a thrown I/O call did not land holds because every Serato
 library write (`database V2`, Subcrates and SmartCrates) replaces its file
@@ -427,15 +430,20 @@ row, and does not advance the external baseline: the Rust batch writers report
 each unmatched path, so a write with nothing to change is told apart from one
 with no entry, and Re-sync counts it as not written (#105).
 
-A missing `database V2` is not evidence that a track is absent (#192). Queued
-metadata updates and renames, and the later rows that depend on them, stay
-queued with a `seratoDatabaseMissing` error naming the path and how many changes
-wait. The drain or Re-sync then fails with that error, so the sync status shows
-it and **Retry Sync** applies the rows once the file is back. A rename waits as
-one unit: no `Subcrates` or `SmartCrates` file is rewritten while `database V2`
-is missing, so the three file sets never disagree about the track's path. Other
-rows still drain. A queued add creates `database V2` when it is missing, and a
-removal from a missing `database V2` has nothing to remove.
+A missing `database V2` is not evidence that a track is absent (#192), and
+crate-agent never creates it. While it is missing, every queued Serato library
+write waits: adds and imports, metadata updates, renames, and removals from
+`database V2` and crates, with the later rows that depend on them. Audio-tag
+writes and Trash, which touch no Serato library file, still drain. No
+`Subcrates` or `SmartCrates` file is rewritten either, so the three file sets
+never disagree about a track. The check runs per drain segment, after
+readiness and conflict deferral, and again at each writer; once a pass finds
+the file missing, the rest of its Serato library writes wait too. Every held row
+records one `seratoDatabaseMissing` error naming the path and how many changes
+the pass held, and the drain or Re-sync fails with it, so the sync status shows
+it and **Retry Sync** applies the rows once the file is back. On a Mac where
+Serato has never run, sync itself reports `sourceMissing`: open Serato once to
+create its library. Discarding queued changes instead is #163.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a

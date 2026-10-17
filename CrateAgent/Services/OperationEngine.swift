@@ -857,7 +857,7 @@ public actor OperationEngine {
         } catch {
             throw OperationEngineError.externalSyncIncomplete(
                 batchId: batchId,
-                underlying: String(describing: error)
+                underlying: error.localizedDescription
             )
         }
     }
@@ -1172,7 +1172,7 @@ public actor OperationEngine {
         let decoder = JSONDecoder()
         for event in events {
             let reconstructed = try Self.resyncWrites(
-                for: event, pathByFileId: pathByFileId, decoder: decoder
+                for: event, pathByFileId: pathByFileId, decoder: decoder, emitting: true
             )
             guard event.eventType.hasReplayableSeratoProjection else { continue }
             guard let fileId = event.fileId, let eventId = event.eventId,
@@ -1405,7 +1405,7 @@ public actor OperationEngine {
                 continue
             }
             // ASC order → the last event to write a field wins for that field.
-            for write in try Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder) {
+            for write in try Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder, emitting: false) {
                 switch write {
                 case let .metadataUpdate(update):
                     for key in Self.metadataFieldMap(update.metadata).keys {
@@ -1480,10 +1480,16 @@ public actor OperationEngine {
     /// Malformed payloads throw before any writes run. Empty for event types
     /// with no replayable Serato projection. Kept in sync with
     /// `EventType.hasReplayableSeratoProjection`.
+    ///
+    /// `emitting` selects what the writes are for. Field ownership (`false`)
+    /// counts every field an event applied, including file-tag fields it left
+    /// out because the file already held them (#114); a replay (`true`) emits
+    /// only what the event actually wrote.
     private static func resyncWrites(
         for event: EventRecord,
         pathByFileId: [Int64: String],
-        decoder: JSONDecoder
+        decoder: JSONDecoder,
+        emitting: Bool
     ) throws -> [SeratoPendingWrite] {
         switch event.eventType {
         case .fileRenamed:
@@ -1513,7 +1519,8 @@ public actor OperationEngine {
                 artist: payload.artist,
                 title: payload.title,
                 album: payload.album,
-                year: payload.year
+                year: payload.year,
+                omittingFileTagFields: emitting ? payload.fileTagFieldsAlreadyOnDisk ?? [] : []
             )
         case .metadataCommittedToSerato:
             // Hygiene / importer path: re-emit the database-V2 metadata
@@ -1544,7 +1551,8 @@ public actor OperationEngine {
             let payload = try decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder)
             guard let fileId = event.fileId,
                   let absolutePath = pathByFileId[fileId] else { return [] }
-            return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
+            return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath,
+                                                 omittingFileTagFields: emitting ? payload.applied.fileTagFieldsAlreadyOnDisk ?? [] : [])
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
             return []
@@ -1923,17 +1931,20 @@ public actor OperationEngine {
     }
 
     /// The run's failures, led by one typed error naming how many queued
-    /// changes wait for a missing `database V2`.
+    /// changes this pass held back for a missing `database V2`. Every held
+    /// row records that same error, so the count and message agree.
     private func failures(of run: SegmentRun) async throws -> [Error] {
-        guard run.awaitingDatabase else { return run.failures }
-        let waiting = try await database.writer.read { database in try SeratoWriteQueue.pendingDatabaseRewriteCount(in: database) }
-        return [OperationEngineError.seratoDatabaseMissing(path: seratoLocator.databaseV2Url.path, waitingCount: waiting)] + run.failures
+        guard !run.awaitingDatabase.isEmpty else { return run.failures }
+        let missing = OperationEngineError.seratoDatabaseMissing(path: seratoLocator.databaseV2Url.path, waitingCount: Set(run.awaitingDatabase.map(\.eventId)).count)
+        try await recordFailure(run.awaitingDatabase, error: missing)
+        return [missing] + run.failures
     }
 
     private static func combinedFailure(_ failures: [Error]) -> Error? {
         guard let first = failures.first else { return nil }
         guard failures.count > 1 else { return first }
-        let details = failures.map(\.localizedDescription).joined(separator: "; ")
+        var seen = Set<String>()
+        let details = failures.map(\.localizedDescription).filter { detail in seen.insert(detail).inserted }.joined(separator: "; ")
         return OperationEngineError.externalSyncIncomplete(batchId: "queued-changes", underlying: "\(details). Fix the causes, then choose Retry Sync.")
     }
 
@@ -1951,8 +1962,14 @@ public actor OperationEngine {
         var blockedQueueIDs = Set<Int64>()
         var queuedEvents = Set<Int64>()
         var failures: [Error] = []
-        /// Whether rows were held back because `database V2` is missing (#192).
-        var awaitingDatabase = false
+        /// Rows held back this pass because `database V2` is missing (#192).
+        /// Once it is found missing, every later Serato library write in the
+        /// pass waits too, so the pass reports one consistent state.
+        var awaitingDatabase: [GuardedSeratoWrite] = []
+        var databaseMissing = false
+        /// A batched segment that failed failed on its store, so later
+        /// segments of that kind in the pass would fail the same way.
+        var failedBatchKinds = Set<SeratoWriteSegment.Kind>()
         var stopped = false
 
         mutating func block(_ write: GuardedSeratoWrite, dependency: SeratoQueueDependency) {
@@ -1974,6 +1991,12 @@ public actor OperationEngine {
     /// rebase their baseline. Rows rejected at the writer boundary leave their
     /// siblings coalesced.
     private func runSegment(_ segment: SeratoWriteSegment, owner: UUID, reported: Bool, run: inout SegmentRun) async throws -> [GuardedSeratoWrite] {
+        guard !run.failedBatchKinds.contains(segment.kind) else {
+            for entry in segment.entries {
+                run.wait(entry.write, dependency: entry.dependency)
+            }
+            return []
+        }
         let stored = try await database.writer.read { database in
             try segment.entries.map { entry -> SeratoWriteSegment.Entry? in
                 guard let queueID = entry.write.queueID, var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
@@ -2026,31 +2049,33 @@ public actor OperationEngine {
         }
         rows = holdingBack(Set(rows.compactMap(\.queueID)).subtracting(claimed), from: rows, run: &run)
         // A missing database V2 shows nothing about which tracks Serato holds,
-        // so rows that rewrite it, and later rows that depend on them, stay
-        // queued with a typed error for Retry Sync instead of completing.
-        let databaseV2Path = seratoLocator.databaseV2Url.path
-        if rows.contains(where: \.write.rewritesSeratoDatabase), !FileManager.default.fileExists(atPath: databaseV2Path) {
+        // and crate-agent never creates it, so every Serato library write, and
+        // later rows that depend on one, stays queued for Retry Sync. Checked
+        // per segment after eligibility, so a deferred or conflicted row keeps
+        // its own state.
+        func holdingForDatabase(_ rows: [GuardedSeratoWrite], run: inout SegmentRun) -> [GuardedSeratoWrite] {
+            if !run.databaseMissing, rows.contains(where: \.write.writesSeratoLibrary) {
+                run.databaseMissing = !FileManager.default.fileExists(atPath: seratoLocator.databaseV2Url.path)
+            }
+            guard run.databaseMissing else { return rows }
             var heldDependency = SeratoQueueDependency()
-            var held: [GuardedSeratoWrite] = []
             var kept: [GuardedSeratoWrite] = []
             for write in rows {
-                if write.write.rewritesSeratoDatabase || dependency(of: write).intersects(heldDependency) {
+                if write.write.writesSeratoLibrary || dependency(of: write).intersects(heldDependency) {
                     heldDependency.formUnion(dependency(of: write))
-                    held.append(write)
+                    run.awaitingDatabase.append(write)
+                    run.wait(write, dependency: dependency(of: write))
                 } else {
                     kept.append(write)
                 }
             }
-            try await recordFailure(held, error: OperationEngineError.seratoDatabaseMissing(path: databaseV2Path, waitingCount: held.count))
-            for write in held {
-                run.wait(write, dependency: dependency(of: write))
-            }
-            run.awaitingDatabase = true
-            rows = kept
+            return kept
         }
         while !rows.isEmpty {
             do {
                 try await requireExternalWriteEligibility(rows)
+                rows = holdingForDatabase(rows, run: &run)
+                guard !rows.isEmpty else { return [] }
                 try await recordAttempt(rows)
                 let missing = try await applyConsecutiveSeratoWrites(rows, reported: reported)
                 let unmatched = rows.filter { write in write.queueID.map(missing.contains) == true }
@@ -2083,6 +2108,10 @@ public actor OperationEngine {
                     run.block(write, dependency: dependency(of: write))
                 }
                 return []
+            } catch let OperationEngineError.seratoDatabaseMissing(path, waitingCount) {
+                try await recordFailure(rows, error: OperationEngineError.seratoDatabaseMissing(path: path, waitingCount: waitingCount))
+                run.databaseMissing = true
+                rows = holdingForDatabase(rows, run: &run)
             } catch ExternalWriteInterruption.deferred {
                 let remainder = try await eligibleWrites(rows)
                 try await supersedeMissing(from: rows, keeping: remainder, reported: reported, run: &run)
@@ -2095,6 +2124,9 @@ public actor OperationEngine {
                     run.wait(write, dependency: dependency(of: write))
                 }
                 run.failures.append(error)
+                if segment.kind != .single {
+                    run.failedBatchKinds.insert(segment.kind)
+                }
                 return []
             }
         }
@@ -2522,17 +2554,8 @@ public actor OperationEngine {
     }
 
     private func applySeratoDatabaseRemoval(_ removal: SeratoPendingRemoval, guardedWrites: [GuardedSeratoWrite]) async throws {
-        let databaseV2Path = seratoLocator.databaseV2Url.path
+        let databaseV2Path = try requireSeratoDatabase(waitingCount: guardedWrites.count)
         let cleanupTarget = guardedWrites.first?.cleanupTargetFileID
-        guard FileManager.default.fileExists(atPath: databaseV2Path) else {
-            // No database V2 yet — nothing to remove from. Same
-            // tolerant behavior as applySeratoMetadataUpdate, except that
-            // cleanup must prove its own removal before it may trash audio.
-            if cleanupTarget != nil {
-                throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: "Duplicate reference removal did not complete.")
-            }
-            return
-        }
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
@@ -2558,7 +2581,10 @@ public actor OperationEngine {
         }
     }
 
+    /// Without a database V2 no crate is rewritten either, so a removal
+    /// lands in all three file sets together.
     private func applySeratoCrateSweepRemoval(_ removal: SeratoPendingRemoval, guardedWrites: [GuardedSeratoWrite]) async throws {
+        _ = try requireSeratoDatabase(waitingCount: guardedWrites.count)
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
@@ -2657,9 +2683,8 @@ public actor OperationEngine {
             guard case let .addTrack(add) = row.write else { return nil }
             return (row, add)
         }
-        guard let firstAdd = adds.first else { return }
-        let databaseV2Path = seratoLocator.databaseV2Url.path
-        let seratoDirectory = seratoLocator.seratoDirectory
+        guard !adds.isEmpty else { return }
+        let databaseV2Path = try requireSeratoDatabase(waitingCount: adds.count)
         let additions = adds.map { entry in
             SeratoTrackAddition(
                 trackPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: entry.add.absolutePath),
@@ -2676,22 +2701,12 @@ public actor OperationEngine {
                 )
             )
         }
-        let bootstrapBytes = freshDatabaseV2Bytes(withTrackPath: additions[0].trackPath, metadata: firstAdd.add.metadata)
         let addWriter = seratoAddTrackBatchWriter
         let scopeAuthorization = readiness?.captureScope()
         let context = mutationContext
         try await performExternalWrite(adds.map(\.row), completing: true) { database, io in
             do {
-                var pending = additions
-                if !FileManager.default.fileExists(atPath: databaseV2Path) {
-                    try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
-                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path), options: .atomic)
-                    io.recordReturned()
-                    pending.removeFirst()
-                }
-                if !pending.isEmpty {
-                    _ = try addWriter(databaseV2Path, pending)
-                }
+                _ = try addWriter(databaseV2Path, additions)
             } catch let CoreError.LandedNotDurable(message) {
                 io.recordReturned()
                 throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: message)
@@ -2714,85 +2729,6 @@ public actor OperationEngine {
             }
             try scopeAuthorization?.check()
         }
-    }
-
-    /// Build the byte layout of a brand-new `database V2` containing
-    /// exactly one otrk for the supplied path + metadata. Used when
-    /// a user drops a file but Serato has never run on this machine
-    /// (the database V2 file doesn't exist yet).
-    private func freshDatabaseV2Bytes(
-        withTrackPath seratoRelativePath: String,
-        metadata: SeratoMetadata
-    ) -> Data {
-        var bytes = Data()
-
-        // vrsn header: 4-byte tag + 4-byte BE length + UTF-16BE payload
-        let versionString = "2.0/Serato Scratch LIVE Database"
-        let versionPayload = utf16BeBytes(of: versionString)
-        bytes.append(contentsOf: "vrsn".utf8)
-        bytes.append(contentsOf: uint32BeBytes(of: UInt32(versionPayload.count)))
-        bytes.append(versionPayload)
-
-        // otrk container with pfil + any t* metadata fields
-        var otrkPayload = Data()
-        appendTlv(tag: "pfil", payload: utf16BeBytes(of: seratoRelativePath), to: &otrkPayload)
-        if let value = metadata.artist {
-            appendTlv(tag: "tart", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.title {
-            appendTlv(tag: "tsng", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.album {
-            appendTlv(tag: "talb", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.genre {
-            appendTlv(tag: "tgen", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.bpm {
-            appendTlv(tag: "tbpm", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.musicalKey {
-            appendTlv(tag: "tkey", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.comment {
-            appendTlv(tag: "tcom", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.length {
-            appendTlv(tag: "tlen", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-        if let value = metadata.label {
-            appendTlv(tag: "tlbl", payload: utf16BeBytes(of: value), to: &otrkPayload)
-        }
-
-        bytes.append(contentsOf: "otrk".utf8)
-        bytes.append(contentsOf: uint32BeBytes(of: UInt32(otrkPayload.count)))
-        bytes.append(otrkPayload)
-        return bytes
-    }
-
-    private func appendTlv(tag: String, payload: Data, to data: inout Data) {
-        precondition(tag.utf8.count == 4)
-        data.append(contentsOf: tag.utf8)
-        data.append(contentsOf: uint32BeBytes(of: UInt32(payload.count)))
-        data.append(payload)
-    }
-
-    private func utf16BeBytes(of string: String) -> Data {
-        var data = Data()
-        for codeUnit in string.utf16 {
-            data.append(UInt8(codeUnit >> 8))
-            data.append(UInt8(codeUnit & 0xFF))
-        }
-        return data
-    }
-
-    private func uint32BeBytes(of value: UInt32) -> [UInt8] {
-        [
-            UInt8((value >> 24) & 0xFF),
-            UInt8((value >> 16) & 0xFF),
-            UInt8((value >> 8) & 0xFF),
-            UInt8(value & 0xFF),
-        ]
     }
 
     /// One Rust FFI call rewrites the `database V2` file for every rename,
@@ -2877,9 +2813,10 @@ public actor OperationEngine {
     }
 
     /// The path of `database V2`. A missing file is not evidence that Serato
-    /// lacks a track, so a write that rewrites it waits, visibly, instead of
-    /// completing as a no-op (#192). `runSegment` holds such rows back first;
-    /// this catches a file that vanished since.
+    /// lacks a track, and crate-agent never creates it, so every Serato
+    /// library write waits, visibly, instead of completing (#192).
+    /// `runSegment` holds such rows back first; this catches a file that
+    /// vanished since, at the point of use.
     private func requireSeratoDatabase(waitingCount: Int) throws -> String {
         let path = seratoLocator.databaseV2Url.path
         guard FileManager.default.fileExists(atPath: path) else {
@@ -3672,7 +3609,8 @@ public actor OperationEngine {
         title: String?,
         album: String?,
         year: Int?,
-        clearFileYear: Bool = false
+        clearFileYear: Bool = false,
+        omittingFileTagFields omitted: Set<MatchFileTagField> = []
     ) -> [SeratoPendingWrite] {
         let metadata = SeratoMetadata(artist: artist, title: title, album: album)
         // An identity-only confirmation (the user kept every display field:
@@ -3684,7 +3622,9 @@ public actor OperationEngine {
         // mtime, and can strip secondary ID3v1/APE tags. Emit each write only
         // when it actually carries a change.
         let hasSeratoMetadataFields = artist != nil || title != nil || album != nil
-        let fileTagNeedsWrite = hasSeratoMetadataFields || year != nil || clearFileYear
+        let fileMetadata = omittingFields(omitted, from: metadata)
+        let fileYear = omitted.contains(.year) ? nil : year
+        let fileTagNeedsWrite = !metadataFieldMap(fileMetadata).isEmpty || fileYear != nil || clearFileYear
 
         var writes: [SeratoPendingWrite] = []
         if hasSeratoMetadataFields {
@@ -3697,10 +3637,37 @@ public actor OperationEngine {
         }
         if fileTagNeedsWrite {
             writes.append(.fileTagWrite(SeratoPendingFileTagWrite(
-                absolutePath: absolutePath, metadata: metadata, year: year, clearYear: clearFileYear
+                absolutePath: absolutePath, metadata: fileMetadata, year: fileYear, clearYear: clearFileYear
             )))
         }
         return writes
+    }
+
+    private static func omittingFields(_ omitted: Set<MatchFileTagField>, from metadata: SeratoMetadata) -> SeratoMetadata {
+        reducedMetadata(metadata, keeping: Set(metadataFieldMap(metadata).keys).subtracting(omitted.map(\.rawValue)))
+    }
+
+    /// The match fields whose value the file already holds on disk, per the
+    /// review's capture. Rewriting them would save the file (with
+    /// `remove_others`) for no change, so the file-tag write leaves them out
+    /// while the event still owns them. A tag write still queued for the file
+    /// will change it first, and a file whose journaled identity moved since
+    /// review was rewritten after the capture (a tag write that landed while
+    /// apply was suspended), so then nothing is left out.
+    private static func fileTagFieldsAlreadyOnDisk(_ payload: ApplyMusicBrainzMatchPayload, file: FileRecord, in db: GRDB.Database) throws -> Set<MatchFileTagField> {
+        guard payload.expectedFileSize == file.fileSize, payload.expectedMtime == file.mtime else { return [] }
+        let queuedTagWrite = try SeratoWriteQueue.fetch(fileID: payload.fileID, in: db).contains { queued in queued.write.kind == .fileTagWrite }
+        guard !queuedTagWrite else { return [] }
+        let unchanged = SeratoMetadata(
+            artist: payload.artist.flatMap { artist in artist == payload.currentFileArtist ? artist : nil },
+            title: payload.title.flatMap { title in title == payload.currentFileTitle ? title : nil },
+            album: payload.album.flatMap { album in album == payload.currentFileAlbum ? album : nil }
+        )
+        var fields = Set(metadataFieldMap(unchanged).keys.compactMap(MatchFileTagField.init(rawValue:)))
+        if let year = payload.year, year == payload.currentFileYear {
+            fields.insert(.year)
+        }
+        return fields
     }
 
     private static func applyMusicBrainzDisplayFields(
@@ -3860,6 +3827,7 @@ public actor OperationEngine {
         forwardPayload.previousFileYear = payload.currentFileYear
         forwardPayload.previousTrackIdentifiers = previousTrackIdentifiers
         forwardPayload.createdTrackRow = createdTrackRow
+        forwardPayload.fileTagFieldsAlreadyOnDisk = try fileTagFieldsAlreadyOnDisk(payload, file: fileRecord, in: db)
 
         let inversePayload = RevertMusicBrainzMatchPayload(applied: forwardPayload)
 
@@ -3879,7 +3847,8 @@ public actor OperationEngine {
             artist: payload.artist,
             title: payload.title,
             album: payload.album,
-            year: payload.year
+            year: payload.year,
+            omittingFileTagFields: forwardPayload.fileTagFieldsAlreadyOnDisk ?? []
         )
         return (eventId, seratoWrites)
     }
@@ -3955,7 +3924,8 @@ public actor OperationEngine {
             in: db
         )
 
-        let seratoWrites = Self.musicBrainzRevertSeratoWrites(applied: applied, absolutePath: fileRecord.path)
+        let seratoWrites = Self.musicBrainzRevertSeratoWrites(applied: applied, absolutePath: fileRecord.path,
+                                                              omittingFileTagFields: applied.fileTagFieldsAlreadyOnDisk ?? [])
         return (eventId, seratoWrites)
     }
 
@@ -3970,9 +3940,12 @@ public actor OperationEngine {
     /// Shared by `applyRevertMusicBrainzMatch` (undo) and `resyncWrites` (so a
     /// reverted event whose external restore write failed mid-undo can be
     /// re-synced — finding #3999974011).
+    /// `omitted` names file-tag fields the forward left out because the file
+    /// already held the matched value; restoring them would rewrite nothing.
     private static func musicBrainzRevertSeratoWrites(
         applied: ApplyMusicBrainzMatchPayload,
-        absolutePath: String
+        absolutePath: String,
+        omittingFileTagFields omitted: Set<MatchFileTagField>
     ) -> [SeratoPendingWrite] {
         // The two external targets restore from DIFFERENT snapshots: Serato's
         // database V2 (and the SQLite `files` row, already restored in
@@ -3991,12 +3964,12 @@ public actor OperationEngine {
             title: applied.title != nil ? (dbSnapshot.title ?? "") : nil,
             album: applied.album != nil ? (dbSnapshot.album ?? "") : nil
         )
-        let fileMetadata = SeratoMetadata(
+        let fileMetadata = omittingFields(omitted, from: SeratoMetadata(
             artist: applied.artist != nil ? (fileSnapshot.artist ?? "") : nil,
             title: applied.title != nil ? (fileSnapshot.title ?? "") : nil,
             album: applied.album != nil ? (fileSnapshot.album ?? "") : nil
-        )
-        let forwardWroteYear = applied.year != nil
+        ))
+        let forwardWroteYear = applied.year != nil && !omitted.contains(.year)
         let fileYear = forwardWroteYear ? applied.previousFileYear : nil
         let clearFileYear = forwardWroteYear && applied.previousFileYear == nil
 
@@ -4244,6 +4217,12 @@ public struct TrackIdentifiers: Codable, Sendable, Equatable {
 /// The `previous…` fields are populated by the engine at apply time to
 /// make the event fully undoable (invariant #2). Callers leave them at
 /// their defaults.
+/// An audio-tag field a MusicBrainz match can apply. Journaled, so an
+/// unknown value fails decoding rather than being silently ignored.
+public enum MatchFileTagField: String, Codable, Sendable, CaseIterable {
+    case artist, title, album, year
+}
+
 public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public let fileID: Int64
     // Identity — always applied:
@@ -4302,6 +4281,11 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public var previousFileYear: Int?
     public var previousTrackIdentifiers: TrackIdentifiers?
     public var createdTrackRow: Bool
+    /// Fields (`artist`, `title`, `album`, `year`) the match applied but left
+    /// out of its audio-tag write because the file already held that value.
+    /// The event still owns them for re-sync; undo and replay skip them. Nil
+    /// for events journaled before #114, which wrote every applied field.
+    public var fileTagFieldsAlreadyOnDisk: Set<MatchFileTagField>?
 
     public init(
         fileID: Int64,
@@ -4592,8 +4576,8 @@ enum SeratoPendingWrite: Sendable, Equatable {
     case removeFromCrates(SeratoPendingRemoval)
     case trashFile(SeratoPendingTrash)
 
-    var rewritesSeratoDatabase: Bool {
-        kind.rewritesSeratoDatabase
+    var writesSeratoLibrary: Bool {
+        kind.writesSeratoLibrary
     }
 }
 
@@ -4754,7 +4738,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
         case let .seratoRewriteFailed(path, underlying):
             "Failed to rewrite Serato library file \(path): \(underlying)"
         case let .seratoDatabaseMissing(path, waitingCount):
-            "Serato's library file \(path) is missing, so \(waitingCount) queued change\(waitingCount == 1 ? " is" : "s are") waiting for it. Reconnect or restore the Serato library (opening Serato once creates it), close Serato, then choose Retry Sync."
+            "Serato's library database V2 is missing at \(path), so \(waitingCount) queued change\(waitingCount == 1 ? " is" : "s are") waiting for it. crate-agent never creates it: open Serato once to create it (or reconnect the drive that holds it), close Serato, then choose Retry Sync."
         case let .fileTagWriteFailed(path, underlying):
             "Failed to write audio tags to \(path): \(underlying)"
         case let .trashFailed(path, underlying):

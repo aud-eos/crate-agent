@@ -706,46 +706,6 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(droppedRecord?.title, "Drop Title")
     }
 
-    func testAddTrackToSeratoBootstrapsDatabaseV2IfMissing() async throws {
-        // Serato has never run on this machine → no database V2.
-        // The mutation should create a fresh one with our otrk.
-        let rootDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("crate-agent-test-bootstrap-\(UUID().uuidString)", isDirectory: true)
-        let seratoDirectoryUrl = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: rootDirectory) }
-        // Note: don't create the _Serato_ directory — applySeratoAddTrack
-        // creates it on demand.
-
-        let (engine, database, _) = try await MainActor.run {
-            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: false)
-        }
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: audioFixture.path("/Users/testuser/Music/A/first.mp3"),
-            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
-            metadata: SeratoMetadata(artist: "First")
-        )))
-        try await prepareAudioFixtures(in: database)
-        let fileId = try await database.writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/first.mp3")])
-        }!
-        try await prepareAudioFixtures(in: database, membership: .pendingImport)
-        try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
-            fileId: fileId,
-            metadata: SeratoMetadata(artist: "First")
-        )))
-
-        let databaseV2Url = seratoDirectoryUrl.appendingPathComponent("database V2")
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: databaseV2Url.path),
-            "database V2 should have been bootstrapped"
-        )
-        let records = try readDatabaseRecords(databasePath: databaseV2Url.path)
-        XCTAssertEqual(records.count, 1)
-        XCTAssertEqual(records[0].path, SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/first.mp3")))
-        XCTAssertEqual(records[0].artist, "First")
-    }
-
     func testDrainAppliesQueuedRewrites() async throws {
         let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
@@ -2508,6 +2468,9 @@ final class FingerprintWorkerTests: XCTestCase {
         XCTAssertEqual(bad.fingerprintStatus, .failed)
         XCTAssertNil(bad.chromaprintFingerprint,
                      "failed rows must not carry a stale hash blob")
+        let failures = try await database.writer.read { db in try WorkerCoverageQuery.files(in: .failed, database: db) }
+        XCTAssertEqual(failures.map(\.path), ["/Music/A/bad.mp3"])
+        XCTAssertEqual(failures.first?.detail, FingerprintError().localizedDescription, "the decoder's reason is kept for Workers")
     }
 
     func testWorkerSkipsAlreadyDoneRows() async throws {
@@ -2714,6 +2677,41 @@ final class FingerprintWorkerTests: XCTestCase {
         XCTAssertEqual(copied.fingerprintStatus, .done)
         XCTAssertEqual(copied.chromaprintFingerprint, existingFingerprint,
                        "the new row must inherit the twin's exact fingerprint bytes")
+    }
+
+    func testInvalidDoneTwinIsNotCopiedAndRetriedRowIsDecoded() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        let hash = Data([0xBA, 0xD0])
+        try await database.writer.write { db in
+            var record = FileRecord(path: "/Music/A/invalid-done.mp3", volumeUuid: "v1", inode: 300, fileSize: 1024, mtime: 1_700_000_000,
+                                    lightweightHash: hash, chromaprintFingerprint: Data([0x01, 0x02, 0x03]), fingerprintStatus: .done)
+            record.libraryMembership = .active
+            record.fileAvailability = .available
+            try record.insert(db)
+        }
+        try await insertPendingFileWithHash(path: "/Music/A/retried.mp3", in: database, inode: 301, lightweightHash: hash)
+
+        let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { _ in [0xFEED] })
+        _ = try await worker.processAllPendingOnce()
+
+        let retried = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/retried.mp3").fetchOne(db)!
+        }
+        XCTAssertEqual(retried.fingerprintStatus, .done)
+        XCTAssertEqual(retried.chromaprintFingerprint, FingerprintEncoder.serialize([0xFEED]),
+                       "an invalid done twin must not be copied; the row is decoded itself")
+    }
+
+    func testDecoderReturningNoHashesMarksRowFailed() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        try await insertPendingFile(path: "/Music/A/silent.mp3", in: database, inode: 1)
+
+        let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { _ in [] })
+        _ = try await worker.processAllPendingOnce()
+
+        let failures = try await database.writer.read { db in try WorkerCoverageQuery.files(in: .failed, database: db) }
+        XCTAssertEqual(failures.map(\.path), ["/Music/A/silent.mp3"])
+        XCTAssertEqual(failures.first?.detail, WorkerMessages.noFingerprintProduced)
     }
 
     func testFilesWithoutHashFingerprintIndependently() async throws {

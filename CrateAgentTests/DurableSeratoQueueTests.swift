@@ -304,40 +304,45 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
     }
 
-    func testAMissingDatabaseV2KeepsQueuedMetadataAndRenamesWaitingUntilItReturns() async throws {
+    func testAMissingDatabaseV2KeepsEveryQueuedSeratoWriteWaitingWithoutCreatingItUntilItReturns() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
-        let file = try await fixture.add("held.wav", bytes: FinalRemovalIntegrationTests.wav())
-        let fileID = try XCTUnwrap(file.id)
-        try save(fixture, paths: [file.path])
-        let crates = try saveCrates(fixture, paths: [file.path])
+        let edited = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let imported = try await fixture.add("imported.wav", membership: .pendingImport, bytes: FinalRemovalIntegrationTests.wav(sample: 1))
+        let removed = try await fixture.add("removed.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 2))
+        try save(fixture, paths: [edited.path, removed.path])
+        let crates = try saveCrates(fixture, paths: [removed.path])
         try await makeSession(fixture, engine: fixture.engine).synchronize()
+        let (editedID, importedID, removedID) = try (XCTUnwrap(edited.id), XCTUnwrap(imported.id), XCTUnwrap(removed.id))
         setRunning(fixture, true)
-        try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: "Committed"), isSeratoAuthoritative: false)), batchId: "edit")
-        try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: "Committed"))), batchId: "edit")
-        let renamed = fixture.directory.appendingPathComponent("renamed.wav").path
-        try await fixture.engine.apply(.renameFile(.init(fileId: fileID, newPath: renamed, previousPath: file.path, physicalMove: true)), batchId: "move")
+        try await fixture.engine.apply(.setMetadata(.init(fileId: editedID, metadata: .init(title: "Committed"), isSeratoAuthoritative: false)), batchId: "edit")
+        try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: editedID, metadata: .init(title: "Committed"))), batchId: "edit")
+        try await fixture.engine.apply(.addTrackToSerato(.init(fileId: importedID, metadata: .init(title: "Imported"))))
+        try await fixture.engine.apply(.removeTrackFromSerato(.init(fileId: removedID)))
+        try await fixture.engine.apply(.removeFileFromCrates(.init(fileId: removedID)))
         setRunning(fixture, false)
         let queued = try await fixture.engine.pendingSeratoWriteCount
         let savedLibrary = try Data(contentsOf: fixture.locator.databaseV2Url)
         try FileManager.default.removeItem(at: fixture.locator.databaseV2Url)
 
         await XCTAssertThrowsErrorAsync(try await fixture.engine.drainPendingSeratoUpdates()) { error in
-            XCTAssertEqual(error as? OperationEngineError, .seratoDatabaseMissing(path: fixture.locator.databaseV2Url.path, waitingCount: 2))
+            XCTAssertEqual(error as? OperationEngineError, .seratoDatabaseMissing(path: fixture.locator.databaseV2Url.path, waitingCount: 4))
         }
         let stillQueued = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(stillQueued, queued)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.locator.databaseV2Url.path), "crate-agent never creates database V2")
         for (url, bytes) in crates {
-            XCTAssertEqual(try Data(contentsOf: url), bytes, "a rename waits for database V2 before touching any crate")
+            XCTAssertEqual(try Data(contentsOf: url), bytes, "a removal waits for database V2 before touching any crate")
         }
 
         try savedLibrary.write(to: fixture.locator.databaseV2Url)
         try await fixture.engine.drainPendingSeratoUpdates()
         let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
-        XCTAssertEqual(records.map { record in SeratoPath.normalized(record.path) }, [renamed])
-        XCTAssertEqual(records.first?.title, "Committed")
+        let titles = Dictionary(uniqueKeysWithValues: records.map { record in (SeratoPath.normalized(record.path), record.title) })
+        XCTAssertEqual(Set(titles.keys), Set([edited.path, imported.path].map(SeratoPath.normalized)))
+        XCTAssertEqual(titles[SeratoPath.normalized(edited.path)], "Committed")
         for (url, _) in crates {
-            XCTAssertEqual(try readCratePaths(cratePath: url.path).map(SeratoPath.normalized), [renamed])
+            XCTAssertEqual(try readCratePaths(cratePath: url.path), [])
         }
     }
 
@@ -463,6 +468,65 @@ final class DurableSeratoQueueTests: XCTestCase {
         let first = try XCTUnwrap(records.first { record in SeratoPath.normalized(record.path) == files[0].path })
         XCTAssertEqual(first.title, "Title first.wav")
         XCTAssertEqual(first.artist, "Second edit artist")
+    }
+
+    func testALargeQueuedBacklogIsWrittenInBoundedRewrites() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        var files: [FileRecord] = []
+        for index in 0 ... SeratoWriteSegmenter.maximumEntriesPerSegment {
+            try await files.append(fixture.add("track-\(index).wav", bytes: FinalRemovalIntegrationTests.wav(sample: UInt8(index % 250))))
+        }
+        try save(fixture, paths: files.map(\.path))
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        setRunning(fixture, true)
+        for file in files {
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .init(title: "Edited \(file.id ?? 0)"))))
+        }
+        setRunning(fixture, false)
+
+        let rewriteSizes = LockedRewriteSizes()
+        let relaunched = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                         seratoMetadataBatchWriter: { databasePath, updates in
+                                             rewriteSizes.append(updates.count)
+                                             return try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+                                         })
+        _ = try await relaunched.drainPendingSeratoUpdates()
+
+        XCTAssertGreaterThan(rewriteSizes.values.count, 1, "One writer transaction held every queued row")
+        XCTAssertTrue(rewriteSizes.values.allSatisfy { size in size <= SeratoWriteSegmenter.maximumEntriesPerSegment })
+        let titles = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).reduce(into: [String: String]()) { titles, record in
+            titles[SeratoPath.normalized(record.path)] = record.title
+        }
+        for file in files {
+            XCTAssertEqual(titles[file.path], "Edited \(file.id ?? 0)")
+        }
+        let remaining = try await relaunched.pendingSeratoWriteCount
+        XCTAssertEqual(remaining, 0)
+
+        // A failing store fails the pass once; later segments for it stay queued for Retry Sync.
+        setRunning(fixture, true)
+        for file in files {
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .init(title: "Retitled \(file.id ?? 0)"))))
+        }
+        setRunning(fixture, false)
+        let failedRewrites = LockedRewriteSizes()
+        let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                      seratoMetadataBatchWriter: { _, updates in
+                                          failedRewrites.append(updates.count)
+                                          throw CocoaError(.fileWriteNoPermission)
+                                      })
+        do {
+            _ = try await failing.drainPendingSeratoUpdates()
+            XCTFail("The failing store accepted the edits")
+        } catch {
+            let message = error.localizedDescription
+            let failure = CocoaError(.fileWriteNoPermission).localizedDescription
+            XCTAssertEqual(message.components(separatedBy: failure).count - 1, 1, "The same store failure was reported per segment: \(message)")
+        }
+        XCTAssertEqual(failedRewrites.values.count, 1, "The pass kept retrying a store that already failed")
+        let retained = try await failing.pendingSeratoWriteCount
+        XCTAssertEqual(retained, files.count)
     }
 
     func testImmediateBatchAppliesMetadataAfterItsFilesRename() async throws {
@@ -1005,5 +1069,18 @@ private final class BoundaryRecorder: @unchecked Sendable {
 
     func recordTrash(_ path: String) {
         lock.withLock { trashedPaths.append(path) }
+    }
+}
+
+private final class LockedRewriteSizes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [Int] = []
+
+    var values: [Int] {
+        lock.withLock { stored }
+    }
+
+    func append(_ size: Int) {
+        lock.withLock { stored.append(size) }
     }
 }
