@@ -77,3 +77,15 @@ public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
         id = inserted.rowID
     }
 }
+
+extension TrackRecord {
+    /// D-C: a 120s-capped fingerprint can collide across two different recordings. Re-identifying
+    /// a row that already names a different recording is a collision only while another file
+    /// depends on it; a file correcting its own row is a legitimate re-match. Returns the
+    /// recording the collision would overwrite.
+    func conflictingRecording(replacingWith incomingRecordingMBID: String, otherFilesReference: () throws -> Bool) rethrows -> String? {
+        guard let existingRecordingMBID = musicbrainzRecordingId, existingRecordingMBID != incomingRecordingMBID,
+              try otherFilesReference() else { return nil }
+        return existingRecordingMBID
+    }
+}

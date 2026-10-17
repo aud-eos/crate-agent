@@ -71,6 +71,15 @@ public actor OperationEngine {
     private var claimedQueueIDs: [Int64: UUID] = [:]
     private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
     private var isDraining = false
+    /// One pass over queued rows runs at a time. A scoped pass leaves a row
+    /// that depends on another pass's unfinished row for a later drain, and
+    /// with Serato closed and readiness open no drain comes until the next
+    /// sync, so overlapping passes would strand it (#117).
+    private var externalPassActive = false
+    private var externalPassWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Set inside a pass, so a pass started from within one (a cleanup step
+    /// a drain advances) runs as part of it instead of waiting for it.
+    @TaskLocal private static var runsInsideExternalPass = false
 
     private enum ExternalWriteInterruption: Error {
         case deferred
@@ -695,10 +704,10 @@ public actor OperationEngine {
         var reduction = QueuedMetadataReduction(overlay: overlay, journaledBaseline: baseline)
         var ownWrittenFields = Set<String>()
         var earlierIntended: [String: Set<String?>] = [:]
-        // Only a row whose I/O was attempted can have landed; an unattempted
-        // row's value in Serato is an external edit that happens to match it.
+        // Only a row whose I/O may have landed can explain a saved value; any
+        // other row's value in Serato is an external edit that happens to match it.
         let intents: [[String: String?]] = queued.map { guarded in
-            guard guarded.attempts > 0, case let .metadataUpdate(update) = guarded.write else { return [:] }
+            guard guarded.mayHaveLanded, case let .metadataUpdate(update) = guarded.write else { return [:] }
             return metadataFieldMap(update.metadata).mapValues { value in value.isEmpty ? nil : value }
         }
         for (position, guarded) in queued.enumerated() {
@@ -947,11 +956,10 @@ public actor OperationEngine {
             for intent in try DuplicateCleanupStore.fetchAll(in: database) {
                 guard intent.step < intent.mutations.count, case .trashFile = intent.mutations[intent.step] else { continue }
                 let targetID = intent.target.token.fileId
-                // A recorded error means the last attempt reported failure, so a
-                // missing path proves nothing about this engine's Trash.
+                // A missing path after a failed attempt proves nothing about this engine's Trash.
                 let attempted = try SeratoWriteQueue.fetch(cleanupTargetFileID: targetID, in: database).first { write in
                     if case .trashFile = write.write {
-                        write.attempts > 0 && write.lastError == nil
+                        write.mayHaveLanded
                     } else {
                         false
                     }
@@ -1535,20 +1543,6 @@ public actor OperationEngine {
             throw OperationEngineError.batchNotFound(batchId: batchId)
         }
 
-        // Out-of-order undo guard (finding #3999974010 / follow-up). A
-        // MusicBrainz match in this batch cannot be cleanly reverted if the
-        // same file was re-matched — or reverted — by a LATER event in a
-        // DIFFERENT batch: undoing it would unlink the file from its current
-        // match and rewrite its audio tags past that match. The authoritative
-        // signal is the event log, NOT the fingerprint row's identity/reference
-        // state — a same-batch sibling (a different file sharing the row) and a
-        // cross-batch re-match of THIS file (even to the same recording, a
-        // different release) leave identical row state, yet one must undo and
-        // the other must be rejected. Checked before any mutation so the atomic
-        // undo fails clean, and History surfaces it so the user undoes the
-        // newer match first (LIFO).
-        try await assertNoLaterMatchSupersedes(events: events, batchId: batchId)
-
         // Pre-decode every inverse before mutating anything. If any
         // event in the batch is non-reversible, we fail clean — no
         // partial undo state lands in the DB.
@@ -1565,6 +1559,9 @@ public actor OperationEngine {
         // one inverse hit a fileNotFound mid-loop.
         let results = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: undoBatchId) { database, moves in
             try authorization?.check()
+            // Inside the transaction that applies the inverses, so an apply
+            // that lands while undo is suspended cannot slip past it (#107).
+            try Self.requireNoLaterMatchSupersedes(events: events, in: database)
             for event in events {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
@@ -1618,7 +1615,7 @@ public actor OperationEngine {
     /// guarded symmetrically: it is rejected when a field the match touched no
     /// longer holds the value the revert restored, since redoing would write
     /// the match value back over a later edit.
-    private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId _: String) async throws {
+    private static func requireNoLaterMatchSupersedes(events: [EventRecord], in db: GRDB.Database) throws {
         let matchEvents = events.filter {
             $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
         }
@@ -1628,16 +1625,11 @@ public actor OperationEngine {
 
         // Per-file MATCH-event history (for the LIFO stack), plus each file's
         // CURRENT row (for the value comparison), read together.
-        let (history, currentFiles): ([EventRecord], [Int64: FileRecord]) = try await database.writer.read { db in
-            let history = try Self.fetchFileEvents(fileIDs: fileIds,
-                                                   eventTypes: [.musicBrainzMatchApplied, .musicBrainzMatchReverted], in: db)
-            let files = try Self.fetchFiles(fileIDs: fileIds, in: db)
-                .reduce(into: [Int64: FileRecord]()) { accumulator, file in
-                    if let id = file.id {
-                        accumulator[id] = file
-                    }
-                }
-            return (history, files)
+        let history = try fetchFileEvents(fileIDs: fileIds, eventTypes: [.musicBrainzMatchApplied, .musicBrainzMatchReverted], in: db)
+        let currentFiles = try fetchFiles(fileIDs: fileIds, in: db).reduce(into: [Int64: FileRecord]()) { accumulator, file in
+            if let id = file.id {
+                accumulator[id] = file
+            }
         }
         var historyByFile: [Int64: [EventRecord]] = [:]
         for event in history {
@@ -1790,6 +1782,27 @@ public actor OperationEngine {
     @discardableResult
     public func drainPendingSeratoUpdates(retryingFailedCleanup: Bool = false) async throws -> ResyncOutcome {
         guard readiness?.permitsExternalWrites != false else { throw LibrarySyncReadinessError.synchronizationRequired }
+        return try await exclusiveExternalPass { try await drainQueue(retryingFailedCleanup: retryingFailedCleanup) }
+    }
+
+    private func exclusiveExternalPass<Result: Sendable>(_ pass: () async throws -> Result) async throws -> Result {
+        if Self.runsInsideExternalPass {
+            return try await pass()
+        }
+        while externalPassActive {
+            await withCheckedContinuation { continuation in externalPassWaiters.append(continuation) }
+        }
+        externalPassActive = true
+        defer {
+            externalPassActive = false
+            if !externalPassWaiters.isEmpty {
+                externalPassWaiters.removeFirst().resume()
+            }
+        }
+        return try await Self.$runsInsideExternalPass.withValue(true) { try await pass() }
+    }
+
+    private func drainQueue(retryingFailedCleanup: Bool) async throws -> ResyncOutcome {
         try await recoverInterruptedEffects()
         if retryingFailedCleanup {
             try await database.writer.write { database in try DuplicateCleanupStore.clearFailures(in: database) }
@@ -2234,6 +2247,10 @@ public actor OperationEngine {
     /// Applies the given rows now in dependency-ordered segments, the same way
     /// a drain does. Rows outside the scope are left for the drain.
     private func processScopedRows(_ queueIDs: Set<Int64>) async throws -> ResyncOutcome {
+        try await exclusiveExternalPass { try await processScopedRowsExclusively(queueIDs) }
+    }
+
+    private func processScopedRowsExclusively(_ queueIDs: Set<Int64>) async throws -> ResyncOutcome {
         let partition = try await partitionScopedRows(queueIDs)
         var run = SegmentRun()
         for write in partition.superseded {
@@ -2406,6 +2423,12 @@ public actor OperationEngine {
     }
 
     private func applyFileTagWrite(_ write: SeratoPendingFileTagWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
+        let year = try write.year.map { requested in
+            guard let year = UInt32(exactly: requested) else {
+                throw OperationEngineError.fileTagWriteFailed(path: write.absolutePath, underlying: "year \(requested) is outside the writable range")
+            }
+            return year
+        }
         let update = AudioTagUpdate(
             artist: write.metadata.artist,
             title: write.metadata.title,
@@ -2419,7 +2442,7 @@ public actor OperationEngine {
             // Serato's database V2 has no year field, so the MusicBrainz
             // match routes year to the file tags only. `writeFileTags`
             // leaves it nil.
-            year: write.year.flatMap { $0 >= 0 ? UInt32($0) : nil },
+            year: year,
             clearYear: write.clearYear
         )
         let tagWriter = fileTagWriter
@@ -3574,27 +3597,17 @@ public actor OperationEngine {
             .filter(Column("fingerprint_hash") == payload.fingerprintHash)
             .fetchOne(db)
         {
-            // D-C: a 120s-capped fingerprint can collide across two DIFFERENT
-            // recordings. When the row already carries a recording MBID that
-            // differs from the incoming one AND another file depends on that
-            // row, overwriting would mis-link every one of those files
-            // (invariant #4). Reject instead. A single file re-identifying
-            // its OWN row (no other references) is a legitimate correction
-            // and proceeds — the reference check is what distinguishes a
-            // collision from a re-match.
-            if let existingRecordingMBID = existingTrack.musicbrainzRecordingId,
-               existingRecordingMBID != payload.recordingMBID
-            {
-                let otherFilesReferenceRow = try FileRecord.hasOtherFilesReferencingTrack(
-                    existingTrack.id, excluding: payload.fileID, in: db
+            // `AutoTaggerService.fingerprintConflictFileIDs` excludes these rows before the batch;
+            // this rejection remains the guard against changes made since that preflight.
+            let existingTrackID = existingTrack.id
+            if let existingMBID = try existingTrack.conflictingRecording(replacingWith: payload.recordingMBID, otherFilesReference: {
+                try FileRecord.hasOtherFilesReferencingTrack(existingTrackID, excluding: payload.fileID, in: db)
+            }) {
+                throw OperationEngineError.fingerprintRecordingConflict(
+                    fileId: payload.fileID,
+                    existingMBID: existingMBID,
+                    incomingMBID: payload.recordingMBID
                 )
-                if otherFilesReferenceRow {
-                    throw OperationEngineError.fingerprintRecordingConflict(
-                        fileId: payload.fileID,
-                        existingMBID: existingRecordingMBID,
-                        incomingMBID: payload.recordingMBID
-                    )
-                }
             }
             previousTrackIdentifiers = TrackIdentifiers(
                 acoustID: existingTrack.acoustidId,

@@ -60,7 +60,7 @@ final class AutoTagSession: ObservableObject {
     @Published private(set) var isApplying = false
     @Published private(set) var actionError: String?
     @Published private(set) var lastResult: String?
-    @Published private(set) var fatalError: String?
+    @Published private(set) var haltReason: String?
     @Published private(set) var pendingResyncBatchId: String?
     @Published private(set) var focusedFileID: Int64?
     @Published private(set) var focusNotice: String?
@@ -121,7 +121,7 @@ final class AutoTagSession: ObservableObject {
             reviewMode = mode
         }
         lookupService.$rows.sink { [weak self] publishedRows in self?.receive(publishedRows) }.store(in: &subscriptions)
-        lookupService.$fatalError.sink { [weak self] error in self?.fatalError = error }.store(in: &subscriptions)
+        lookupService.$haltReason.sink { [weak self] error in self?.haltReason = error }.store(in: &subscriptions)
         lookupService.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
     }
 
@@ -203,7 +203,7 @@ final class AutoTagSession: ObservableObject {
         focusNotice = nil
         actionError = nil
         lastResult = nil
-        fatalError = nil
+        haltReason = nil
         isScanning = true
         let task = Task { [self] in
             do {
@@ -438,21 +438,26 @@ final class AutoTagSession: ObservableObject {
             do {
                 let tokens = lookupService.membershipTokens(for: payloads.map(\.fileID))
                 let staleIDs = try await lookupService.staleFileIDs(for: payloads).union(payloads.map(\.fileID).filter { tokens[$0] == nil })
-                let freshPayloads = payloads.filter { !staleIDs.contains($0.fileID) }
-                let staleNotice = staleIDs.isEmpty ? "" : " Skipped \(staleIDs.count) file(s) that changed since scanning; scan them again."
+                let currentPayloads = payloads.filter { !staleIDs.contains($0.fileID) }
+                let conflictIDs = try await lookupService.fingerprintConflictFileIDs(for: currentPayloads)
+                let freshPayloads = currentPayloads.filter { !conflictIDs.contains($0.fileID) }
+                var skipNotice = staleIDs.isEmpty ? "" : " Skipped \(staleIDs.count) file(s) that changed since scanning; scan them again."
+                if !conflictIDs.isEmpty {
+                    skipNotice += " Skipped \(conflictIDs.count) file(s) whose fingerprint is already linked to a different recording by another file; review them individually."
+                }
                 guard !freshPayloads.isEmpty else {
-                    actionError = staleNotice.trimmingCharacters(in: .whitespaces)
+                    actionError = skipNotice.trimmingCharacters(in: .whitespaces)
                     return
                 }
                 let batchID = UUID().uuidString
                 do {
                     try await applyBatch(freshPayloads.map { .applyMusicBrainzMatch($0) }, batchID, tokens)
                     markApplied(freshPayloads)
-                    lastResult = "Applied \(freshPayloads.count) file(s)." + staleNotice
+                    lastResult = "Applied \(freshPayloads.count) file(s)." + skipNotice
                 } catch let OperationEngineError.externalSyncIncomplete(failedBatchID, underlying) {
                     markApplied(freshPayloads)
                     pendingResyncBatchId = failedBatchID
-                    actionError = "Applied to the library; some external writes are incomplete: \(underlying)" + staleNotice
+                    actionError = "Applied to the library; some external writes are incomplete: \(underlying)" + skipNotice
                 }
             } catch { actionError = "Could not apply the approved files: \(error.localizedDescription)" }
         }

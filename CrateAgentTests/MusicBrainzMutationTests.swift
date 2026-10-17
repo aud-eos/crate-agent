@@ -1289,6 +1289,37 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// #107: an edit that lands while undo is suspended must still be seen
+    /// by its clobber guard. The edit starts when the guard reads the match
+    /// history; with the guard outside undo's transaction, the edit commits
+    /// in between and undo overwrites it.
+    func testUndoGuardSeesAnEditThatLandsWhileUndoIsSuspended() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileID) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(.applyMusicBrainzMatch(fullPayload(fileID: fileID, fingerprintHash: sha256(sampleFingerprintBytes),
+                                                                  artist: "Matched Artist", title: nil, album: nil, year: nil)), batchId: "match")
+        let concurrentEdit = OnceStartedTask()
+        try await database.writer.write { connection in
+            connection.trace { event in
+                let statement = event.expandedDescription
+                guard statement.hasPrefix("SELECT"), statement.contains(EventType.musicBrainzMatchApplied.rawValue) else { return }
+                concurrentEdit.start {
+                    try await engine.apply(.setMetadata(SetMetadataPayload(fileId: fileID, metadata: SeratoMetadata(artist: "Manually Edited"))),
+                                           batchId: "manual-edit")
+                }
+            }
+        }
+        do { _ = try await engine.undoBatch("match") }
+        catch OperationEngineError.undoSupersededByLaterMatch {}
+        try await concurrentEdit.finished()
+        try await database.writer.write { connection in connection.trace(nil) }
+
+        let artist = try await database.writer.read { connection in try FileRecord.fetchOne(connection, key: fileID)?.artist }
+        XCTAssertEqual(artist, "Manually Edited", "Undo overwrote an edit that landed after its guard ran")
+    }
+
     /// A later non-match write that RE-AFFIRMS the match's value (as
     /// `LibraryScanner`'s drift `setMetadata` does — it re-writes the full
     /// artist/title/album snapshot when any one field drifts) must NOT block
@@ -1850,5 +1881,25 @@ final class MusicBrainzMutationTests: XCTestCase {
             XCTAssertEqual(fileA.title, "oldA")
             XCTAssertEqual(fileB.title, "oldB")
         }
+    }
+}
+
+/// Starts one operation from inside a database callback, where it cannot
+/// commit until that callback's transaction ends, and lets the test await it.
+private final class OnceStartedTask: @unchecked Sendable {
+    private struct NeverStarted: Error {}
+    private let lock = NSLock()
+    private var task: Task<Void, Error>?
+
+    func start(_ operation: @escaping @Sendable () async throws -> Void) {
+        lock.withLock {
+            guard task == nil else { return }
+            task = Task { try await operation() }
+        }
+    }
+
+    func finished() async throws {
+        guard let task = lock.withLock({ task }) else { throw NeverStarted() }
+        try await task.value
     }
 }
