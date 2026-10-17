@@ -360,7 +360,15 @@ attempt's mark (`may_have_landed`), and an attempt never clears a mark it did no
 set. Upgrading keeps a row attempted without a recorded error as possibly landed,
 as it was read before the marker existed. A saved value matching an edit that
 never reached I/O, or whose every I/O call threw, is the user's own Serato edit
-and wins. A failed segment fails all of its rows together
+and wins. That a thrown I/O call did not land holds because every Serato
+library write (`database V2`, Subcrates and SmartCrates) replaces its file
+atomically: the bytes go to a temporary file in the same directory, which is
+flushed and then renamed over the target, so a write that throws before the
+rename leaves the previous bytes in place (#193). If only the directory flush
+after the rename fails, the writer throws `LandedNotDurable`: the new bytes are
+in place, so the engine records the I/O as returned before rethrowing, and the
+row stays visible and retries the same bytes. Each rewrite first removes
+`.crate-agent-*.tmp` files a crashed rewrite left in that directory. A failed segment fails all of its rows together
 and blocks their dependents; a row whose target becomes conflicted at the write
 boundary is blocked alone with its dependents, and the rest of the segment applies.
 
@@ -377,8 +385,17 @@ edit whose baseline is still unknown learns the fields of an earlier edit of our
 once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its
 write may have landed by that rule; a failed Trash attempt is not proof the audio moved.
 
+A metadata update whose path the parsed `database V2` has no entry at, or a
+rename whose track neither `database V2` nor any crate holds at its final path
+afterwards, completes as `noSeratoRecord` in the transaction that removes its
+row, and does not advance the external baseline: the Rust batch writers report
+each unmatched path, so a write with nothing to change is told apart from one
+with no entry, and Re-sync counts it as not written (#105). A missing
+`database V2` is not evidence that a track is absent and keeps its tolerant
+behavior.
+
 The ready summary reports each dropped change by disposition (superseded,
-uncertain, interrupted, malformed, or legacy unrecoverable) once, and turns to a
+uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
 warning. An outcome this version does not recognize, such as one recorded by a
 newer build, is counted as not applied rather than blocking readiness. History marks a batch with the number of its changes that were not
 applied.
