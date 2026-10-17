@@ -345,8 +345,8 @@ The Rust writers for `database V2`, Subcrates and SmartCrates use the same rule:
 a rename, metadata update, removal, addition or held-path check matches a stored
 path by its NFC form, so a decomposed spelling Finder stored matches a composed
 request, and the reverse. Matching never rewrites a path field's bytes; only a
-rename replaces the matched field, with the requested destination. A record that
-spells a path differently but equivalently is a conflict, which the scope above
+rename replaces the matched field, with the requested destination. Two records whose
+spellings are equivalent form a conflict, which the scope above
 keeps away from those writers.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
