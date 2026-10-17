@@ -218,15 +218,16 @@ final class OrganizePreviewTests: XCTestCase {
         var selected = Set<Int>()
         let configuration = VirtualizedPreviewTable(dataID: "examples", accessibilityLabel: "Example preview", rowCount: rows.count, row: { index in rows[index] },
                                                     columns: [PreviewTableColumn(identifier: "name", title: "Name", width: 200, text: { row in row.name })],
-                                                    accessibilityName: { row in row.name }, isSelected: { identifier in selected.contains(identifier) },
-                                                    setSelected: {
-                                                        identifier, included in if included {
-                                                            selected.insert(identifier)
-                                                        } else {
-                                                            selected.remove(identifier)
-                                                        }
-                                                    },
-                                                    selectAll: { selected = [10, 20] }, enabled: true, density: .compact)
+                                                    selection: .init(accessibilityName: { row in row.name }, isSelected: { identifier in selected.contains(identifier) },
+                                                                     setSelected: { identifier, included in
+                                                                         if included {
+                                                                             selected.insert(identifier)
+                                                                         } else {
+                                                                             selected.remove(identifier)
+                                                                         }
+                                                                     },
+                                                                     selectAll: { selected = [10, 20] }),
+                                                    enabled: true, density: .compact)
         let coordinator = configuration.makeCoordinator()
         let scroll = coordinator.makeScrollView()
         let table = scroll.documentView as! PreviewNSTableView

@@ -14,14 +14,18 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
     let rowCount: Int
     let row: (Int) -> Row
     let columns: [PreviewTableColumn<Row>]
-    let accessibilityName: (Row) -> String
-    let isSelected: (Row.ID) -> Bool
-    let setSelected: (Row.ID, Bool) -> Void
-    let selectAll: () -> Void
+    let selection: Selection?
     let enabled: Bool
     let density: AppDensity
     var sort: ((String, Bool) -> Void)?
-    var isSelectable: (Row) -> Bool = { _ in true }
+
+    struct Selection {
+        let accessibilityName: (Row) -> String
+        let isSelected: (Row.ID) -> Bool
+        let setSelected: (Row.ID, Bool) -> Void
+        let selectAll: () -> Void
+        var isSelectable: (Row) -> Bool = { _ in true }
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -62,12 +66,14 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
             table.allowsMultipleSelection = false
             table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
             table.setAccessibilityLabel(configuration.accessibilityLabel)
-            let selectionColumn = NSTableColumn(identifier: Self.selectionColumnID)
-            selectionColumn.title = "Select"
-            selectionColumn.width = 48
-            selectionColumn.minWidth = 48
-            selectionColumn.maxWidth = 48
-            table.addTableColumn(selectionColumn)
+            if configuration.selection != nil {
+                let selectionColumn = NSTableColumn(identifier: Self.selectionColumnID)
+                selectionColumn.title = "Select"
+                selectionColumn.width = 48
+                selectionColumn.minWidth = 48
+                selectionColumn.maxWidth = 48
+                table.addTableColumn(selectionColumn)
+            }
             for column in configuration.columns {
                 let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.identifier))
                 tableColumn.title = column.title
@@ -76,16 +82,16 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
                 table.addTableColumn(tableColumn)
             }
             table.toggleFocusedRow = { [weak self] in
-                guard let self, let table = self.table, configuration.enabled,
+                guard let self, let table = self.table, let selection = configuration.selection, configuration.enabled,
                       table.selectedRow >= 0, table.selectedRow < self.configuration.rowCount else { return }
                 let row = configuration.row(table.selectedRow)
-                guard configuration.isSelectable(row) else { return }
-                configuration.setSelected(row.id, !configuration.isSelected(row.id))
+                guard selection.isSelectable(row) else { return }
+                selection.setSelected(row.id, !selection.isSelected(row.id))
                 refreshVisibleCheckboxes()
             }
             table.selectMatchingRows = { [weak self] in
-                guard let self, configuration.enabled else { return }
-                configuration.selectAll()
+                guard let self, let selection = configuration.selection, configuration.enabled else { return }
+                selection.selectAll()
                 refreshVisibleCheckboxes()
             }
             scrollView.documentView = table
@@ -130,10 +136,10 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row index: Int) -> NSView? {
             guard let tableColumn, index >= 0, index < configuration.rowCount else { return nil }
             let row = configuration.row(index)
-            if tableColumn.identifier == Self.selectionColumnID {
+            if tableColumn.identifier == Self.selectionColumnID, let selection = configuration.selection {
                 let checkbox = tableView.makeView(withIdentifier: tableColumn.identifier, owner: nil) as? PreviewCheckbox ?? PreviewCheckbox()
                 checkbox.identifier = tableColumn.identifier
-                configure(checkbox, row: row)
+                configure(checkbox, row: row, selection: selection)
                 return checkbox
             }
             guard let column = configuration.columns.first(where: { column in column.identifier == tableColumn.identifier.rawValue }) else {
@@ -149,31 +155,31 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
             return cell
         }
 
-        private func configure(_ checkbox: PreviewCheckbox, row: Row) {
+        private func configure(_ checkbox: PreviewCheckbox, row: Row, selection: Selection) {
             checkbox.title = ""
-            checkbox.state = configuration.isSelected(row.id) ? .on : .off
-            let selectable = configuration.isSelectable(row)
+            checkbox.state = selection.isSelected(row.id) ? .on : .off
+            let selectable = selection.isSelectable(row)
             checkbox.isHidden = !selectable
             checkbox.setAccessibilityElement(selectable)
             checkbox.isEnabled = configuration.enabled && selectable
             checkbox.controlSize = configuration.density == .compact ? .small : .regular
-            checkbox.setAccessibilityLabel("Select \(configuration.accessibilityName(row))")
+            checkbox.setAccessibilityLabel("Select \(selection.accessibilityName(row))")
             let dataID = configuration.dataID
             let identifier = row.id
             checkbox.onPress = { [weak self] in
-                guard let self, selectable, configuration.enabled, configuration.dataID == dataID else { return }
-                configuration.setSelected(identifier, !configuration.isSelected(identifier))
+                guard let self, selectable, let current = configuration.selection, configuration.enabled, configuration.dataID == dataID else { return }
+                current.setSelected(identifier, !current.isSelected(identifier))
                 refreshVisibleCheckboxes()
             }
         }
 
         private func refreshVisibleCheckboxes() {
-            guard let table else { return }
+            guard let table, let selection = configuration.selection else { return }
             let visible = table.rows(in: table.visibleRect)
             guard visible.location != NSNotFound else { return }
             for index in visible.location ..< min(NSMaxRange(visible), configuration.rowCount) {
                 if let checkbox = table.view(atColumn: 0, row: index, makeIfNecessary: false) as? PreviewCheckbox {
-                    configure(checkbox, row: configuration.row(index))
+                    configure(checkbox, row: configuration.row(index), selection: selection)
                 }
             }
         }
