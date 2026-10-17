@@ -619,6 +619,7 @@ public actor LibraryHygieneRunner {
         await note("Trimming whitespace on \(issues.count) field\(issues.count == 1 ? "" : "s") across \(issuesByFileId.count) file\(issuesByFileId.count == 1 ? "" : "s")…")
 
         var filesProcessed = 0
+        var filesChanged = 0
         for (fileId, fileIssues) in issuesByFileId {
             guard let file = filesById[fileId] else { continue }
             let merged = LibraryHygiene.mergedTrimmedMetadata(
@@ -626,16 +627,19 @@ public actor LibraryHygieneRunner {
                 issues: fileIssues
             )
             await note("Trimming \(fileIssues.count) field\(fileIssues.count == 1 ? "" : "s") on \(filenameOnly(file.path))")
-            try await applyMergedMetadata(
+            if try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
-            )
-            filesProcessed += 1
+            ) {
+                filesProcessed += 1
+            } else {
+                filesChanged += 1
+            }
         }
 
-        await note("Trimmed whitespace on \(issues.count) field\(issues.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")")
+        await note("Trimmed whitespace on \(issues.count) field\(issues.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")\(changedNote(filesChanged))")
         return effectiveBatchId
     }
 
@@ -657,6 +661,7 @@ public actor LibraryHygieneRunner {
         await note("Applying find/replace across \(matches.count) field\(matches.count == 1 ? "" : "s") in \(matchesByFileId.count) file\(matchesByFileId.count == 1 ? "" : "s")…")
 
         var filesProcessed = 0
+        var filesChanged = 0
         for (fileId, fileMatches) in matchesByFileId {
             guard let file = filesById[fileId] else { continue }
             let merged = LibraryHygiene.mergedFindReplaceMetadata(
@@ -664,16 +669,19 @@ public actor LibraryHygieneRunner {
                 matches: fileMatches
             )
             await note("Replacing text in \(fileMatches.count) field\(fileMatches.count == 1 ? "" : "s") on \(filenameOnly(file.path))")
-            try await applyMergedMetadata(
+            if try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
-            )
-            filesProcessed += 1
+            ) {
+                filesProcessed += 1
+            } else {
+                filesChanged += 1
+            }
         }
 
-        await note("Replaced text in \(matches.count) field\(matches.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")")
+        await note("Replaced text in \(matches.count) field\(matches.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")\(changedNote(filesChanged))")
         return effectiveBatchId
     }
 
@@ -695,6 +703,7 @@ public actor LibraryHygieneRunner {
         await note("Normalizing case on \(fixes.count) field\(fixes.count == 1 ? "" : "s") in \(fixesByFileId.count) file\(fixesByFileId.count == 1 ? "" : "s")…")
 
         var filesProcessed = 0
+        var filesChanged = 0
         for (fileId, fileFixes) in fixesByFileId {
             guard let file = filesById[fileId] else { continue }
             let merged = LibraryHygiene.mergedCaseMetadata(
@@ -702,25 +711,27 @@ public actor LibraryHygieneRunner {
                 fixes: fileFixes
             )
             await note("Normalizing case on \(fileFixes.count) field\(fileFixes.count == 1 ? "" : "s") on \(filenameOnly(file.path))")
-            try await applyMergedMetadata(
+            if try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
-            )
-            filesProcessed += 1
+            ) {
+                filesProcessed += 1
+            } else {
+                filesChanged += 1
+            }
         }
 
-        await note("Normalized case on \(fixes.count) field\(fixes.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")")
+        await note("Normalized case on \(fixes.count) field\(fixes.count == 1 ? "" : "s") across \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")\(changedNote(filesChanged))")
         return effectiveBatchId
     }
 
     /// Set the same value on `field` across every file in `fileIds`
     /// — bulk fill for missing fields. The runner trims the
-    /// supplied value (whitespace-only fills would be a no-op), and
-    /// skips files whose live value is already non-missing (the
-    /// scan-vs-apply race could otherwise overwrite a real value
-    /// the user typed in elsewhere between scan and apply).
+    /// supplied value (whitespace-only fills would be a no-op), skips
+    /// files whose snapshot already has a value, and skips files whose
+    /// metadata changed after the snapshot was taken.
     @discardableResult
     public func applyMissingFieldFill<F: HygieneFileSource>(
         field: SeratoMetadataField,
@@ -744,12 +755,10 @@ public actor LibraryHygieneRunner {
 
         var filesProcessed = 0
         var filesSkipped = 0
+        var filesChanged = 0
         for fileId in fileIds {
             guard let file = filesById[fileId] else { continue }
             guard LibraryHygiene.isMissing(field.read(from: file)) else {
-                // Field acquired a value since the scan (manual
-                // edit elsewhere, Serato exit reload, etc.). Skip
-                // rather than clobber.
                 filesSkipped += 1
                 continue
             }
@@ -759,17 +768,20 @@ public actor LibraryHygieneRunner {
                 value: trimmedValue
             )
             await note("Filling \(field.displayName) on \(filenameOnly(file.path))")
-            try await applyMergedMetadata(
+            if try await applyMergedMetadata(
                 fileId: fileId,
                 file: file,
                 merged: merged,
                 batchId: effectiveBatchId
-            )
-            filesProcessed += 1
+            ) {
+                filesProcessed += 1
+            } else {
+                filesChanged += 1
+            }
         }
 
         let skippedNote = filesSkipped > 0 ? ", \(filesSkipped) skipped (already populated)" : ""
-        await note("Filled \(field.displayName) on \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")\(skippedNote)")
+        await note("Filled \(field.displayName) on \(filesProcessed) file\(filesProcessed == 1 ? "" : "s")\(skippedNote)\(changedNote(filesChanged))")
         return effectiveBatchId
     }
 
@@ -782,12 +794,16 @@ public actor LibraryHygieneRunner {
     ///
     /// All three carry the pre-fix `previousMetadata` so each is
     /// individually invertible — see the matching engine extensions.
+    ///
+    /// `merged` was derived from the scan-time snapshot, so the engine
+    /// rejects the write if the live row has diverged from it. Returns
+    /// false for that file instead of overwriting the newer values.
     private func applyMergedMetadata(
         fileId: Int64,
         file: some HygieneFileSource,
         merged: SeratoMetadata,
         batchId: String
-    ) async throws {
+    ) async throws -> Bool {
         let previousSnapshot = SeratoMetadata(
             artist: file.artist,
             title: file.title,
@@ -805,23 +821,33 @@ public actor LibraryHygieneRunner {
         // file tags. Bundling avoids three separate writer
         // transactions per file — the hot path during hygiene runs
         // over thousands of files.
-        try await operationEngine.applyBatch(
-            [
-                .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged, isSeratoAuthoritative: false)),
-                .commitMetadataToSerato(CommitMetadataToSeratoPayload(
-                    fileId: fileId,
-                    metadata: merged,
-                    previousMetadata: previousSnapshot
-                )),
-                .writeFileTags(WriteFileTagsPayload(
-                    fileId: fileId,
-                    metadata: merged,
-                    previousMetadata: previousSnapshot
-                )),
-            ],
-            batchId: batchId,
-            expectedMembershipTokens: [fileId: FileMembershipToken(fileId: fileId, revision: file.membershipRevision)]
-        )
+        do {
+            try await operationEngine.applyBatch(
+                [
+                    .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged, isSeratoAuthoritative: false)),
+                    .commitMetadataToSerato(CommitMetadataToSeratoPayload(
+                        fileId: fileId,
+                        metadata: merged,
+                        previousMetadata: previousSnapshot
+                    )),
+                    .writeFileTags(WriteFileTagsPayload(
+                        fileId: fileId,
+                        metadata: merged,
+                        previousMetadata: previousSnapshot
+                    )),
+                ],
+                batchId: batchId,
+                expectedMembershipTokens: [fileId: FileMembershipToken(fileId: fileId, revision: file.membershipRevision)],
+                expectedMetadata: [fileId: previousSnapshot]
+            )
+        } catch OperationEngineError.metadataChanged {
+            return false
+        }
+        return true
+    }
+
+    private nonisolated func changedNote(_ count: Int) -> String {
+        count > 0 ? ", \(count) skipped (changed since scan)" : ""
     }
 
     private nonisolated func filenameOnly(_ path: String) -> String {

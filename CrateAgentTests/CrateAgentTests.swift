@@ -3740,37 +3740,34 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
         XCTAssertEqual(updated, ["Hip-Hop", "Hip-Hop"])
     }
 
-    func testApplyFillSkipsRowsWhoseFieldIsNoLongerMissing() async throws {
+    func testApplyFillSkipsRowsPopulatedInTheSnapshotOrEditedSinceTheScan() async throws {
         let (engine, database) = try await MainActor.run { try makeEngine() }
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/missing.mp3",
-            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
-            metadata: SeratoMetadata(genre: nil)
-        )))
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: "/Music/A/already.mp3",
-            volumeUuid: "v1", inode: 2, fileSize: 1, mtime: 1,
-            metadata: SeratoMetadata(genre: "Existing")
-        )))
+        for (inode, name, genre) in [(Int64(1), "missing", String?.none), (2, "already", "Existing"), (3, "edited", nil)] {
+            try await engine.apply(.indexNewFile(IndexNewFilePayload(
+                path: "/Music/A/\(name).mp3",
+                volumeUuid: "v1", inode: inode, fileSize: 1, mtime: 1,
+                metadata: SeratoMetadata(genre: genre)
+            )))
+        }
         try await seedProcessableHygieneFiles(database)
-        let files = try await database.writer.read { db in
+        let snapshot = try await database.writer.read { db in
             try FileRecord.fetchAll(db)
         }
-        // Both fileIds passed in even though one already has a value.
-        // The runner's live re-check should skip the already-populated one.
+        let editedID = try XCTUnwrap(snapshot.first { file in file.path.hasSuffix("edited.mp3") }?.id)
+        try await engine.apply(.setMetadata(SetMetadataPayload(fileId: editedID, metadata: SeratoMetadata(genre: "Typed Meanwhile"))))
+
         let runner = LibraryHygieneRunner(operationEngine: engine)
         _ = try await runner.applyMissingFieldFill(
             field: .genre,
             value: "Hip-Hop",
-            fileIds: files.compactMap(\.id),
-            files: files
+            fileIds: snapshot.compactMap(\.id),
+            files: snapshot
         )
 
         let updated = try await database.writer.read { db in
             try String.fetchAll(db, sql: "SELECT genre FROM files ORDER BY id")
         }
-        XCTAssertEqual(updated, ["Hip-Hop", "Existing"],
-                       "fileId whose live value is non-missing must not be overwritten")
+        XCTAssertEqual(updated, ["Hip-Hop", "Existing", "Typed Meanwhile"])
     }
 
     func testApplyFillRejectsWhitespaceOnlyValue() async throws {
