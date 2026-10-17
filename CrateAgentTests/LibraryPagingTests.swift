@@ -126,8 +126,9 @@ final class LibraryPagingTests: XCTestCase {
         let expanded = try await interaction("expand", LibraryBrowseQuery(sort: fixture.query.sort, expandedFamilies: [firstFamily]))
         let collapsed = try await interaction("collapse", fixture.query)
         let included = try await interaction("include_alternates", LibraryBrowseQuery(sort: fixture.query.sort, includeAlternates: true))
+        let searched = try await interaction("search", LibraryBrowseQuery(search: "Artist A", sort: fixture.query.sort))
         await store.close()
-        let metrics = "\(ungrouped) \(grouped) \(expanded) \(collapsed) \(included)"
+        let metrics = "\(ungrouped) \(grouped) \(expanded) \(collapsed) \(included) \(searched)"
         print("SONG_FAMILY_PAGING_METRICS \(metrics)")
         let attachment = XCTAttachment(string: metrics)
         attachment.lifetime = .keepAlways

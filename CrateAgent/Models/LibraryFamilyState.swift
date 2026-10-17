@@ -11,6 +11,7 @@ struct LibraryFamilyState: Equatable, Sendable {
     let selectedHiddenCount: Int
     /// Processable members a search hides: the ones "Also select N hidden" selects.
     let hiddenEligible: [PagedIdentity<Int64>]
+    let selectedHiddenEligible: Int
     /// Files shown beneath the main row when expanded (while searching, the matching ones).
     let alternateCount: Int
     /// Processable alternates: the ones Include alternates selects.
@@ -29,6 +30,7 @@ struct LibraryFamilyState: Equatable, Sendable {
         hiddenCount = hidden.count
         selectedHiddenCount = hidden.filter { member in selected.contains(member.identity.id) }.count
         hiddenEligible = hidden.filter(\.isEligible).map(\.identity)
+        selectedHiddenEligible = hiddenEligible.filter { identity in selected.contains(identity.id) }.count
         alternateCount = alternates.count
         eligibleAlternates = alternates.filter(\.isEligible).map(\.identity)
         selectedEligibleAlternates = eligibleAlternates.filter { identity in selected.contains(identity.id) }.count
@@ -55,7 +57,7 @@ struct LibraryFamilyState: Equatable, Sendable {
     /// hides, offered once the family has a selection: true selects them.
     var hiddenSelection: (label: String, selects: Bool)? {
         guard selectedCount > 0, !hiddenEligible.isEmpty else { return nil }
-        let selects = selectedHiddenCount < hiddenEligible.count
+        let selects = selectedHiddenEligible < hiddenEligible.count
         return (LibraryFamilyMessages.hiddenSelection(selects: selects, count: hiddenEligible.count), selects)
     }
 
