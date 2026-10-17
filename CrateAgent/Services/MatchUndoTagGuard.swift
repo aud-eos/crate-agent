@@ -132,17 +132,19 @@ enum MatchUndoTagGuard {
     /// of the match's change. Absent and empty text are the same tag value.
     static func conflictingFields(live: AudioTags, applied: ApplyMusicBrainzMatchPayload) -> [String] {
         let restored = applied.fileTagRestoreSnapshot
+        // A field the match left untouched on disk is not rewritten, so a later edit to it is safe.
+        let untouched = applied.fileTagFieldsAlreadyOnDisk ?? []
         let textFields: [(name: String, written: String?, restored: String?, live: String?)] = [
             ("artist", applied.artist, restored.artist, live.artist),
             ("title", applied.title, restored.title, live.title),
             ("album", applied.album, restored.album, live.album),
         ]
         var conflicts = textFields.compactMap { field -> String? in
-            guard let written = field.written else { return nil }
+            guard let written = field.written, !untouched.contains(field.name) else { return nil }
             let ends = Set([written, field.restored ?? ""])
             return ends.contains(field.live ?? "") ? nil : field.name
         }
-        if let year = applied.year {
+        if let year = applied.year, !untouched.contains(OperationEngine.fileYearField) {
             let ends: Set<Int?> = [year, applied.previousFileYear]
             if !ends.contains(live.year.map(Int.init)) {
                 conflicts.append("year")

@@ -1171,7 +1171,7 @@ public actor OperationEngine {
         let decoder = JSONDecoder()
         for event in events {
             let reconstructed = try Self.resyncWrites(
-                for: event, pathByFileId: pathByFileId, decoder: decoder
+                for: event, pathByFileId: pathByFileId, decoder: decoder, emitting: true
             )
             guard event.eventType.hasReplayableSeratoProjection else { continue }
             guard let fileId = event.fileId, let eventId = event.eventId,
@@ -1404,7 +1404,7 @@ public actor OperationEngine {
                 continue
             }
             // ASC order → the last event to write a field wins for that field.
-            for write in try Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder) {
+            for write in try Self.resyncWrites(for: event, pathByFileId: pathByFileId, decoder: decoder, emitting: false) {
                 switch write {
                 case let .metadataUpdate(update):
                     for key in Self.metadataFieldMap(update.metadata).keys {
@@ -1479,10 +1479,16 @@ public actor OperationEngine {
     /// Malformed payloads throw before any writes run. Empty for event types
     /// with no replayable Serato projection. Kept in sync with
     /// `EventType.hasReplayableSeratoProjection`.
+    ///
+    /// `emitting` selects what the writes are for. Field ownership (`false`)
+    /// counts every field an event applied, including file-tag fields it left
+    /// out because the file already held them (#114); a replay (`true`) emits
+    /// only what the event actually wrote.
     private static func resyncWrites(
         for event: EventRecord,
         pathByFileId: [Int64: String],
-        decoder: JSONDecoder
+        decoder: JSONDecoder,
+        emitting: Bool
     ) throws -> [SeratoPendingWrite] {
         switch event.eventType {
         case .fileRenamed:
@@ -1512,7 +1518,8 @@ public actor OperationEngine {
                 artist: payload.artist,
                 title: payload.title,
                 album: payload.album,
-                year: payload.year
+                year: payload.year,
+                omittingFileTagFields: emitting ? payload.fileTagFieldsAlreadyOnDisk ?? [] : []
             )
         case .metadataCommittedToSerato:
             // Hygiene / importer path: re-emit the database-V2 metadata
@@ -1543,7 +1550,8 @@ public actor OperationEngine {
             let payload = try decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder)
             guard let fileId = event.fileId,
                   let absolutePath = pathByFileId[fileId] else { return [] }
-            return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
+            return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath,
+                                                 omittingFileTagFields: emitting ? payload.applied.fileTagFieldsAlreadyOnDisk ?? [] : [])
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
             return []
@@ -3657,7 +3665,8 @@ public actor OperationEngine {
         title: String?,
         album: String?,
         year: Int?,
-        clearFileYear: Bool = false
+        clearFileYear: Bool = false,
+        omittingFileTagFields omitted: Set<String> = []
     ) -> [SeratoPendingWrite] {
         let metadata = SeratoMetadata(artist: artist, title: title, album: album)
         // An identity-only confirmation (the user kept every display field:
@@ -3669,7 +3678,9 @@ public actor OperationEngine {
         // mtime, and can strip secondary ID3v1/APE tags. Emit each write only
         // when it actually carries a change.
         let hasSeratoMetadataFields = artist != nil || title != nil || album != nil
-        let fileTagNeedsWrite = hasSeratoMetadataFields || year != nil || clearFileYear
+        let fileMetadata = omittingFields(omitted, from: metadata)
+        let fileYear = omitted.contains(fileYearField) ? nil : year
+        let fileTagNeedsWrite = !metadataFieldMap(fileMetadata).isEmpty || fileYear != nil || clearFileYear
 
         var writes: [SeratoPendingWrite] = []
         if hasSeratoMetadataFields {
@@ -3682,10 +3693,37 @@ public actor OperationEngine {
         }
         if fileTagNeedsWrite {
             writes.append(.fileTagWrite(SeratoPendingFileTagWrite(
-                absolutePath: absolutePath, metadata: metadata, year: year, clearYear: clearFileYear
+                absolutePath: absolutePath, metadata: fileMetadata, year: fileYear, clearYear: clearFileYear
             )))
         }
         return writes
+    }
+
+    /// The audio-tag key for year, alongside `metadataFieldMap`'s text fields.
+    static let fileYearField = "year"
+
+    private static func omittingFields(_ omitted: Set<String>, from metadata: SeratoMetadata) -> SeratoMetadata {
+        reducedMetadata(metadata, keeping: Set(metadataFieldMap(metadata).keys).subtracting(omitted))
+    }
+
+    /// The match fields whose value the file already holds on disk, per the
+    /// review's capture. Rewriting them would save the file (with
+    /// `remove_others`) for no change, so the file-tag write leaves them out
+    /// while the event still owns them. A tag write still queued for the file
+    /// will change it first, so then nothing is left out.
+    private static func fileTagFieldsAlreadyOnDisk(_ payload: ApplyMusicBrainzMatchPayload, in db: GRDB.Database) throws -> Set<String> {
+        let queuedTagWrite = try SeratoWriteQueue.fetch(fileID: payload.fileID, in: db).contains { queued in queued.write.kind == .fileTagWrite }
+        guard !queuedTagWrite else { return [] }
+        let unchanged = SeratoMetadata(
+            artist: payload.artist.flatMap { artist in artist == payload.currentFileArtist ? artist : nil },
+            title: payload.title.flatMap { title in title == payload.currentFileTitle ? title : nil },
+            album: payload.album.flatMap { album in album == payload.currentFileAlbum ? album : nil }
+        )
+        var fields = Set(metadataFieldMap(unchanged).keys)
+        if let year = payload.year, year == payload.currentFileYear {
+            fields.insert(fileYearField)
+        }
+        return fields
     }
 
     private static func applyMusicBrainzDisplayFields(
@@ -3845,6 +3883,7 @@ public actor OperationEngine {
         forwardPayload.previousFileYear = payload.currentFileYear
         forwardPayload.previousTrackIdentifiers = previousTrackIdentifiers
         forwardPayload.createdTrackRow = createdTrackRow
+        forwardPayload.fileTagFieldsAlreadyOnDisk = try fileTagFieldsAlreadyOnDisk(payload, in: db)
 
         let inversePayload = RevertMusicBrainzMatchPayload(applied: forwardPayload)
 
@@ -3864,7 +3903,8 @@ public actor OperationEngine {
             artist: payload.artist,
             title: payload.title,
             album: payload.album,
-            year: payload.year
+            year: payload.year,
+            omittingFileTagFields: forwardPayload.fileTagFieldsAlreadyOnDisk ?? []
         )
         return (eventId, seratoWrites)
     }
@@ -4053,7 +4093,8 @@ public actor OperationEngine {
             in: db
         )
 
-        let seratoWrites = Self.musicBrainzRevertSeratoWrites(applied: applied, absolutePath: fileRecord.path)
+        let seratoWrites = Self.musicBrainzRevertSeratoWrites(applied: applied, absolutePath: fileRecord.path,
+                                                              omittingFileTagFields: applied.fileTagFieldsAlreadyOnDisk ?? [])
         return (eventId, seratoWrites)
     }
 
@@ -4068,9 +4109,12 @@ public actor OperationEngine {
     /// Shared by `applyRevertMusicBrainzMatch` (undo) and `resyncWrites` (so a
     /// reverted event whose external restore write failed mid-undo can be
     /// re-synced — finding #3999974011).
+    /// `omitted` names file-tag fields the forward left out because the file
+    /// already held the matched value; restoring them would rewrite nothing.
     private static func musicBrainzRevertSeratoWrites(
         applied: ApplyMusicBrainzMatchPayload,
-        absolutePath: String
+        absolutePath: String,
+        omittingFileTagFields omitted: Set<String>
     ) -> [SeratoPendingWrite] {
         // The two external targets restore from DIFFERENT snapshots: Serato's
         // database V2 (and the SQLite `files` row, already restored in
@@ -4089,12 +4133,12 @@ public actor OperationEngine {
             title: applied.title != nil ? (dbSnapshot.title ?? "") : nil,
             album: applied.album != nil ? (dbSnapshot.album ?? "") : nil
         )
-        let fileMetadata = SeratoMetadata(
+        let fileMetadata = omittingFields(omitted, from: SeratoMetadata(
             artist: applied.artist != nil ? (fileSnapshot.artist ?? "") : nil,
             title: applied.title != nil ? (fileSnapshot.title ?? "") : nil,
             album: applied.album != nil ? (fileSnapshot.album ?? "") : nil
-        )
-        let forwardWroteYear = applied.year != nil
+        ))
+        let forwardWroteYear = applied.year != nil && !omitted.contains(fileYearField)
         let fileYear = forwardWroteYear ? applied.previousFileYear : nil
         let clearFileYear = forwardWroteYear && applied.previousFileYear == nil
 
@@ -4392,6 +4436,11 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public var previousFileYear: Int?
     public var previousTrackIdentifiers: TrackIdentifiers?
     public var createdTrackRow: Bool
+    /// Fields (`artist`, `title`, `album`, `year`) the match applied but left
+    /// out of its audio-tag write because the file already held that value.
+    /// The event still owns them for re-sync; undo and replay skip them. Nil
+    /// for events journaled before #114, which wrote every applied field.
+    public var fileTagFieldsAlreadyOnDisk: Set<String>?
 
     public init(
         fileID: Int64,

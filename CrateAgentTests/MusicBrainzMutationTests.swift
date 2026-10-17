@@ -1547,6 +1547,82 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    // MARK: - Fields already on disk are not rewritten (#114)
+
+    func testFileTagWritesOmitFieldsAlreadyOnDiskWhileTheCanonicalRowKeepsThem() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: "New Artist", title: "Same Title", album: nil, year: 1994,
+                currentFileYear: 1994, currentFileArtist: "Disk Artist", currentFileTitle: "Same Title"
+            )),
+            batchId: "already-on-disk"
+        )
+
+        let forward = try XCTUnwrap(recorder.calls.first?.update)
+        XCTAssertEqual(forward.artist, "New Artist")
+        XCTAssertNil(forward.title)
+        XCTAssertNil(forward.year)
+        try await database.writer.read { db in
+            let file = try XCTUnwrap(FileRecord.fetchOne(db, key: fileId))
+            let track = try XCTUnwrap(TrackRecord.fetchOne(db, key: XCTUnwrap(file.trackId)))
+            XCTAssertEqual(track.title, "Same Title")
+            XCTAssertEqual(track.year, 1994)
+        }
+
+        try await engine.undoBatch("already-on-disk")
+        XCTAssertEqual(recorder.calls.count, 2)
+        let restore = try XCTUnwrap(recorder.calls.last?.update)
+        XCTAssertEqual(restore.artist, "Disk Artist")
+        XCTAssertNil(restore.title)
+        XCTAssertNil(restore.year)
+        XCTAssertFalse(restore.clearYear)
+    }
+
+    func testUndoLeavesALaterEditToAFieldTheMatchDidNotRewrite() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: "New Artist", title: "Same Title", album: nil, year: nil,
+                currentFileArtist: "Disk Artist", currentFileTitle: "Same Title"
+            )),
+            batchId: "match"
+        )
+        try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(title: "Later Edit"))), batchId: "edit")
+
+        try await engine.undoBatch("match")
+        let restore = try XCTUnwrap(recorder.calls.last?.update)
+        XCTAssertEqual(restore.artist, "Disk Artist")
+        XCTAssertNil(restore.title)
+    }
+
+    func testQueuedTagEditKeepsAMatchFieldThatEqualsTheCapturedValue() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, _, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder, seratoIsRunning: true)
+        }
+        try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(title: "Queued Edit"))), batchId: "queued-edit")
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: nil, title: "Same Title", album: nil, year: nil, currentFileTitle: "Same Title"
+            )),
+            batchId: "later-match"
+        )
+
+        await runningState?.stop()
+        try await engine.drainPendingSeratoUpdates()
+        XCTAssertEqual(recorder.calls.last?.update.title, "Same Title")
+    }
+
     // MARK: - D-A: legacy event decode (fields added mid-branch)
 
     /// An event JOURNALED by an earlier build of this branch — before D-A
