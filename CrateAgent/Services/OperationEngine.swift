@@ -1614,9 +1614,10 @@ public actor OperationEngine {
                 }
                 try MatchUndoTagGuard.requireUnchanged(read)
             }
-            // A grouping link's inverse checks that grouping still owns the
-            // link itself, and keeps it otherwise (docs/song-families.md).
-            for event in events where !event.eventType.isSongFamilyRecordingLink {
+            // Undoing a grouping link checks that grouping still owns the link
+            // and keeps it otherwise, so a retired file never blocks the undo
+            // (docs/song-families.md). Its redo takes the general guard.
+            for event in events where event.eventType != .songFamilyRecordingLinked {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
                       file.libraryMembership != .retired,
@@ -3784,10 +3785,11 @@ public actor OperationEngine {
                 throw OperationEngineError.insertDidNotReturnRowId
             }
             // Undo retains an empty fingerprint row for FK stability, and song
-            // grouping links a file to one. Reusing a bare row no other file
-            // depends on must seed kept fields just like creation.
+            // grouping links a file to one. Reusing a bare row no other library
+            // file depends on must seed kept fields just like creation; a
+            // retired file keeps its link but no longer names the recording.
             let isEmptyOrphan = try existingTrack.isBare
-                && !FileRecord.hasOtherFilesReferencingTrack(existingId, excluding: payload.fileID, in: db)
+                && FileRecord.otherActiveFileReferencingTrack(existingId, excluding: payload.fileID, in: db) == nil
             existingTrack.acoustidId = payload.acoustID
             existingTrack.musicbrainzRecordingId = payload.recordingMBID
             existingTrack.musicbrainzReleaseId = payload.releaseMBID

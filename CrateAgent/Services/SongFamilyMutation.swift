@@ -48,16 +48,13 @@ public enum SongFamilyOperation: Codable, Sendable, Equatable {
     }
 }
 
-extension EventType {
-    var isSongFamilyRecordingLink: Bool {
-        self == .songFamilyRecordingLinked || self == .songFamilyRecordingUnlinked
-    }
-}
-
-/// A file link a song-family event created or removed; the payload of both link events.
+/// A file link a song-family event created or removed; the payload of both
+/// link events. `membershipRevision` is the file's revision when the event was
+/// written, so replaying it is refused once the file was retired or replaced.
 public struct SongFamilyRecordingLink: Codable, Sendable, Equatable {
     public let fileId: Int64
     public let trackId: Int64
+    public let membershipRevision: Int64
 }
 
 /// The journaled state of every family and recording an operation touched. A
@@ -214,7 +211,7 @@ enum SongFamilyMutation {
             guard try capture(like: payload.expected, in: database) == payload.expected else { throw SongFamilyError.changedSinceRecorded }
             change = SongFamilyChange(operation: operation, familyId: nil, before: payload.expected, after: payload.target)
         } else {
-            change = try plan(operation, in: database)
+            change = try plan(operation, batchId: batchId, in: database)
         }
         guard change.before != change.after else { return nil }
         try write(change.after, in: database)
@@ -223,12 +220,12 @@ enum SongFamilyMutation {
                                                forwardPayload: change, inversePayload: inverse, in: database)
     }
 
-    private static func plan(_ operation: SongFamilyOperation, in database: GRDB.Database) throws -> SongFamilyChange {
+    private static func plan(_ operation: SongFamilyOperation, batchId: String, in database: GRDB.Database) throws -> SongFamilyChange {
         switch operation {
         case let .create(members, representative):
             let trackIDs = try resolve(members, in: database)
             guard trackIDs.count >= 2 else { throw SongFamilyError.tooFewMembers }
-            let dissolving = try familiesToDissolve(for: trackIDs, joining: nil, in: database)
+            let dissolving = try familiesToDissolve(for: trackIDs, joining: nil, batchId: batchId, in: database)
             let representativeID = try representative.map { member in try resolve([member], in: database)[0] }
             if let representativeID, !trackIDs.contains(representativeID) {
                 throw SongFamilyError.representativeNotMember
@@ -245,7 +242,7 @@ enum SongFamilyMutation {
             try requireFamily(familyID, in: database)
             let trackIDs = try resolve(members, in: database)
             guard !trackIDs.isEmpty else { throw SongFamilyError.tooFewMembers }
-            let dissolving = try familiesToDissolve(for: trackIDs, joining: familyID, in: database)
+            let dissolving = try familiesToDissolve(for: trackIDs, joining: familyID, batchId: batchId, in: database)
             let before = try capture(familyIds: dissolving.union([familyID]), trackIds: trackIDs, in: database)
             var after = before
             dissolving.forEach { familyID in after.dissolve(familyID) }
@@ -350,9 +347,12 @@ enum SongFamilyMutation {
         return file
     }
 
-    /// A recording's name: its first library file's title or file name, else its own title.
+    /// A recording's name: its first library file's title or file name,
+    /// preferring a file still in the library, else its own title.
     private static func name(ofTrack trackID: Int64, in database: GRDB.Database) throws -> String {
-        if let file = try FileRecord.filter(Column("track_id") == trackID).order(Column("id")).fetchOne(database) {
+        if let file = try FileRecord.filter(Column("track_id") == trackID)
+            .order(SQL(sql: "CASE WHEN \(FileProcessingEligibility.activeSQL) THEN 0 ELSE 1 END"), Column("id")).fetchOne(database)
+        {
             return file.displayName
         }
         return try TrackRecord.fetchOne(database, key: trackID)?.title ?? "Untitled recording"
@@ -371,12 +371,7 @@ enum SongFamilyMutation {
     private static func link(_ fileID: Int64, in database: GRDB.Database) throws -> SongFamilyRecordingLink? {
         let file = try activeFile(fileID, in: database)
         guard file.trackId == nil else { return nil }
-        guard file.fingerprintStatus == .done, let fingerprint = file.chromaprintFingerprint,
-              (file.fingerprintedSize ?? file.fileSize) == file.fileSize, (file.fingerprintedMtime ?? file.mtime) == file.mtime
-        else {
-            throw SongFamilyError.recordingUnidentified(file: file.displayName)
-        }
-        let hash = Data(SHA256.hash(data: fingerprint))
+        guard let hash = currentFingerprintHash(of: file) else { throw SongFamilyError.recordingUnidentified(file: file.displayName) }
         let trackID: Int64
         if let existing = try TrackRecord.filter(Column("fingerprint_hash") == hash).fetchOne(database), let existingID = existing.id {
             try requireUnclaimed(existing, by: fileID, in: database)
@@ -387,17 +382,31 @@ enum SongFamilyMutation {
             guard let id = track.id else { throw OperationEngineError.insertDidNotReturnRowId }
             trackID = id
         }
-        return try setLink(SongFamilyRecordingLink(fileId: fileID, trackId: trackID), in: database)
+        return try setLink(SongFamilyRecordingLink(fileId: fileID, trackId: trackID, membershipRevision: file.membershipRevision), in: database)
     }
 
+    /// Redo of a link, under the same rule as `link`: the file's current
+    /// fingerprint must still identify the recording.
     private static func relink(_ recorded: SongFamilyRecordingLink, in database: GRDB.Database) throws -> SongFamilyRecordingLink? {
         guard try fileRecord(recorded.fileId, in: database).trackId != recorded.trackId else { return nil }
         let file = try activeFile(recorded.fileId, in: database)
-        guard file.trackId == nil, let track = try TrackRecord.fetchOne(database, key: recorded.trackId) else {
+        guard file.trackId == nil, let track = try TrackRecord.fetchOne(database, key: recorded.trackId),
+              currentFingerprintHash(of: file) == track.fingerprintHash
+        else {
             throw SongFamilyError.linkChanged(file: file.displayName)
         }
         try requireUnclaimed(track, by: recorded.fileId, in: database)
-        return try setLink(recorded, in: database)
+        return try setLink(SongFamilyRecordingLink(fileId: recorded.fileId, trackId: recorded.trackId, membershipRevision: file.membershipRevision),
+                           in: database)
+    }
+
+    private static func currentFingerprintHash(of file: FileRecord) -> Data? {
+        guard file.fingerprintStatus == .done, let fingerprint = file.chromaprintFingerprint,
+              (file.fingerprintedSize ?? file.fileSize) == file.fileSize, (file.fingerprintedMtime ?? file.mtime) == file.mtime
+        else {
+            return nil
+        }
+        return Data(SHA256.hash(data: fingerprint))
     }
 
     /// A link a later identity change claimed stays; that change owns it now.
@@ -411,7 +420,7 @@ enum SongFamilyMutation {
             return nil
         }
         try database.execute(sql: "UPDATE files SET track_id = NULL WHERE id = ?", arguments: [recorded.fileId])
-        return recorded
+        return SongFamilyRecordingLink(fileId: recorded.fileId, trackId: recorded.trackId, membershipRevision: file.membershipRevision)
     }
 
     private static func setLink(_ link: SongFamilyRecordingLink, in database: GRDB.Database) throws -> SongFamilyRecordingLink {
@@ -450,19 +459,30 @@ enum SongFamilyMutation {
     /// dissolves. A recording already in `familyID` is left where it is. A
     /// family with fewer than two live versions is already dissolved as far as
     /// the user can tell, so it may be taken over (the journal keeps it for
-    /// undo); a recording in a live family is refused.
-    private static func familiesToDissolve(for trackIds: [Int64], joining familyID: Int64?, in database: GRDB.Database) throws -> Set<Int64> {
+    /// undo); a recording in a live family is refused. Liveness is measured
+    /// before this batch's own links, which would otherwise revive the very
+    /// family the user is regrouping out of.
+    private static func familiesToDissolve(for trackIds: [Int64], joining familyID: Int64?, batchId: String,
+                                           in database: GRDB.Database) throws -> Set<Int64>
+    {
+        let linkedByBatch = try Int64.fetchAll(database, EventRecord.select(Column("file_id"))
+            .filter(Column("batch_id") == batchId && Column("event_type") == EventType.songFamilyRecordingLinked.rawValue))
+        let liveBeforeBatch: SQL = """
+        EXISTS (SELECT 1 FROM files WHERE files.track_id = tracks.id AND \(sql: FileProcessingEligibility.activeSQL) \
+        AND files.id NOT IN \(linkedByBatch))
+        """
         var dissolving = Set<Int64>()
         for track in try TrackRecord.filter(keys: trackIds).fetchAll(database) {
             guard let current = track.workId, current != familyID, !dissolving.contains(current), let trackID = track.id else { continue }
             let liveVersions = try Int64.fetchAll(database, TrackRecord.select(Column("id")).filter(Column("work_id") == current)
-                .filter(sql: liveTrackSQL).order(Column("id")))
+                .filter(liveBeforeBatch).order(Column("id")))
             guard liveVersions.count >= 2 else {
                 dissolving.insert(current)
                 continue
             }
+            let otherVersions = liveVersions.filter { version in version != trackID }
             throw try SongFamilyError.memberAlreadyInFamily(recording: name(ofTrack: trackID, in: database),
-                                                            familyVersions: liveVersions.map { version in try name(ofTrack: version, in: database) })
+                                                            familyVersions: otherVersions.map { version in try name(ofTrack: version, in: database) })
         }
         return dissolving
     }
