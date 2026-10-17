@@ -297,8 +297,12 @@ lookups under writer serialization. Ordered reference renames retain their expli
 path transition; an unrelated occupant of an old path cannot authorize rewriting
 or removing that occupant's V2/crate references. The one exception is a chain or
 swap within one drain pass: when a later rename moves a different file into an
-earlier rename's old path, that occupant does not supersede the earlier rename,
-even when the two land in different bounded segments (#199). Expected supersession removes only
+earlier rename's old path, the earlier rename skips the old-path occupancy check,
+even when the two land in different bounded segments. It keeps every other
+identity check. A rename that some store already took also skips that check, so
+it finishes in the rest. When a rename is dropped, every later rename in the pass
+into its old path is dropped too, transitively, because the record there never
+moved (#199). Expected supersession removes only
 the obsolete queued work and records a `serato_write_dispositions` row so the drop
 stays visible after a restart; unexpected I/O failure stays visible and retryable.
 
@@ -311,7 +315,10 @@ and retrying the external subset does not repeat the local mutation journal.
 `serato_rename_progress` records, in each store's writer transaction, which
 queued renames V2 and each crate already took. A retry after supersession,
 failure or restart rewrites only the stores a rename has not reached. Applying a
-landed chain or swap a second time would move its records again.
+landed chain or swap a second time would move its records again. A store rewrite
+that lands just before a crash, ahead of its transaction's commit, is applied
+again on restart. With WAL and `synchronous=NORMAL`, a power loss can also drop
+a committed progress row while the rewritten store survives.
 
 Duplicate cleanup retains the original keeper and target authority for every step.
 V2 removal, both crate forms, and Trash must actually complete before it reports

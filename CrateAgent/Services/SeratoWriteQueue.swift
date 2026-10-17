@@ -88,6 +88,12 @@ enum SeratoWriteQueueError: LocalizedError {
 /// The durable queue of Serato-side effects. A row is inserted in the same
 /// transaction as the mutation that produced it and deleted in the writer
 /// transaction that performs (or supersedes) its I/O.
+/// Whether one Serato file held a queued rename's record when it took the rename.
+struct SeratoRenameOutcome: Sendable {
+    let queueID: Int64
+    let matched: Bool
+}
+
 enum SeratoWriteQueue {
     private static let columns = "queue_id, event_id, kind, file_id, membership_revision, payload, cleanup_target_file_id, attempts, last_error, may_have_landed, io_started"
 
@@ -227,7 +233,6 @@ enum SeratoWriteQueue {
         var stored = write
         let payload = try encode(write)
         try database.execute(sql: "UPDATE serato_write_queue SET payload = ? WHERE queue_id = ?", arguments: [payload, queueID])
-        try database.execute(sql: "DELETE FROM serato_rename_progress WHERE queue_id = ?", arguments: [queueID])
         stored.queuedPayload = payload
         return stored
     }
@@ -245,9 +250,13 @@ enum SeratoWriteQueue {
         }
     }
 
-    static func recordRenameProgress(_ outcomes: [(queueID: Int64, matched: Bool)], store: String, in database: Database) throws {
+    static func hasRenameProgress(queueID: Int64, in database: Database) throws -> Bool {
+        try Bool.fetchOne(database, sql: "SELECT EXISTS (SELECT 1 FROM serato_rename_progress WHERE queue_id = ?)", arguments: [queueID]) == true
+    }
+
+    static func recordRenameProgress(_ outcomes: [SeratoRenameOutcome], store: String, in database: Database) throws {
         for outcome in outcomes {
-            try database.execute(sql: "INSERT INTO serato_rename_progress (queue_id, store, matched) VALUES (?, ?, ?)",
+            try database.execute(sql: "INSERT INTO serato_rename_progress (queue_id, store, matched) VALUES (?, ?, ?) ON CONFLICT (queue_id, store) DO NOTHING",
                                  arguments: [outcome.queueID, store, outcome.matched])
         }
     }

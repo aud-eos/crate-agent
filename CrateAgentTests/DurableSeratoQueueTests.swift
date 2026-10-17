@@ -381,6 +381,61 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertEqual(titles[three], "Two")
     }
 
+    func testARenameIntoAPathWhoseDepartureWasSupersededDoesNotLand() async throws {
+        for shape in ["swap", "chain"] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let (one, two, three) = try await chainFixture(fixture)
+            let hop = fixture.directory.appendingPathComponent("hop.wav").path
+            let renames: [TrackMutation] = try shape == "swap" ? [
+                .renameFile(RenameFilePayload(fileId: XCTUnwrap(one.id), newPath: hop, previousPath: one.path, physicalMove: true)),
+                .renameFile(RenameFilePayload(fileId: XCTUnwrap(two.id), newPath: one.path, previousPath: two.path, physicalMove: true)),
+                .renameFile(RenameFilePayload(fileId: XCTUnwrap(one.id), newPath: two.path, previousPath: hop, physicalMove: true)),
+            ] : chainRenames(one: one, two: two, three: three)
+            setRunning(fixture, true)
+            try await fixture.engine.applyBatch(renames, batchId: shape)
+            setRunning(fixture, false)
+            // The file that left its path changes, so its renames are superseded.
+            let departed = shape == "swap" ? two.path : three
+            try FinalRemovalIntegrationTests.wav(sample: 9, durationSeconds: 2).write(to: URL(fileURLWithPath: departed))
+            _ = try await fixture.engine.drainPendingSeratoUpdates()
+
+            let paths = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).map { record in SeratoPath.normalized(record.path) }
+            XCTAssertEqual(paths.count, Set(paths).count, "\(shape): database V2 holds two records at one path")
+            XCTAssertEqual(try titlesByPath(fixture), [one.path: "One", two.path: "Two"], shape)
+            for crate in try fixture.locator.enumerateCrateFiles() {
+                XCTAssertEqual(try readCratePaths(cratePath: crate.path).map(SeratoPath.normalized).sorted(), [one.path, two.path].sorted(), "\(shape): \(crate.lastPathComponent)")
+            }
+        }
+    }
+
+    func testAPartlyLandedChainRenameFinishesAfterItsArrivalIsSuperseded() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let (one, two, three) = try await chainFixture(fixture)
+        setRunning(fixture, true)
+        try await fixture.engine.applyBatch(chainRenames(one: one, two: two, three: three), batchId: "chain")
+        setRunning(fixture, false)
+        let subcrates = fixture.locator.subcratesDirectoryUrl.path
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: subcrates)
+        do { _ = try await fixture.engine.drainPendingSeratoUpdates(); XCTFail("The read-only crate accepted the renames") }
+        catch {}
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: subcrates)
+        // The file that moved in becomes inaccessible, so its rename is dropped
+        // before the next pass, and the departure no longer has a later arrival.
+        let arrived = try await fixture.database.writer.read { database in try XCTUnwrap(FileRecord.fetchOne(database, key: one.id)) }
+        try await fixture.engine.apply(.setFileLibraryState(.init(
+            fileId: XCTUnwrap(arrived.id), expectedRevision: arrived.membershipRevision,
+            state: .init(membership: .active, availability: .inaccessible, libraryID: arrived.seratoLibraryId, retiredAt: nil)
+        )))
+        _ = try await fixture.engine.drainPendingSeratoUpdates()
+
+        let crate = fixture.locator.subcratesDirectoryUrl.appendingPathComponent("queued.crate").path
+        XCTAssertEqual(try readCratePaths(cratePath: crate).map(SeratoPath.normalized).sorted(), [one.path, three].sorted(),
+                       "The rename that landed in database V2 never reached the crate")
+        XCTAssertEqual(try titlesByPath(fixture)[three], "Two")
+    }
+
     func testRetryAfterASupersededSiblingDoesNotReapplyALandedChain() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }

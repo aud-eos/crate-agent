@@ -1905,7 +1905,7 @@ public actor OperationEngine {
             }
             guard disposition == .eligible, !queued.isOrphanedCleanup, try await isEligible(queued) else {
                 try await supersede(queued, reported: reported)
-                run.superseded.insert(queued.eventId)
+                run.recordSuperseded(queued)
                 continue
             }
             ready.append(SeratoWriteSegment.Entry(write: queued, dependency: dependency))
@@ -1955,7 +1955,17 @@ public actor OperationEngine {
         /// A batched segment that failed failed on its store, so later
         /// segments of that kind in the pass would fail the same way.
         var failedBatchKinds = Set<SeratoWriteSegment.Kind>()
+        /// Old paths of renames dropped this pass: the record there never moved,
+        /// so a later rename into one of them would land on top of it.
+        var unvacatedPaths = Set<String>()
         var stopped = false
+
+        mutating func recordSuperseded(_ write: GuardedSeratoWrite) {
+            superseded.insert(write.eventId)
+            if case let .rename(rename) = write.write {
+                unvacatedPaths.insert(rename.oldAbsolutePath)
+            }
+        }
 
         mutating func block(_ write: GuardedSeratoWrite, dependency: SeratoQueueDependency) {
             blocked.formUnion(dependency)
@@ -2011,6 +2021,7 @@ public actor OperationEngine {
         }
         var rows = try await eligibleWrites(candidates)
         try await supersedeMissing(from: candidates, keeping: rows, reported: reported, run: &run)
+        rows = try await supersedingArrivals(in: rows, reported: reported, run: &run)
         let claimed = claim(Set(rows.compactMap(\.queueID)), owner: owner)
         defer {
             release(claimed, owner: owner)
@@ -2048,10 +2059,11 @@ public actor OperationEngine {
                 let survivors = rows.filter { write in write.queueID.map(rejected.contains) != true }
                 for write in rows where write.queueID.map(rejected.contains) == true {
                     try await supersede(write, reported: reported)
-                    run.superseded.insert(write.eventId)
+                    run.recordSuperseded(write)
                 }
                 rows = try await eligibleWrites(survivors)
                 try await supersedeMissing(from: survivors, keeping: rows, reported: reported, run: &run)
+                rows = try await supersedingArrivals(in: rows, reported: reported, run: &run)
             } catch let ExternalWriteInterruption.stale(stale) {
                 rows = holdingBack(stale, from: rows, run: &run)
             } catch let ExternalWriteInterruption.conflicted(conflicted) {
@@ -2090,11 +2102,26 @@ public actor OperationEngine {
         return []
     }
 
+    /// Drops each rename into a path whose rename was dropped this pass, in
+    /// queue order so the drop carries along a chain or swap (#199).
+    private func supersedingArrivals(in rows: [GuardedSeratoWrite], reported: Bool, run: inout SegmentRun) async throws -> [GuardedSeratoWrite] {
+        var kept: [GuardedSeratoWrite] = []
+        for write in rows {
+            if case let .rename(rename) = write.write, run.unvacatedPaths.contains(rename.newAbsolutePath) {
+                try await supersede(write, reported: reported)
+                run.recordSuperseded(write)
+            } else {
+                kept.append(write)
+            }
+        }
+        return kept
+    }
+
     private func supersedeMissing(from candidates: [GuardedSeratoWrite], keeping kept: [GuardedSeratoWrite], reported: Bool, run: inout SegmentRun) async throws {
         let keptIDs = Set(kept.compactMap(\.queueID))
         for write in candidates where write.queueID.map(keptIDs.contains) != true {
             try await supersede(write, reported: reported)
-            run.superseded.insert(write.eventId)
+            run.recordSuperseded(write)
         }
     }
 
@@ -2445,7 +2472,7 @@ public actor OperationEngine {
         var run = SegmentRun()
         for write in partition.superseded {
             try await supersede(write, reported: true)
-            run.superseded.insert(write.eventId)
+            run.recordSuperseded(write)
         }
         let blockedEvents = Set(partition.blocked.map(\.eventId))
         let owner = UUID()
@@ -2877,27 +2904,35 @@ public actor OperationEngine {
                                 guardedWrites: [GuardedSeratoWrite],
                                 rewrite: @escaping @Sendable (String, [SeratoPathRename]) throws -> SeratoBatchWriteResult) async throws
     {
-        let pending = renames.filter { rename in progress[rename.queueID]?[store] == nil }
-        guard !pending.isEmpty else { return }
+        let candidates = renames.filter { rename in progress[rename.queueID]?[store] == nil }
+        guard !candidates.isEmpty else { return }
         try await requireExternalWriteEligibility(guardedWrites)
         let written = try await performExternalWrite(guardedWrites) { database, io -> RenameStoreWrite in
-            let outcomes: [(queueID: Int64, matched: Bool)]
+            let taken = try SeratoWriteQueue.renameProgress(of: candidates.map(\.queueID), in: database)
+            let recorded = candidates.compactMap { rename in
+                taken[rename.queueID]?[store].map { matched in SeratoRenameOutcome(queueID: rename.queueID, matched: matched) }
+            }
+            let pending = candidates.filter { rename in taken[rename.queueID]?[store] == nil }
+            guard !pending.isEmpty else { return RenameStoreWrite(outcomes: recorded, landedNotDurable: nil) }
+            let outcomes: [SeratoRenameOutcome]
             var landedNotDurable: CoreError?
             do {
                 let unmatched = try Set(rewrite(store, pending.map(\.pair)).unmatchedIndices)
-                outcomes = pending.enumerated().map { position, rename in (rename.queueID, !unmatched.contains(UInt32(position))) }
+                outcomes = pending.enumerated().map { position, rename in
+                    SeratoRenameOutcome(queueID: rename.queueID, matched: !unmatched.contains(UInt32(position)))
+                }
             } catch let error as CoreError {
                 guard case .LandedNotDurable = error else { throw error }
                 // The file was replaced, so its renames must not run again; which records it held is unknown.
                 landedNotDurable = error
-                outcomes = pending.map { rename in (rename.queueID, true) }
+                outcomes = pending.map { rename in SeratoRenameOutcome(queueID: rename.queueID, matched: true) }
             }
             io.recordReturned()
             try SeratoWriteQueue.recordRenameProgress(outcomes, store: store, in: database)
-            return RenameStoreWrite(matched: outcomes.map(\.matched), landedNotDurable: landedNotDurable)
+            return RenameStoreWrite(outcomes: recorded + outcomes, landedNotDurable: landedNotDurable)
         }
-        for (rename, matched) in zip(pending, written.matched) {
-            progress[rename.queueID, default: [:]][store] = matched
+        for outcome in written.outcomes {
+            progress[outcome.queueID, default: [:]][store] = outcome.matched
         }
         if let landedNotDurable = written.landedNotDurable {
             throw landedNotDurable
@@ -2905,7 +2940,7 @@ public actor OperationEngine {
     }
 
     private struct RenameStoreWrite: Sendable {
-        let matched: [Bool]
+        let outcomes: [SeratoRenameOutcome]
         let landedNotDurable: CoreError?
     }
 

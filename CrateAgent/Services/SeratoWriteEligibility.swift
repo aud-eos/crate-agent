@@ -105,7 +105,10 @@ enum SeratoWriteEligibility {
         case let .removeFromDatabase(write): try requireReference(write.absolutePath, file: file)
         case let .removeFromCrates(write): try requireReference(write.absolutePath, file: file)
         case let .rename(write):
-            if !guarded.oldPathRefilled {
+            // A rename some Serato file already took must finish in the rest,
+            // or V2 and the crates would disagree about where its track is.
+            let partlyLanded = try guarded.queueID.map { queueID in try SeratoWriteQueue.hasRenameProgress(queueID: queueID, in: database) } == true
+            if !guarded.oldPathRefilled, !partlyLanded {
                 try requireReference(write.oldAbsolutePath, file: file)
             }
             if write.newAbsolutePath != file.path, FileManager.default.fileExists(atPath: write.newAbsolutePath) {
