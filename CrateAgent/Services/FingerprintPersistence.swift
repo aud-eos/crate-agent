@@ -26,9 +26,9 @@ enum FingerprintPersistence {
         return result
     }
 
-    /// - Parameter freshnessBasis: the file's on-disk size + mtime AT THE TIME
-    ///   this fingerprint was computed, persisted into
-    ///   `fingerprinted_size`/`fingerprinted_mtime` so a later scan can tell a
+    /// - Parameter freshnessBasis: the file's on-disk identity AT THE TIME
+    ///   this fingerprint was computed, persisted into the `fingerprinted_*`
+    ///   columns so a later scan can tell a
     ///   trustworthy stored fingerprint from a stale one WITHOUT re-decoding
     ///   (finding #3999114461). Pass it whenever the caller computed the
     ///   fingerprint from the live file (the on-demand path). Nil leaves the
@@ -66,10 +66,12 @@ enum FingerprintPersistence {
                 SET chromaprint_fingerprint = ?,
                     fingerprint_status = ?,
                     fingerprinted_size = ?,
-                    fingerprinted_mtime = ?
+                    fingerprinted_mtime = ?,
+                    fingerprinted_mtime_nanoseconds = ?,
+                    fingerprinted_inode = ?
                 WHERE id = ?\(pendingGuard)
                 """,
-                arguments: [fingerprint, status.rawValue, basis.fileSize, basis.mtime, fileID]
+                arguments: [fingerprint, status.rawValue, basis.fileSize, basis.mtime, basis.mtimeNanoseconds, basis.inode, fileID]
             )
         } else {
             try db.execute(

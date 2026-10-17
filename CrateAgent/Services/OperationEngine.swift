@@ -1563,6 +1563,7 @@ public actor OperationEngine {
             try Self.decodeInverseMutation(event: event)
         }
 
+        let redoFreshness = try await liveFreshnessOfRedoneFiles(events)
         let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
         let context = mutationContext
         // One transaction for every inverse mutation in the batch.
@@ -1575,6 +1576,7 @@ public actor OperationEngine {
             // Inside the transaction that applies the inverses, so an apply
             // that lands while undo is suspended cannot slip past it (#107).
             try Self.requireNoLaterMatchSupersedes(events: events, in: database)
+            try Self.requireRedoneFilesUnchanged(redoFreshness, in: database)
             for event in events {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
@@ -1592,6 +1594,31 @@ public actor OperationEngine {
         }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
         return undoBatchId
+    }
+
+    /// A redo (undoing a revert) re-applies a match without Apply's review-time check, so it
+    /// compares each file's live stat with its row identity, which our own tag writes keep
+    /// current: an external edit or replacement since the revert refuses the redo (#118).
+    /// Stat runs here, outside the write transaction; the transaction rechecks the row.
+    private func liveFreshnessOfRedoneFiles(_ events: [EventRecord]) async throws -> [Int64: FileFreshnessSnapshot?] {
+        let fileIDs = events.filter { event in event.eventType == .musicBrainzMatchReverted }.compactMap(\.fileId)
+        guard !fileIDs.isEmpty else { return [:] }
+        let paths = try await database.writer.read { database in
+            try FileRecord.filter(keys: fileIDs).fetchAll(database).compactMap { file in file.id.map { fileID in (fileID, file.path) } }
+        }
+        return await Task.detached(priority: .userInitiated) {
+            paths.reduce(into: [Int64: FileFreshnessSnapshot?]()) { result, entry in
+                result[entry.0] = FileMetadataCollector.collect(at: entry.1).map(FileFreshnessSnapshot.init)
+            }
+        }.value
+    }
+
+    private static func requireRedoneFilesUnchanged(_ liveFreshness: [Int64: FileFreshnessSnapshot?], in database: GRDB.Database) throws {
+        for (fileID, live) in liveFreshness {
+            guard let live, let file = try FileRecord.fetchOne(database, key: fileID), file.freshness.isConfirmed(by: live) else {
+                throw OperationEngineError.redoFileChanged(fileId: fileID)
+            }
+        }
     }
 
     /// Throws `undoSupersededByLaterMatch` if any match-affecting event in the
@@ -3583,12 +3610,9 @@ public actor OperationEngine {
         }
 
         // D-A note: apply-time candidate staleness is enforced BEFORE this
-        // transaction by `AutoTaggerService.staleFileIDs`, which re-stats the
-        // file on disk and compares to the payload's on-disk-at-lookup
-        // snapshot. It can't run here — this closure is inside the writer
-        // transaction and must not do file I/O — and a DB-vs-DB comparison
-        // would be a no-op anyway (nothing mutates `files.fileSize`/`mtime`
-        // after indexing; see D-B).
+        // transaction by `AutoTaggerService.staleFileIDs` (and, for a redo, by
+        // `requireRedoneFilesUnchanged`), which compare a live stat taken outside
+        // the writer transaction, since this closure must not do file I/O.
 
         // Snapshot the file's Serato metadata + track link before
         // mutating, so the inverse can restore them exactly.
@@ -4220,12 +4244,20 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     /// engine can't do that stat inside its write transaction, so the guard
     /// runs in the async apply path, not here.
     ///
-    /// Optional so an event JOURNALED by an earlier build of this branch —
-    /// before D-A added these fields — still decodes (both come back nil);
-    /// such a legacy event predates the check, so revalidation skips it.
+    /// Optional so events journaled before D-A (all nil) or before migration
+    /// 018 (no nanoseconds or inode) still decode for undo. Revalidation
+    /// treats any missing field as unconfirmed, so such a payload is stale.
     /// `AutoTagRowModel.payload()` always populates them for a fresh apply.
     public let expectedFileSize: Int64?
     public let expectedMtime: Int64?
+    public var expectedMtimeNanoseconds: Int64?
+    public var expectedInode: Int64?
+
+    /// The reviewed on-disk identity, or nil when the payload never recorded one.
+    public var expectedFreshness: FileFreshnessSnapshot? {
+        guard let expectedFileSize, let expectedMtime else { return nil }
+        return FileFreshnessSnapshot(fileSize: expectedFileSize, inode: expectedInode, mtime: expectedMtime, mtimeNanoseconds: expectedMtimeNanoseconds)
+    }
     // Cherry-picked display fields — absent (nil) means not applied:
     public let artist: String?
     public let title: String?
@@ -4270,6 +4302,8 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         fingerprintHash: Data,
         expectedFileSize: Int64? = nil,
         expectedMtime: Int64? = nil,
+        expectedMtimeNanoseconds: Int64? = nil,
+        expectedInode: Int64? = nil,
         artist: String?,
         title: String?,
         album: String?,
@@ -4294,6 +4328,8 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         self.fingerprintHash = fingerprintHash
         self.expectedFileSize = expectedFileSize
         self.expectedMtime = expectedMtime
+        self.expectedMtimeNanoseconds = expectedMtimeNanoseconds
+        self.expectedInode = expectedInode
         self.artist = artist
         self.title = title
         self.album = album
@@ -4648,6 +4684,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// rather than silently corrupting the current state (findings #3999114450,
     /// #3999974010). Detected from the event log in `undoBatch`.
     case undoSupersededByLaterMatch(fileId: Int64)
+    /// The file changed on disk since the match was undone, so redoing it could label different audio.
+    case redoFileChanged(fileId: Int64)
     case metadataChanged(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
@@ -4685,6 +4723,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
             "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
+        case let .redoFileChanged(fileId):
+            "Can't redo this MusicBrainz match for file id \(fileId): the audio file changed since the match was undone. Re-scan it before matching again."
         case let .metadataChanged(fileId):
             "File id \(fileId) metadata changed after it was reviewed. Re-scan before applying."
         case let .externalSyncIncomplete(batchId, underlying):

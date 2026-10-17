@@ -1087,6 +1087,56 @@ final class AutoTaggerServiceTests: XCTestCase {
         )
     }
 
+    /// #118, through production stat: a same-length edit within one second is a change for both a
+    /// reviewed candidate and a cached fingerprint, while an unchanged file reuses its recomputed
+    /// fingerprint. A basis recorded with whole seconds only cannot confirm anything.
+    func testSameSecondSameLengthEditIsDetectedForCandidatesAndCachedFingerprints() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audio = directory.appendingPathComponent("track.mp3")
+        let second = 1_800_000_000
+        try Data("original".utf8).write(to: audio)
+        try setModificationTime(of: audio.path, seconds: second, nanoseconds: 100_000_000)
+        let identity = try XCTUnwrap(FileMetadataCollector.collect(at: audio.path))
+        let database = try makeDatabase()
+        let fileID = try database.writer.write { db -> Int64 in
+            var record = FileRecord(path: audio.path, volumeUuid: identity.volumeUuid, inode: identity.inode, fileSize: identity.fileSize,
+                                    mtime: identity.mtime, chromaprintFingerprint: FingerprintEncoder.serialize([1, 2, 3]), fingerprintStatus: .done,
+                                    fingerprintedSize: identity.fileSize, fingerprintedMtime: identity.mtime)
+            record.libraryMembership = .active
+            record.fileAvailability = .available
+            try record.insert(db)
+            return try XCTUnwrap(record.id)
+        }
+        let decodes = FingerprintCallCounter()
+        let recording = makeRecording()
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])] },
+            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in
+                decodes.increment()
+                return [7, 8, 9]
+            },
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(decodes.value, 1, "a basis without subsecond time cannot confirm the stored fingerprint")
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(decodes.value, 1, "the recomputed basis survives persistence and confirms the unchanged file")
+        let reviewed = try XCTUnwrap(service.candidate(for: fileID))
+
+        try overwriteInPlace(audio.path, with: Data("replaced".utf8))
+        try setModificationTime(of: audio.path, seconds: second, nanoseconds: 900_000_000)
+        let stale = try await service.staleFileIDs(for: [AutoTagRowModel(candidate: reviewed).payload()])
+        XCTAssertEqual(stale, [fileID], "the reviewed candidate no longer describes the file")
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(decodes.value, 2, "the cached fingerprint no longer describes the file")
+    }
+
     // MARK: - D-A: apply-time candidate revalidation
 
     private func makeMatchPayload(
