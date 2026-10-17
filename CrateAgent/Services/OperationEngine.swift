@@ -74,6 +74,8 @@ public actor OperationEngine {
     /// pass and must not be processed again, or overtaken by a dependent row,
     /// until that pass releases it.
     private var claimedQueueIDs: [Int64: UUID] = [:]
+    /// Per queue row, how far the current attempt's external writes got.
+    private var attemptIO: [Int64: ExternalIOProgress.Stage] = [:]
     private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
     private var isDraining = false
     /// One pass over queued rows runs at a time. A scoped pass leaves a row
@@ -1987,7 +1989,12 @@ public actor OperationEngine {
         var rows = try await eligibleWrites(candidates)
         try await supersedeMissing(from: candidates, keeping: rows, reported: reported, run: &run)
         let claimed = claim(Set(rows.compactMap(\.queueID)), owner: owner)
-        defer { release(claimed, owner: owner) }
+        defer {
+            release(claimed, owner: owner)
+            for queueID in claimed {
+                attemptIO[queueID] = nil
+            }
+        }
         func dependency(of write: GuardedSeratoWrite) -> SeratoQueueDependency {
             write.queueID.flatMap { queueID in dependencies[queueID] } ?? SeratoQueueDependency()
         }
@@ -2159,12 +2166,19 @@ public actor OperationEngine {
 
     private func recordAttempt(_ writes: [GuardedSeratoWrite]) async throws {
         try await database.writer.write { database in try SeratoWriteQueue.recordAttempt(writes, in: database) }
+        for queueID in writes.compactMap(\.queueID) {
+            attemptIO[queueID] = nil
+        }
     }
 
+    /// A row none of whose writes returned cannot have landed: each one that
+    /// reached I/O threw. A row with a write that returned keeps its mark.
     private func recordFailure(_ writes: [GuardedSeratoWrite], error: Error) async throws {
         let message = error.localizedDescription
+        let unwritten = writes.compactMap(\.queueID).filter { queueID in attemptIO[queueID] != .returned }
         try await database.writer.write { database in
             try SeratoWriteQueue.recordFailure(writes, message: message, in: database)
+            try SeratoWriteQueue.clearIOStarted(unwritten, in: database)
             for target in Set(writes.compactMap(\.cleanupTargetFileID)) {
                 guard let intent = try DuplicateCleanupStore.fetch(targetFileID: target, in: database) else { continue }
                 try DuplicateCleanupStore.recordFailure(targetFileID: target, message: Self.duplicateCleanupFailureMessage(intent, error: error), in: database)
@@ -2220,53 +2234,96 @@ public actor OperationEngine {
     /// reduced row was completed or superseded meanwhile and is skipped
     /// rather than applied twice. With `completing`, the rows are deleted in
     /// the same transaction as the I/O.
-    private func performExternalWrite<Result: Sendable>(
-        _ writes: [GuardedSeratoWrite], completing: Bool = false, operation: @escaping @Sendable (GRDB.Database) throws -> Result
-    ) async throws -> Result {
+    private func performExternalWrite<Output: Sendable>(
+        _ writes: [GuardedSeratoWrite], completing: Bool = false, operation: @escaping @Sendable (GRDB.Database) throws -> Output
+    ) async throws -> Output {
         let watchdog = seratoWatchdog
         let readiness = readiness
         let drainAuthorization = LibrarySyncReadiness.drainAuthorization
         let locator = seratoLocator
+        let queueIDs = writes.compactMap(\.queueID)
+        let unstarted = queueIDs.filter { queueID in attemptIO[queueID] == nil }
+        try await database.writer.write { database in try SeratoWriteQueue.markIOStarting(queueIDs, in: database) }
+        let progress = ExternalIOProgress()
+        defer {
+            if let stage = progress.stage {
+                for queueID in queueIDs where attemptIO[queueID] != .returned {
+                    attemptIO[queueID] = stage
+                }
+            }
+        }
         // Releasing writer serialization before I/O lets retirement commit against old authorization.
-        return try await database.writer.write { database in
-            var stale = Set<Int64>()
-            for write in writes {
-                guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
-                if try SeratoWriteQueue.state(of: write, in: database) != .current {
-                    stale.insert(queueID)
-                }
+        let outcome = try await database.writer.write { database -> Swift.Result<Output, ExternalWriteInterruption> in
+            do {
+                try Self.requireExternalWriteBoundary(writes, watchdog: watchdog, readiness: readiness, drainAuthorization: drainAuthorization, in: database)
+            } catch let interruption as ExternalWriteInterruption {
+                // Nothing was written, so these rows' marks must not survive.
+                try SeratoWriteQueue.clearIOStarted(unstarted, in: database)
+                return .failure(interruption)
             }
-            if !stale.isEmpty {
-                throw ExternalWriteInterruption.stale(stale)
-            }
-            guard try Self.eligibleWrites(writes, in: database).count == writes.count,
-                  !watchdog.isRunningForExternalWrite,
-                  readiness?.permitsExternalWrites(drain: drainAuthorization) != false
-            else {
-                throw ExternalWriteInterruption.deferred
-            }
-            try Self.requireUnconflicted(writes, readiness: readiness, in: database)
-            var superseded = Set<Int64>()
-            for write in writes {
-                guard let queueID = write.queueID else { continue }
-                guard let file = try FileRecord.fetchOne(database, key: write.token.fileId) else {
-                    superseded.insert(queueID)
-                    continue
-                }
-                do { try SeratoWriteEligibility.requirePhysicalTarget(write, file: file, in: database) }
-                catch is FileProcessingEligibilityError { superseded.insert(queueID) }
-            }
-            if !superseded.isEmpty {
-                throw ExternalWriteInterruption.superseded(superseded)
-            }
-            guard !watchdog.isRunningForExternalWrite,
-                  readiness?.permitsExternalWrites(drain: drainAuthorization) != false else { throw ExternalWriteInterruption.deferred }
-            try Self.requireUnconflicted(writes, readiness: readiness, in: database)
+            progress.record(.entered)
             let result = try operation(database)
+            progress.record(.returned)
             if completing {
                 try Self.completeQueuedWrites(writes, locator: locator, in: database)
             }
-            return result
+            return .success(result)
+        }
+        return try outcome.get()
+    }
+
+    /// Every check that must still hold at the moment of external I/O.
+    private static func requireExternalWriteBoundary(_ writes: [GuardedSeratoWrite], watchdog: SeratoWatchdog, readiness: LibrarySyncReadiness?,
+                                                     drainAuthorization: LibrarySyncReadiness.Authorization?, in database: GRDB.Database) throws
+    {
+        var stale = Set<Int64>()
+        for write in writes {
+            guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
+            if try SeratoWriteQueue.state(of: write, in: database) != .current {
+                stale.insert(queueID)
+            }
+        }
+        if !stale.isEmpty {
+            throw ExternalWriteInterruption.stale(stale)
+        }
+        guard try Self.eligibleWrites(writes, in: database).count == writes.count,
+              !watchdog.isRunningForExternalWrite,
+              readiness?.permitsExternalWrites(drain: drainAuthorization) != false
+        else {
+            throw ExternalWriteInterruption.deferred
+        }
+        try Self.requireUnconflicted(writes, readiness: readiness, in: database)
+        var superseded = Set<Int64>()
+        for write in writes {
+            guard let queueID = write.queueID else { continue }
+            guard let file = try FileRecord.fetchOne(database, key: write.token.fileId) else {
+                superseded.insert(queueID)
+                continue
+            }
+            do { try SeratoWriteEligibility.requirePhysicalTarget(write, file: file, in: database) }
+            catch is FileProcessingEligibilityError { superseded.insert(queueID) }
+        }
+        if !superseded.isEmpty {
+            throw ExternalWriteInterruption.superseded(superseded)
+        }
+        guard !watchdog.isRunningForExternalWrite,
+              readiness?.permitsExternalWrites(drain: drainAuthorization) != false else { throw ExternalWriteInterruption.deferred }
+        try Self.requireUnconflicted(writes, readiness: readiness, in: database)
+    }
+
+    /// How far one external write got, set on the database queue and read
+    /// back on the actor once the write returns or throws.
+    private final class ExternalIOProgress: @unchecked Sendable {
+        enum Stage: Equatable { case entered, returned }
+        private let lock = NSLock()
+        private var stored: Stage?
+
+        var stage: Stage? {
+            lock.withLock { stored }
+        }
+
+        func record(_ stage: Stage) {
+            lock.withLock { stored = stage }
         }
     }
 

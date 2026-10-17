@@ -26,6 +26,7 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     var attempts = 0
     var lastError: String?
     var earlierAttemptMayHaveLanded = false
+    var ioStarted = false
     var cleanupTargetFileID: Int64?
 }
 
@@ -34,11 +35,11 @@ extension GuardedSeratoWrite {
         externalBaseline != nil && baselineKnownFields?.contains(field) != false
     }
 
-    /// `recordAttempt` clears the error before I/O and a thrown write records
-    /// one, so only an attempt that recorded no error can have landed; a later
-    /// failed retry does not undo an earlier attempt that may have.
+    /// The writer boundary marks a row before its I/O and clears the mark
+    /// when the attempt stopped before any I/O or every write for the row
+    /// threw; a later attempt keeps an earlier one's mark.
     var mayHaveLanded: Bool {
-        earlierAttemptMayHaveLanded || (attempts > 0 && lastError == nil)
+        earlierAttemptMayHaveLanded || ioStarted
     }
 }
 

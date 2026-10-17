@@ -261,6 +261,51 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
     }
 
+    func testAnAttemptStoppedBeforeItsWriteDoesNotLookLandedAfterAFailedRetry() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let sibling = try await fixture.add("sibling.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 1))
+        try save(fixture, paths: [file.path, sibling.path])
+        try setV2(fixture, path: file.path, title: "Original A")
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        setRunning(fixture, true)
+        for (target, title) in [(file, "Queued B"), (file, "Newest C"), (sibling, "Sibling edit")] {
+            let fileID = try XCTUnwrap(target.id)
+            try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: title), isSeratoAuthoritative: false)))
+            try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: title))))
+        }
+        setRunning(fixture, false)
+        // The sibling's audio changes once the attempt starts, so the writer
+        // boundary supersedes it and the pass retries before any write ran.
+        let siblingChanged = LockedTestFlag()
+        let siblingPath = sibling.path
+        let changedSibling = FinalRemovalIntegrationTests.wav(sample: 9, durationSeconds: 2)
+        try await fixture.database.writer.write { connection in
+            connection.trace { event in
+                guard event.expandedDescription.hasPrefix("UPDATE serato_write_queue SET"), event.expandedDescription.contains("attempts = attempts + 1"),
+                      siblingChanged.setOnce() else { return }
+                do { try changedSibling.write(to: URL(fileURLWithPath: siblingPath)) }
+                catch { XCTFail("Could not change the sibling: \(error)") }
+            }
+        }
+        let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                      seratoMetadataBatchWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+        do { _ = try await failing.drainPendingSeratoUpdates(); XCTFail("The failing writer accepted the edits") }
+        catch {}
+        try await fixture.database.writer.write { connection in connection.trace(nil) }
+        XCTAssertTrue(siblingChanged.setOnce() == false, "The sibling was never changed at the boundary")
+        try setV2(fixture, path: file.path, title: "Queued B")
+
+        let restarted = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator)
+        try await makeSession(fixture, engine: restarted).synchronize()
+
+        let record = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first { record in
+            SeratoPath.normalized(record.path) == file.path
+        }
+        XCTAssertEqual(record?.title, "Queued B", "A queued edit that never reached Serato was taken for our own write")
+    }
+
     func testCleanupFinishesOnRestartOnlyWhenTrashActuallyRan() async throws {
         for trashSucceeded in [true, false] {
             let fixture = try SeratoRemovalFixture()
