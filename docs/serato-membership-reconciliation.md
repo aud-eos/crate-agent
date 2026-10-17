@@ -346,7 +346,10 @@ edit joins one rewrite unless a rename, add, or V2 removal queued since that
 rewrite opened touches the same file or path; then it starts a new rewrite after
 that row. Consecutive renames share one path batch, which applies them in order:
 a rename of an earlier rename's destination (old → middle → new) lands the record
-at the final path. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
+at the final path. Consecutive adds of different files share one registration:
+Serato's existing paths are read once, every add lands in one V2 rewrite, and
+each import is confirmed in the same transaction; a second add of the same file
+starts a new registration. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
