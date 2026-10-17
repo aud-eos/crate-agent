@@ -248,8 +248,8 @@ blocked while any other notified or observed Serato application remains running.
 
 Main window and menu bar share waiting, reconciliation, result, and failure status
 with Retry Sync. Missing or corrupt source errors retain queued writes. Fingerprint
-worker database errors appear in the Library header and activity log without changing
-file-info scan state; **Retry Fingerprinting** restarts only that worker. Initial
+worker database errors appear in the Library header, Workers, and activity log without
+changing file-info scan state; **Retry Fingerprinting** in Workers restarts only that worker. Initial
 completion becomes true only after the whole scan sequence succeeds.
 
 Synchronization acknowledgements belong to the latest requested generation, not

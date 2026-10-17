@@ -109,7 +109,7 @@ final class FingerprintResponsivenessTests: XCTestCase {
                 (view as? NSTableView).map { table in [table] } ?? view.subviews.flatMap { child in tables(in: child) }
             }
             let libraryTable = try XCTUnwrap(tables(in: host).first { table in table is PagedNSTableView })
-            let sidebar = try XCTUnwrap(tables(in: host).first { table in !(table is PagedNSTableView) && table.numberOfRows == 5 })
+            let sidebar = try XCTUnwrap(tables(in: host).first { table in !(table is PagedNSTableView) && table.numberOfRows == MainWindowView.Section.allCases.count - 1 })
             var maximumScroll = Duration.zero
             var maximumNavigation = Duration.zero
             for iteration in 0 ..< 10 {

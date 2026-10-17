@@ -17,9 +17,11 @@ final class MigrationTests: XCTestCase {
         let before = try queue.read { connection in
             try (Row.fetchAll(connection, sql: "SELECT * FROM files"), Row.fetchAll(connection, sql: "SELECT * FROM events"))
         }
+        let existingFileColumns = before.0.first.map { row in Array(row.columnNames) } ?? []
         try migrator.migrate(queue)
         try queue.read { connection in
-            XCTAssertEqual(try Row.fetchAll(connection, sql: "SELECT * FROM files"), before.0)
+            let preservedFiles = try Row.fetchAll(connection, sql: "SELECT \(existingFileColumns.joined(separator: ", ")) FROM files")
+            XCTAssertEqual(preservedFiles, before.0)
             XCTAssertEqual(try Row.fetchAll(connection, sql: "SELECT * FROM events"), before.1)
         }
     }

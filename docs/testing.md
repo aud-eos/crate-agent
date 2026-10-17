@@ -214,8 +214,8 @@ These are warm-fixture measurements, not a promise for every disk or library.
 
 Owner-app smoke check: launch against an already indexed library, navigate/search
 while validation runs, then relaunch unchanged; change one Serato title and close
-Serato; verify that title updates and unrelated rows remain available. Exercise
-**Re-scan File Info**, **Stop Sync**, and **Retry Sync**. Inspect any file-info errors
+Serato; verify that title updates and unrelated rows remain available. In Workers,
+exercise **Re-scan File Info**, **Stop Sync**, and **Retry Sync**. Inspect any file-info errors
 and path conflicts before attempting processing on affected files.
 
 ## Planning large-library work
