@@ -108,6 +108,17 @@ database, so quitting crate-agent before Serato does not lose them. If an extern
 the library transaction committed, the UI retains the recovery information;
 reapplying the same batch is not a substitute for recovery.
 
+An applied field whose value the file already holds on disk, as read during
+review, is left out of the audio-tag write. Confirming a match that changes
+nothing in the file's tags therefore does not rewrite the file, change its
+modification time, or drop secondary tags. The match still records the field in
+the recording and in Serato's database, still owns it for **Re-sync Serato**,
+and undo does not rewrite it. When a tag write for the file is still queued, or
+the file's recorded size or modification time changed since review, the review's
+reading is out of date, so every applied field is written. Redo checks every
+applied field against the file, so it refuses to overwrite a later edit even to
+a field the original match left alone.
+
 Removing a track from Serato retires its indexed entry, preserving its recording
 link and History. Serato can remove membership alone or also move audio to Trash.
 crate-agent retirement itself never moves, deletes, or restores audio.
