@@ -75,14 +75,15 @@ enum MatchUndoTagGuard {
 
     static func read(_ request: Request, reader: OperationEngine.FileTagReader) throws -> Read {
         let fileID = request.fileID, path = request.path, direction = request.direction
-        let identity = try availability(fileID: fileID, path: path, direction: direction) { try AudioFileReadIdentity.read(at: path) }
+        let identity = try reaching(fileID: fileID, path: path, direction: direction) { try AudioFileReadIdentity.read(at: path) }
         let read = Read(fileID: fileID, path: path, direction: direction, identity: identity)
         let live: AudioTags
         do { live = try reader(path) }
         catch {
             // A file that vanished mid-read is reported as unavailable, not as a tag-read failure.
             try requireUnchanged(read)
-            throw error
+            let reason = access(path, R_OK) == 0 ? "its tags could not be read: \(String(describing: error))" : describing(errno: errno)
+            throw OperationEngineError.undoFileUnreadable(fileId: fileID, path: path, reason: reason, direction: direction)
         }
         try requireUnchanged(read)
         let conflicts = conflictingFields(live: live, applied: request.applied)
@@ -94,30 +95,36 @@ enum MatchUndoTagGuard {
 
     /// The file still is the one whose tags were checked.
     static func requireUnchanged(_ read: Read) throws {
-        do { try availability(fileID: read.fileID, path: read.path, direction: read.direction) { try read.identity.requireUnchanged(at: read.path) } }
-        catch SeratoMembershipSnapshotError.sourceChanged {
-            throw OperationEngineError.undoFileChangedWhileChecking(fileId: read.fileID, direction: read.direction)
-        }
+        try reaching(fileID: read.fileID, path: read.path, direction: read.direction) { try read.identity.requireUnchanged(at: read.path) }
     }
 
-    /// A missing file is reported as unavailable; any other failure to reach
-    /// it (permission, I/O, not a regular file) names its actual reason.
-    private static func availability<Value>(fileID: Int64, path: String, direction: MatchHistoryDirection,
-                                            _ body: () throws -> Value) throws -> Value
+    /// Maps a failure to reach the file into undo's typed errors: missing is
+    /// unavailable, a changed file or link target changed while checking, and
+    /// any other failure (permission, I/O, not a regular file) names its reason.
+    private static func reaching<Value>(fileID: Int64, path: String, direction: MatchHistoryDirection,
+                                        _ body: () throws -> Value) throws -> Value
     {
         do { return try body() }
-        catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+        catch SeratoMembershipSnapshotError.sourceChanged {
+            throw OperationEngineError.undoFileChangedWhileChecking(fileId: fileID, direction: direction)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             throw OperationEngineError.undoFileUnavailable(fileId: fileID, path: path, direction: direction)
         } catch let error as CocoaError {
             let reason = switch error.code {
-            case .fileReadNoPermission: "permission denied"
+            case .fileReadNoPermission: describing(errno: EACCES)
             case .fileReadUnsupportedScheme: "it is not a regular file"
             default: error.localizedDescription
             }
             throw OperationEngineError.undoFileUnreadable(fileId: fileID, path: path, reason: reason, direction: direction)
         } catch let error as POSIXError {
-            throw OperationEngineError.undoFileUnreadable(fileId: fileID, path: path, reason: String(cString: strerror(error.code.rawValue)),
-                                                          direction: direction)
+            throw OperationEngineError.undoFileUnreadable(fileId: fileID, path: path, reason: describing(errno: error.code.rawValue), direction: direction)
+        }
+    }
+
+    private static func describing(errno code: Int32) -> String {
+        switch code {
+        case EACCES, EPERM: "permission denied"
+        default: String(cString: strerror(code))
         }
     }
 

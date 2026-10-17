@@ -161,6 +161,7 @@ final class DurableSeratoQueueTests: XCTestCase {
             ("crash during one coalesced rewrite", false, true),
             ("crash before commit", true, true),
             ("crash before commit, then a failed retry", true, true),
+            ("crash before commit, then a retry that failed before its fold", true, true),
             ("Serato relaunched", true, true),
             ("Serato relaunched, baseline unknown", true, false),
             ("Serato saved B itself", false, true),
@@ -226,6 +227,21 @@ final class DurableSeratoQueueTests: XCTestCase {
                                                   seratoMetadataBatchWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) })
                     do { _ = try await failing.drainPendingSeratoUpdates(); XCTFail("\(label): the failing writer accepted the edits") }
                     catch {}
+                } else if label.hasSuffix("before its fold") {
+                    // A failure before the retry folds the crashed attempt's mark must not erase it.
+                    try await fixture.database.writer.write { database in
+                        try database.execute(sql: """
+                        CREATE TEMP TRIGGER fail_before_fold BEFORE UPDATE ON serato_write_queue WHEN NEW.attempts = OLD.attempts + 1
+                        BEGIN SELECT RAISE(ABORT, 'the attempt failed before folding the earlier mark'); END
+                        """)
+                    }
+                    let relaunched = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator)
+                    _ = try? await relaunched.drainPendingSeratoUpdates()
+                    let failedBeforeFold = try await fixture.database.writer.write { database in
+                        try database.execute(sql: "DROP TRIGGER fail_before_fold")
+                        return try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM serato_write_queue WHERE last_error LIKE '%before folding%'") ?? 0
+                    }
+                    XCTAssertGreaterThan(failedBeforeFold, 0, "\(label): the retry did not fail before its fold")
                 }
             } else {
                 let relaunched = LockedTestFlag()

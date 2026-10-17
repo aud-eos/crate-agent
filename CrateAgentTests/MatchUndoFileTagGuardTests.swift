@@ -77,30 +77,35 @@ final class MatchUndoFileTagGuardTests: XCTestCase {
     }
 
     func testUndoOfAFileItCannotReachNamesTheFileAndWhy() async throws {
-        for missing in [true, false] {
+        for blocker in ["file deleted", "directory unsearchable", "file unreadable"] {
             let fixture = try SeratoRemovalFixture()
             defer { fixture.cleanup() }
             let file = try await matched(fixture)
             let directory = (file.path as NSString).deletingLastPathComponent
-            if missing {
-                try FileManager.default.removeItem(atPath: file.path)
-            } else {
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: directory)
+            switch blocker {
+            case "file deleted": try FileManager.default.removeItem(atPath: file.path)
+            case "directory unsearchable": try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: directory)
+            default: try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
             }
-            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory) }
+            defer {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+            }
 
             do {
                 _ = try await fixture.engine.undoBatch("match")
-                XCTFail("Undo ran without the file it restores")
+                XCTFail("\(blocker): undo ran without the file it restores")
             } catch let OperationEngineError.undoFileUnavailable(fileID, path, _) {
-                XCTAssertTrue(missing, "A file undo could not read for lack of permission was reported missing")
+                XCTAssertEqual(blocker, "file deleted", "A file undo could not read for lack of permission was reported missing")
                 XCTAssertEqual(fileID, file.id)
                 XCTAssertEqual(path, file.path)
             } catch let OperationEngineError.undoFileUnreadable(fileID, path, reason, _) {
-                XCTAssertFalse(missing)
+                XCTAssertNotEqual(blocker, "file deleted")
                 XCTAssertEqual(fileID, file.id)
                 XCTAssertEqual(path, file.path)
-                XCTAssertEqual(reason, "permission denied")
+                XCTAssertEqual(reason, "permission denied", blocker)
+            } catch {
+                XCTFail("\(blocker): undo threw \(error) instead of naming the file and why")
             }
         }
     }
