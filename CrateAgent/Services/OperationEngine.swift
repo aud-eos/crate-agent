@@ -1699,22 +1699,13 @@ public actor OperationEngine {
             }
         }
         let decoder = JSONDecoder()
+        let liveMatches = MatchHistoryStacks.liveApplies(in: history) { event in event.fileId }
 
         for event in matchEvents {
             guard let fileId = event.fileId, let eventId = event.eventId else { continue }
             let fileHistory = historyByFile[fileId] ?? []
             if event.eventType == .musicBrainzMatchApplied {
-                var stack: [Int64] = []
-                for historyEvent in fileHistory {
-                    if historyEvent.eventType == .musicBrainzMatchApplied {
-                        if let id = historyEvent.eventId {
-                            stack.append(id)
-                        }
-                    } else if !stack.isEmpty {
-                        stack.removeLast()
-                    }
-                }
-                if stack.last != eventId {
+                if liveMatches[fileId]?.last != eventId {
                     throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                 }
                 // Value comparison against the current row: a field the match

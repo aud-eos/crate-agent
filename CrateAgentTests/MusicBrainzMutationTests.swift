@@ -1223,9 +1223,9 @@ final class MusicBrainzMutationTests: XCTestCase {
         let fileB = try await insertMatchableFile(database, path: "/Music/A/b.flac", inode: 2)
 
         try await engine.apply(.applyMusicBrainzMatch(fullPayload(fileID: fileA, fingerprintHash: fingerprint, artist: "Artist A", title: nil, album: nil, year: nil,
-                                                                  recordingMBID: "recA", releaseMBID: "relX")), batchId: "artistOnly")
+                                                                  recordingMBID: "recA", releaseMBID: "relA")), batchId: "artistOnly")
         try await engine.apply(.applyMusicBrainzMatch(fullPayload(fileID: fileB, fingerprintHash: fingerprint, artist: nil, title: nil, album: "Album B", year: nil,
-                                                                  recordingMBID: "recA", releaseMBID: "relX")), batchId: "albumOnly")
+                                                                  recordingMBID: "recA", releaseMBID: "relB")), batchId: "albumOnly")
 
         try await engine.undoBatch("artistOnly")
         var track = try await database.writer.read { db in try TrackRecord.fetchOne(db, key: trackID) }
@@ -1236,6 +1236,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         track = try await database.writer.read { db in try TrackRecord.fetchOne(db, key: trackID) }
         XCTAssertEqual(track?.artist, "X")
         XCTAssertEqual(track?.album, "Album X")
+        XCTAssertEqual(track?.musicbrainzReleaseId, "relX", "the release A's undo skipped returns past A's undone match")
     }
 
     /// P matches the shared row, a later Q re-matches it, and Q's file is then

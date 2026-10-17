@@ -8,7 +8,7 @@ import GRDB
 /// row's prior values. A match is live while its file's match history, read as
 /// a stack (apply pushes, revert pops), still holds it. History is grouped by
 /// the payload's file, not `events.file_id`, so a removed file's matches stay
-/// live (#112). Undoing a live match restores a field it wrote only if no
+/// live (#112); file IDs are never reused (`AUTOINCREMENT`). Undoing a live match restores a field it wrote only if no
 /// later live match also wrote that field. The restored value is the row's
 /// value before the oldest writer after the latest earlier live writer of that
 /// field, which skips writers that were undone while a later one kept the field.
@@ -46,7 +46,9 @@ enum CanonicalTrackOwnership {
             .order(Column("event_id"))
             .fetchAll(database)
         let decodedApplies = try applies.map { event in try (event, decode(ApplyMusicBrainzMatchPayload.self, from: event, decoder: decoder)) }
-        let live = try liveApplyEventIDs(fileIDs: Set(decodedApplies.map { _, payload in payload.fileID }), in: database, decoder: decoder)
+        let removedFileIDs = Set(decodedApplies.filter { event, _ in event.fileId == nil }.map { _, payload in payload.fileID })
+        let presentFileIDs = Set(decodedApplies.compactMap { event, _ in event.fileId })
+        let live = try liveApplyEventIDs(presentFileIDs: presentFileIDs, removedFileIDs: removedFileIDs, in: database, decoder: decoder)
         return decodedApplies.compactMap { event, payload in
             guard let eventID = event.eventId else { return nil }
             return writer(eventID: eventID, payload: payload, isLive: live.contains(eventID))
@@ -114,32 +116,30 @@ enum CanonicalTrackOwnership {
                                           year: wrote(payload.year, kept: payload.currentFileYear)))
     }
 
-    /// Match events are read for the files themselves and for removed files,
-    /// whose events no longer carry a `file_id`; a reused file ID stays apart
-    /// from the removed file that held it before.
-    private static func liveApplyEventIDs(fileIDs: Set<Int64>, in database: Database, decoder: JSONDecoder) throws -> Set<Int64> {
-        guard !fileIDs.isEmpty else { return [] }
+    /// A removed file's events lost their `file_id`, so its history is found
+    /// by the file named in the payload, and only for files that need it.
+    private static func liveApplyEventIDs(presentFileIDs: Set<Int64>, removedFileIDs: Set<Int64>, in database: Database,
+                                          decoder: JSONDecoder) throws -> Set<Int64>
+    {
         let matchTypes = [EventType.musicBrainzMatchApplied.rawValue, EventType.musicBrainzMatchReverted.rawValue]
-        let history = try EventRecord
+        var history = try EventRecord
             .filter(matchTypes.contains(Column("event_type")))
-            .filter(fileIDs.contains(Column("file_id")) || Column("file_id") == nil)
-            .order(Column("event_id"))
+            .filter(presentFileIDs.contains(Column("file_id")))
             .fetchAll(database)
-        struct HistoryKey: Hashable {
-            let fileID: Int64
-            let removed: Bool
+        if !removedFileIDs.isEmpty {
+            history += try EventRecord.fetchAll(database, sql: """
+            SELECT * FROM events
+            WHERE file_id IS NULL AND event_type IN (?, ?)
+              AND COALESCE(json_extract(payload_json, '$.fileID'), json_extract(payload_json, '$.applied.fileID'))
+                  IN (\(databaseQuestionMarks(count: removedFileIDs.count)))
+            """, arguments: StatementArguments(matchTypes) + StatementArguments(Array(removedFileIDs)))
         }
-        var stacks: [HistoryKey: [Int64]] = [:]
-        for event in history {
-            guard let eventID = event.eventId else { continue }
+        history.sort { first, second in (first.eventId ?? 0) < (second.eventId ?? 0) }
+        let stacks = try MatchHistoryStacks.liveApplies(in: history) { event -> Int64? in
             if event.eventType == .musicBrainzMatchApplied {
-                let payload = try decode(ApplyMusicBrainzMatchPayload.self, from: event, decoder: decoder)
-                stacks[HistoryKey(fileID: payload.fileID, removed: event.fileId == nil), default: []].append(eventID)
-            } else {
-                let payload = try decode(RevertMusicBrainzMatchPayload.self, from: event, decoder: decoder)
-                let key = HistoryKey(fileID: payload.applied.fileID, removed: event.fileId == nil)
-                _ = stacks[key]?.popLast()
+                return try decode(ApplyMusicBrainzMatchPayload.self, from: event, decoder: decoder).fileID
             }
+            return try decode(RevertMusicBrainzMatchPayload.self, from: event, decoder: decoder).applied.fileID
         }
         return Set(stacks.values.joined())
     }
