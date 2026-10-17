@@ -137,7 +137,7 @@ public actor FingerprintWorker {
     /// this again will pick up any newly-pending rows.
     @discardableResult
     public func processAllPendingOnce() async throws -> Progress {
-        try await requeueUnconfirmableBases()
+        try await adoptLegacyBases()
         let pendingCount = try await fetchPendingCount()
         if pendingCount > 0 {
             let batch = try await fetchPendingBatch(limit: max(pendingCount, concurrency * 4))
@@ -177,13 +177,13 @@ public actor FingerprintWorker {
                 }
             }
         }
-        var requeuedUnconfirmableBases = false
+        var adoptedLegacyBases = false
         while !Task.isCancelled {
             var pendingCount = 0
             do {
-                if !requeuedUnconfirmableBases {
-                    try await requeueUnconfirmableBases()
-                    requeuedUnconfirmableBases = true
+                if !adoptedLegacyBases {
+                    try await adoptLegacyBases()
+                    adoptedLegacyBases = true
                 }
                 pendingCount = try await fetchPendingCount()
                 if pendingCount == 0 {
@@ -533,10 +533,10 @@ public actor FingerprintWorker {
 
     // MARK: - DB helpers
 
-    private func requeueUnconfirmableBases() async throws {
-        let requeued = try await database.writer.write { db in try FingerprintPersistence.requeueUnconfirmableBases(in: db) }
-        if requeued > 0 {
-            Self.logger.info("Refreshing \(requeued) fingerprints recorded before subsecond file times")
+    private func adoptLegacyBases() async throws {
+        let adopted = try await database.writer.write { db in try FingerprintPersistence.adoptLegacyBasesMatchingTheirRows(in: db) }
+        if adopted > 0 {
+            Self.logger.info("Adopted \(adopted) fingerprint bases recorded before subsecond file times")
         }
     }
 

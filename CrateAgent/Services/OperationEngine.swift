@@ -1034,7 +1034,7 @@ public actor OperationEngine {
         case .trackRemovedFromSerato: .removeFromDatabase
         case .fileRemovedFromCrates: .removeFromCrates
         case .fileTrashed: .trashFile
-        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested: nil
+        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested: nil
         }
     }
 
@@ -1452,7 +1452,7 @@ public actor OperationEngine {
             true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested:
             false
         }
     }
@@ -1555,7 +1555,7 @@ public actor OperationEngine {
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath,
                                                  omittingFileTagFields: emitting ? payload.applied.fileTagFieldsAlreadyOnDisk ?? [] : [])
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested:
             return []
         }
     }
@@ -1828,7 +1828,7 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
-        case .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+        case .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested:
             // Observation inverses preserve audit evidence, not permission to
             // reverse an external Serato decision or re-add its membership.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
@@ -3127,6 +3127,9 @@ public actor OperationEngine {
             let eventId = try FileIdentityObservationMutation.apply(payload.observation, batchId: batchId, timestamp: timestampMillis, in: db,
                                                                     metadataEvidence: payload.evidence, expectedMetadata: payload.expectedMetadata)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .recordSubsecondModificationTime(payload):
+            let eventId = try SubsecondModificationTimeMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .setFileLibraryState(payload):
             let eventId = try FileLibraryStateMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
@@ -4150,6 +4153,7 @@ public enum TrackMutation: Sendable {
     case observeFileLocation(ObserveFileLocationPayload)
     case observeFileIdentity(ObserveFileIdentityPayload)
     case observeFileMetadata(ObserveFileMetadataPayload)
+    case recordSubsecondModificationTime(RecordSubsecondModificationTimePayload)
     case beginFileImport(BeginFileImportPayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)

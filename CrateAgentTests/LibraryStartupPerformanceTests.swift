@@ -54,7 +54,50 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         let resultAttachment = XCTAttachment(string: result)
         resultAttachment.lifetime = .keepAlways
         add(resultAttachment)
+        try await verifyUpgradeBackfill(fixture)
         try await verifyNavigationDuringSync(fixture)
+    }
+
+    /// The first sync after migration 018 records 30,000 legacy rows' subsecond times from
+    /// stat evidence (#118): no audio reads, writer waits inside #189's budget, slim events
+    /// even for fingerprinted rows, and the next restart back on the fast path.
+    private func verifyUpgradeBackfill(_ fixture: LibraryStartupPerformanceFixture) async throws {
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL, chromaprint_fingerprint = ?, fingerprint_status = 'done'",
+                                 arguments: [Data(repeating: 7, count: 4096)])
+        }
+        let eventBytesBefore = try await eventBytes(fixture.database)
+        let counters = LibrarySyncMetrics()
+        let probe = WriterWaitProbe(database: fixture.database)
+        let start = ContinuousClock.now
+        try await LibrarySyncMetrics.$current.withValue(counters) { try await fixture.makeSession(checkpointed: true).synchronize() }
+        let upgrade = start.duration(to: .now)
+        let longestWriterWait = await probe.stop()
+        let eventBytesAdded = try await eventBytes(fixture.database) - eventBytesBefore
+        let awaiting = try await fixture.database.writer.read { database in
+            try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM files WHERE mtime_nanoseconds IS NULL")
+        }
+        let restartStart = ContinuousClock.now
+        try await fixture.makeSession(checkpointed: true).synchronize()
+        let restart = restartStart.duration(to: .now)
+        XCTAssertEqual(awaiting, 0)
+        XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
+        XCTAssertEqual(counters.snapshot().audioTagReads, 0)
+        XCTAssertLessThan(longestWriterWait, .milliseconds(500))
+        XCTAssertLessThan(eventBytesAdded / 30000, 512)
+        XCTAssertLessThan(upgrade, .seconds(60))
+        XCTAssertLessThan(restart, .seconds(2))
+        let result = "STARTUP_UPGRADE files=30000 fingerprinted=true upgrade=\(upgrade) writer_wait_max=\(longestWriterWait) event_bytes=\(eventBytesAdded) restart=\(restart) hash=\(counters.snapshot().lightweightHashReads) phases=\(counters.phaseDurations())"
+        print(result)
+        let attachment = XCTAttachment(string: result)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func eventBytes(_ database: LibraryDatabase) async throws -> Int {
+        try await database.writer.read { database in
+            try Int.fetchOne(database, sql: "SELECT COALESCE(SUM(LENGTH(payload_json) + LENGTH(inverse_payload_json)), 0) FROM events") ?? 0
+        }
     }
 
     private func verifyNavigationDuringSync(_ fixture: LibraryStartupPerformanceFixture) async throws {
@@ -120,5 +163,29 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         let attachment = XCTAttachment(string: result)
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+}
+
+/// Issues an empty write every 5 ms, as #189 measured drains, and reports the longest
+/// time one waited for the writer.
+private struct WriterWaitProbe {
+    private let task: Task<Duration, Never>
+
+    init(database: LibraryDatabase) {
+        task = Task.detached {
+            var longest = Duration.zero
+            while !Task.isCancelled {
+                let start = ContinuousClock.now
+                do { try await database.writer.write { _ in } } catch { break }
+                longest = max(longest, start.duration(to: .now))
+                do { try await Task.sleep(for: .milliseconds(5)) } catch { break }
+            }
+            return longest
+        }
+    }
+
+    func stop() async -> Duration {
+        task.cancel()
+        return await task.value
     }
 }

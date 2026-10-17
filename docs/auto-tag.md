@@ -94,14 +94,15 @@ operation engine. It checks whether files changed since review: size, inode and
 modification time to the nanosecond must all still match what the review read, so a
 same-length edit within one second or an atomic replacement sends the track back for
 review. A stored fingerprint is reused only under the same rule, and redoing an undone
-match is refused when the file changed after the undo. Fingerprints recorded before
-subsecond time was tracked cannot be confirmed, so the background fingerprint worker
-queues each such file for one more decode at low priority, and **Workers** counts them
-as pending until it finishes. The next library sync records the subsecond time of
-unchanged files from their stat evidence, without reading the audio. Until then, a
-row without a subsecond time matches any time within its recorded second, so redo of
-an undone match made before the upgrade still proceeds when size, second and inode
-match. Content is not compared, so an edit that restores the original
+match is refused when the file changed after the undo. The first library sync after
+upgrading records the subsecond time of unchanged files from their stat evidence,
+without reading the audio; History shows it as one "Recorded precise modification
+time" entry. A fingerprint basis recorded before subsecond time was tracked is adopted
+when its size and second still match the file, so the fingerprint is reused rather
+than decoded again; one that disagrees is decoded once more when Auto-Tag reaches it.
+Until a row's subsecond time is recorded, it matches any time within its recorded
+second, so redo of an undone match made before the upgrade still proceeds when size,
+second and inode match. Content is not compared, so an edit that restores the original
 size, timestamp and inode goes undetected. Serato library
 and tag writes queue while Serato is running; the queue is stored in the library
 database, so quitting crate-agent before Serato does not lose them. If an external write fails after

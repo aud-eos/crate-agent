@@ -69,6 +69,7 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
 {
     case fileLocationObserved = "file_location_observed"
     case fileIdentityObserved = "file_identity_observed"
+    case fileModificationTimeRecorded = "file_modification_time_recorded"
     case fileLibraryStateChanged = "file_library_state_changed"
     case fileImportRequested = "file_import_requested"
     case trackImported = "track_imported"
@@ -104,7 +105,7 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
             // re-synced (finding #3999974011).
             true
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested:
             false
         }
     }

@@ -26,6 +26,9 @@ enum SeratoConflictTargets {
         case let .observeFileMetadata(payload):
             fileID = payload.observation.fileId
             include(payload.observation.identity, in: &target)
+        case let .recordSubsecondModificationTime(payload):
+            fileID = payload.time.fileId
+            include(payload.identity, in: &target)
         case let .observeFileIdentity(payload):
             fileID = payload.fileId
             include(payload.previousIdentity, in: &target)

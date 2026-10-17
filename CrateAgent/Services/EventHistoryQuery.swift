@@ -150,6 +150,7 @@ public enum EventHistoryQuery {
             EventType.trackAddedToSerato.rawValue,
             EventType.fileLocationObserved.rawValue,
             EventType.fileIdentityObserved.rawValue,
+            EventType.fileModificationTimeRecorded.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
             EventType.fileImportRequested.rawValue,
             EventType.fileTrashed.rawValue,
@@ -193,6 +194,8 @@ public enum EventHistoryQuery {
             return "Observed location for \(count) file\(pluralS)"
         case .fileIdentityObserved:
             return "Observed identity for \(count) file\(pluralS)"
+        case .fileModificationTimeRecorded:
+            return "Recorded precise modification time for \(count) file\(pluralS)"
         case .fileLibraryStateChanged:
             return "Observed library state for \(count) file\(pluralS)"
         case .fileImportRequested:
