@@ -791,7 +791,8 @@ public actor OperationEngine {
     private static func validateObservedIdentity(_ mutation: TrackMutation, in database: GRDB.Database) throws {
         switch mutation {
         case let .indexNewFile(payload):
-            let expected = FileMetadata(path: payload.path, volumeUuid: payload.volumeUuid, inode: payload.inode, fileSize: payload.fileSize, mtime: payload.mtime, lightweightHash: payload.lightweightHash)
+            let expected = FileMetadata(path: payload.path, volumeUuid: payload.volumeUuid, inode: payload.inode, fileSize: payload.fileSize, mtime: payload.mtime,
+                                        mtimeNanoseconds: payload.mtimeNanoseconds, lightweightHash: payload.lightweightHash)
             guard try FileMetadataCollector.collectVerified(at: payload.path) == expected else { throw SeratoMembershipSnapshotError.sourceChanged }
         case let .setFileLibraryState(payload) where payload.state.availability == .available:
             guard let file = try FileRecord.fetchOne(database, key: payload.fileId),
@@ -3088,6 +3089,7 @@ public actor OperationEngine {
             inode: fileRecord.inode,
             fileSize: fileRecord.fileSize,
             mtime: fileRecord.mtime,
+            mtimeNanoseconds: fileRecord.mtimeNanoseconds,
             lightweightHash: fileRecord.lightweightHash,
             bitrateKbps: fileRecord.bitrateKbps,
             metadata: SeratoMetadata(
@@ -3136,6 +3138,7 @@ public actor OperationEngine {
             inode: payload.inode,
             fileSize: payload.fileSize,
             mtime: payload.mtime,
+            mtimeNanoseconds: payload.mtimeNanoseconds,
             lightweightHash: payload.lightweightHash,
             fingerprintStatus: .pending,
             bitrateKbps: payload.bitrateKbps,
@@ -4367,6 +4370,8 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
     public let inode: Int64
     public let fileSize: Int64
     public let mtime: Int64
+    /// Nil in payloads journaled before migration 016 (see `FileMetadata.mtimeNanoseconds`).
+    public var mtimeNanoseconds: Int64?
     public let lightweightHash: Data?
     public let bitrateKbps: Int?
     public let metadata: SeratoMetadata
@@ -4377,6 +4382,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         inode: Int64,
         fileSize: Int64,
         mtime: Int64,
+        mtimeNanoseconds: Int64? = nil,
         lightweightHash: Data? = nil,
         bitrateKbps: Int? = nil,
         metadata: SeratoMetadata = .empty
@@ -4386,6 +4392,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         self.inode = inode
         self.fileSize = fileSize
         self.mtime = mtime
+        self.mtimeNanoseconds = mtimeNanoseconds
         self.lightweightHash = lightweightHash
         self.bitrateKbps = bitrateKbps
         self.metadata = metadata

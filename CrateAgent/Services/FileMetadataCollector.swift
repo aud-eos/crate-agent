@@ -24,7 +24,12 @@ public struct FileMetadata: Codable, Sendable, Equatable {
     public let volumeUuid: String
     public let inode: Int64
     public let fileSize: Int64
+    /// Whole seconds since the epoch (`st_mtimespec.tv_sec`).
     public let mtime: Int64
+    /// The subsecond part of the modification time in nanoseconds (`st_mtimespec.tv_nsec`,
+    /// 0..<1_000_000_000). Nil when it was never recorded: rows indexed and payloads
+    /// journaled before migration 016 hold seconds only.
+    public let mtimeNanoseconds: Int64?
     /// Optional because callers that don't care about cross-volume
     /// move detection skip the disk read. Nil when omitted or when
     /// the hash couldn't be computed (unreadable file, etc.).
@@ -36,6 +41,7 @@ public struct FileMetadata: Codable, Sendable, Equatable {
         inode: Int64,
         fileSize: Int64,
         mtime: Int64,
+        mtimeNanoseconds: Int64? = nil,
         lightweightHash: Data? = nil
     ) {
         self.path = path
@@ -43,7 +49,17 @@ public struct FileMetadata: Codable, Sendable, Equatable {
         self.inode = inode
         self.fileSize = fileSize
         self.mtime = mtime
+        self.mtimeNanoseconds = mtimeNanoseconds
         self.lightweightHash = lightweightHash
+    }
+
+    /// Physical identity: equal when every recorded field matches. A side recorded before
+    /// subsecond times were kept matches on whole seconds, so legacy rows stay the same file;
+    /// freshness decisions use the stricter `FileFreshnessSnapshot.isConfirmed(by:)`.
+    public static func == (lhs: FileMetadata, rhs: FileMetadata) -> Bool {
+        lhs.path == rhs.path && lhs.volumeUuid == rhs.volumeUuid && lhs.inode == rhs.inode && lhs.fileSize == rhs.fileSize
+            && lhs.mtime == rhs.mtime && lhs.lightweightHash == rhs.lightweightHash
+            && (lhs.mtimeNanoseconds == nil || rhs.mtimeNanoseconds == nil || lhs.mtimeNanoseconds == rhs.mtimeNanoseconds)
     }
 }
 
@@ -118,6 +134,7 @@ public enum FileMetadataCollector {
             inode: Int64(statBuffer.st_ino),
             fileSize: Int64(statBuffer.st_size),
             mtime: Int64(statBuffer.st_mtimespec.tv_sec),
+            mtimeNanoseconds: Int64(statBuffer.st_mtimespec.tv_nsec),
             lightweightHash: hash
         )
     }

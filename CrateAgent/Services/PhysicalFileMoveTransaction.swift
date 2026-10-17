@@ -71,7 +71,8 @@ final class PhysicalFileMoveTransaction {
             try FileManager.default.moveItem(atPath: source.path, toPath: destination.path)
             moves.append((source.path, destination.path, nil, nil))
             let expected = FileMetadata(path: destination.path, volumeUuid: source.volumeUuid, inode: source.inode,
-                                        fileSize: source.fileSize, mtime: source.mtime, lightweightHash: source.lightweightHash)
+                                        fileSize: source.fileSize, mtime: source.mtime, mtimeNanoseconds: source.mtimeNanoseconds,
+                                        lightweightHash: source.lightweightHash)
             let ownedDestination = try OwnedAudioIdentity.read(at: destination.path)
             guard ownedDestination.metadata == expected, ownedDestination.digest == ownedSource.digest else {
                 throw MoveError.changedDestination(destination.path)
