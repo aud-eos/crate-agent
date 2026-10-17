@@ -34,6 +34,9 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     /// panel (finding #3999114447) — the recovery is idempotent, so exposing
     /// it for every re-syncable batch is safe.
     public let canResync: Bool
+    /// Queued Serato or audio-tag changes from this batch that were recorded
+    /// as not applied (`serato_write_dispositions`).
+    public let notAppliedCount: Int
 
     public var timestamp: Date {
         Date(timeIntervalSince1970: TimeInterval(firstTimestampMillis) / 1000)
@@ -92,8 +95,8 @@ public enum EventHistoryQuery {
         LIMIT ?
         """
 
-        let rows: [Row] = try await database.writer.read { db in
-            try Row.fetchAll(db, sql: sql, arguments: [limit])
+        let (rows, notApplied): ([Row], [String: Int]) = try await database.writer.read { db in
+            try (Row.fetchAll(db, sql: sql, arguments: [limit]), SeratoWriteDispositions.notAppliedCounts(in: db))
         }
 
         let allBatchIds = Set(rows.map(\.batchId))
@@ -108,7 +111,8 @@ public enum EventHistoryQuery {
                 canUndo: canUndoBatch(typeList: typeList),
                 isUndoBatch: row.batchId.hasPrefix("undo:"),
                 canResync: canResyncBatch(typeList: typeList)
-                    && !batchHasBeenUndone(row.batchId, allBatchIds: allBatchIds)
+                    && !batchHasBeenUndone(row.batchId, allBatchIds: allBatchIds),
+                notAppliedCount: notApplied[row.batchId] ?? 0
             )
         }
     }

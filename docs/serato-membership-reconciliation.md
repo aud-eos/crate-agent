@@ -325,6 +325,32 @@ observation treats a saved value equal to an earlier queued edit as that edit
 landing, so the newest edit still applies after an interruption. A queue row or
 pre-upgrade fence that no longer decodes is removed with a `malformed`
 disposition; the rest of the queue still applies.
+
+The pass groups eligible rows into segments in queue order. Every V2 metadata
+edit joins one rewrite unless a rename, add, or V2 removal queued since that
+rewrite opened touches the same file or path; then it starts a new rewrite after
+that row. Consecutive renames share one path batch, and every other write is its
+own segment. Edits to the same record are merged in queue order before the batch
+writer, which keeps only one update per path. A strict observation also treats a
+saved value equal to a later queued edit of the same file as our own coalesced
+write, so it is neither reapplied nor reported. A failed segment fails all of its
+rows together and blocks their dependents.
+
+A file with a queued rename is observed at the path Serato still holds: the
+record at the oldest pending rename's old path supplies that file's saved
+metadata, so a Serato edit made there is kept rather than overwritten by the
+rename. When Serato holds records at both the old and the new path, the rename
+is a path conflict: it appears in **Review conflicts** and its writes stay queued.
+
+A queued edit whose captured baseline is unknown learns the fields of an earlier
+edit of ours once that edit lands, so it applies instead of being dropped as
+uncertain. An interrupted cleanup Trash finishes on restart only when its last
+attempt left no error; a failed Trash attempt is not proof the audio moved.
+
+The ready summary reports each dropped change by disposition (superseded,
+uncertain, interrupted, malformed, or legacy unrecoverable) once, and turns to a
+warning. History marks a batch with the number of its changes that were not
+applied.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.

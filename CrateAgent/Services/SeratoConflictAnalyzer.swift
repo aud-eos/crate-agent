@@ -12,7 +12,10 @@ struct SeratoConflictAnalyzer: Sendable {
         self.inspect = inspect
     }
 
-    func analyze(snapshot: SeratoMembershipSnapshot, files: [FileRecord]) async throws -> SeratoConflictAnalysis {
+    /// `pendingRenames` adds a conflict for each queued rename whose old and
+    /// new paths both hold a saved record: applying the rename would leave two
+    /// records for one file, and either one may hold the user's newer edits.
+    func analyze(snapshot: SeratoMembershipSnapshot, files: [FileRecord], pendingRenames: [PendingRenameSource] = []) async throws -> SeratoConflictAnalysis {
         var normalizedPaths: [String: String] = [:]
         func normalized(_ path: String) -> String {
             if let cached = normalizedPaths[path] {
@@ -30,7 +33,14 @@ struct SeratoConflictAnalyzer: Sendable {
             occurrencesByPath[normalized(record.path), default: []].append(index)
         }
         let duplicatePaths = occurrencesByPath.keys.filter { path in occurrencesByPath[path]!.count > 1 }.sorted()
-        guard !duplicatePaths.isEmpty else {
+        let duplicates = Set(duplicatePaths)
+        let collisions = pendingRenames.filter { rename in
+            let saved = normalized(rename.savedPath)
+            let current = normalized(rename.currentPath)
+            return saved != current && occurrencesByPath[saved] != nil && occurrencesByPath[current] != nil
+                && !duplicates.contains(saved) && !duplicates.contains(current)
+        }
+        guard !duplicatePaths.isEmpty || !collisions.isEmpty else {
             return SeratoConflictAnalysis(source: snapshot.source, libraryID: snapshot.libraryID, generation: snapshot.generation, conflicts: [], scope: SeratoConflictScope())
         }
         var filesByPath: [String: [Int]] = [:]
@@ -47,12 +57,10 @@ struct SeratoConflictAnalyzer: Sendable {
         var conflicts: [SeratoPathConflict] = []
         var scope = SeratoConflictScope()
         var observationsByBytes: [Data: ConflictPathObservation] = [:]
-        for path in duplicatePaths {
-            try Task.checkCancellation()
-            var target = SeratoConflictTarget(paths: [path])
-            var occurrences: [SeratoConflictOccurrence] = []
+        func observe(_ path: String, into target: inout SeratoConflictTarget) throws -> [SeratoConflictOccurrence] {
             let indexedVolumes = Set((filesByPath[path] ?? []).map { index in files[index].volumeUuid }.filter { volume in volume != LegacyFileIdentity.unknownVolume })
-            for index in occurrencesByPath[path]! {
+            var occurrences: [SeratoConflictOccurrence] = []
+            for index in occurrencesByPath[path] ?? [] {
                 let record = snapshot.records[index]
                 let absolutePath = record.path.hasPrefix("/") ? record.path : "/" + record.path
                 let rawPathBytes = Data(record.path.utf8)
@@ -75,6 +83,24 @@ struct SeratoConflictAnalyzer: Sendable {
                 }
                 occurrences.append(SeratoConflictOccurrence(id: index, record: record, rawPathBytes: rawPathBytes, observation: observation))
             }
+            return occurrences
+        }
+        for collision in collisions {
+            try Task.checkCancellation()
+            let saved = normalized(collision.savedPath)
+            let current = normalized(collision.currentPath)
+            var target = SeratoConflictTarget(fileIDs: [collision.fileID], paths: [saved, current])
+            let occurrences = try observe(saved, into: &target) + observe(current, into: &target)
+            for index in (filesByPath[saved] ?? []) + (filesByPath[current] ?? []) {
+                target.include(files[index])
+            }
+            scope.protect(target, group: current)
+            conflicts.append(SeratoPathConflict(id: current, occurrences: occurrences, fileIDs: target.fileIDs))
+        }
+        for path in duplicatePaths {
+            try Task.checkCancellation()
+            var target = SeratoConflictTarget(paths: [path])
+            let occurrences = try observe(path, into: &target)
             var candidates = filesByPath[path] ?? []
             for identity in target.physicalIdentities {
                 candidates += filesByIdentity[identity] ?? []

@@ -114,6 +114,14 @@ struct SeratoConflictOccurrence: Identifiable, Sendable {
     let observation: ConflictPathObservation
 }
 
+/// A file whose Serato rename is still queued: Serato's record is expected at
+/// `savedPath` until the rename applies.
+struct PendingRenameSource: Sendable, Equatable {
+    let fileID: Int64
+    let savedPath: String
+    let currentPath: String
+}
+
 struct SeratoPathConflict: Identifiable, Sendable {
     let id: String
     let occurrences: [SeratoConflictOccurrence]

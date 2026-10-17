@@ -423,7 +423,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             XCTAssertEqual(record.title ?? "", externalTitle)
             XCTAssertEqual(try readAudioTags(filePath: file.path).title, "Independent audio title")
             guard case let .ready(summary) = session.state else { return XCTFail("\(session.state)") }
-            XCTAssertEqual(summary.supersededWrites, 2)
+            XCTAssertEqual(summary.notAppliedWrites.total, 2)
             let replay = try await fixture.engine.resyncSeratoForBatch("audio-owner")
             XCTAssertEqual(replay.appliedCount, 1)
             XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first?.title ?? "", externalTitle)

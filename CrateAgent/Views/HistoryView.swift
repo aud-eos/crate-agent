@@ -83,6 +83,11 @@ struct HistoryView: View {
                     StatusBadge(title: batch.isUndoBatch ? "Undo batch" : "Recorded changes",
                                 systemImage: batch.isUndoBatch ? "arrow.uturn.backward.circle" : "clock")
                 }
+                if batch.notAppliedCount > 0 {
+                    StatusBadge(title: SeratoWriteDispositionMessages.historyBadge(count: batch.notAppliedCount),
+                                systemImage: "exclamationmark.triangle", tint: .orange)
+                        .help(SeratoWriteDispositionMessages.historyHelp)
+                }
             }
         } actions: {
             if batch.canResync {
@@ -95,7 +100,7 @@ struct HistoryView: View {
                 .controlSize(density.controlSize)
                 .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil || seratoWatchdog.isSeratoRunning)
                 .help(seratoWatchdog.isSeratoRunning
-                    ? "Quit Serato before re-syncing — writes would queue in memory and disappear on app restart."
+                    ? "Quit Serato before re-syncing. Serato overwrites its library files while it is open."
                     : "Re-run this batch's Serato library and audio-tag writes. Newer edits made in external tag editors can be overwritten.")
             }
 

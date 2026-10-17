@@ -69,8 +69,8 @@ struct LibrarySyncStatusView: View {
         case let .ready(summary):
             "Library synced · \(summary.retired) removed from Serato · \(summary.reactivated) activated · \(summary.unavailable) unavailable"
                 + (summary.pathConflictCount > 0 ? " · \(summary.pathConflictCount) path conflicts · \(summary.conflictBlockedWriteCount) changes waiting for repair" : "")
-                + (summary.supersededWrites > 0 ? " · \(summary.supersededWrites) queued changes superseded" : "")
-                + (summary.interruptedWrites > 0 ? " · \(summary.interruptedWrites) interrupted audio changes not retried" : "")
+                + SeratoWriteDisposition.allCases.filter { disposition in summary.notAppliedWrites[disposition] > 0 }
+                .map { disposition in " · " + SeratoWriteDispositionMessages.summary(disposition, count: summary.notAppliedWrites[disposition]) }.joined()
                 + (summary.duplicateCleanupMessage.map { " · " + $0 } ?? "")
         }
     }
@@ -81,7 +81,7 @@ struct LibrarySyncStatusView: View {
         case .failed: "exclamationmark.triangle.fill"
         case .waitingForSerato: "clock"
         case .reconciling: "arrow.triangle.2.circlepath"
-        case let .ready(summary): summary.pathConflictCount > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle"
+        case let .ready(summary): summary.pathConflictCount > 0 || summary.notAppliedWrites.total > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle"
         }
     }
 
@@ -91,7 +91,7 @@ struct LibrarySyncStatusView: View {
         case .failed: .red
         case .waitingForSerato: .orange
         case .reconciling: .accentColor
-        case let .ready(summary): summary.pathConflictCount > 0 ? .orange : .secondary
+        case let .ready(summary): summary.pathConflictCount > 0 || summary.notAppliedWrites.total > 0 ? .orange : .secondary
         }
     }
 }

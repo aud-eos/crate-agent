@@ -269,7 +269,7 @@ public actor LibraryScanner {
         let analysis: SeratoConflictAnalysis = if let suppliedAnalysis {
             suppliedAnalysis
         } else {
-            try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+            try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files, pendingRenames: operationEngine.pendingRenameSources())
         }
         try analysis.validate(snapshot)
         try await reader.validate(snapshot)
@@ -286,6 +286,10 @@ public actor LibraryScanner {
             let path = SeratoPath.normalized(record.path)
             guard analysis.scope.conflictingPath(for: SeratoConflictTarget(paths: [path])) == nil else { continue }
             guard records.updateValue(record, forKey: path) == nil else { throw SeratoReconciliationError.ambiguousIdentity(path) }
+        }
+        var renameSources: [String: Int64] = [:]
+        for source in try await operationEngine.pendingRenameSources() where analysis.scope.conflictingPath(for: SeratoConflictTarget(fileIDs: [source.fileID])) == nil {
+            renameSources[SeratoPath.normalized(source.savedPath)] = source.fileID
         }
         let plannedCount = plan.map { plan in plan.refreshPaths.union(plan.metadataPaths).count } ?? records.count
         var completed = 0
@@ -316,6 +320,14 @@ public actor LibraryScanner {
                     updated += 1
                 }
                 refreshedEvidence[identifier] = evidence
+                continue
+            }
+            if existing == nil, let fileID = renameSources[path] {
+                // Serato still saves this file's record at the old path of its
+                // queued rename, so the record is that file's saved metadata.
+                if try await observeRenamedRecord(record, fileID: fileID, snapshot: snapshot, reader: reader) {
+                    updated += 1
+                }
                 continue
             }
             if let existing, existing.libraryMembership != .active || existing.fileAvailability != .available
@@ -406,6 +418,23 @@ public actor LibraryScanner {
     /// Read Serato's database V2 and return the records keyed by
     /// absolute path. Off the actor's isolation domain because the
     /// FFI call can take a while on a 25MB database.
+    /// Observes the record at a queued rename's old path as the renamed file's
+    /// saved metadata. Audio identity is not re-read: the record names a path
+    /// the file no longer occupies, so only its saved V2 fields are evidence.
+    private func observeRenamedRecord(_ record: SeratoTrackRecord, fileID: Int64, snapshot: SeratoMembershipSnapshot,
+                                      reader: SeratoMembershipSnapshotReader) async throws -> Bool
+    {
+        guard let file = try await database.writer.read({ connection in try FileRecord.fetchOne(connection, key: fileID) }),
+              file.libraryMembership == .active, file.fileAvailability == .available,
+              file.seratoLibraryId == nil || file.seratoLibraryId == snapshot.libraryID else { return false }
+        let authorization = try await reader.authorization(for: snapshot)
+        let events = try await operationEngine.observeSnapshotMetadata(.init(fileId: fileID, expectedRevision: file.membershipRevision,
+                                                                             previousIdentity: file.identity, identity: file.identity,
+                                                                             metadata: makeSeratoMetadata(fromRecord: record), bitrateKbps: file.bitrateKbps,
+                                                                             expectedState: file.libraryState), authorization: authorization)
+        return !events.isEmpty
+    }
+
     private func loadSeratoRecords() async throws -> [(String, SeratoTrackRecord)] {
         let databaseV2Path = seratoLocator.databaseV2Url.path
         guard FileManager.default.fileExists(atPath: databaseV2Path) else {

@@ -402,9 +402,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     continue
                 }
                 try processingAuthorization.check()
-                let dispositions = try await operationEngine.takeUnreportedDispositions()
-                summary.supersededWrites = dispositions.notApplied
-                summary.interruptedWrites = dispositions.interrupted
+                summary.notAppliedWrites = try await operationEngine.takeUnreportedDispositions()
                 summary.retired = cumulativeChanges.retired
                 summary.reactivated = cumulativeChanges.reactivated
                 summary.pathConflictCount = analysis.conflicts.count
@@ -435,7 +433,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
         } else {
             try await scanner.identityProjectionsForConflictAnalysis()
         }
-        let analysis = try await conflictAnalyzer.analyze(snapshot: snapshot, files: files)
+        let analysis = try await conflictAnalyzer.analyze(snapshot: snapshot, files: files, pendingRenames: operationEngine.pendingRenameSources())
         try await reader.validate(snapshot)
         try Task.checkCancellation()
         try readiness.install(analysis.scope, for: authorization)
