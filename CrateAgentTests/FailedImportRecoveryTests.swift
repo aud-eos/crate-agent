@@ -27,7 +27,8 @@ final class FailedImportRecoveryTests: XCTestCase {
             try await fixture.engine.apply(.addTrackToSerato(.init(fileId: XCTUnwrap(pending.id), metadata: .empty)), batchId: "late-import")
         } catch let OperationEngineError.externalSyncIncomplete(batchId, underlying) {
             XCTAssertEqual(batchId, "late-import")
-            XCTAssertTrue(underlying.contains("synchronizationRequired") || underlying.contains("SeratoPathConflictError"))
+            let refusals = [LibrarySyncReadinessError.synchronizationRequired.localizedDescription, SeratoPathConflictError(path: pending.path).localizedDescription]
+            XCTAssertTrue(refusals.contains { refusal in underlying.contains(refusal) }, underlying)
         }
         try await fixture.database.writer.write { database in database.trace(nil) }
         let after = try await fixture.row(pending)
