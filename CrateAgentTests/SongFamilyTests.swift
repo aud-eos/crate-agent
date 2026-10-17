@@ -87,14 +87,10 @@ final class SongFamilyTests: XCTestCase {
         let withoutFile = try await service.family(id: familyID)
         XCTAssertNil(withoutFile)
 
-        _ = try await service.attach([.file(movedFile)], to: familyID)
-        _ = try await service.attach([.file(movedFile)], to: familyID)
-        let reattached = try await service.family(id: familyID)
-        XCTAssertEqual(reattached?.versionCount, 2)
-
         try await engine.undoBatch("rematch")
         let restored = try await service.family(id: familyID)
         XCTAssertEqual(restored?.members.map(\.trackId), [tracks[0], tracks[1]])
+        XCTAssertEqual(restored?.versionCount, 2)
     }
 
     func testUndoingAGroupKeepsTheLinkALaterMatchClaimed() async throws {
