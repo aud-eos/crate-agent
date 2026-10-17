@@ -6,8 +6,7 @@ struct ReconciliationSummary: Sendable, Equatable {
     var reactivated: Int = 0
     var unavailable: Int = 0
     var skippedUnsupported: Int = 0
-    var supersededWrites: Int = 0
-    var interruptedWrites: Int = 0
+    var notAppliedWrites = SeratoWriteDispositionCounts()
     var pathConflictCount: Int = 0
     var conflictBlockedWriteCount: Int = 0
     var duplicateCleanupMessage: String?
@@ -79,7 +78,7 @@ actor SeratoMembershipReconciler {
         let analysis: SeratoConflictAnalysis = if let suppliedAnalysis {
             suppliedAnalysis
         } else {
-            try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+            try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files, pendingRenames: operationEngine.pendingRenameSources())
         }
         try analysis.validate(snapshot)
         try await reader.validate(snapshot)

@@ -95,7 +95,8 @@ final class SeratoConflictReviewModel: ObservableObject {
         case 1: "The verified references resolve to one physical file. Preserve its audio and your preferred metadata and crate memberships."
         default: "The references resolve to distinct physical files. Inspect each file before choosing which library references to retain."
         }
-        return diagnosis + (uncertain ? " Some locations could not be inspected. Restore access before deciding an entry is stale." : "")
+        let rename = conflict.renameSource.map { source in SeratoConflictMessages.renameCollision(from: source, to: conflict.id) + " " } ?? ""
+        return rename + diagnosis + (uncertain ? " Some locations could not be inspected. Restore access before deciding an entry is stale." : "")
     }
 
     static func describe(_ occurrence: SeratoConflictOccurrence) -> String {
