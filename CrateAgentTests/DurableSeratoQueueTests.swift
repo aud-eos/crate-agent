@@ -304,6 +304,49 @@ final class DurableSeratoQueueTests: XCTestCase {
         }
     }
 
+    func testAMissingDatabaseV2KeepsEveryQueuedSeratoWriteWaitingWithoutCreatingItUntilItReturns() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let edited = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let imported = try await fixture.add("imported.wav", membership: .pendingImport, bytes: FinalRemovalIntegrationTests.wav(sample: 1))
+        let removed = try await fixture.add("removed.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 2))
+        try save(fixture, paths: [edited.path, removed.path])
+        let crates = try saveCrates(fixture, paths: [removed.path])
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        let (editedID, importedID, removedID) = try (XCTUnwrap(edited.id), XCTUnwrap(imported.id), XCTUnwrap(removed.id))
+        setRunning(fixture, true)
+        try await fixture.engine.apply(.setMetadata(.init(fileId: editedID, metadata: .init(title: "Committed"), isSeratoAuthoritative: false)), batchId: "edit")
+        try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: editedID, metadata: .init(title: "Committed"))), batchId: "edit")
+        try await fixture.engine.apply(.addTrackToSerato(.init(fileId: importedID, metadata: .init(title: "Imported"))))
+        try await fixture.engine.apply(.removeTrackFromSerato(.init(fileId: removedID)))
+        try await fixture.engine.apply(.removeFileFromCrates(.init(fileId: removedID)))
+        setRunning(fixture, false)
+        let queued = try await fixture.engine.pendingSeratoWriteCount
+        XCTAssertEqual(queued, 4)
+        let savedLibrary = try Data(contentsOf: fixture.locator.databaseV2Url)
+        try FileManager.default.removeItem(at: fixture.locator.databaseV2Url)
+
+        await XCTAssertThrowsErrorAsync(try await fixture.engine.drainPendingSeratoUpdates()) { error in
+            XCTAssertEqual(error as? OperationEngineError, .seratoDatabaseMissing(path: fixture.locator.databaseV2Url.path, waitingCount: queued))
+        }
+        let stillQueued = try await fixture.engine.pendingSeratoWriteCount
+        XCTAssertEqual(stillQueued, queued)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.locator.databaseV2Url.path), "crate-agent never creates database V2")
+        for (url, bytes) in crates {
+            XCTAssertEqual(try Data(contentsOf: url), bytes, "a removal waits for database V2 before touching any crate")
+        }
+
+        try savedLibrary.write(to: fixture.locator.databaseV2Url)
+        try await fixture.engine.drainPendingSeratoUpdates()
+        let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
+        let titles = Dictionary(uniqueKeysWithValues: records.map { record in (SeratoPath.normalized(record.path), record.title) })
+        XCTAssertEqual(Set(titles.keys), Set([edited.path, imported.path].map(SeratoPath.normalized)))
+        XCTAssertEqual(titles[SeratoPath.normalized(edited.path)], "Committed")
+        for (url, _) in crates {
+            XCTAssertEqual(try readCratePaths(cratePath: url.path), [])
+        }
+    }
+
     func testAnAttemptStoppedBeforeItsWriteDoesNotLookLandedAfterAFailedRetry() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }

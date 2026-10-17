@@ -9,6 +9,16 @@ enum SeratoWriteKind: String, Codable, Sendable {
     case removeFromDatabase
     case removeFromCrates
     case trashFile
+
+    /// Writes to Serato's library files (database V2, crates, smart crates),
+    /// which all wait together while `database V2` is missing (#192). Audio
+    /// tags and Trash are not Serato library files.
+    var writesSeratoLibrary: Bool {
+        switch self {
+        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates: true
+        case .fileTagWrite, .trashFile: false
+        }
+    }
 }
 
 extension SeratoPendingWrite: Codable {

@@ -45,6 +45,9 @@ lofty = "0.24"
 # Same-directory temporary files for atomic Serato library rewrites (#193).
 tempfile = "3.27"
 
+# NFC path comparison, matching Swift's `SeratoPath.normalized` (#179).
+unicode-normalization = "0.1.26"
+
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
 
