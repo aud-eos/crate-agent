@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-enum SeratoWriteKind: String, Codable, Sendable {
+enum SeratoWriteKind: String, Codable, Sendable, CaseIterable {
     case rename
     case metadataUpdate
     case addTrack
@@ -9,6 +9,16 @@ enum SeratoWriteKind: String, Codable, Sendable {
     case removeFromDatabase
     case removeFromCrates
     case trashFile
+
+    /// Writes that must rewrite an existing `database V2`. An add creates the
+    /// file when it is missing, and a removal from a missing file has nothing
+    /// to remove.
+    var rewritesSeratoDatabase: Bool {
+        switch self {
+        case .rename, .metadataUpdate: true
+        case .addTrack, .fileTagWrite, .removeFromDatabase, .removeFromCrates, .trashFile: false
+        }
+    }
 }
 
 extension SeratoPendingWrite: Codable {
@@ -244,6 +254,13 @@ enum SeratoWriteQueue {
 
     static func pendingEventCount(in database: Database) throws -> Int {
         try Int.fetchOne(database, sql: "SELECT COUNT(DISTINCT event_id) FROM serato_write_queue") ?? 0
+    }
+
+    /// Queued changes that wait for `database V2` while it is missing.
+    static func pendingDatabaseRewriteCount(in database: Database) throws -> Int {
+        let kinds = SeratoWriteKind.allCases.filter(\.rewritesSeratoDatabase).map(\.rawValue)
+        return try Int.fetchOne(database, sql: "SELECT COUNT(DISTINCT event_id) FROM serato_write_queue WHERE kind IN (\(databaseQuestionMarks(count: kinds.count)))",
+                                arguments: StatementArguments(kinds)) ?? 0
     }
 
     /// A new attempt keeps whether the previous one may have landed before

@@ -425,9 +425,17 @@ rename whose track neither `database V2` nor any crate holds at its final path
 afterwards, completes as `noSeratoRecord` in the transaction that removes its
 row, and does not advance the external baseline: the Rust batch writers report
 each unmatched path, so a write with nothing to change is told apart from one
-with no entry, and Re-sync counts it as not written (#105). A missing
-`database V2` is not evidence that a track is absent and keeps its tolerant
-behavior.
+with no entry, and Re-sync counts it as not written (#105).
+
+A missing `database V2` is not evidence that a track is absent (#192). Queued
+metadata updates and renames, and the later rows that depend on them, stay
+queued with a `seratoDatabaseMissing` error naming the path and how many changes
+wait. The drain or Re-sync then fails with that error, so the sync status shows
+it and **Retry Sync** applies the rows once the file is back. A rename waits as
+one unit: no `Subcrates` or `SmartCrates` file is rewritten while `database V2`
+is missing, so the three file sets never disagree about the track's path. Other
+rows still drain. A queued add creates `database V2` when it is missing, and a
+removal from a missing `database V2` has nothing to remove.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
