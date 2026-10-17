@@ -59,7 +59,12 @@ public struct AudioFileReadIdentity: Codable, Equatable, Sendable {
         var target = stat()
         let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         guard lstat(path, &entry) == 0, stat(path, &target) == 0 else {
-            throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: path])
+            let failure = errno
+            switch failure {
+            case ENOENT, ENOTDIR: throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: path])
+            case EACCES, EPERM: throw CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: path])
+            default: throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO, userInfo: [NSFilePathErrorKey: path])
+            }
         }
         guard target.st_mode & S_IFMT == S_IFREG else {
             throw CocoaError(.fileReadUnsupportedScheme, userInfo: [NSFilePathErrorKey: path])

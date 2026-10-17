@@ -134,9 +134,18 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         excluding excludingFileId: Int64,
         in db: GRDB.Database
     ) throws -> Bool {
-        try FileRecord
+        try otherFileReferencingTrack(trackId, excluding: excludingFileId, in: db) != nil
+    }
+
+    /// The lowest-id file other than `excludingFileId` that links to `trackId`.
+    public static func otherFileReferencingTrack(
+        _ trackId: Int64?,
+        excluding excludingFileId: Int64,
+        in db: GRDB.Database
+    ) throws -> Int64? {
+        try Int64.fetchOne(db, FileRecord.select(Column("id"))
             .filter(Column("track_id") == trackId && Column("id") != excludingFileId)
-            .fetchCount(db) > 0
+            .order(Column("id")))
     }
 }
 

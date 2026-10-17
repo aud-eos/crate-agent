@@ -90,6 +90,8 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case songFamilySplit = "song_family_split"
     case songFamilyRepresentativeChanged = "song_family_representative_changed"
     case songFamilyRestored = "song_family_restored"
+    case songFamilyRecordingLinked = "song_family_recording_linked"
+    case songFamilyRecordingUnlinked = "song_family_recording_unlinked"
 
     /// Whether this event type projects onto Serato/audio-file writes that
     /// `OperationEngine.resyncSeratoForBatch` can idempotently replay from the
@@ -113,7 +115,8 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
-             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             false
         }
     }

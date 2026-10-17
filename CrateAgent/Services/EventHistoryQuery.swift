@@ -235,6 +235,10 @@ public enum EventHistoryQuery {
             return "Changed the main version of \(songFamilies(count))"
         case .songFamilyRestored:
             return "Restored \(songFamilies(count))"
+        case .songFamilyRecordingLinked:
+            return "Linked \(count) file\(pluralS) to \(count == 1 ? "its recording" : "their recordings") for grouping"
+        case .songFamilyRecordingUnlinked:
+            return "Unlinked \(count) file\(pluralS) from \(count == 1 ? "its grouping recording" : "their grouping recordings")"
         }
     }
 

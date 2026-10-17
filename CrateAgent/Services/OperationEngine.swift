@@ -39,6 +39,10 @@ public actor OperationEngine {
     /// real audio files on disk.
     public typealias FileTagWriter = @Sendable (String, AudioTagUpdate) throws -> Void
 
+    /// Injectable audio-file tag reader, the read half of the same boundary:
+    /// a test that fakes the writer fakes the reader to match it.
+    public typealias FileTagReader = @Sendable (String) throws -> AudioTags
+
     /// Injectable database-V2 metadata batch writer. Production wires
     /// in the Rust `batchUpdateDatabaseRecords` FFI (one file read +
     /// one file write covering every track in the batch); tests inject
@@ -66,6 +70,7 @@ public actor OperationEngine {
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
     private let fileTagWriter: FileTagWriter
+    private let fileTagReader: FileTagReader
     private let seratoMetadataBatchWriter: SeratoMetadataBatchWriter
     private let seratoAddTrackBatchWriter: SeratoAddTrackBatchWriter
     private let fileTrasher: FileTrasher
@@ -77,6 +82,8 @@ public actor OperationEngine {
     /// pass and must not be processed again, or overtaken by a dependent row,
     /// until that pass releases it.
     private var claimedQueueIDs: [Int64: UUID] = [:]
+    /// Per queue row, how far the current attempt's external writes got.
+    private var attemptIO: [Int64: AttemptIOStage] = [:]
     private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
     private var isDraining = false
     /// One pass over queued rows runs at a time. A scoped pass leaves a row
@@ -133,6 +140,7 @@ public actor OperationEngine {
         fileTagWriter: @escaping FileTagWriter = { path, update in
             try writeAudioTags(filePath: path, update: update)
         },
+        fileTagReader: @escaping FileTagReader = { path in try readAudioTags(filePath: path) },
         seratoMetadataBatchWriter: @escaping SeratoMetadataBatchWriter = { databasePath, updates in
             try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
         },
@@ -151,6 +159,7 @@ public actor OperationEngine {
         self.seratoWatchdog = seratoWatchdog
         self.seratoLocator = seratoLocator
         self.fileTagWriter = fileTagWriter
+        self.fileTagReader = fileTagReader
         self.seratoMetadataBatchWriter = seratoMetadataBatchWriter
         self.seratoAddTrackBatchWriter = seratoAddTrackBatchWriter
         self.fileTrasher = fileTrasher
@@ -477,7 +486,7 @@ public actor OperationEngine {
     private func readinessAuthorization(for mutations: [TrackMutation]) throws -> LibrarySyncReadiness.Authorization? {
         let requiresReady = mutations.contains { mutation in
             switch mutation {
-            case .indexNewFile, .beginFileImport, .addTrackToSerato, .songFamily: false
+            case .indexNewFile, .beginFileImport, .addTrackToSerato: false
             default: true
             }
         }
@@ -1026,7 +1035,8 @@ public actor OperationEngine {
         case .fileTrashed: .trashFile
         case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
-             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored: nil
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked: nil
         }
     }
 
@@ -1445,7 +1455,8 @@ public actor OperationEngine {
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
              .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
-             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             false
         }
     }
@@ -1542,7 +1553,8 @@ public actor OperationEngine {
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
-             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             return []
         }
     }
@@ -1568,6 +1580,10 @@ public actor OperationEngine {
             try Self.decodeInverseMutation(event: event)
         }
 
+        // Ordering is checked first so a superseded match reports that, not
+        // the newer match's tags; both checks run again inside the transaction.
+        try await database.writer.read { database in try Self.requireNoLaterMatchSupersedes(events: events, in: database) }
+        let tagReads = try await readMatchFileTags(events)
         let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
         let context = mutationContext
         // One transaction for every inverse mutation in the batch.
@@ -1580,6 +1596,12 @@ public actor OperationEngine {
             // Inside the transaction that applies the inverses, so an apply
             // that lands while undo is suspended cannot slip past it (#107).
             try Self.requireNoLaterMatchSupersedes(events: events, in: database)
+            for read in tagReads {
+                guard try FileRecord.fetchOne(database, key: read.fileID)?.path == read.path else {
+                    throw FileProcessingEligibilityError.superseded(fileId: read.fileID)
+                }
+                try MatchUndoTagGuard.requireUnchanged(read)
+            }
             for event in events {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
@@ -1597,6 +1619,36 @@ public actor OperationEngine {
         }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
         return undoBatchId
+    }
+
+    /// Reads the live tags of every file whose match this undo reverses or
+    /// redoes, refusing when the inverse would overwrite a later tag edit.
+    private func readMatchFileTags(_ events: [EventRecord]) async throws -> [MatchUndoTagGuard.Read] {
+        let decoder = JSONDecoder()
+        var matches: [(fileID: Int64, direction: MatchHistoryDirection, applied: ApplyMusicBrainzMatchPayload)] = []
+        for event in events {
+            guard let fileID = event.fileId else { continue }
+            switch event.eventType {
+            case .musicBrainzMatchApplied:
+                try matches.append((fileID, .undo, Self.decodeEventPayload(ApplyMusicBrainzMatchPayload.self, event: event, decoder: decoder)))
+            case .musicBrainzMatchReverted:
+                try matches.append((fileID, .redo, Self.decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder).applied))
+            default: continue
+            }
+        }
+        guard !matches.isEmpty else { return [] }
+        let paths = try await database.writer.read { database in
+            try Self.fetchFiles(fileIDs: matches.map(\.fileID), in: database).reduce(into: [Int64: String]()) { paths, file in
+                if let fileID = file.id {
+                    paths[fileID] = file.path
+                }
+            }
+        }
+        let requests = try matches.map { match in
+            guard let path = paths[match.fileID] else { throw OperationEngineError.fileNotFound(fileId: match.fileID) }
+            return MatchUndoTagGuard.Request(fileID: match.fileID, path: path, direction: match.direction, applied: match.applied)
+        }
+        return try await MatchUndoTagGuard.readAll(requests, reader: fileTagReader)
     }
 
     /// Throws `undoSupersededByLaterMatch` if any match-affecting event in the
@@ -1792,6 +1844,10 @@ public actor OperationEngine {
         case .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
             return try .songFamily(.restore(decoder.decode(RestoreSongFamiliesPayload.self, from: inverseJsonData)))
+        case .songFamilyRecordingLinked:
+            return try .songFamily(.unlinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
+        case .songFamilyRecordingUnlinked:
+            return try .songFamily(.relinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
         }
     }
 
@@ -1959,7 +2015,12 @@ public actor OperationEngine {
         var rows = try await eligibleWrites(candidates)
         try await supersedeMissing(from: candidates, keeping: rows, reported: reported, run: &run)
         let claimed = claim(Set(rows.compactMap(\.queueID)), owner: owner)
-        defer { release(claimed, owner: owner) }
+        defer {
+            release(claimed, owner: owner)
+            for queueID in claimed {
+                attemptIO[queueID] = nil
+            }
+        }
         func dependency(of write: GuardedSeratoWrite) -> SeratoQueueDependency {
             write.queueID.flatMap { queueID in dependencies[queueID] } ?? SeratoQueueDependency()
         }
@@ -2131,12 +2192,20 @@ public actor OperationEngine {
 
     private func recordAttempt(_ writes: [GuardedSeratoWrite]) async throws {
         try await database.writer.write { database in try SeratoWriteQueue.recordAttempt(writes, in: database) }
+        for queueID in writes.compactMap(\.queueID) {
+            attemptIO[queueID] = nil
+        }
     }
 
+    /// A row none of whose writes' I/O returned cannot have landed: each one
+    /// that reached I/O threw from it. Only a mark this attempt set is
+    /// cleared; any other may be an earlier process's that is not folded yet.
     private func recordFailure(_ writes: [GuardedSeratoWrite], error: Error) async throws {
         let message = error.localizedDescription
+        let unwritten = writes.compactMap(\.queueID).filter { queueID in attemptIO[queueID] == .marked }
         try await database.writer.write { database in
             try SeratoWriteQueue.recordFailure(writes, message: message, in: database)
+            try SeratoWriteQueue.clearIOStarted(unwritten, in: database)
             for target in Set(writes.compactMap(\.cleanupTargetFileID)) {
                 guard let intent = try DuplicateCleanupStore.fetch(targetFileID: target, in: database) else { continue }
                 try DuplicateCleanupStore.recordFailure(targetFileID: target, message: Self.duplicateCleanupFailureMessage(intent, error: error), in: database)
@@ -2192,53 +2261,122 @@ public actor OperationEngine {
     /// reduced row was completed or superseded meanwhile and is skipped
     /// rather than applied twice. With `completing`, the rows are deleted in
     /// the same transaction as the I/O.
-    private func performExternalWrite<Result: Sendable>(
-        _ writes: [GuardedSeratoWrite], completing: Bool = false, operation: @escaping @Sendable (GRDB.Database) throws -> Result
-    ) async throws -> Result {
+    private func performExternalWrite<Output: Sendable>(
+        _ writes: [GuardedSeratoWrite], completing: Bool = false, operation: @escaping @Sendable (GRDB.Database) throws -> Output
+    ) async throws -> Output {
+        try await performExternalWrite(writes, completing: completing) { database, io in
+            let result = try operation(database)
+            io.recordReturned()
+            return result
+        }
+    }
+
+    /// For a writer that validates or records after its I/O: it reports
+    /// through `io` the moment its I/O returns, so a later throw cannot make
+    /// that I/O look as if it never landed.
+    private func performExternalWrite<Output: Sendable>(
+        _ writes: [GuardedSeratoWrite], completing: Bool = false, operation: @escaping @Sendable (GRDB.Database, ExternalIOProgress) throws -> Output
+    ) async throws -> Output {
         let watchdog = seratoWatchdog
         let readiness = readiness
         let drainAuthorization = LibrarySyncReadiness.drainAuthorization
         let locator = seratoLocator
+        let queueIDs = writes.compactMap(\.queueID)
+        let unmarked = queueIDs.filter { queueID in attemptIO[queueID] == nil }
+        if !unmarked.isEmpty {
+            try await database.writer.write { database in try SeratoWriteQueue.markIOStarting(unmarked, in: database) }
+            for queueID in unmarked {
+                attemptIO[queueID] = .marked
+            }
+        }
+        let unwritten = queueIDs.filter { queueID in attemptIO[queueID] == .marked }
+        let progress = ExternalIOProgress()
+        defer {
+            if progress.returned {
+                for queueID in queueIDs {
+                    attemptIO[queueID] = .returned
+                }
+            }
+        }
         // Releasing writer serialization before I/O lets retirement commit against old authorization.
-        return try await database.writer.write { database in
-            var stale = Set<Int64>()
-            for write in writes {
-                guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
-                if try SeratoWriteQueue.state(of: write, in: database) != .current {
-                    stale.insert(queueID)
-                }
+        let outcome = try await database.writer.write { database -> Swift.Result<Output, ExternalWriteInterruption> in
+            do {
+                try Self.requireExternalWriteBoundary(writes, watchdog: watchdog, readiness: readiness, drainAuthorization: drainAuthorization, in: database)
+            } catch let interruption as ExternalWriteInterruption {
+                // Nothing was written, so this attempt's marks for rows no write reached must not survive.
+                try SeratoWriteQueue.clearIOStarted(unwritten, in: database)
+                return .failure(interruption)
             }
-            if !stale.isEmpty {
-                throw ExternalWriteInterruption.stale(stale)
-            }
-            guard try Self.eligibleWrites(writes, in: database).count == writes.count,
-                  !watchdog.isRunningForExternalWrite,
-                  readiness?.permitsExternalWrites(drain: drainAuthorization) != false
-            else {
-                throw ExternalWriteInterruption.deferred
-            }
-            try Self.requireUnconflicted(writes, readiness: readiness, in: database)
-            var superseded = Set<Int64>()
-            for write in writes {
-                guard let queueID = write.queueID else { continue }
-                guard let file = try FileRecord.fetchOne(database, key: write.token.fileId) else {
-                    superseded.insert(queueID)
-                    continue
-                }
-                do { try SeratoWriteEligibility.requirePhysicalTarget(write, file: file, in: database) }
-                catch is FileProcessingEligibilityError { superseded.insert(queueID) }
-            }
-            if !superseded.isEmpty {
-                throw ExternalWriteInterruption.superseded(superseded)
-            }
-            guard !watchdog.isRunningForExternalWrite,
-                  readiness?.permitsExternalWrites(drain: drainAuthorization) != false else { throw ExternalWriteInterruption.deferred }
-            try Self.requireUnconflicted(writes, readiness: readiness, in: database)
-            let result = try operation(database)
+            let result = try operation(database, progress)
             if completing {
                 try Self.completeQueuedWrites(writes, locator: locator, in: database)
             }
-            return result
+            return .success(result)
+        }
+        if case .failure = outcome {
+            for queueID in unwritten {
+                attemptIO[queueID] = nil
+            }
+        }
+        return try outcome.get()
+    }
+
+    /// Every check that must still hold at the moment of external I/O.
+    private static func requireExternalWriteBoundary(_ writes: [GuardedSeratoWrite], watchdog: SeratoWatchdog, readiness: LibrarySyncReadiness?,
+                                                     drainAuthorization: LibrarySyncReadiness.Authorization?, in database: GRDB.Database) throws
+    {
+        var stale = Set<Int64>()
+        for write in writes {
+            guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
+            if try SeratoWriteQueue.state(of: write, in: database) != .current {
+                stale.insert(queueID)
+            }
+        }
+        if !stale.isEmpty {
+            throw ExternalWriteInterruption.stale(stale)
+        }
+        guard try Self.eligibleWrites(writes, in: database).count == writes.count,
+              !watchdog.isRunningForExternalWrite,
+              readiness?.permitsExternalWrites(drain: drainAuthorization) != false
+        else {
+            throw ExternalWriteInterruption.deferred
+        }
+        try Self.requireUnconflicted(writes, readiness: readiness, in: database)
+        var superseded = Set<Int64>()
+        for write in writes {
+            guard let queueID = write.queueID else { continue }
+            guard let file = try FileRecord.fetchOne(database, key: write.token.fileId) else {
+                superseded.insert(queueID)
+                continue
+            }
+            do { try SeratoWriteEligibility.requirePhysicalTarget(write, file: file, in: database) }
+            catch is FileProcessingEligibilityError { superseded.insert(queueID) }
+        }
+        if !superseded.isEmpty {
+            throw ExternalWriteInterruption.superseded(superseded)
+        }
+        guard !watchdog.isRunningForExternalWrite,
+              readiness?.permitsExternalWrites(drain: drainAuthorization) != false else { throw ExternalWriteInterruption.deferred }
+        try Self.requireUnconflicted(writes, readiness: readiness, in: database)
+    }
+
+    /// `marked`: this attempt committed the row's `io_started` mark.
+    /// `returned`: a write for the row returned from its I/O, so it may have
+    /// landed however the rest of its transaction ended.
+    private enum AttemptIOStage: Equatable { case marked, returned }
+
+    /// Whether one external write's I/O returned, set on the database queue
+    /// and read back on the actor once the write returns or throws.
+    private final class ExternalIOProgress: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored = false
+
+        var returned: Bool {
+            lock.withLock { stored }
+        }
+
+        func recordReturned() {
+            lock.withLock { stored = true }
         }
     }
 
@@ -2319,12 +2457,13 @@ public actor OperationEngine {
     private func applyTrashFileOperation(_ trash: SeratoPendingTrash, guardedWrites: [GuardedSeratoWrite]) async throws {
         let trasher = fileTrasher
         let context = mutationContext
-        try await performExternalWrite(guardedWrites, completing: true) { database in
+        try await performExternalWrite(guardedWrites, completing: true) { database, io in
             do {
                 try trasher(trash.absolutePath)
             } catch {
                 throw OperationEngineError.trashFailed(path: trash.absolutePath, underlying: String(describing: error))
             }
+            io.recordReturned()
             guard let targetFileID = guardedWrites.first?.cleanupTargetFileID else { return }
             guard let intent = try DuplicateCleanupStore.fetch(targetFileID: targetFileID, in: database) else {
                 throw FileProcessingEligibilityError.superseded(fileId: targetFileID)
@@ -2354,8 +2493,9 @@ public actor OperationEngine {
             fromAbsolute: removal.absolutePath
         )
         do {
-            _ = try await performExternalWrite(guardedWrites, completing: true) { database in
+            _ = try await performExternalWrite(guardedWrites, completing: true) { database, io in
                 let removed = try removeTrackFromDatabase(databasePath: databaseV2Path, trackPath: seratoRelativePath)
+                io.recordReturned()
                 if let cleanupTarget {
                     guard try !readDatabaseRecordsStrict(databasePath: databaseV2Path).contains(where: { record in SeratoPath.normalized(record.path) == SeratoPath.normalized(removal.absolutePath) }) else {
                         throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: "Duplicate reference removal did not complete.")
@@ -2443,13 +2583,14 @@ public actor OperationEngine {
         )
         let tagWriter = fileTagWriter
         do {
-            try await performExternalWrite(guardedWrites, completing: true) { database in
+            try await performExternalWrite(guardedWrites, completing: true) { database, io in
                 guard let guardedWrite = guardedWrites.first,
                       let file = try FileRecord.fetchOne(database, key: guardedWrite.token.fileId)
                 else {
                     throw OperationEngineError.insertDidNotReturnRowId
                 }
                 try tagWriter(write.absolutePath, update)
+                io.recordReturned()
                 let identity = try FileMetadataCollector.collectVerified(at: write.absolutePath)
                 try FileIdentityObservationMutation.recordOwnedTagWrite(previous: file, identity: identity, eventID: guardedWrite.eventId, in: database)
             }
@@ -2495,12 +2636,13 @@ public actor OperationEngine {
         let addWriter = seratoAddTrackBatchWriter
         let scopeAuthorization = readiness?.captureScope()
         let context = mutationContext
-        try await performExternalWrite(adds.map(\.row), completing: true) { database in
+        try await performExternalWrite(adds.map(\.row), completing: true) { database, io in
             do {
                 var pending = additions
                 if !FileManager.default.fileExists(atPath: databaseV2Path) {
                     try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
                     try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+                    io.recordReturned()
                     pending.removeFirst()
                 }
                 if !pending.isEmpty {
@@ -2509,6 +2651,7 @@ public actor OperationEngine {
             } catch {
                 throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: String(describing: error))
             }
+            io.recordReturned()
             try scopeAuthorization?.check()
             let libraryID = try context.locator.supportedLibraryIdentity()
             for (row, _) in adds {
@@ -3652,10 +3795,11 @@ public actor OperationEngine {
             guard let existingId = existingTrack.id else {
                 throw OperationEngineError.insertDidNotReturnRowId
             }
-            // Undo retains an empty fingerprint row for FK stability. Reusing
-            // that unreferenced row must seed kept fields just like creation.
-            let isEmptyOrphan = try existingTrack == TrackRecord(id: existingId, fingerprintHash: payload.fingerprintHash)
-                && FileRecord.filter(Column("track_id") == existingId).fetchCount(db) == 0
+            // Undo retains an empty fingerprint row for FK stability, and song
+            // grouping links a file to one. Reusing a bare row no other file
+            // depends on must seed kept fields just like creation.
+            let isEmptyOrphan = try existingTrack.isBare
+                && !FileRecord.hasOtherFilesReferencingTrack(existingId, excluding: payload.fileID, in: db)
             existingTrack.acoustidId = payload.acoustID
             existingTrack.musicbrainzRecordingId = payload.recordingMBID
             existingTrack.musicbrainzReleaseId = payload.releaseMBID
@@ -3958,7 +4102,7 @@ public actor OperationEngine {
         // For each text field the forward wrote, restore that target's snapshot
         // value, or "" to clear a field the match added from empty.
         let dbSnapshot = applied.previousMetadata ?? .empty
-        let fileSnapshot = applied.previousFileTags ?? applied.previousMetadata ?? .empty
+        let fileSnapshot = applied.fileTagRestoreSnapshot
 
         let v2Metadata = SeratoMetadata(
             artist: applied.artist != nil ? (dbSnapshot.artist ?? "") : nil,
@@ -4627,6 +4771,25 @@ struct SeratoPendingAddTrack: Codable, Sendable, Equatable {
 
 // MARK: - Errors
 
+/// Undoing a match event, or undoing its revert, which redoes the match.
+public enum MatchHistoryDirection: Sendable, Equatable {
+    case undo, redo
+
+    var verb: String {
+        switch self {
+        case .undo: "undo"
+        case .redo: "redo"
+        }
+    }
+
+    var gerund: String {
+        switch self {
+        case .undo: "undoing"
+        case .redo: "redoing"
+        }
+    }
+}
+
 public enum OperationEngineError: LocalizedError, Equatable {
     case fileNotFound(fileId: Int64)
     case insertDidNotReturnRowId
@@ -4654,6 +4817,19 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// rather than silently corrupting the current state (findings #3999114450,
     /// #3999974010). Detected from the event log in `undoBatch`.
     case undoSupersededByLaterMatch(fileId: Int64)
+    /// Undo or redo of a match was refused because the audio file's tags no
+    /// longer hold either end of the match for these fields: a later tag edit
+    /// that the inverse would overwrite (#111).
+    case undoWouldOverwriteFileTags(fileId: Int64, fields: [String], direction: MatchHistoryDirection)
+    /// The audio file changed between undo's tag check and its commit, so
+    /// the check no longer describes the file the inverse would rewrite.
+    case undoFileChangedWhileChecking(fileId: Int64, direction: MatchHistoryDirection)
+    /// Undo or redo of a match needs to read the audio file it would
+    /// rewrite, and the file is missing or its volume is offline.
+    case undoFileUnavailable(fileId: Int64, path: String, direction: MatchHistoryDirection)
+    /// Undo or redo of a match could not read the audio file it would
+    /// rewrite for a reason other than its absence, such as permissions.
+    case undoFileUnreadable(fileId: Int64, path: String, reason: String, direction: MatchHistoryDirection)
     case metadataChanged(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
@@ -4691,6 +4867,14 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
             "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
+        case let .undoWouldOverwriteFileTags(fileId, fields, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): its audio file's \(fields.joined(separator: ", ")) changed since, and \(direction.gerund) would overwrite that edit."
+        case let .undoFileUnavailable(fileId, path, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): \((path as NSString).lastPathComponent) is missing or its drive is offline. Reconnect it, then \(direction.verb) again."
+        case let .undoFileUnreadable(fileId, path, reason, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): \(path) can't be read (\(reason))."
+        case let .undoFileChangedWhileChecking(fileId, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): its audio file changed while \(direction.verb) was checking it. Try again."
         case let .metadataChanged(fileId):
             "File id \(fileId) metadata changed after it was reviewed. Re-scan before applying."
         case let .externalSyncIncomplete(batchId, underlying):

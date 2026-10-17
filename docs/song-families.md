@@ -10,12 +10,44 @@ every member belongs to one MusicBrainz release.
 - `works` holds one row per family. Its `representative_track_id` is the
   user's saved main-version choice, or null to use the automatic choice.
 - A member is a recording (`tracks` row), linked by `tracks.work_id`. A
-  recording belongs to at most one family. Several files that encode the same
-  recording (FLAC and MP3) count as one version.
+  recording belongs to at most one family. Files reach a family through
+  `files.track_id`, so files linked to the same recording row count as one
+  version. Encodings whose fingerprints differ (most FLAC and MP3 pairs) are
+  separate recordings, and count as separate versions.
 - Members keep their own fingerprint identity, tags, and MusicBrainz IDs.
   Grouping never writes audio tags, Serato files, or recording identifiers.
-- A family always has at least two recordings. A change that leaves fewer
-  dissolves it and leaves the remaining recording standalone.
+
+## The link and membership rule
+
+Every path that changes `files.track_id` or `tracks.work_id` follows these
+rules:
+
+1. **Identity paths own links.** MusicBrainz match and undo, and file identity
+   observation, decide which recording a file is. Grouping only fills a gap:
+   it links a non-retired, unlinked file with a current fingerprint to the
+   recording that fingerprint identifies, and only when that recording is new
+   or unclaimed. Unclaimed means no other file is linked to it and it has no
+   AcoustID, MusicBrainz, or ISRC identifier. Anything else is refused with
+   `fingerprintCollision`, naming the other file when there is one. A 120-second
+   fingerprint can match two different recordings (Clean and Dirty edits), and
+   grouping must not merge them or hand one the other's MusicBrainz identity.
+2. **Each grouping link is its own per-file event**
+   (`song_family_recording_linked`, with `file_id` set). It shows in the file's
+   History, and undo applies the retired and replaced-file guard to it.
+3. **Undo removes a grouping link only while grouping still owns it.** That is,
+   while the file is still linked to that recording and the recording is still
+   unclaimed. Once a later match claims it, undo keeps the link (the match owns
+   it now) and still undoes the membership. Redo re-creates a link only under
+   rule 1.
+4. **Live members.** A member counts only while at least one non-retired file is
+   linked to it. A member whose last file is retired, replaced, or re-matched to
+   another recording keeps its assignment silently, so undoing that change
+   brings it back. Members without files never count toward the version count,
+   the two-member minimum, or the displayed representative. A change that
+   dissolves a family clears them too.
+5. **Membership never moves silently.** Adding a recording that is already in
+   the family is a no-op. A live recording in another family is refused with
+   `memberAlreadyInFamily`, and the client offers `merge` instead.
 
 ## API
 
@@ -24,22 +56,18 @@ every member belongs to one MusicBrainz release.
 | Call | Effect |
 | --- | --- |
 | `create(_:representative:)` | Groups two or more recordings. |
-| `attach(_:to:)` | Adds recordings to a family. |
-| `detach(_:from:)` | Removes recordings; dissolves the family below two. |
+| `attach(_:to:)` | Adds recordings to a family; existing members are left as they are. |
+| `detach(_:from:)` | Removes recordings; dissolves the family below two live members. |
 | `merge(_:into:)` | Moves every member of the given families into one, keeping its saved main version. |
 | `split(_:from:)` | Moves two or more members into a new family, with the saved main version if it moves. |
 | `setRepresentative(_:of:)` | Saves a main version, or clears it with nil. |
-| `family(id:)`, `family(containingTrack:)` | Reads a family with its displayed representative and members. |
+| `family(id:)`, `family(containingTrack:)` | Reads a family's live members, with its displayed representative. |
 
-Members are passed as `SongFamilyMember.track(id)` or `.file(id)`. A file
-without a linked recording resolves to the `tracks` row its current Chromaprint
-fingerprint identifies, created when missing. Retired files and files without a
-current fingerprint are rejected with `recordingUnidentified`, so unmatched
-files can be grouped without MusicBrainz data.
-
-A recording that already belongs to another family is never reassigned:
-`create` and `attach` throw `memberAlreadyInFamily`, and the client offers
-`merge` instead.
+Members are passed as `SongFamilyMember.track(id)` or `.file(id)`. In the same
+batch as the change, the service links each unlinked `.file` under rule 1, so
+a refused link leaves nothing behind. Retired files are rejected with
+`fileRetired`, files without a current fingerprint with `recordingUnidentified`,
+and recordings with no file in the library with `recordingHasNoFiles`.
 
 ## Displayed representative
 
@@ -82,10 +110,11 @@ under the 1 s hard budget in `LibraryPagingTests`, which attaches the timings.
 
 ## History and undo
 
-Every call is one `OperationEngine` mutation (`.songFamily`) in its own batch.
-Its event records the affected families, recording assignments, and file links
-before and after the change. Undo restores the earlier state only if the
-recorded later state is still current; otherwise it fails with
-`changedSinceRecorded`, and the later change must be undone first. Undo leaves
-a recording row it created in place but unlinks its file, as MusicBrainz undo
-does.
+Every call is one History batch. The membership change is one `.songFamily`
+event that records the affected families and recording assignments before and
+after. Each link it needed is a separate per-file event. Undo restores the
+earlier membership only if the recorded later state is still current;
+otherwise it fails with `changedSinceRecorded`, and the later change must be
+undone first. Links are undone under rule 3. A recording row that grouping
+created is left in place, as MusicBrainz undo does. Grouping and its undo both
+wait for library synchronization to be ready, like other library changes.
