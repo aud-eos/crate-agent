@@ -200,7 +200,8 @@ impl TlvRecord {
 }
 
 fn decode_utf16be(bytes: &[u8]) -> Option<String> {
-    if !bytes.len().is_multiple_of(2) {
+    let (code_unit_pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
         return None;
     }
     // Stream the u16 units through char::decode_utf16 directly into
@@ -208,9 +209,9 @@ fn decode_utf16be(bytes: &[u8]) -> Option<String> {
     // calls this up to 10× per otrk; a 20k-track read previously
     // allocated 200k transient vectors.
     char::decode_utf16(
-        bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+        code_unit_pairs
+            .iter()
+            .map(|code_unit_pair| u16::from_be_bytes(*code_unit_pair)),
     )
     .collect::<Result<String, _>>()
     .ok()
