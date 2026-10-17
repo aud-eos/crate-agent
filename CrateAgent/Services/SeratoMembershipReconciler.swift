@@ -111,9 +111,11 @@ actor SeratoMembershipReconciler {
             if observed == .offline {
                 summary.skippedUnsupported += 1
             }
+            var verifiedTrashLocation: FileMetadata?
             if observed == .missing {
                 let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
                 observed = try FileTrashLocation.availability(of: location, resolver: availability)
+                verifiedTrashLocation = observed == .trashed ? location : nil
             }
             let saved = savedPaths.contains(SeratoPath.normalized(path))
             let ownedRemoval = try await operationEngine.pendingCleanupOwnsRemoval(of: file)
@@ -148,7 +150,8 @@ actor SeratoMembershipReconciler {
             let state = FileLibraryState(membership: membership, availability: observed,
                                          libraryID: observed == .offline ? file.seratoLibraryId : snapshot.libraryID,
                                          retiredAt: membership == .retired ? (file.retiredAt ?? Int64(Date().timeIntervalSince1970 * 1000)) : nil)
-            mutations.append(.setFileLibraryState(.init(fileId: fileID, expectedRevision: revision, state: state, observedReadditionAfterOwnedRemoval: readdedAfterOwnedRemoval ? true : nil)))
+            mutations.append(.setFileLibraryState(.init(fileId: fileID, expectedRevision: revision, state: state, observedReadditionAfterOwnedRemoval: readdedAfterOwnedRemoval ? true : nil,
+                                                        trashLocation: verifiedTrashLocation)))
             try await beforeCommit()
             let authorization = try await reader.authorization(for: snapshot)
             let expected = FileObservationExpectation(fileId: fileID, revision: file.membershipRevision, identity: file.identity, state: file.libraryState)

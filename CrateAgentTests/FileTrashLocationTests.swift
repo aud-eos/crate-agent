@@ -149,3 +149,79 @@ private final class TrashedFilesFixture {
         try? FileManager.default.removeItem(at: directory)
     }
 }
+
+/// The Trash-location contract at the engine, with no Trash volume: a recorded item whose
+/// volume is mounted but which no longer exists stands for an item emptied before commit.
+final class FileTrashLocationContractTests: XCTestCase {
+    private var database: LibraryDatabase!
+    private var engine: OperationEngine!
+
+    override func setUp() async throws {
+        let database = try LibraryDatabase.openInMemory()
+        self.database = database
+        engine = await MainActor.run {
+            OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                            seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
+        }
+    }
+
+    func testReturningToTrashedReverifiesTheRecordedItemAtCommit() async throws {
+        let file = try await insertInaccessibleFile(location: emptiedLocation())
+        do {
+            _ = try await engine.applyFilesystemObservations([.setFileLibraryState(.init(
+                fileId: XCTUnwrap(file.id), expectedRevision: file.membershipRevision, state: state(of: file, availability: .trashed)
+            ))], batchId: "return-to-trash")
+            XCTFail("An emptied Trash item must not justify a trashed row")
+        } catch FileProcessingEligibilityError.superseded {}
+        let row = try await reload(file)
+        XCTAssertEqual(row.fileAvailability, .inaccessible)
+    }
+
+    func testLoggedInverseOfLeavingInaccessibleIsAcceptedAndRestoresTheLocation() async throws {
+        let location = try emptiedLocation()
+        let file = try await insertInaccessibleFile(location: location)
+        let fileID = try XCTUnwrap(file.id)
+        _ = try await engine.applyFilesystemObservations([.setFileLibraryState(.init(
+            fileId: fileID, expectedRevision: file.membershipRevision, state: state(of: file, availability: .missing)
+        ))], batchId: "gone")
+        let event = try await database.writer.read { connection in
+            try XCTUnwrap(EventRecord.filter(Column("batch_id") == "gone").fetchOne(connection))
+        }
+        let inverse = try JSONDecoder().decode(SetFileLibraryStatePayload.self, from: Data(event.inversePayloadJson.utf8))
+        _ = try await engine.applyFilesystemObservations([.setFileLibraryState(inverse)], batchId: "inverse")
+        let row = try await reload(file)
+        XCTAssertEqual(row.fileAvailability, .inaccessible)
+        let restored = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
+        XCTAssertEqual(restored, location)
+    }
+
+    private func emptiedLocation() throws -> FileMetadata {
+        let directory = FileManager.default.temporaryDirectory
+        let probe = directory.appendingPathComponent(UUID().uuidString)
+        try Data([1, 2, 3, 4]).write(to: probe)
+        defer { try? FileManager.default.removeItem(at: probe) }
+        let volume = try XCTUnwrap(FileMetadataCollector.collect(at: probe.path)).volumeUuid
+        return FileMetadata(path: directory.appendingPathComponent("emptied-\(UUID().uuidString).mp3").path, volumeUuid: volume,
+                            inode: 1, fileSize: 4, mtime: 1, lightweightHash: Data([9]))
+    }
+
+    private func insertInaccessibleFile(location: FileMetadata) async throws -> FileRecord {
+        try await database.writer.write { connection in
+            var file = FileRecord(path: "/Music/A/trashed.mp3", volumeUuid: location.volumeUuid, inode: 1, fileSize: 4, mtime: 1,
+                                  lightweightHash: location.lightweightHash)
+            file.libraryMembership = .active
+            file.fileAvailability = .inaccessible
+            try file.insert(connection)
+            try FileTrashLocation.store(location, fileID: XCTUnwrap(file.id), in: connection)
+            return file
+        }
+    }
+
+    private func state(of file: FileRecord, availability: FileAvailability) -> FileLibraryState {
+        FileLibraryState(membership: file.libraryMembership, availability: availability, libraryID: file.seratoLibraryId, retiredAt: file.retiredAt)
+    }
+
+    private func reload(_ file: FileRecord) async throws -> FileRecord {
+        try await database.writer.read { connection in try XCTUnwrap(FileRecord.fetchOne(connection, key: file.id)) }
+    }
+}

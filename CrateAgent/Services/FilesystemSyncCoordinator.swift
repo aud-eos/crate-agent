@@ -88,8 +88,8 @@ public actor FilesystemSyncCoordinator {
             if try await resolvePendingMove(for: knownPath, batchID: batchID) {
                 return
             }
-            let availability = try await currentAvailability(of: knownPath)
-            try await observe(file: knownPath, availability: availability, metadata: nil, batchID: batchID)
+            let current = try await currentAvailability(of: knownPath)
+            try await observe(file: knownPath, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
             return
         }
         try await revalidateTrashLocation(at: observation.path, batchID: batchID)
@@ -156,11 +156,12 @@ public actor FilesystemSyncCoordinator {
     }
 
     /// A trashed row keeps its indexed path, so only its recorded Trash item proves the audio still exists.
-    private func currentAvailability(of file: FileRecord) async throws -> FileAvailability {
+    private func currentAvailability(of file: FileRecord) async throws -> (availability: FileAvailability, trashLocation: FileMetadata?) {
         let availability = try inspectKnownIdentity(file)
-        guard availability == .missing, let fileID = file.id else { return availability }
+        guard availability == .missing, let fileID = file.id else { return (availability, nil) }
         let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
-        return try FileTrashLocation.availability(of: location, resolver: availabilityResolver)
+        let observed = try FileTrashLocation.availability(of: location, resolver: availabilityResolver)
+        return (observed, observed == .trashed ? location : nil)
     }
 
     /// Removing or emptying a Trash item reports only its Trash path, never the indexed path.
@@ -171,9 +172,9 @@ public actor FilesystemSyncCoordinator {
         }
         for file in trashedFiles {
             try await operationEngine.requireUnconflicted(.file(file))
-            let availability = try await currentAvailability(of: file)
-            guard availability != file.fileAvailability else { continue }
-            try await observe(file: file, availability: availability, metadata: nil, batchID: batchID)
+            let current = try await currentAvailability(of: file)
+            guard current.availability != file.fileAvailability else { continue }
+            try await observe(file: file, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
         }
     }
 

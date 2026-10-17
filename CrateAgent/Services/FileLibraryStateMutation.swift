@@ -10,7 +10,7 @@ public enum FileLibraryStateMutationError: LocalizedError, Equatable {
         case let .staleRevision(fileId, expected, actual):
             "File \(fileId) membership changed: expected revision \(expected), found \(actual). Refresh before retrying."
         case let .trashLocationWithoutTrash(fileId):
-            "File \(fileId) cannot record a Trash location unless it is in Trash."
+            "File \(fileId) can keep a Trash location only while it is in Trash, offline or inaccessible."
         }
     }
 }
@@ -56,16 +56,22 @@ enum FileLibraryStateMutation {
     }
 
     /// A recorded Trash item belongs to a trashed row. Offline and inaccessible say nothing
-    /// about whether that item still exists, so they keep it for the next check.
+    /// about whether that item still exists, so they keep it for the next check. A trashed
+    /// state is re-verified here, under the write lock, because Trash can be emptied while
+    /// the caller awaits the commit.
     private static func nextTrashLocation(_ payload: SetFileLibraryStatePayload, previous: FileMetadata?) throws -> FileMetadata? {
-        guard payload.state.availability == .trashed else {
+        switch payload.state.availability {
+        case .trashed:
+            guard let location = payload.trashLocation ?? previous else { return nil }
+            guard try FileTrashLocation.availability(of: location, resolver: FileAvailabilityResolver()) == .trashed else {
+                throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
+            }
+            return location
+        case .offline, .inaccessible:
+            return payload.trashLocation ?? previous
+        case .available, .missing, .unknown:
             guard payload.trashLocation == nil else { throw FileLibraryStateMutationError.trashLocationWithoutTrash(fileId: payload.fileId) }
-            return payload.state.availability == .offline || payload.state.availability == .inaccessible ? previous : nil
+            return nil
         }
-        guard let location = payload.trashLocation else { return previous }
-        guard try FileTrashLocation.availability(of: location, resolver: FileAvailabilityResolver()) == .trashed else {
-            throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
-        }
-        return location
     }
 }
