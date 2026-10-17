@@ -36,11 +36,15 @@ struct PendingDuplicateCleanup: Sendable {
     var waitingEventID: Int64?
     var removedV2 = false
     var failure: String?
+    /// Perceptual cleanups recheck cached audio evidence in the transaction
+    /// that starts them; later steps rely on the identity revalidation.
+    var audioRequirement = DuplicateAudioRequirement.none
 
-    init(target: FileActionAuthority, keeper: FileActionAuthority, batchID: String) {
+    init(target: FileActionAuthority, keeper: FileActionAuthority, batchID: String, audioRequirement: DuplicateAudioRequirement = .none) {
         self.target = target
         self.keeper = keeper
         self.batchID = batchID
+        self.audioRequirement = audioRequirement
     }
 
     var mutations: [TrackMutation] {

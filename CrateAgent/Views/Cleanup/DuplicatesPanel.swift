@@ -24,6 +24,9 @@ struct DuplicatesPanel: View {
     /// (DuplicateKeeperPicker.chooseDefaultKeeper). Per-group radio
     /// taps write into this dictionary.
     @State private var keeperOverrides: [String: Int64] = [:]
+    /// Per cross-format group, the files the user explicitly checked for
+    /// Trash. Cross-format groups never pre-select anything.
+    @State private var crossFormatSelections: [String: Set<Int64>] = [:]
     @State private var isScanning: Bool = false
     @State private var isResolving: Bool = false
     @State private var actionError: String?
@@ -47,6 +50,8 @@ struct DuplicatesPanel: View {
     /// Bumped by every rescan so a slower, older scan can't overwrite
     /// the results of a newer one (live updates and Rescan overlap).
     @State private var scanGeneration = 0
+    /// The running decoded-audio check for perceptual clusters, if any.
+    @State private var audioCheckTask: Task<Void, Never>?
     /// Coalesces bursts of fingerprint writes into one rescan.
     private static let liveRescanInterval: Duration = .milliseconds(1500)
 
@@ -86,7 +91,11 @@ struct DuplicatesPanel: View {
         }
         .task { await rescan() }
         .task { await rescanAsLibraryChanges() }
-        .onDisappear { services.audioPreview.stop() }
+        .onDisappear {
+            services.audioPreview.stop()
+            audioCheckTask?.cancel()
+            audioCheckTask = nil
+        }
         .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
         // Cache invalidation: when the group set changes (after a
         // rescan, or after a resolve removed files) or the user
@@ -108,12 +117,14 @@ struct DuplicatesPanel: View {
             ),
             presenting: pendingResolveGroup
         ) { group in
-            Button("Move \(group.size - 1) file\(group.size - 1 == 1 ? "" : "s") to Trash", role: .destructive) {
+            let count = trashCount(for: group)
+            Button("Move \(count) file\(count == 1 ? "" : "s") to Trash", role: .destructive) {
                 Task { await resolve(group: group) }
             }
             Button("Cancel", role: .cancel) {}
         } message: { group in
-            Text("This moves \(group.size - 1) file\(group.size - 1 == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. The file in Trash stays restorable from Finder until you empty Trash. This action can't be undone from History.")
+            let count = trashCount(for: group)
+            Text("This moves \(count) file\(count == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. The file in Trash stays restorable from Finder until you empty Trash. This action can't be undone from History.")
         }
         .alert(
             "Resolve selected duplicate groups?",
@@ -176,6 +187,12 @@ struct DuplicatesPanel: View {
                 Task { await rescan() }
             }
             Spacer()
+            if mode == .perceptual, checkingAudioFileCount > 0 {
+                Text("Checking audio of \(checkingAudioFileCount) file\(checkingAudioFileCount == 1 ? "" : "s")")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("Files that share a fingerprint are decoded to confirm their audio is the same before any can be moved to Trash.")
+            }
             if mode == .perceptual {
                 Text("\(fingerprintCoverage.done) of \(fingerprintCoverage.total) fingerprinted")
                     .font(.callout.monospacedDigit())
@@ -225,37 +242,78 @@ struct DuplicatesPanel: View {
     }
 
     private func refreshConflictSelection() {
-        results.setBlockedIDs(Set(groups.filter { group in conflictReason(group) != nil }.map(\.id)))
+        results.setBlockedIDs(Set(groups.filter { group in !group.preselectsCleanup || conflictReason(group) != nil }.map(\.id)))
+    }
+
+    /// Files a resolve of `group` would move to Trash: every non-keeper,
+    /// or in a cross-format group only the ones the user checked.
+    private func trashCount(for group: ScannedGroup) -> Int {
+        group.audioCheck == .crossFormat ? explicitSelection(for: group).count : max(0, group.size - 1)
+    }
+
+    private func explicitSelection(for group: ScannedGroup) -> Set<Int64> {
+        guard let keeper = group.files.first(where: { file in file.id == effectiveKeeperId(for: group) }) else { return [] }
+        return (crossFormatSelections[group.id] ?? []).filter { identifier in
+            guard identifier != keeper.id, let file = group.files.first(where: { file in file.id == identifier }) else { return false }
+            return group.audioRelation(of: file, toKeeper: keeper) != .different
+        }
+    }
+
+    private var checkingAudioFileCount: Int {
+        groups.reduce(0) { total, group in group.audioCheck == .checking ? total + group.size : total }
     }
 
     private func groupCard(_ group: ScannedGroup) -> some View {
         VStack(alignment: .leading, spacing: density.spacing) {
             HStack(spacing: density.spacing) {
-                Toggle("Select group", isOn: Binding(get: { results.selectedIDs.contains(group.id) }, set: { results.setSelected($0, id: group.id) }))
-                    .toggleStyle(.checkbox)
-                    .disabled(conflictReason(group) != nil)
-                Text("\(group.size) copies · \(modeHeader(for: group))")
+                if group.preselectsCleanup {
+                    Toggle("Select group", isOn: Binding(get: { results.selectedIDs.contains(group.id) }, set: { results.setSelected($0, id: group.id) }))
+                        .toggleStyle(.checkbox)
+                        .disabled(conflictReason(group) != nil)
+                }
+                Text(groupHeader(for: group))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button {
-                    pendingResolveGroup = group
-                } label: {
-                    Label("Trash \(group.size - 1) copies", systemImage: "trash")
-                        .labelStyle(.titleAndIcon)
+                if group.offersCleanup {
+                    Button {
+                        pendingResolveGroup = group
+                    } label: {
+                        Label(group.audioCheck == .crossFormat ? "Trash \(trashCount(for: group)) selected" : "Trash \(trashCount(for: group)) copies",
+                              systemImage: "trash")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .controlSize(density.controlSize)
+                    .disabled(isResolving || conflictReason(group) != nil || trashCount(for: group) == 0)
+                    .seratoWriteGated(help: "Move non-keepers in this group to Trash and remove their Serato references in one batch.",
+                                      runningHelp: SeratoGateMessages.duplicateResolveBlocked)
                 }
-                .controlSize(density.controlSize)
-                .disabled(isResolving || conflictReason(group) != nil)
-                .seratoWriteGated(help: "Move non-keepers in this group to Trash and remove their Serato references in one batch.",
-                                  runningHelp: SeratoGateMessages.duplicateResolveBlocked)
             }
             if let reason = conflictReason(group) {
                 Text(reason).font(.callout).foregroundStyle(.orange)
             }
-            VStack(spacing: density.detailSpacing) {
-                ForEach(group.files, id: \.id) { file in
-                    duplicateRow(file: file, group: group)
+            if group.audioCheck == .crossFormat {
+                Text("Different formats: audio can't be compared exactly. Listen before removing. Nothing here is selected for Trash until you check it.")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+            if group.audioCheck == .checking {
+                HStack(spacing: density.spacing) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking audio. These files can't be moved to Trash until their decoded audio is confirmed the same.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
+            }
+            if !group.files.isEmpty {
+                VStack(spacing: density.detailSpacing) {
+                    ForEach(group.files, id: \.id) { file in
+                        duplicateRow(file: file, group: group)
+                    }
+                }
+            }
+            if !group.keptFiles.isEmpty {
+                keptSection(group.keptFiles)
             }
         }
         .padding(.horizontal, density.pagePadding)
@@ -279,14 +337,62 @@ struct DuplicatesPanel: View {
         }
     }
 
-    private func modeHeader(for group: ScannedGroup) -> String {
-        switch group.mode {
-        case .byteLevel:
-            let first = group.files.first
-            let size = first.map { Self.byteCountFormatter.string(fromByteCount: $0.fileSize) } ?? ""
-            return "byte-level, \(size) each"
-        case .perceptual:
-            return "perceptual match"
+    private func groupHeader(for group: ScannedGroup) -> String {
+        switch group.audioCheck {
+        case .notRequired:
+            let size = group.files.first.map { Self.byteCountFormatter.string(fromByteCount: $0.fileSize) } ?? ""
+            return "\(group.size) copies · byte-level, \(size) each"
+        case .checking:
+            return "\(group.size) files · perceptual match · checking audio"
+        case .confirmed:
+            return "\(group.size) copies · perceptual match · identical audio"
+        case .crossFormat:
+            return "\(group.size) files · perceptual match · different formats"
+        case .differs:
+            return "\(group.keptFiles.count) files · perceptual match · audio differs"
+        }
+    }
+
+    private func keptSection(_ kept: [DuplicateFinder.KeptFile<DuplicateFileRow>]) -> some View {
+        let differing = kept.filter { entry in entry.reason == .audioDiffers }.count
+        let unreadable = kept.count - differing
+        return VStack(alignment: .leading, spacing: density.detailSpacing) {
+            if differing > 0 {
+                Text("\(differing) file\(differing == 1 ? "" : "s") share\(differing == 1 ? "s" : "") a fingerprint but \(differing == 1 ? "its" : "their") audio differs, so \(differing == 1 ? "it's" : "they're") kept")
+                    .font(.callout.weight(.medium))
+            }
+            if unreadable > 0 {
+                Text("\(unreadable) file\(unreadable == 1 ? "" : "s") couldn't be checked, so \(unreadable == 1 ? "it's" : "they're") kept")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.orange)
+            }
+            ForEach(kept, id: \.file.id) { entry in
+                HStack(alignment: .top, spacing: density.spacing) {
+                    if let identifier = entry.file.id {
+                        AudioPreviewButton(player: services.audioPreview, fileID: identifier, path: entry.file.path)
+                    }
+                    VStack(alignment: .leading, spacing: density.detailSpacing) {
+                        TrackHeading(artist: entry.file.artist, title: entry.file.title, filename: (entry.file.path as NSString).lastPathComponent)
+                        Text(entry.file.path)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(entry.file.path)
+                        Text(keptReason(entry.reason))
+                            .font(.callout)
+                            .foregroundStyle(entry.reason == .audioDiffers ? Color.secondary : Color.orange)
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    private func keptReason(_ reason: DuplicateFinder.KeptReason) -> String {
+        switch reason {
+        case .audioDiffers: "Kept: its decoded audio matches no other file here."
+        case let .unreadable(message): "Kept: \(message)"
         }
     }
 
@@ -323,6 +429,8 @@ struct DuplicatesPanel: View {
                     .help(file.path)
                 if isKeeper {
                     StatusBadge(title: "Keeper", systemImage: "checkmark.circle", tint: .accentColor)
+                } else if group.audioCheck == .crossFormat, let identifier = file.id {
+                    crossFormatChoice(file: file, fileID: identifier, group: group)
                 }
                 HStack(spacing: density.spacing) {
                     Text(Self.byteCountFormatter.string(fromByteCount: file.fileSize))
@@ -352,6 +460,31 @@ struct DuplicatesPanel: View {
             .help("Show this file in Finder so you can review or delete it manually.")
         }
         .padding(.vertical, density.rowPadding)
+    }
+
+    @ViewBuilder
+    private func crossFormatChoice(file: DuplicateFileRow, fileID: Int64, group: ScannedGroup) -> some View {
+        let keeper = group.files.first { candidate in candidate.id == effectiveKeeperId(for: group) }
+        if let keeper, group.audioRelation(of: file, toKeeper: keeper) == .different {
+            Text("Audio differs from the keeper, so it can't be moved to Trash here.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        } else {
+            Toggle("Move to Trash", isOn: Binding(
+                get: { crossFormatSelections[group.id]?.contains(fileID) ?? false },
+                set: { isOn in
+                    var selection = crossFormatSelections[group.id] ?? []
+                    if isOn {
+                        selection.insert(fileID)
+                    } else {
+                        selection.remove(fileID)
+                    }
+                    crossFormatSelections[group.id] = selection
+                }
+            ))
+            .toggleStyle(.checkbox)
+            .help("Different formats can't be compared exactly. Listen to both files before choosing this one.")
+        }
     }
 
     @ViewBuilder
@@ -403,7 +536,7 @@ struct DuplicatesPanel: View {
     /// the actual outcome stay aligned.
     private var totalNonKeeperCount: Int {
         results.selectedRows.reduce(0) { accumulator, group in
-            guard effectiveKeeperId(for: group) != nil else { return accumulator }
+            guard group.preselectsCleanup, effectiveKeeperId(for: group) != nil else { return accumulator }
             return accumulator + (group.size - 1)
         }
     }
@@ -465,8 +598,32 @@ struct DuplicatesPanel: View {
             // surviving groups while pruning stale ones.
             let currentIds = Set(groups.map(\.id))
             keeperOverrides = keeperOverrides.filter { entry in currentIds.contains(entry.key) }
+            crossFormatSelections = crossFormatSelections.filter { entry in currentIds.contains(entry.key) }
+            if groups.contains(where: { group in group.audioCheck == .checking }) {
+                startAudioCheck()
+            }
         } catch {
             actionError = "Couldn't scan library: \(error.localizedDescription)"
+        }
+    }
+
+    /// Decodes pending cluster members in the background; each saved batch
+    /// reaches the panel through the live rescan.
+    private func startAudioCheck() {
+        guard audioCheckTask == nil else { return }
+        let verifier = services.duplicateAudioVerifier
+        audioCheckTask = Task(priority: .utility) {
+            let failure: Error?
+            do {
+                try await verifier.verifyPendingFiles()
+                failure = nil
+            } catch {
+                failure = error
+            }
+            audioCheckTask = nil
+            if let failure, !(failure is CancellationError) {
+                actionError = "Audio check stopped: \(failure.localizedDescription). Use Rescan to try again."
+            }
         }
     }
 
@@ -514,11 +671,11 @@ struct DuplicatesPanel: View {
 
         let resolver = DuplicateResolver(operationEngine: services.operationEngine, database: services.database, activityLog: services.activityLog)
         do {
-            let outcome = try await resolver.resolve(group: group, keeperId: keeperId)
+            let outcome = try await resolver.resolve(group: group, keeperId: keeperId, explicitlySelectedFileIDs: explicitSelection(for: group))
             if outcome.failureCount == 0 {
                 lastResolution = "Moved \(outcome.trashedCount) duplicate\(outcome.trashedCount == 1 ? "" : "s") to Trash; \(outcome.pendingCount) pending until Serato closes"
             } else {
-                actionError = "Moved \(outcome.trashedCount); \(outcome.pendingCount) pending; \(outcome.failureCount) stopped (see activity log)"
+                actionError = "Moved \(outcome.trashedCount); \(outcome.pendingCount) pending; \(outcome.failureCount) stopped: \(outcome.errors.first ?? "see activity log")"
             }
             await rescan()
             await reportCleanupFailure()
@@ -536,7 +693,7 @@ struct DuplicatesPanel: View {
     private func resolveAll() async {
         let resolvable: [(group: ScannedGroup, keeperId: Int64)] =
             results.selectedRows.compactMap { group in
-                guard let keeperId = effectiveKeeperId(for: group) else { return nil }
+                guard group.preselectsCleanup, let keeperId = effectiveKeeperId(for: group) else { return nil }
                 return (group, keeperId)
             }
         guard !resolvable.isEmpty else {

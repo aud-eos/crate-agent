@@ -30,6 +30,7 @@ public final class AppServices: ObservableObject {
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
+    public let duplicateAudioVerifier: DuplicateAudioVerifier
     public let activityLog: ActivityLog
     let audioPreview = AudioPreviewPlayer()
     let autoTaggerService: AutoTaggerService
@@ -179,6 +180,7 @@ public final class AppServices: ObservableObject {
 
         let worker = FingerprintWorker(database: database, readiness: readiness)
         fingerprintWorker = worker
+        duplicateAudioVerifier = DuplicateAudioVerifier(database: database)
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and

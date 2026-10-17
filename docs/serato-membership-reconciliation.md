@@ -308,6 +308,21 @@ existing queue and publishes the existing Sync failure/Retry Sync surface. Norma
 sync leaves it failed; explicit Retry Sync resumes after fresh strict authorization,
 without re-journaling the mutation or renewing the original plan.
 
+Perceptual cleanup also needs decoded-audio evidence. Files sharing a 120 s
+fingerprint can be different versions (Clean and Dirty edits), so
+`DuplicateAudioVerifier` decodes each cluster member once and caches, in
+`file_audio_digests`, a SHA-256 of its PCM (interleaved f32 little-endian at the
+native rate, with the sample rate and channel count), its container/codec, its
+decoded duration and a hash of its full-length fingerprint. A row counts only
+while its size, mtime and inode match the file. Identical PCM is the only basis
+for pre-selecting a group. Files of different formats that share a full-length
+fingerprint and decode within 0.5 s of each other are grouped but never
+pre-selected, because Clean and Dirty edits can pass that test; the user checks
+each file by hand. Unmatched files, files that fail to decode, and clusters
+still being checked offer nothing. The cleanup's first writer transaction
+rechecks the cached evidence for the exact identities it was authorized with:
+identical PCM, or a cross-format match only for a file the user selected.
+
 Only a registered sequence with a confirmed own V2 removal may retain an absent
 member during reconciliation. An unstarted queued removal has no exemption.
 Retirement, replacement, a changed keeper, or a saved re-add cancels old cleanup.
