@@ -94,7 +94,7 @@ struct HistoryView: View {
                 .controlSize(density.controlSize)
                 .disabled(resyncInFlightBatchId != nil || undoInFlightBatchId != nil)
                 .seratoWriteGated(help: "Re-run this batch's Serato library and audio-tag writes. Newer edits made in external tag editors can be overwritten.",
-                                  runningHelp: "Quit Serato before re-syncing — writes would queue in memory and disappear on app restart.")
+                                  runningHelp: SeratoGateMessages.quitBefore("re-syncing"))
             }
 
             Button("Undo") {
