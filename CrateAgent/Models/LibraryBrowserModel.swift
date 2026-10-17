@@ -133,8 +133,8 @@ final class LibraryBrowserModel: ObservableObject {
     }
 
     /// The clicked row alone, or the selection when the row is selected. Selected
-    /// files the view no longer shows, or that changed since they were selected,
-    /// are left out.
+    /// files the view no longer shows are left out; one that changed since it
+    /// was selected refuses the command.
     func familyActionTarget(for row: BrowserRow) async throws -> LibraryFamilyActionTarget {
         guard let snapshot = results.snapshot else { throw PagingError.unavailableDatabase }
         guard selection.visibleSelectedIDs.contains(row.id) else {

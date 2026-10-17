@@ -42,6 +42,30 @@ final class AutoTagSessionTests: XCTestCase {
         XCTAssertEqual(matchCount, 0)
     }
 
+    func testApplyAppliesTheFreshFileAndSkipsOneWhoseMembershipChangedSinceScanning() async throws {
+        let fixture = try SessionFixture(fileCount: 2)
+        let engine = OperationEngine(database: fixture.database,
+                                     seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
+                                     fileTagWriter: { _, _ in })
+        let session = AutoTagSession(database: fixture.database, lookupService: fixture.service, applyBatch: { mutations, batchID, tokens in
+            _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens)
+        }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: nil)
+        session.selectVisibleFileIDs(fixture.fileIDs)
+        await session.startScan()
+        session.approveAllSuggested()
+        // Changed synchronously, so apply starts before the session's membership observation sees it.
+        let bumpRevision = { () throws in
+            try fixture.database.writer.write { database in
+                try database.execute(sql: "UPDATE files SET membership_revision = membership_revision + 1 WHERE id = ?", arguments: [fixture.fileIDs[0]])
+            }
+        }
+        try bumpRevision()
+        await session.applyConfirmed()
+        XCTAssertEqual(session.appliedFileIDs, [fixture.fileIDs[1]], session.actionError ?? "no error")
+        XCTAssertTrue(session.lastResult?.contains("Skipped 1 file(s) that changed since scanning") == true, session.lastResult ?? "no result")
+    }
+
     func testRetiredChoicesStayInspectableButCannotBeApprovedAfterReactivation() async throws {
         let fixture = try SessionFixture(fileCount: 2)
         fixture.session.selectVisibleFileIDs(fixture.fileIDs)

@@ -94,10 +94,14 @@ replaced, and returns when it is available again.
 
 ## Library
 
-- **Main row.** A family with at least two versions in the current status scope
-  shows one main row: the displayed representative's file.
-  - **Versions** counts the family's different recordings, as in **5 versions**,
-    or **5 versions · 2 selected** when members are selected.
+- **Main row.** A family with at least two live versions shows one main row in
+  each status view that holds its files: the displayed representative's file.
+  A family with fewer than two live versions, and any file whose recording has
+  no live file, shows as standalone rows with no family commands, in every
+  view, including **Removed from Serato**.
+  - **Versions** counts the family's different live recordings, the same count
+    as `SongFamilyService.family(id:)`, as in **5 versions**, or
+    **5 versions · 2 selected** when members are selected.
   - The files beneath the main row also include other encodings of the main
     version, so the disclosure counts files instead: **Show 4 files** /
     **Hide 4 files**.
@@ -133,9 +137,11 @@ replaced, and returns when it is available again.
   them from the family. Each is one History entry.
   - A command acts on the clicked row alone unless that row is selected. Then it
     acts on the selection, limited to files the view shows (including collapsed
-    alternates) at the revision they were selected at.
-  - Each targeted file is passed to `SongFamilyService` as authority, so a file
-    whose membership changes before the transaction refuses the whole change.
+    alternates). A selected file that changed after it was selected refuses
+    the command, naming the file, instead of being left out.
+  - Each targeted file is passed to `SongFamilyService` as authority
+    (`applyBatch(authorizingMembershipTokens:)`), so a file whose membership
+    changes before the transaction refuses the whole change.
   - `LibraryFamilyActions` and `LibraryBrowserModel.familyActionTarget(for:)`
     are the API the view calls.
 - **Empty libraries.** The family columns and the global Include alternates

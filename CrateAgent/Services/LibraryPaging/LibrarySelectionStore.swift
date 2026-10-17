@@ -94,18 +94,42 @@ actor LibrarySelectionStore: PagedSelectionProvider {
     }
 
     /// Selected files the snapshot still shows, collapsed alternates included,
-    /// at the revision they were selected at. Throws when more than `limit`.
+    /// at the revision they were selected at. Throws when more than `limit`,
+    /// or when a selected file changed after it was selected, naming it, so a
+    /// command never acts on part of what the user chose.
     func selectedIdentities(in snapshot: Snapshot, limit: Int) async throws -> [Identity] {
         var selected: [Identity] = []
+        var changed: [Int64] = []
         var lastID: Int64?
         while true {
             try Task.checkCancellation()
             let batch = try await snapshot.identities(after: lastID, limit: 200)
-            guard let last = batch.last else { return selected }
-            let chosen = try selectedIDs(in: batch)
-            selected += batch.filter { identity in chosen.contains(identity.id) }
-            guard selected.count <= limit else { throw LibrarySelectionError.tooManySelected(limit: limit) }
+            guard let last = batch.last else { break }
+            let revisions = try selectedRevisions(of: batch)
+            for identity in batch {
+                guard let revision = revisions[identity.id] else { continue }
+                if revision == identity.revision {
+                    selected.append(identity)
+                } else {
+                    changed.append(identity.id)
+                }
+            }
+            guard selected.count + changed.count <= limit else { throw LibrarySelectionError.tooManySelected(limit: limit) }
             lastID = last.id
+        }
+        guard changed.isEmpty else {
+            let names = try await pool.read { database in try FileRecord.filter(keys: changed).order(Column("id")).fetchAll(database).map(\.displayName) }
+            throw LibrarySelectionError.changedSinceSelected(files: names)
+        }
+        return selected
+    }
+
+    private func selectedRevisions(of identities: [Identity]) throws -> [Int64: Int64] {
+        let placeholders = Array(repeating: "?", count: identities.count).joined(separator: ",")
+        return try requireStorage().read { database in
+            try Row.fetchAll(database, sql: "SELECT id, revision FROM selected_identity WHERE included = 1 AND id IN (\(placeholders))",
+                             arguments: StatementArguments(identities.map(\.id)))
+                .reduce(into: [Int64: Int64]()) { revisions, row in revisions[row["id"]] = row["revision"] }
         }
     }
 
@@ -237,10 +261,13 @@ actor LibrarySelectionStore: PagedSelectionProvider {
 
 enum LibrarySelectionError: LocalizedError, Equatable {
     case tooManySelected(limit: Int)
+    case changedSinceSelected(files: [String])
 
     var errorDescription: String? {
         switch self {
         case let .tooManySelected(limit): "Select at most \(limit) files for this action."
+        case let .changedSinceSelected(files):
+            "\(files.map { file in "“\(file)”" }.formatted(.list(type: .and))) changed after you selected \(files.count == 1 ? "it" : "them"). Select \(files.count == 1 ? "it" : "them") again, then retry."
         }
     }
 }

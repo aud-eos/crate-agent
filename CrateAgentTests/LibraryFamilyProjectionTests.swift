@@ -141,6 +141,35 @@ final class LibraryFamilyProjectionTests: XCTestCase {
         XCTAssertEqual(family.count, 3)
     }
 
+    func testAFamilyLeftWithOneLiveVersionIsShownAsStandaloneRowsWithoutFamilyCommands() async throws {
+        try await pool.write { connection in
+            try connection.execute(sql: "UPDATE files SET library_membership = ? WHERE id IN (?, ?)",
+                                   arguments: [LibraryMembership.retired.rawValue, self.instrumental, self.missingAcapella])
+        }
+        let active = try await rows(LibraryBrowseQuery(expandedFamilies: [familyID]))
+        XCTAssertEqual(active.map(\.familyId), [nil, nil])
+        let mainRow = try XCTUnwrap(active.first { row in row.id == main })
+        XCTAssertEqual(LibraryFamilyAction.allCases.filter { action in action.applies(to: mainRow, targetCount: 1) }, [])
+
+        let removed = try await rows(LibraryBrowseQuery(filter: .removedFromSerato, expandedFamilies: [familyID]))
+        XCTAssertEqual(Set(removed.map(\.id)), [instrumental, missingAcapella])
+        XCTAssertEqual(removed.map(\.familyId), [nil, nil])
+    }
+
+    func testASelectedFileThatChangedSinceItWasSelectedRefusesTheCommandByName() async throws {
+        let store = try LibrarySelectionStore(database: database)
+        try await store.set([.init(id: main, revision: 0), .init(id: instrumental, revision: 0)], selected: true)
+        try await pool.write { connection in
+            try connection.execute(sql: "UPDATE files SET membership_revision = membership_revision + 1 WHERE id = ?", arguments: [self.instrumental])
+        }
+        let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: LibraryBrowseQuery(expandedFamilies: [familyID]))
+
+        await XCTAssertThrowsErrorAsync(try await store.selectedIdentities(in: snapshot, limit: 10)) { error in
+            XCTAssertEqual(error as? LibrarySelectionError, .changedSinceSelected(files: ["Song (Instrumental)"]))
+        }
+        await store.close()
+    }
+
     private func rows(_ query: LibraryBrowseQuery) async throws -> [BrowserRow] {
         let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: query)
         return try await snapshot.rows(in: 0 ..< snapshot.count())

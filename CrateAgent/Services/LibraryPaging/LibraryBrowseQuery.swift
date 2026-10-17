@@ -44,8 +44,9 @@ struct LibraryBrowseSort: Hashable, Sendable {
 }
 
 /// The Library projection: one row per standalone file, one main row per song
-/// family, and a family's alternates beneath it while it is expanded or while a
-/// search matches them. `placed` holds every file in the status scope with its
+/// family with two or more live versions, and a family's alternates beneath it
+/// while it is expanded or while a search matches them. A file whose recording
+/// has no live file is standalone. `placed` holds every file in the status scope with its
 /// family placement; `in_scope` marks the files the result counts (every match,
 /// plus the main row of each family that has a matching member).
 struct LibraryBrowseQuery: Hashable, Sendable {
@@ -83,30 +84,37 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         COALESCE(works.representative_track_id = files.track_id, 0) AS saved_main,
         (\(matches)) AS matches
         """
+        let live = SongFamilyMutation.liveTrackSQL
         return """
-        WITH family_files AS MATERIALIZED (
+        WITH live_families AS MATERIALIZED (
+            SELECT work_id AS family_id, COUNT(*) AS versions FROM tracks
+            WHERE work_id IS NOT NULL AND \(live) GROUP BY work_id HAVING COUNT(*) >= 2
+        ),
+        family_files AS MATERIALIZED (
             SELECT files.id, files.membership_revision, files.title, tracks.work_id AS family_id, files.track_id AS recording_id,
                    tracks.musicbrainz_recording_id AS recording_mbid, \(sortKey) AS sort_key, \(familyColumns)
-            FROM tracks CROSS JOIN works ON works.id = tracks.work_id CROSS JOIN files ON files.track_id = tracks.id
-            WHERE tracks.work_id IS NOT NULL AND \(filter.predicate)
+            FROM live_families CROSS JOIN tracks ON tracks.work_id = live_families.family_id CROSS JOIN works ON works.id = tracks.work_id
+            CROSS JOIN files ON files.track_id = tracks.id
+            WHERE \(live) AND \(filter.predicate)
         ),
         families AS (
-            SELECT family_id, COUNT(DISTINCT recording_id) AS versions, MAX(matches) AS matched FROM family_files GROUP BY family_id
+            SELECT family_files.family_id, live_families.versions, MAX(matches) AS matched
+            FROM family_files JOIN live_families ON live_families.family_id = family_files.family_id GROUP BY family_files.family_id
         ),
         heads AS (
             SELECT family_id, id AS head_id, sort_key AS head_key FROM (
                 SELECT family_id, id, sort_key, ROW_NUMBER() OVER (PARTITION BY family_id ORDER BY \(order)) AS position FROM family_files
-            ) WHERE position = 1 AND family_id IN (SELECT family_id FROM families WHERE versions >= 2)
+            ) WHERE position = 1
         ),
         placed AS (
-            SELECT \(BrowserRow.browserColumnsSQL), tracks.work_id AS family_id, files.track_id AS recording_id, \(familyColumns),
+            SELECT \(BrowserRow.browserColumnsSQL), heads.family_id, files.track_id AS recording_id, \(familyColumns),
                    COALESCE(heads.head_id, files.id) AS group_id,
                    CASE WHEN heads.head_id IS NULL THEN 0 WHEN heads.head_id = files.id THEN 1 ELSE 2 END AS family_role,
                    families.versions AS family_versions,
                    CASE WHEN heads.head_id = files.id THEN families.matched ELSE (\(matches)) END AS in_scope,
                    COALESCE(heads.head_key, \(sortKey)) AS group_key, \(sortKey) AS sort_key
             FROM files LEFT JOIN tracks ON tracks.id = files.track_id LEFT JOIN works ON works.id = tracks.work_id
-            LEFT JOIN heads ON heads.family_id = works.id LEFT JOIN families ON families.family_id = works.id
+            LEFT JOIN heads ON heads.family_id = works.id AND \(live) LEFT JOIN families ON families.family_id = heads.family_id
             WHERE \(filter.predicate)
         )
         """

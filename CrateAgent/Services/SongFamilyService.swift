@@ -129,8 +129,7 @@ public struct SongFamilyService: Sendable {
             guard case let .file(fileID) = member else { return nil }
             return .songFamily(.linkRecording(fileId: fileID))
         }
-        let tokens = Dictionary(authority.map { token in (token.fileId, token) }) { first, _ in first }
-        _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID, expectedMembershipTokens: tokens)
+        _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID, authorizingMembershipTokens: authority)
         let change = try await database.writer.read { database in
             try EventRecord.filter(Column("batch_id") == batchID && Column("event_type") == operation.eventType.rawValue).fetchOne(database)
                 .map { event in try JSONDecoder().decode(SongFamilyChange.self, from: Data(event.payloadJson.utf8)) }

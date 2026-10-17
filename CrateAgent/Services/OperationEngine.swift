@@ -441,15 +441,20 @@ public actor OperationEngine {
     /// `expectedMetadata` rejects the batch with `metadataChanged` when a
     /// row's metadata no longer matches the snapshot the caller derived
     /// its values from.
+    ///
+    /// `authorizingMembershipTokens` names files no mutation acts on whose
+    /// selection still authorizes the batch (a family change acting on
+    /// selected rows); each must be current inside the transaction.
     @discardableResult
     public func applyBatch(
         _ mutations: [TrackMutation],
         batchId: String,
         expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+        authorizingMembershipTokens: [FileMembershipToken] = [],
         expectedMetadata: [Int64: SeratoMetadata] = [:]
     ) async throws -> [Int64] {
         try await executeBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
-                               expectedMetadata: expectedMetadata)
+                               authorizingMembershipTokens: authorizingMembershipTokens, expectedMetadata: expectedMetadata)
     }
 
     func applyFilesystemObservations(_ mutations: [TrackMutation], batchId: String,
@@ -495,6 +500,7 @@ public actor OperationEngine {
 
     private func executeBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              authorizingMembershipTokens: [FileMembershipToken] = [],
                               expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
@@ -512,10 +518,7 @@ public actor OperationEngine {
                     throw OperationEngineError.metadataChanged(fileId: fileID)
                 }
             }
-            // A token for a file no mutation names still authorizes the batch (a family
-            // change acting on a selected row), so it must be current too.
-            let mutationFileIDs = Set(mutations.compactMap(\.tokenFileID))
-            for token in (expectedMembershipTokens ?? [:]).values where !mutationFileIDs.contains(token.fileId) {
+            for token in authorizingMembershipTokens {
                 guard try FileRecord.fetchOne(db, key: token.fileId)?.membershipRevision == token.revision else {
                     throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
                 }
