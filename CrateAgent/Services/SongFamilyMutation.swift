@@ -329,7 +329,7 @@ enum SongFamilyMutation {
                 trackID = id
             case let .file(fileID):
                 let file = try activeFile(fileID, in: database)
-                guard let linked = file.trackId else { throw SongFamilyError.recordingUnidentified(file: name(of: file)) }
+                guard let linked = file.trackId else { throw SongFamilyError.recordingUnidentified(file: file.displayName) }
                 trackID = linked
             }
             if !trackIDs.contains(trackID) {
@@ -341,7 +341,7 @@ enum SongFamilyMutation {
 
     private static func activeFile(_ fileID: Int64, in database: GRDB.Database) throws -> FileRecord {
         let file = try fileRecord(fileID, in: database)
-        guard file.libraryMembership != .retired else { throw SongFamilyError.fileRetired(file: name(of: file)) }
+        guard file.libraryMembership != .retired else { throw SongFamilyError.fileRetired(file: file.displayName) }
         return file
     }
 
@@ -350,14 +350,10 @@ enum SongFamilyMutation {
         return file
     }
 
-    static func name(of file: FileRecord) -> String {
-        file.title.flatMap { title in title.isEmpty ? nil : title } ?? (file.path as NSString).lastPathComponent
-    }
-
     /// A recording's name: its first library file's title or file name, else its own title.
     private static func name(ofTrack trackID: Int64, in database: GRDB.Database) throws -> String {
         if let file = try FileRecord.filter(Column("track_id") == trackID).order(Column("id")).fetchOne(database) {
-            return name(of: file)
+            return file.displayName
         }
         return try TrackRecord.fetchOne(database, key: trackID)?.title ?? "Untitled recording"
     }
@@ -378,7 +374,7 @@ enum SongFamilyMutation {
         guard file.fingerprintStatus == .done, let fingerprint = file.chromaprintFingerprint,
               (file.fingerprintedSize ?? file.fileSize) == file.fileSize, (file.fingerprintedMtime ?? file.mtime) == file.mtime
         else {
-            throw SongFamilyError.recordingUnidentified(file: name(of: file))
+            throw SongFamilyError.recordingUnidentified(file: file.displayName)
         }
         let hash = Data(SHA256.hash(data: fingerprint))
         let trackID: Int64
@@ -398,7 +394,7 @@ enum SongFamilyMutation {
         guard try fileRecord(recorded.fileId, in: database).trackId != recorded.trackId else { return nil }
         let file = try activeFile(recorded.fileId, in: database)
         guard file.trackId == nil, let track = try TrackRecord.fetchOne(database, key: recorded.trackId) else {
-            throw SongFamilyError.linkChanged(file: name(of: file))
+            throw SongFamilyError.linkChanged(file: file.displayName)
         }
         try requireUnclaimed(track, by: recorded.fileId, in: database)
         return try setLink(recorded, in: database)
@@ -431,7 +427,7 @@ enum SongFamilyMutation {
         guard let trackID = track.id else { throw OperationEngineError.insertDidNotReturnRowId }
         let other = try FileRecord.otherActiveFileReferencingTrack(trackID, excluding: fileID, in: database)
         guard other != nil || track.hasRecordingIdentity else { return }
-        throw try SongFamilyError.fingerprintCollision(file: name(of: fileRecord(fileID, in: database)), otherFile: other.map(name(of:)))
+        throw try SongFamilyError.fingerprintCollision(file: fileRecord(fileID, in: database).displayName, otherFile: other.map(\.displayName))
     }
 
     // MARK: - Membership
