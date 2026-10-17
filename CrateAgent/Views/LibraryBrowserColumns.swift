@@ -4,15 +4,15 @@ enum LibraryBrowserColumns {
     private static let statusIdentifier = "status"
     private static let previewIdentifier = "preview"
     static func make(showsFilenames: Bool, density: AppDensity, readiness: LibrarySyncReadiness? = nil,
-                     preview: AudioPreviewPlayer? = nil) -> [PagedTableColumn<BrowserRow>]
+                     player: TrackPlayer? = nil) -> [PagedTableColumn<BrowserRow>]
     {
         let definitions: [(LibraryBrowseSort.Column?, String, CGFloat)] = [
             (.artist, "Artist", 220), (.title, "Title", 280), (.bpm, "BPM", 70),
             (.musicalKey, "Key", 50), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
         ]
-        let previewColumns = preview.map { player in
-            [PagedTableColumn<BrowserRow>(identifier: previewIdentifier, title: "", width: 28, makeCell: { AudioPreviewCell() }, updateCell: { view, row in
-                guard let cell = view as? AudioPreviewCell else { preconditionFailure("Unexpected preview cell") }
+        let previewColumns = player.map { player in
+            [PagedTableColumn<BrowserRow>(identifier: previewIdentifier, title: "", width: 28, makeCell: { TrackPlayCell() }, updateCell: { view, row in
+                guard let cell = view as? TrackPlayCell else { preconditionFailure("Unexpected preview cell") }
                 cell.update(row: row, player: player)
             }, sortable: false)]
         } ?? []
