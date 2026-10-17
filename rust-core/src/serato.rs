@@ -32,7 +32,7 @@
 //   https://github.com/flatmax/XwaxSeratoScanner   (SeratoData.py / Entry.py — `database V2` tag derivation rules)
 //   https://github.com/Holzhaus/serato-tags   (per-track GEOB tags inside audio files — relevant to Pillar F)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
@@ -253,10 +253,59 @@ fn track_paths_in_otrks(records: &[TlvRecord], path_tag: &[u8; 4]) -> Vec<String
         .collect()
 }
 
-/// Replace every `otrk` whose `path_tag` payload decodes to `old_path`
-/// with one whose `path_tag` payload encodes `new_path`. Preserves all
-/// other fields nested inside the `otrk` container byte-exact. Returns
-/// the number of `otrk` records whose path was rewritten.
+/// Walks an `otrk` payload's nested TLV headers in place, without
+/// allocating, and reports whether any `path_tag` field's raw payload is
+/// one of `encoded_paths`. UTF-16 encoding is unique, so matching the
+/// encoded bytes is exactly equivalent to decoding and comparing strings.
+/// The walk follows real field boundaries: target bytes inside another
+/// field's payload, or straddling two fields, never match. A `true`
+/// result is only a candidate — callers still full-parse it, so an otrk
+/// with a malformed tail keeps its unparseable-otrk handling.
+fn otrk_has_path_in(
+    otrk_payload: &[u8],
+    path_tag: &[u8; 4],
+    encoded_paths: &HashSet<Vec<u8>>,
+) -> bool {
+    let mut found = false;
+    walk_nested_fields(otrk_payload, |tag, payload| {
+        if tag == path_tag && encoded_paths.contains(payload) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Visits each well-formed nested field in order and returns whether the
+/// whole payload parsed cleanly — the same acceptance as
+/// `TlvRecord::parse_all`.
+fn walk_nested_fields<'payload>(
+    payload: &'payload [u8],
+    mut visit: impl FnMut(&[u8; 4], &'payload [u8]),
+) -> bool {
+    let mut offset = 0;
+    while offset < payload.len() {
+        let Some(header) = payload.get(offset..offset + 8) else {
+            return false;
+        };
+        let tag: &[u8; 4] = header[..4].try_into().expect("header holds a 4-byte tag");
+        let length = u32::from_be_bytes(
+            header[4..]
+                .try_into()
+                .expect("header holds a 4-byte length"),
+        ) as usize;
+        let start = offset + 8;
+        let Some(field) = start
+            .checked_add(length)
+            .and_then(|end| payload.get(start..end))
+        else {
+            return false;
+        };
+        visit(tag, field);
+        offset = start + length;
+    }
+    true
+}
+
 /// Drop every top-level `otrk` whose path field (`pfil` for
 /// database V2, `ptrk` for `.crate`) matches `target_path`.
 /// Non-otrk records and otrks pointing elsewhere are preserved
@@ -266,9 +315,11 @@ fn remove_otrks_referencing_path(
     path_tag: &[u8; 4],
     target_path: &str,
 ) -> usize {
+    let encoded_target = HashSet::from([encode_utf16be(target_path)]);
     let original_len = records.len();
     records.retain(|record| {
-        if &record.tag != TAG_OTRK {
+        if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &encoded_target)
+        {
             return true;
         }
         let Ok(nested) = TlvRecord::parse_all(&record.payload) else {
@@ -301,12 +352,7 @@ fn rewrite_path_in_otrks(
 
 /// Multi-rename variant: rewrite every otrk whose path field matches
 /// any key in `renames`, replacing it with the mapped value. One pass
-/// over the records, HashMap-O(1) lookup per matching nested record.
-///
-/// Cost vs. N separate `rewrite_path` calls: one file read + one file
-/// write at the caller layer instead of N + N. The per-otrk nested
-/// parse cost is unchanged — but it was already paid by every otrk
-/// regardless of rename target, so batching doesn't make it worse.
+/// over the records; only otrks holding a rename source are parsed.
 fn rewrite_paths_in_otrks(
     records: &mut [TlvRecord],
     path_tag: &[u8; 4],
@@ -315,9 +361,14 @@ fn rewrite_paths_in_otrks(
     if renames.is_empty() {
         return 0;
     }
+    let encoded_sources: HashSet<Vec<u8>> = renames
+        .keys()
+        .map(|old_path| encode_utf16be(old_path))
+        .collect();
     let mut count: usize = 0;
     for record in records.iter_mut() {
-        if &record.tag != TAG_OTRK {
+        if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &encoded_sources)
+        {
             continue;
         }
         let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
@@ -558,6 +609,34 @@ impl DatabaseV2 {
 
     /// Number of `otrk` track entries in the database. Useful for
     /// progress reporting on full library scans.
+    /// Which of `paths` a well-formed `otrk` holds, matched on encoded
+    /// bytes without decoding every record.
+    pub fn held_paths<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path str>,
+    ) -> HashSet<String> {
+        let requested: HashMap<Vec<u8>, &str> = paths
+            .into_iter()
+            .map(|path| (encode_utf16be(path), path))
+            .collect();
+        let mut held = HashSet::new();
+        let mut matched: Vec<&str> = Vec::new();
+        for record in self.records.iter().filter(|record| &record.tag == TAG_OTRK) {
+            matched.clear();
+            let well_formed = walk_nested_fields(&record.payload, |tag, payload| {
+                if tag == TAG_PFIL {
+                    if let Some(path) = requested.get(payload) {
+                        matched.push(path);
+                    }
+                }
+            });
+            if well_formed {
+                held.extend(matched.iter().map(|path| (*path).to_owned()));
+            }
+        }
+        held
+    }
+
     pub fn track_count(&self) -> usize {
         self.records
             .iter()
@@ -565,52 +644,61 @@ impl DatabaseV2 {
             .count()
     }
 
-    /// Append a new `otrk` for `track_path` with the supplied
-    /// metadata fields. Used by crate-agent's drag-drop import flow
-    /// to register a file with Serato without going through Serato's
-    /// own UI.
+    /// Append an `otrk` for each `(track_path, metadata)` addition whose
+    /// path Serato does not already hold, in order. Used by crate-agent's
+    /// import flow to register files with Serato without going through
+    /// Serato's own UI. The existing paths are collected once, so a batch
+    /// costs one pass over the library rather than one per addition.
     ///
-    /// Returns `true` if the track was added, `false` if Serato
-    /// already has an otrk for this path (no-op — Serato dedupes
-    /// itself, but we mirror that behavior to keep the file size
-    /// from drifting on repeated imports).
+    /// Returns one flag per addition: `true` if it was appended, `false`
+    /// if Serato (or an earlier addition in this batch) already has the
+    /// path — Serato dedupes itself, and mirroring that keeps the file
+    /// from growing on repeated imports. As with the per-path matchers,
+    /// an otrk that does not fully parse does not count as holding its path.
     ///
     /// Like `update_track_metadata`, must only be called while
     /// Serato is NOT running. The Swift caller gates via
     /// SeratoWatchdog.
-    pub fn add_track(&mut self, track_path: &str, metadata: &SeratoMetadataUpdate) -> bool {
-        let already_present = self.records.iter().any(|record| {
-            if &record.tag != TAG_OTRK {
-                return false;
+    pub fn add_tracks(&mut self, additions: &[(String, SeratoMetadataUpdate)]) -> Vec<bool> {
+        let mut present: HashSet<Vec<u8>> =
+            HashSet::with_capacity(self.records.len() + additions.len());
+        let mut otrk_paths: Vec<&[u8]> = Vec::new();
+        for record in self.records.iter().filter(|record| &record.tag == TAG_OTRK) {
+            otrk_paths.clear();
+            let well_formed = walk_nested_fields(&record.payload, |tag, payload| {
+                if tag == TAG_PFIL {
+                    otrk_paths.push(payload);
+                }
+            });
+            if well_formed {
+                present.extend(otrk_paths.iter().map(|payload| payload.to_vec()));
             }
-            let Ok(nested) = TlvRecord::parse_all(&record.payload) else {
-                return false;
-            };
-            nested.iter().any(|field| {
-                &field.tag == TAG_PFIL
-                    && decode_utf16be(&field.payload).as_deref() == Some(track_path)
-            })
-        });
-        if already_present {
-            return false;
         }
 
-        let mut nested = vec![TlvRecord {
-            tag: *TAG_PFIL,
-            payload: encode_utf16be(track_path),
-        }];
-        // Return value ignored: a fresh otrk starts empty so every
-        // supplied field is by definition new — for an add_track the
-        // mutation always counts.
-        let _ = apply_metadata_update_to_nested(&mut nested, metadata);
-
-        let mut payload = Vec::with_capacity(nested.iter().map(|r| 8 + r.payload.len()).sum());
-        TlvRecord::write_all(&nested, &mut payload).expect("writing to Vec<u8> cannot fail");
-        self.records.push(TlvRecord {
-            tag: *TAG_OTRK,
-            payload,
-        });
-        true
+        additions
+            .iter()
+            .map(|(track_path, metadata)| {
+                let encoded_path = encode_utf16be(track_path);
+                if !present.insert(encoded_path.clone()) {
+                    return false;
+                }
+                let mut nested = vec![TlvRecord {
+                    tag: *TAG_PFIL,
+                    payload: encoded_path,
+                }];
+                // A fresh otrk starts empty, so every supplied field is new.
+                let _ = apply_metadata_update_to_nested(&mut nested, metadata);
+                let mut payload =
+                    Vec::with_capacity(nested.iter().map(|field| 8 + field.payload.len()).sum());
+                TlvRecord::write_all(&nested, &mut payload)
+                    .expect("writing to Vec<u8> cannot fail");
+                self.records.push(TlvRecord {
+                    tag: *TAG_OTRK,
+                    payload,
+                });
+                true
+            })
+            .collect()
     }
 
     /// Update Serato's metadata for the track whose `pfil` equals
@@ -1547,8 +1635,8 @@ mod tests {
             bpm: Some("128.000".to_string()),
             ..Default::default()
         };
-        let added = database.add_track("Users/x/Music/A/new.mp3", &metadata);
-        assert!(added, "should report added");
+        let added = database.add_tracks(&[("Users/x/Music/A/new.mp3".to_string(), metadata)]);
+        assert_eq!(added, [true], "should report added");
         assert_eq!(database.track_count(), 2);
 
         // Re-parse to verify both tracks are addressable as records.
@@ -1557,38 +1645,13 @@ mod tests {
         let records = reparsed.track_records();
         assert_eq!(records.len(), 2);
 
-        let new_record = records.iter().find(|r| r.path == "Users/x/Music/A/new.mp3");
+        let new_record = records
+            .iter()
+            .find(|record| record.path == "Users/x/Music/A/new.mp3");
         let new_record = new_record.expect("new track present in re-parsed database");
         assert_eq!(new_record.artist.as_deref(), Some("New Artist"));
         assert_eq!(new_record.title.as_deref(), Some("New Title"));
         assert_eq!(new_record.bpm.as_deref(), Some("128.000"));
-    }
-
-    #[test]
-    fn add_track_is_idempotent_for_existing_path() {
-        let bytes = synthetic_library(
-            "2.0/Serato Scratch LIVE Database",
-            TAG_PFIL,
-            &["Users/x/Music/A/dup.mp3"],
-        );
-        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let metadata = SeratoMetadataUpdate {
-            artist: Some("Ignored".to_string()),
-            ..Default::default()
-        };
-        let added = database.add_track("Users/x/Music/A/dup.mp3", &metadata);
-        assert!(!added, "duplicate add must be a no-op");
-        assert_eq!(database.track_count(), 1);
-
-        // The pre-existing otrk's metadata should be unchanged —
-        // add_track only handles inserts, not updates. The
-        // existing entry had no `tart`, so it should still have none.
-        let records = database.track_records();
-        assert_eq!(records.len(), 1);
-        assert!(
-            records[0].artist.is_none(),
-            "existing entry's metadata is untouched"
-        );
     }
 
     #[test]
@@ -1599,14 +1662,16 @@ mod tests {
             &["Users/x/Music/A/existing.mp3"],
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let added =
-            database.add_track("Users/x/Music/A/bare.mp3", &SeratoMetadataUpdate::default());
-        assert!(added);
+        let added = database.add_tracks(&[(
+            "Users/x/Music/A/bare.mp3".to_string(),
+            SeratoMetadataUpdate::default(),
+        )]);
+        assert_eq!(added, [true]);
 
         let records = database.track_records();
         let bare = records
             .iter()
-            .find(|r| r.path == "Users/x/Music/A/bare.mp3")
+            .find(|record| record.path == "Users/x/Music/A/bare.mp3")
             .unwrap();
         assert!(bare.artist.is_none());
         assert!(bare.title.is_none());
@@ -1662,6 +1727,187 @@ mod tests {
         let after = CrateFile::from_bytes(&crate_file.to_bytes().unwrap()).unwrap();
         let paths = after.track_paths();
         assert_eq!(paths, vec!["Users/x/Music/A/keep.mp3"]);
+    }
+
+    // ===== path pre-filter adversarial fixtures =====
+
+    // The tail `瑳湧\0\u{4}ab` encodes as a complete `tsng` field holding
+    // "ab", so an otrk storing `Music/Café/` followed by that field holds
+    // the target's UTF-16BE bytes contiguously across the field boundary.
+    const PREFILTER_TARGET: &str = "Music/Caf\u{e9}/\u{7473}\u{6e67}\u{0}\u{4}ab";
+    const PREFILTER_PREFIX: &str = "Music/Caf\u{e9}/";
+    const PREFILTER_RENAMED: &str = "Music/Renamed.mp3";
+
+    fn raw_field(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = tag.to_vec();
+        bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn raw_path(path_tag: &[u8; 4], path: &str) -> Vec<u8> {
+        raw_field(path_tag, &encode_utf16be(path))
+    }
+
+    fn otrk_from_fields(fields: &[Vec<u8>]) -> TlvRecord {
+        TlvRecord {
+            tag: *TAG_OTRK,
+            payload: fields.concat(),
+        }
+    }
+
+    /// The otrks whose path field is exactly `path`: one with the path
+    /// first, one holding it in a second path field.
+    fn otrks_holding(path_tag: &[u8; 4], path: &str) -> [TlvRecord; 2] {
+        [
+            otrk_from_fields(&[
+                raw_path(path_tag, path),
+                raw_field(b"tart", &encode_utf16be("Kept")),
+            ]),
+            otrk_from_fields(&[
+                raw_path(path_tag, "Music/Other.mp3"),
+                raw_path(path_tag, path),
+            ]),
+        ]
+    }
+
+    /// An otrk whose path field matches but whose trailing field is
+    /// truncated, so it does not parse.
+    fn truncated_otrk_holding_target(path_tag: &[u8; 4]) -> TlvRecord {
+        otrk_from_fields(&[raw_path(path_tag, PREFILTER_TARGET), b"tsng\0\0".to_vec()])
+    }
+
+    /// Records that contain the target's UTF-16BE bytes, or bytes that
+    /// nearly match, without any path field equal to the target.
+    fn non_matching_records(path_tag: &[u8; 4]) -> Vec<TlvRecord> {
+        let target = encode_utf16be(PREFILTER_TARGET);
+        let other = raw_path(path_tag, "Music/Other.mp3");
+        let fake_header = raw_field(path_tag, &target);
+        vec![
+            TlvRecord {
+                tag: *b"zzzz",
+                payload: fake_header.clone(),
+            },
+            otrk_from_fields(&[raw_path(path_tag, &format!("{PREFILTER_TARGET}.bak"))]),
+            otrk_from_fields(&[raw_path(path_tag, &format!("X{PREFILTER_TARGET}"))]),
+            otrk_from_fields(&[raw_path(
+                path_tag,
+                &PREFILTER_TARGET[..PREFILTER_TARGET.len() - 1],
+            )]),
+            otrk_from_fields(&[raw_path(
+                path_tag,
+                &PREFILTER_TARGET.replace('\u{e9}', "e\u{301}"),
+            )]),
+            otrk_from_fields(&[other.clone(), raw_field(b"tcom", &target)]),
+            otrk_from_fields(&[other.clone(), raw_field(b"tcom", &fake_header)]),
+            otrk_from_fields(&[
+                other,
+                raw_field(b"bbgl", &[&[0], target.as_slice()].concat()),
+            ]),
+            otrk_from_fields(&[
+                raw_path(path_tag, PREFILTER_PREFIX),
+                raw_field(b"tsng", &encode_utf16be("ab")),
+            ]),
+            truncated_otrk_holding_target(path_tag),
+        ]
+    }
+
+    /// The version record, every non-matching record, and the matching
+    /// otrks for `path` interleaved among them.
+    fn prefilter_library(path_tag: &[u8; 4], matching_path: &str) -> Vec<TlvRecord> {
+        let [first, second] = otrks_holding(path_tag, matching_path);
+        let mut records = vec![TlvRecord {
+            tag: *b"vrsn",
+            payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+        }];
+        let others = non_matching_records(path_tag);
+        let (front, back) = others.split_at(others.len() / 2);
+        records.extend_from_slice(front);
+        records.push(first);
+        records.extend_from_slice(back);
+        records.push(second);
+        records
+    }
+
+    #[test]
+    fn path_removal_matches_only_exact_path_fields() {
+        for path_tag in [TAG_PFIL, TAG_PTRK] {
+            let records = prefilter_library(path_tag, PREFILTER_TARGET);
+            let target = encode_utf16be(PREFILTER_TARGET);
+            let straddling = &non_matching_records(path_tag)[8].payload;
+            assert!(
+                straddling
+                    .windows(target.len())
+                    .any(|window| window == target),
+                "the split fixture must hold the target bytes across its field boundary"
+            );
+            let mut expected = vec![records[0].clone()];
+            expected.extend(non_matching_records(path_tag));
+            let (removed, remaining) = if path_tag == TAG_PFIL {
+                let mut database = DatabaseV2 { records };
+                (database.remove_track(PREFILTER_TARGET), database.records)
+            } else {
+                let mut crate_file = CrateFile { records };
+                (
+                    crate_file.remove_track(PREFILTER_TARGET),
+                    crate_file.records,
+                )
+            };
+            assert_eq!(removed, 2);
+            assert_eq!(remaining, expected);
+        }
+    }
+
+    #[test]
+    fn path_rewrite_matches_only_exact_path_fields() {
+        for path_tag in [TAG_PFIL, TAG_PTRK] {
+            let renames =
+                HashMap::from([(PREFILTER_TARGET.to_string(), PREFILTER_RENAMED.to_string())]);
+            let records = prefilter_library(path_tag, PREFILTER_TARGET);
+            let (rewritten, result) = if path_tag == TAG_PFIL {
+                let mut database = DatabaseV2 { records };
+                (database.rewrite_paths(&renames), database.records)
+            } else {
+                let mut crate_file = CrateFile { records };
+                (crate_file.rewrite_paths(&renames), crate_file.records)
+            };
+            assert_eq!(rewritten, 2);
+            assert_eq!(result, prefilter_library(path_tag, PREFILTER_RENAMED));
+        }
+    }
+
+    #[test]
+    fn batch_add_skips_paths_already_held_and_repeated_in_the_batch() {
+        let mut database = DatabaseV2 {
+            records: prefilter_library(TAG_PFIL, PREFILTER_TARGET),
+        };
+        let original = database.records.clone();
+        let metadata = SeratoMetadataUpdate {
+            title: Some("Imported".to_string()),
+            ..Default::default()
+        };
+        let additions = [
+            PREFILTER_TARGET,
+            "Music/New.mp3",
+            &PREFILTER_TARGET.replace('\u{e9}', "e\u{301}"),
+            "Music/New.mp3",
+        ]
+        .map(|path| (path.to_string(), metadata.clone()));
+        assert_eq!(database.add_tracks(&additions), [false, true, false, false]);
+        assert_eq!(database.records[..original.len()], original[..]);
+        assert_eq!(database.records.len(), original.len() + 1);
+        let added = extract_track_record(&database.records[original.len()].payload).unwrap();
+        assert_eq!(added.path, "Music/New.mp3");
+        assert_eq!(added.title.as_deref(), Some("Imported"));
+
+        let mut malformed_only = DatabaseV2 {
+            records: vec![truncated_otrk_holding_target(TAG_PFIL)],
+        };
+        assert_eq!(
+            malformed_only.add_tracks(&[(PREFILTER_TARGET.to_string(), metadata)]),
+            [true],
+            "an otrk that does not parse does not hold its path"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -51,12 +51,20 @@ fn unmatched<'a>(
     database: &serato::DatabaseV2,
     requested: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Vec<String> {
-    let present: HashSet<String> = database.track_paths().into_iter().collect();
+    let requested: Vec<(&str, &str)> = requested.into_iter().collect();
+    let held = database.held_paths(requested.iter().map(|(_, held_at)| *held_at));
     requested
         .into_iter()
-        .filter(|(_, held_at)| !present.contains(*held_at))
+        .filter(|(_, held_at)| !held.contains(*held_at))
         .map(|(requested_path, _)| requested_path.to_owned())
         .collect()
+}
+
+/// One track in a `batch_add_tracks_to_database` call.
+#[derive(Debug, Clone)]
+pub struct SeratoTrackAddition {
+    pub track_path: String,
+    pub metadata: SeratoMetadataUpdate,
 }
 
 /// Renames apply in order. The rewrite looks each record up once, so a
@@ -340,18 +348,32 @@ pub fn batch_update_database_records(
     Ok(SeratoBatchWriteResult::new(count, unmatched_paths))
 }
 
-pub fn add_track_to_database(
+/// Bulk import registration: one file read + one file write, with the
+/// library's existing paths collected once, regardless of how many tracks
+/// are added. Returns the number of otrks appended; additions Serato
+/// already holds are skipped.
+pub fn batch_add_tracks_to_database(
     database_path: String,
-    track_path: String,
-    metadata: SeratoMetadataUpdate,
+    additions: Vec<SeratoTrackAddition>,
 ) -> Result<u32, CoreError> {
+    if additions.is_empty() {
+        return Ok(0);
+    }
     let path = PathBuf::from(database_path);
     let mut database = serato::DatabaseV2::read_from_path(&path)?;
-    let added = database.add_track(&track_path, &metadata);
-    if added {
+    let pairs: Vec<(String, SeratoMetadataUpdate)> = additions
+        .into_iter()
+        .map(|addition| (addition.track_path, addition.metadata))
+        .collect();
+    let added = database
+        .add_tracks(&pairs)
+        .into_iter()
+        .filter(|added| *added)
+        .count();
+    if added > 0 {
         database.write_to_path(&path)?;
     }
-    Ok(if added { 1 } else { 0 })
+    Ok(u32::try_from(added).expect("add count exceeded u32"))
 }
 
 pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> {
@@ -536,8 +558,14 @@ mod conflict_round_trip_tests {
                 );
                 assert_eq!(fs::read(&path).unwrap(), protected);
                 assert_eq!(
-                    add_track_to_database(path.clone(), "Music/New.mp3".into(), metadata("New"))
-                        .unwrap(),
+                    batch_add_tracks_to_database(
+                        path.clone(),
+                        vec![SeratoTrackAddition {
+                            track_path: "Music/New.mp3".into(),
+                            metadata: metadata("New"),
+                        }]
+                    )
+                    .unwrap(),
                     1
                 );
                 assert!(fs::read(&path).unwrap().starts_with(&protected));

@@ -142,6 +142,43 @@ final class GroupedWriteSupersessionTests: XCTestCase {
         XCTAssertEqual(eventCount, 6)
     }
 
+    func testGroupedImportsRegisterValidSiblingsInOneV2Pass() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let replaced = try await fixture.add("replaced.wav", membership: .pendingImport)
+        let first = try await fixture.add("first.wav", membership: .pendingImport)
+        let second = try await fixture.add("second.wav", membership: .pendingImport)
+        let existing = fixture.directory.appendingPathComponent("existing.wav").path
+        try fixture.save(paths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: existing)])
+        let log = ActivityLog()
+        let batches = MetadataBatches()
+        let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                     seratoAddTrackBatchWriter: { path, additions in
+                                         batches.record(additions.map(\.trackPath))
+                                         return try batchAddTracksToDatabase(databasePath: path, additions: additions)
+                                     }, activityLog: log)
+        let boundary = BoundaryIntervention()
+        try await installReplacement(fixture, path: replaced.path, replacement: Data(repeating: 41, count: 512), boundary: boundary)
+        let events = try await engine.applyBatch([replaced, first, second].map { file in
+            try TrackMutation.addTrackToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .init(title: (file.path as NSString).lastPathComponent)))
+        }, batchId: "grouped-imports")
+        try await fixture.database.writer.write { $0.trace(nil) }
+
+        XCTAssertTrue(boundary.didReplace)
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(batches.values, [[first.path, second.path].map(SeratoLibraryLocator.seratoRelativePath)], "Valid siblings must register in one V2 pass")
+        let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
+        XCTAssertEqual(records.map { record in SeratoPath.normalized(record.path) }, [existing, first.path, second.path])
+        XCTAssertEqual(records.map(\.title), [nil, "first.wav", "second.wav"])
+        XCTAssertTrue(log.recent.contains { $0.message.contains("wrote 2, queued 0, superseded 1") })
+        let memberships = try await fixture.database.writer.read { database in
+            try [replaced, first, second].map { file in try FileRecord.fetchOne(database, key: file.id)?.libraryMembership }
+        }
+        XCTAssertEqual(memberships, [.pendingImport, .active, .active])
+        let queueDepth = try await engine.pendingSeratoWriteCount
+        XCTAssertEqual(queueDepth, 0)
+    }
+
     private func installReplacement(_ fixture: SeratoRemovalFixture, path: String, replacement: Data,
                                     boundary: BoundaryIntervention, restartAtFileID: Int64? = nil, afterV2Path: String? = nil) async throws
     {
