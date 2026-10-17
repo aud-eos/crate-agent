@@ -559,8 +559,12 @@ struct DuplicatesPanel: View {
     }
 
     private func reportCleanupFailure() async {
-        if let message = await services.operationEngine.failedDuplicateCleanupMessage {
-            services.syncSession.reportFailure(message)
+        do {
+            if let message = try await services.operationEngine.failedDuplicateCleanupMessage {
+                services.syncSession.reportFailure(message)
+            }
+        } catch {
+            services.syncSession.reportFailure(error.localizedDescription)
         }
     }
 }

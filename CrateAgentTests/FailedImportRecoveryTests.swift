@@ -36,7 +36,7 @@ final class FailedImportRecoveryTests: XCTestCase {
             try EventRecord.filter(Column("batch_id").like("import-confirmed:%")).fetchCount(database)
         }
         XCTAssertEqual(confirmations, 0)
-        let retained = await fixture.engine.pendingSeratoWriteCount
+        let retained = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(retained, 1)
         gate.invalidate()
         let authorization = gate.prepareDrain()
@@ -45,7 +45,7 @@ final class FailedImportRecoveryTests: XCTestCase {
         try await fixture.engine.drainPendingSeratoUpdates()
         let repaired = try await fixture.row(pending)
         XCTAssertEqual(repaired.libraryMembership, .active)
-        let remaining = await fixture.engine.pendingSeratoWriteCount
+        let remaining = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(remaining, 0)
     }
 
@@ -95,7 +95,7 @@ final class FailedImportRecoveryTests: XCTestCase {
             XCTAssertEqual(result.filesImported, 0)
             XCTAssertEqual(result.filesPendingSync, 1)
             XCTAssertEqual(result.filesSkipped, 0)
-            let queued = await fixture.engine.pendingSeratoWriteCount
+            let queued = try await fixture.engine.pendingSeratoWriteCount
             XCTAssertEqual(queued, 1, scenario)
             let pending = try await fixture.database.writer.read { database in
                 try XCTUnwrap(FileRecord.filter(Column("path") == audio.path).fetchOne(database))
@@ -113,7 +113,7 @@ final class FailedImportRecoveryTests: XCTestCase {
                     try await fixture.engine.drainPendingSeratoUpdates()
                     XCTFail("The retained add must still fail against corrupt V2")
                 } catch {}
-                let retained = await fixture.engine.pendingSeratoWriteCount
+                let retained = try await fixture.engine.pendingSeratoWriteCount
                 XCTAssertEqual(retained, 1, "A second external-write failure must not lose or duplicate the add")
             }
 
@@ -140,7 +140,7 @@ final class FailedImportRecoveryTests: XCTestCase {
                 XCTFail("Corrupt V2 must keep Retry Sync failed")
             } catch {}
             guard case .failed = session.state else { return XCTFail("Retry failure must stay visible") }
-            let stillQueued = await fixture.engine.pendingSeratoWriteCount
+            let stillQueued = try await fixture.engine.pendingSeratoWriteCount
             XCTAssertEqual(stillQueued, 1)
             try fixture.save(paths: [])
 
@@ -164,7 +164,7 @@ final class FailedImportRecoveryTests: XCTestCase {
                 XCTAssertNotEqual(after.libraryMembership, .active)
                 XCTAssertTrue(paths.isEmpty, scenario)
             }
-            let drained = await fixture.engine.pendingSeratoWriteCount
+            let drained = try await fixture.engine.pendingSeratoWriteCount
             XCTAssertEqual(drained, 0)
             let eventsAfterRetry = try await fixture.database.writer.read { database in
                 try EventRecord.filter(Column("file_id") == fileID).order(Column("event_id")).fetchAll(database)

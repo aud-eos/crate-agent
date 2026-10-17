@@ -76,18 +76,21 @@ an existing row. An active, available row owned by another library remains
 unchanged and is counted as skipped. Unowned legacy rows acquire membership
 through reconciliation before metadata scanning.
 
-The engine retains the last successfully authorized external metadata observation
-per file/revision for the lifetime of its in-process queue, including unchanged
-observations. Each queued V2 edit captures that baseline separately from SQLite's
-local intended values. Saved `A` followed by queued `B` and unchanged saved `A`
+The engine persists the last successfully authorized external metadata observation
+per file/revision in `serato_external_baselines`, including unchanged observations;
+the published checkpoint's evidence is the fallback when no row exists yet. Each
+queued V2 edit captures that baseline in its own queue row, inside the mutation
+transaction, separately from SQLite's local intended values. Saved `A` followed by queued `B` and unchanged saved `A`
 allows `B`; a later saved `C` or clear supersedes only affected older V2 fields.
 Unknown baselines report uncertainty/conflict rather than inventing newer external
 ownership. The observation journals affected `uncertainV2Fields` separately from
 proven raw external changes. History fences older V2 projections across those
 fields and visibly counts their supersession; retry does not grant them fresh
 authority. Independent fields and audio-tag writes retain their own authority.
-Successful own V2 writes advance the external baseline; a real drain is followed
-by a fresh strict read and metadata scan before readiness can reopen.
+Successful own V2 writes advance the external baseline in the same transaction
+that removes their queue row, so a later own write to another file cannot make the
+baseline unknown. A real drain is followed by a fresh strict read and metadata scan
+before readiness can reopen.
 
 Identity observations carry raw previous/current external metadata as well as the
 local projection. History uses their actual changed fields, including clears, as
@@ -221,16 +224,16 @@ review persistence without granting retired or replaced candidates new authority
 Successful explicit adds and snapshots use the same volume UUID plus canonical
 directory ownership identifier. Add confirmation remains the engine's existing
 `import-confirmed:<eventID>` transaction. Failed adds retain pending membership.
-An immediate add failure also retains the original guarded add in the in-memory
-queue and reports a pending-sync import result. The Library drop flow publishes
+An immediate add failure also retains the original guarded add as a durable
+`serato_write_queue` row and reports a pending-sync import result. The Library drop flow publishes
 the failure through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or
 changing the original event payloads/inverses. Failed or unattempted adds are
 retained once per event; already completed adds are not queued again. The normal
 membership, physical-target, and Serato-running checks still apply, so changed,
 retired, or removed audio supersedes the old request. A new explicit drop can
-establish new intent under the existing membership-revision rules.
-This work does not implement the general durable queue (#110) or change shared
+establish new intent under the existing membership-revision rules; the older row
+it supersedes no longer blocks the new import. This work does not change shared
 recording ownership rules (#113).
 
 ## Physical effects and duplicate cleanup
@@ -241,7 +244,8 @@ checks the actual target and original content intent, and rechecks after journal
 lookups under writer serialization. Ordered reference renames retain their explicit
 path transition; an unrelated occupant of an old path cannot authorize rewriting
 or removing that occupant's V2/crate references. Expected supersession removes only
-the obsolete queued work; unexpected I/O failure stays visible and retryable.
+the obsolete queued work and records a `serato_write_dispositions` row so the drop
+stays visible after a restart; unexpected I/O failure stays visible and retryable.
 
 Coalesced metadata and consecutive rename groups retain each physically rejected
 event's identity. The engine rebuilds the FFI payload from the still-eligible,
@@ -266,7 +270,10 @@ Retirement, replacement, a changed keeper, or a saved re-add cancels old cleanup
 A re-add after confirmed own removal journals an active-to-active revision and
 permanent History fence without inventing retirement or altering recording/audio.
 Pending, completed, failed, and superseded counts remain visible in sync status.
-This bookkeeping is in-process and does not implement durable queue recovery.
+The sequence is durable in `duplicate_cleanup_intents`: each step's mutation,
+queued effects, and intent update commit together, the confirmed V2 removal is
+recorded in the removal transaction, and the Trash transaction also deletes the
+row and the intent. A restart resumes the cleanup at its recorded step.
 
 Physical move rollback and retained-source cleanup use `OwnedAudioIdentity`:
 precise device/inode/size/mtime/ctime plus a streaming SHA-256 digest of every byte.
@@ -302,8 +309,13 @@ Filesystem delivery retains blocked observations and holds its checkpoint while
 later independent observations proceed. Repair retry replays retained observations
 through current identity checks.
 
-Queue draining makes a bounded pass. Protected entries and later dependent entries
-remain in order; independent writes can proceed. A blocked entry is not superseded.
+Queue draining makes a bounded pass over the durable queue in FIFO order. Protected
+entries and later dependent entries remain in order; independent writes can proceed.
+A blocked entry is not superseded. A failed entry records its error and blocks only
+its dependents; the pass continues and then reports the failure. Rows are deleted in
+the transaction that commits their I/O, so a replay after a crash finds nothing to
+redo, and an attempted audio-tag write or Trash whose target then changed is
+reported as interrupted instead of being repeated.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.
@@ -326,7 +338,7 @@ choosing a winner; use the strict session for partial synchronization.
 ## Incremental checkpoint
 
 Schema-only migrations add versioned saved occurrences, file evidence, a slim stat
-projection, dirty-row tracking, and durable external-effect fences. Raw path bytes
+projection, dirty-row tracking, durable physical-move fences, and the durable Serato write queue. Raw path bytes
 and occurrence multiplicity are preserved. SQLite triggers advance a revision for
 relevant file changes; fingerprint progress alone does not invalidate the cache.
 
@@ -346,9 +358,14 @@ as success. A later local Serato write loads its original baseline by file token
 without loading the complete metadata cache. Unknown interrupted-write baselines
 remain unknown.
 
-Publication checks the expected local revision, current source authorization, and
-unfinished effect fences. Per-session accounting identifies its own observation
+Publication checks the expected local revision, current source authorization,
+unfinished physical-move fences, and the Serato write queue: it requires an empty
+queue, and opening readiness without publishing allows only the rows the drain left
+blocked by path conflicts. Per-session accounting identifies its own observation
 writes; unrelated concurrent changes invalidate the candidate. Unresolved durable
 fences surface an explicit Retry Sync / History recovery error and are never cleared
-merely because a read succeeded. The checkpoint is derived evidence, not a durable
-queue for lost in-memory intent.
+merely because a read succeeded. Pre-upgrade `event:<id>` fences are recovered at
+the start of each sync: a replayable event is rebuilt into queue rows from its
+journal, a destructive one is recorded as `legacyUnrecoverable`, and the fence is
+deleted in the same transaction. The checkpoint is derived evidence; queued intent
+lives in the queue.

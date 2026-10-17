@@ -294,7 +294,7 @@ final class LibraryStartupTests: XCTestCase {
         try await session.synchronize()
         XCTAssertNoThrow(try gate.capture())
         XCTAssertThrowsError(try gate.capture().check(target: .file(file)))
-        let queued = await fixture.engine.pendingSeratoWriteCount
+        let queued = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(queued, 1)
     }
 
@@ -408,8 +408,6 @@ final class LibraryStartupTests: XCTestCase {
         try await session.synchronize()
         let current = try await fixture.row(file)
         XCTAssertEqual(current.libraryMembership, .active)
-        let effects = try await store.pendingEffects()
-        XCTAssertTrue(effects.isEmpty)
         let checkpoint = try await store.loadHeader()
         XCTAssertNotNil(checkpoint)
         XCTAssertNoThrow(try gate.capture())

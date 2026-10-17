@@ -227,7 +227,7 @@ final class OperationEngineTests: XCTestCase {
         let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
         XCTAssertEqual(updatedPaths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/new.mp3"))])
 
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 0, "no queueing should occur when Serato is closed")
     }
 
@@ -259,7 +259,7 @@ final class OperationEngineTests: XCTestCase {
         let crateContents = try readCratePaths(cratePath: crateFileUrl.path)
         XCTAssertEqual(crateContents, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/old.mp3"))])
 
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 1, "the rewrite must be queued, not applied")
     }
 
@@ -623,7 +623,7 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(serataRecords.first?.artist, "Brand New Artist")
         XCTAssertEqual(serataRecords.first?.bpm, "128.000")
 
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 0, "Serato closed → write applies immediately, queue empty")
     }
 
@@ -657,7 +657,7 @@ final class OperationEngineTests: XCTestCase {
         let preDrainRecords = try readDatabaseRecords(databasePath: databaseV2Url.path)
         XCTAssertNotEqual(preDrainRecords.first?.artist, "Queued Artist")
 
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 1, "metadata update must be queued")
 
         // Now drain — verifies the same drain path handles both
@@ -669,7 +669,7 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(postDrainRecords.first?.artist, "Queued Artist")
         XCTAssertEqual(postDrainRecords.first?.bpm, "130.000")
 
-        let queueDepthAfter = await engine.pendingSeratoWriteCount
+        let queueDepthAfter = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepthAfter, 0)
     }
 
@@ -778,7 +778,7 @@ final class OperationEngineTests: XCTestCase {
         let updatedPaths = try readCratePaths(cratePath: crateFileUrl.path)
         XCTAssertEqual(updatedPaths, [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/new.mp3"))])
 
-        let queueDepthAfterDrain = await engine.pendingSeratoWriteCount
+        let queueDepthAfterDrain = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepthAfterDrain, 0)
     }
 
@@ -4506,7 +4506,7 @@ final class WriteFileTagsMutationTests: XCTestCase {
 
         XCTAssertEqual(recorder.calls.count, 0,
                        "writer must NOT fire while Serato is running — Serato may have the file mmapped")
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 1,
                        "file tag write must be queued alongside other Serato-gated writes")
     }

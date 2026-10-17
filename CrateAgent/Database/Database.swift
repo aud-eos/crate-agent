@@ -120,6 +120,7 @@ public final class LibraryDatabase {
         AddFileLibraryStateMigration.register(in: &migrator)
         AddSyncCheckpointMigration.register(in: &migrator)
         AddSyncStatProjectionMigration.register(in: &migrator)
+        AddDurableSeratoQueueMigration.register(in: &migrator)
         return migrator
     }
 }

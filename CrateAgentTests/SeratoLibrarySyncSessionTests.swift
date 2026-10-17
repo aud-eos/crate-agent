@@ -22,7 +22,12 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
                                                         identity: file.identity, readIdentity: AudioFileReadIdentity.read(at: file.path), bitrateProbed: true)
             baselines[FileMembershipToken(fileId: identifier, revision: file.membershipRevision)] = .empty
         }
-        try await fixture.engine.restoreObservedSeratoMetadata(baselines, authorization: fixture.reader.authorization(for: previous))
+        let savedBaselines = baselines
+        try await fixture.database.writer.write { database in
+            for (token, metadata) in savedBaselines {
+                try SeratoExternalBaselines.save(metadata, token: token, in: database)
+            }
+        }
         let bytes = try SeratoTestEncoding.record("vrsn", XCTUnwrap("2.0/Serato Scratch LIVE Database".data(using: .utf16BigEndian)))
             + SeratoTestEncoding.record("otrk", SeratoTestEncoding.record("pfil", XCTUnwrap(changed.path.data(using: .utf16BigEndian)))
                 + SeratoTestEncoding.record("tsng", XCTUnwrap("External title".data(using: .utf16BigEndian))))
@@ -178,7 +183,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         let repaired = try readDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path).first { record in SeratoPath.normalized(record.path) == protected.path }
         XCTAssertEqual(repaired?.title, "Chosen in Serato")
         XCTAssertEqual(repaired?.artist, "Queued artist")
-        let pending = await fixture.engine.pendingSeratoWriteCount
+        let pending = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(pending, 0)
     }
 
@@ -206,7 +211,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         XCTAssertEqual(first.conflictBlockedCount, 1)
         XCTAssertEqual(second.conflictBlockedCount, 1)
         XCTAssertEqual(second.supersededCount, 0)
-        let failure = await fixture.engine.failedDuplicateCleanupMessage
+        let failure = try await fixture.engine.failedDuplicateCleanupMessage
         XCTAssertNil(failure)
         let records = try readDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path)
         XCTAssertTrue(records.contains { record in SeratoPath.normalized(record.path) == target.path })
@@ -494,7 +499,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         guard case .failed = session.state else { return XCTFail("Expected monitored failure") }
         XCTAssertThrowsError(try gate.capture())
         XCTAssertFalse(session.initialSyncComplete)
-        let pendingBefore = await fixture.engine.pendingSeratoWriteCount
+        let pendingBefore = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(pendingBefore, 1)
         let before = try await fixture.row(file)
         XCTAssertEqual(before.libraryMembership, .pendingImport)
@@ -503,7 +508,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         await session.waitUntilIdle()
         XCTAssertNoThrow(try gate.capture())
         XCTAssertTrue(session.initialSyncComplete)
-        let pendingAfter = await fixture.engine.pendingSeratoWriteCount
+        let pendingAfter = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(pendingAfter, 0)
     }
 
@@ -552,13 +557,13 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         session.beginFilesystemRetry()
         try await processor.retry()
         XCTAssertThrowsError(try gate.capture())
-        let queuedBeforeCheckpointCompletion = await fixture.engine.pendingSeratoWriteCount
+        let queuedBeforeCheckpointCompletion = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(queuedBeforeCheckpointCompletion, 1)
         XCTAssertEqual(try Data(contentsOf: fixture.locator.databaseV2Url), SeratoTestEncoding.library(paths: []))
         session.finishFilesystemRetry(succeeded: true)
         try await session.synchronize()
         XCTAssertNoThrow(try gate.capture())
-        let queuedAfterRetry = await fixture.engine.pendingSeratoWriteCount
+        let queuedAfterRetry = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(queuedAfterRetry, 0)
         let after = try await fixture.row(file)
         XCTAssertEqual(after.libraryMembership, .retired)
@@ -610,7 +615,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         XCTAssertThrowsError(try gate.capture())
         let before = try await fixture.row(removed)
         XCTAssertEqual(before.libraryMembership, .active)
-        let queued = await fixture.engine.pendingSeratoWriteCount
+        let queued = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(queued, 1)
         XCTAssertEqual(try Data(contentsOf: fixture.locator.databaseV2Url), SeratoTestEncoding.library(paths: []))
         fixture.lifecycle.running = false
@@ -663,7 +668,7 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         let worker = FingerprintWorker(database: fixture.database, fingerprintFunction: { _ in XCTFail("Unvalidated row was decoded"); return [] }, readiness: gate)
         do { _ = try await worker.processAllPendingOnce(); XCTFail("Unvalidated worker ran") } catch is LibrarySyncReadinessError {}
         try await fixture.engine.apply(.addTrackToSerato(.init(fileId: XCTUnwrap(imported.id), metadata: SeratoMetadata())))
-        let queued = await fixture.engine.pendingSeratoWriteCount
+        let queued = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(queued, 1)
         let current = try await fixture.row(file)
         XCTAssertEqual(current.path, file.path)

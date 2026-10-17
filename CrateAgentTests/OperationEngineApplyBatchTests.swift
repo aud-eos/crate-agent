@@ -269,7 +269,7 @@ final class OperationEngineApplyBatchTests: XCTestCase {
             return (rowA, rowB)
         }
 
-        let queueDepthBefore = await engine.pendingSeratoWriteCount
+        let queueDepthBefore = try await engine.pendingSeratoWriteCount
 
         try await engine.applyBatch(
             [
@@ -279,7 +279,7 @@ final class OperationEngineApplyBatchTests: XCTestCase {
             batchId: "rename-batch"
         )
 
-        let queueDepthAfter = await engine.pendingSeratoWriteCount
+        let queueDepthAfter = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(
             queueDepthAfter - queueDepthBefore,
             2,

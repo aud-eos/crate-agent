@@ -232,6 +232,8 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 lastRequest = request
                 pendingRequest = .incremental
                 try Task.checkCancellation()
+                try await operationEngine.recoverLegacyEffectFences()
+                try await operationEngine.refreshQueueDepth()
                 watchdog.refresh()
                 guard !watchdog.isSeratoRunning else { pendingRequest = request; state = .waitingForSerato; return }
                 state = .reconciling
@@ -259,7 +261,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 } else {
                     cachedSource = nil
                 }
-                let pendingWork = await operationEngine.hasPendingSynchronizationWork
+                let pendingWork = try await operationEngine.hasPendingSynchronizationWork
                 if let checkpointStore, let header, let baseRevision, let cachedSource,
                    header.complete, !header.hadConflicts, header.localRevision == baseRevision,
                    stats?.changedFileIDs.isEmpty == true, !pendingWork, !filesystemRetryActive,
@@ -312,17 +314,6 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 }
                 let dirty = try await checkpointStore?.dirtyFiles()
                 var evidence = Dictionary(uniqueKeysWithValues: (checkpoint?.files ?? []).map { file in (file.fileID, file) })
-                if let checkpoint {
-                    let records = Dictionary(grouping: checkpoint.records) { record in SeratoPath.normalized(String(decoding: record.pathBytes, as: UTF8.self)) }
-                    var baselines: [FileMembershipToken: SeratoMetadata] = [:]
-                    for file in files {
-                        guard let identifier = file.id, let stored = evidence[identifier],
-                              stored.membershipRevision == file.membershipRevision, stored.identity == file.identity,
-                              let occurrences = records[SeratoPath.normalized(file.path)], occurrences.count == 1 else { continue }
-                        baselines[FileMembershipToken(fileId: identifier, revision: file.membershipRevision)] = occurrences[0].metadata
-                    }
-                    try await operationEngine.restoreObservedSeratoMetadata(baselines, authorization: reader.authorization(for: snapshot))
-                }
                 let plan: LibraryRefreshPlan? = if checkpointStore != nil {
                     try await LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: stats?.validatedFileIDs ?? [])
                         .makePlan(request: request, snapshot: snapshot, indexedFiles: files,
@@ -355,10 +346,8 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     try await operationEngine.drainPendingSeratoUpdates(retryingFailedCleanup: retryingFailedCleanup)
                 }
                 retryingFailedCleanup = false
-                cumulativeChanges.supersededWrites += drain.supersededCount
-                summary.supersededWrites = cumulativeChanges.supersededWrites
                 summary.conflictBlockedWriteCount = drain.conflictBlockedCount
-                summary.duplicateCleanupMessage = await operationEngine.duplicateCleanupMessage
+                summary.duplicateCleanupMessage = try await operationEngine.duplicateCleanupMessage
                 if drain.appliedCount > 0, checkpointStore != nil {
                     requested = true
                     pendingRequest = request
@@ -391,11 +380,9 @@ final class SeratoLibrarySyncSession: ObservableObject {
                                                       localRevision: expectedRevision, watchRoots: watchRoots,
                                                       eventID: (retainedStartupObservations.isEmpty ? startupReplay?.eventID : nil) ?? checkpoint?.header.eventID ?? 0,
                                                       hadConflicts: !analysis.conflicts.isEmpty)
-                    let effects = try await checkpointStore.pendingEffects()
-                    if !effects.isEmpty, summary.conflictBlockedWriteCount > 0 {
-                        let knownPending = await operationEngine.pendingEffectFenceIDs
+                    if !drain.blockedQueueIDs.isEmpty {
                         try await checkpointStore.authorizeReady(expectedRevision: expectedRevision, source: reader.authorization(for: validatedSnapshot),
-                                                                 ready: authorization, allowedPendingEffects: knownPending)
+                                                                 ready: authorization, allowedQueueIDs: drain.blockedQueueIDs)
                     } else {
                         try await checkpointStore.publish(.init(header: header, records: validatedSnapshot.records.map(SavedSeratoOccurrence.init), files: retainedEvidence),
                                                           expectedRevision: expectedRevision, sourceAuthorization: reader.authorization(for: validatedSnapshot), ready: authorization)
@@ -416,6 +403,9 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     continue
                 }
                 try processingAuthorization.check()
+                let dispositions = try await operationEngine.takeUnreportedDispositions()
+                summary.supersededWrites = dispositions.notApplied
+                summary.interruptedWrites = dispositions.interrupted
                 summary.retired = cumulativeChanges.retired
                 summary.reactivated = cumulativeChanges.reactivated
                 summary.pathConflictCount = analysis.conflicts.count

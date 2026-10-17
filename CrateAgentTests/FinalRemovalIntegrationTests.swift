@@ -106,7 +106,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
         XCTAssertEqual(try crates.map { try Data(contentsOf: $0.0) }, crateBytes)
         XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).count, 2)
-        let pendingCount = await engine.pendingSeratoWriteCount
+        let pendingCount = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(pendingCount, 0)
     }
 
@@ -392,7 +392,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         XCTAssertEqual(try readAudioTags(filePath: other.path).title, "Other applies")
         XCTAssertEqual(outcome.supersededCount, 1)
         XCTAssertEqual(outcome.appliedCount, 1)
-        let depth = await fixture.engine.pendingSeratoWriteCount
+        let depth = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(depth, 0)
     }
 
@@ -473,47 +473,6 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             XCTAssertNotNil(current, change)
             let eventsAfter = try await fixture.events()
             XCTAssertEqual(eventsAfter, eventsBefore, change)
-        }
-    }
-
-    func testDuplicateRestartRetainsOwnerUntilLegitimatePendingEffectsFinish() async throws {
-        let fixture = try SeratoRemovalFixture()
-        defer { fixture.cleanup() }
-        let keeper = try await fixture.add("keeper.wav", bytes: Self.wav())
-        let target = try await fixture.add("target.wav", bytes: Self.wav())
-        try save(fixture, paths: [keeper.path, target.path])
-        let crates = try saveCrates(fixture, paths: [keeper.path, target.path])
-        let engine = cleanupEngine(fixture)
-        let session = makeSession(fixture, engine: engine)
-        try await session.synchronize()
-        try await fixture.database.writer.write { database in
-            database.trace { event in
-                if event.expandedDescription.contains("INSERT INTO \"events\""), event.expandedDescription.contains("file_removed_from_crates") {
-                    DispatchQueue.main.sync {
-                        fixture.lifecycle.running = true
-                        fixture.watchdog.refresh()
-                    }
-                }
-            }
-        }
-        let group = DuplicateFinder.DuplicateGroup(groupKey: "pending", mode: .byteLevel, files: [keeper, target])
-        let outcome = try await DuplicateResolver(operationEngine: engine).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "pending-cleanup")
-        XCTAssertTrue(fixture.lifecycle.running, "The real mutation boundary must restart Serato")
-        XCTAssertEqual(outcome.trashedCount, 0)
-        let pendingOwner = try await fixture.database.writer.read { try FileRecord.fetchOne($0, key: target.id) }
-        XCTAssertNotNil(pendingOwner)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
-        try await fixture.database.writer.write { $0.trace(nil) }
-        fixture.lifecycle.running = false
-        fixture.watchdog.refresh()
-        try await session.synchronize()
-        let completedOwner = try await fixture.database.writer.read { try FileRecord.fetchOne($0, key: target.id) }
-        XCTAssertNil(completedOwner)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("owned-trash-target.wav").path))
-        XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).map { SeratoPath.normalized($0.path) }, [keeper.path])
-        for (url, _) in crates {
-            XCTAssertEqual(try readCratePaths(cratePath: url.path).map(SeratoPath.normalized), [keeper.path])
         }
     }
 

@@ -60,7 +60,7 @@ final class GroupedWriteSupersessionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: replaced.path)), replacement)
         if restart {
             XCTAssertTrue(boundary.didRestart)
-            let queued = await engine.pendingSeratoWriteCount
+            let queued = try await engine.pendingSeratoWriteCount
             XCTAssertEqual(queued, 2)
             XCTAssertTrue(batches.values.isEmpty)
             XCTAssertTrue(log.recent.contains { $0.message.contains("wrote 0, queued 2, superseded 1") })
@@ -77,7 +77,7 @@ final class GroupedWriteSupersessionTests: XCTestCase {
         }
         let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
         XCTAssertEqual(records.map(\.title), [nil, "Desired 1", "Desired 2"])
-        let queued = await engine.pendingSeratoWriteCount
+        let queued = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queued, 0)
         let journal = try await fixture.database.writer.read { database in
             try EventRecord.filter(Column("batch_id") == "grouped-metadata").fetchAll(database)
@@ -134,7 +134,7 @@ final class GroupedWriteSupersessionTests: XCTestCase {
             XCTAssertEqual(try readCratePaths(cratePath: crate.path).map(SeratoPath.normalized), [replaced.path, firstFinal, secondFinal])
         }
         XCTAssertTrue(log.recent.contains { $0.message.contains("wrote 5, queued 0, superseded 1") })
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 0)
         let eventCount = try await fixture.database.writer.read { database in
             try EventRecord.filter(Column("batch_id") == "grouped-renames").fetchCount(database)

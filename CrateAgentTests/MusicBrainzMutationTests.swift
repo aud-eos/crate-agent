@@ -1786,13 +1786,13 @@ final class MusicBrainzMutationTests: XCTestCase {
         // Both the Serato-DB metadata update and the file-tag write are
         // queued while Serato is running (invariant #3 + the mmapped-file
         // safety guard that gates file-tag writes).
-        let queueDepth = await engine.pendingSeratoWriteCount
+        let queueDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(queueDepth, 2, "Serato-DB update + file-tag write both queued")
         XCTAssertEqual(recorder.calls.count, 0, "file-tag writer must not fire while Serato runs")
 
         await runningState?.stop()
         try await engine.drainPendingSeratoUpdates()
-        let drainedDepth = await engine.pendingSeratoWriteCount
+        let drainedDepth = try await engine.pendingSeratoWriteCount
         XCTAssertEqual(drainedDepth, 0, "queue drains on Serato quit")
         XCTAssertEqual(recorder.calls.count, 1, "file-tag write dispatched on drain")
         XCTAssertEqual(recorder.calls.first?.update.year, 1994)

@@ -48,8 +48,20 @@ actor SyncCheckpointStore {
         try connection.execute(sql: "DELETE FROM sync_effect_fences WHERE batch_id = ?", arguments: [batchID])
     }
 
-    static func eventFence(_ eventID: Int64) -> String {
-        "event:\(eventID)"
+    /// Pre-queue builds fenced each journaled event's external effects; only
+    /// `recoverLegacyEffectFences` still reads these.
+    static let legacyEventFencePrefix = "event:"
+
+    /// Physical-move and legacy fences and queued effects must all be finished
+    /// before a checkpoint can claim the library is complete. A cleanup intent
+    /// between steps owns no row and does not block: it forces the next
+    /// startup onto the strict path, which advances it.
+    private static func requireNoUnfinishedEffects(allowedQueueIDs: Set<Int64>, in connection: Database) throws {
+        guard try !Bool.fetchOne(connection, sql: "SELECT EXISTS(SELECT 1 FROM sync_effect_fences)")! else {
+            throw SyncCheckpointError.incompleteEffects
+        }
+        let queued = try Set(Int64.fetchAll(connection, sql: "SELECT queue_id FROM serato_write_queue"))
+        guard queued.isSubset(of: allowedQueueIDs) else { throw SyncCheckpointError.queuedChangesPending }
     }
 
     func loadHeader() async throws -> SyncCheckpointHeader? {
@@ -62,13 +74,13 @@ actor SyncCheckpointStore {
         guard version <= SyncCheckpointHeader.currentVersion else { throw SyncCheckpointError.malformed }
         guard version == SyncCheckpointHeader.currentVersion else { return nil }
         let bytes: Data = row["payload"]
-        let header = try decode(SyncCheckpointHeader.self, from: bytes)
+        let header = try decodeCanonical(SyncCheckpointHeader.self, from: bytes)
         guard header.formatVersion == version, header.localRevision >= 0,
               !header.libraryID.isEmpty, Set(header.watchRoots).count == header.watchRoots.count else { throw SyncCheckpointError.malformed }
         return header
     }
 
-    private static func decode<Value: Codable>(_ type: Value.Type, from bytes: Data) throws -> Value {
+    static func decodeCanonical<Value: Codable>(_ type: Value.Type, from bytes: Data) throws -> Value {
         let value = try JSONDecoder().decode(type, from: bytes)
         let original = try JSONSerialization.jsonObject(with: bytes) as? NSDictionary
         let canonical = try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? NSDictionary
@@ -85,13 +97,13 @@ actor SyncCheckpointStore {
                 let ordinal: Int = row["ordinal"]
                 guard ordinal == index else { throw SyncCheckpointError.malformed }
                 let bytes: Data = row["metadata"]
-                let record = try SavedSeratoOccurrence(pathBytes: row["path"], metadata: Self.decode(SeratoMetadata.self, from: bytes))
+                let record = try SavedSeratoOccurrence(pathBytes: row["path"], metadata: Self.decodeCanonical(SeratoMetadata.self, from: bytes))
                 _ = try record.record()
                 return record
             }
             let files = try Row.fetchAll(connection, sql: "SELECT file_id, payload FROM sync_file_evidence ORDER BY file_id").map { row in
                 let bytes: Data = row["payload"]
-                let evidence = try Self.decode(SyncFileEvidence.self, from: bytes)
+                let evidence = try Self.decodeCanonical(SyncFileEvidence.self, from: bytes)
                 let fileID: Int64 = row["file_id"]
                 guard fileID == evidence.fileID else { throw SyncCheckpointError.malformed }
                 return evidence
@@ -110,9 +122,7 @@ actor SyncCheckpointStore {
         try await database.writer.writeWithoutTransaction { connection in
             try connection.inTransaction {
                 try sourceAuthorization?.check()
-                guard try !Bool.fetchOne(connection, sql: "SELECT EXISTS(SELECT 1 FROM sync_effect_fences)")! else {
-                    throw SyncCheckpointError.incompleteEffects
-                }
+                try Self.requireNoUnfinishedEffects(allowedQueueIDs: [], in: connection)
                 guard try Self.revision(in: connection) == expectedRevision, checkpoint.header.localRevision == expectedRevision else {
                     throw SyncCheckpointError.changed
                 }
@@ -147,30 +157,36 @@ actor SyncCheckpointStore {
         }
     }
 
-    func authorizeReady(expectedRevision: Int64, source: SeratoSnapshotAuthorization, ready: LibrarySyncReadiness.Authorization, allowedPendingEffects: Set<String> = []) async throws {
+    func authorizeReady(expectedRevision: Int64, source: SeratoSnapshotAuthorization, ready: LibrarySyncReadiness.Authorization,
+                        allowedQueueIDs: Set<Int64> = []) async throws
+    {
         try await database.writer.writeWithoutTransaction { connection in
             guard try Self.revision(in: connection) == expectedRevision else { throw SyncCheckpointError.changed }
-            let effects = try Set(String.fetchAll(connection, sql: "SELECT batch_id FROM sync_effect_fences"))
-            guard effects.isSubset(of: allowedPendingEffects) else { throw SyncCheckpointError.incompleteEffects }
+            try Self.requireNoUnfinishedEffects(allowedQueueIDs: allowedQueueIDs, in: connection)
             try source.check()
             try Task.checkCancellation()
             try ready.gate.markReady(ready)
         }
     }
 
-    func cachedBaseline(token: FileMembershipToken, identity: FileMetadata, locator: SeratoLibraryLocator) async throws -> SeratoMetadata? {
-        try await database.writer.read { connection in
-            guard let header = try Self.header(in: connection), header.complete,
-                  try SeratoSourceIdentity.read(locator.databaseV2Url) == header.source,
-                  try locator.supportedLibraryIdentity() == header.libraryID,
-                  let bytes = try Data.fetchOne(connection, sql: "SELECT payload FROM sync_file_evidence WHERE file_id = ?", arguments: [token.fileId]) else { return nil }
-            let evidence = try Self.decode(SyncFileEvidence.self, from: bytes)
-            guard evidence.membershipRevision == token.revision, evidence.identity == identity else { return nil }
-            let metadata = try Data.fetchAll(connection, sql: "SELECT metadata FROM sync_saved_occurrences WHERE normalized_path = ?", arguments: [SeratoPath.normalized(identity.path)])
-            guard metadata.count == 1 else { return nil }
-            let baseline = try Self.decode(SeratoMetadata.self, from: metadata[0])
-            guard try SeratoSourceIdentity.read(locator.databaseV2Url) == header.source else { return nil }
-            return baseline
-        }
+    /// The checkpoint's saved occurrence for a file whose evidence still matches
+    /// its revision and identity. The current V2 source may differ: own writes
+    /// and strict observations after publication are kept in
+    /// `serato_external_baselines`, which callers consult first.
+    static func checkpointBaseline(token: FileMembershipToken, identity: FileMetadata, locator: SeratoLibraryLocator,
+                                   in connection: Database) throws -> SeratoMetadata?
+    {
+        guard let header = try header(in: connection), header.complete,
+              let bytes = try Data.fetchOne(connection, sql: "SELECT payload FROM sync_file_evidence WHERE file_id = ?", arguments: [token.fileId])
+        else { return nil }
+        let libraryID: String
+        // An unidentifiable library cannot vouch for this checkpoint; the baseline stays unknown, which observation reports as uncertain.
+        do { libraryID = try locator.supportedLibraryIdentity() } catch { return nil }
+        guard libraryID == header.libraryID else { return nil }
+        let evidence = try decodeCanonical(SyncFileEvidence.self, from: bytes)
+        guard evidence.membershipRevision == token.revision, evidence.identity == identity else { return nil }
+        let metadata = try Data.fetchAll(connection, sql: "SELECT metadata FROM sync_saved_occurrences WHERE normalized_path = ?", arguments: [SeratoPath.normalized(identity.path)])
+        guard metadata.count == 1 else { return nil }
+        return try decodeCanonical(SeratoMetadata.self, from: metadata[0])
     }
 }

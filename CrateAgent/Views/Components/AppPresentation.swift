@@ -70,6 +70,7 @@ struct LibrarySyncStatusView: View {
             "Library synced · \(summary.retired) removed from Serato · \(summary.reactivated) activated · \(summary.unavailable) unavailable"
                 + (summary.pathConflictCount > 0 ? " · \(summary.pathConflictCount) path conflicts · \(summary.conflictBlockedWriteCount) changes waiting for repair" : "")
                 + (summary.supersededWrites > 0 ? " · \(summary.supersededWrites) queued changes superseded" : "")
+                + (summary.interruptedWrites > 0 ? " · \(summary.interruptedWrites) interrupted audio changes not retried" : "")
                 + (summary.duplicateCleanupMessage.map { " · " + $0 } ?? "")
         }
     }

@@ -3,27 +3,6 @@ import GRDB
 import XCTest
 
 final class SyncCheckpointStoreTests: XCTestCase {
-    @MainActor
-    func testFailedImportEffectKeepsFenceUntilSuccessfulRetry() async throws {
-        let gate = LibrarySyncReadiness()
-        let fixture = try SeratoRemovalFixture(readiness: gate)
-        defer { fixture.cleanup() }
-        let file = try await fixture.add("pending.wav", membership: .pendingImport)
-        let store = SyncCheckpointStore(database: fixture.database)
-        try gate.markReady(gate.prepareDrain())
-        try Data("invalid".utf8).write(to: fixture.locator.databaseV2Url)
-        do {
-            try await fixture.engine.apply(.addTrackToSerato(.init(fileId: XCTUnwrap(file.id), metadata: .empty)), batchId: "failed-import")
-            XCTFail("Invalid V2 accepted import")
-        } catch is OperationEngineError {}
-        let retained = try await store.pendingEffects()
-        XCTAssertFalse(retained.isEmpty)
-        try fixture.save(paths: [])
-        try await fixture.engine.drainPendingSeratoUpdates()
-        let completed = try await store.pendingEffects()
-        XCTAssertEqual(completed, [])
-    }
-
     func testDatabaseChangesInvalidateDurablyButRollbackAndFingerprintProgressDoNot() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -68,6 +47,7 @@ final class SyncCheckpointStoreTests: XCTestCase {
         XCTAssertFalse(dirty.paths.contains(Data("/fixture/rolled-back.wav".utf8)))
     }
 
+    @MainActor
     func testPublicationRejectsStaleRevisionAndDurableUnacknowledgedEffects() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -95,6 +75,31 @@ final class SyncCheckpointStoreTests: XCTestCase {
         do { try await reopened.publish(checkpoint, expectedRevision: revision); XCTFail("Unacknowledged I/O produced a completed checkpoint") }
         catch SyncCheckpointError.incompleteEffects {}
         try await reopened.finishEffect(batchID: "external-write")
+        let queueID = try await database.writer.write { connection in
+            try connection.execute(sql: """
+            INSERT INTO serato_write_queue (event_id, kind, file_id, membership_revision, payload, created_at)
+            VALUES (1, 'metadataUpdate', 1, 0, x'00', 0)
+            """)
+            return connection.lastInsertedRowID
+        }
+        let queuedRevision = try await reopened.currentRevision()
+        let queuedHeader = try SyncCheckpointHeader(libraryID: "fixture", source: SeratoSourceIdentity.read(sourceURL), localRevision: queuedRevision,
+                                                    watchRoots: [directory.path], eventID: 42, hadConflicts: false)
+        do {
+            try await reopened.publish(LibrarySyncCheckpoint(header: queuedHeader, records: [], files: []), expectedRevision: queuedRevision)
+            XCTFail("A queued Serato write produced a completed checkpoint")
+        } catch SyncCheckpointError.queuedChangesPending {}
+        let watchdog = SeratoWatchdog { [] }
+        let reader = SeratoMembershipSnapshotReader(locator: SeratoLibraryLocator(seratoDirectory: directory), watchdog: watchdog)
+        let source = try await reader.authorization(for: reader.read())
+        let gate = LibrarySyncReadiness()
+        do {
+            try await reopened.authorizeReady(expectedRevision: queuedRevision, source: source, ready: gate.prepareDrain())
+            XCTFail("A queued write outside the blocked set opened readiness")
+        } catch SyncCheckpointError.queuedChangesPending {}
+        try await reopened.authorizeReady(expectedRevision: queuedRevision, source: source, ready: gate.prepareDrain(), allowedQueueIDs: [queueID])
+        XCTAssertNoThrow(try gate.capture())
+        try await database.writer.write { connection in try connection.execute(sql: "DELETE FROM serato_write_queue") }
         try await database.writer.write { connection in
             var file = FileRecord(path: "/late.wav", volumeUuid: "fixture", inode: 1, fileSize: 1, mtime: 1)
             try file.insert(connection)
