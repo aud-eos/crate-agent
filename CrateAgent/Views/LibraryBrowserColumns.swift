@@ -2,12 +2,21 @@ import AppKit
 
 enum LibraryBrowserColumns {
     private static let statusIdentifier = "status"
-    static func make(showsFilenames: Bool, density: AppDensity, readiness: LibrarySyncReadiness? = nil) -> [PagedTableColumn<BrowserRow>] {
+    private static let previewIdentifier = "preview"
+    static func make(showsFilenames: Bool, density: AppDensity, readiness: LibrarySyncReadiness? = nil,
+                     preview: AudioPreviewPlayer? = nil) -> [PagedTableColumn<BrowserRow>]
+    {
         let definitions: [(LibraryBrowseSort.Column?, String, CGFloat)] = [
             (.artist, "Artist", 220), (.title, "Title", 280), (.bpm, "BPM", 70),
             (.musicalKey, "Key", 50), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
         ]
-        return definitions.map { column, title, width in
+        let previewColumns = preview.map { player in
+            [PagedTableColumn<BrowserRow>(identifier: previewIdentifier, title: "", width: 28, makeCell: { AudioPreviewCell() }, updateCell: { view, row in
+                guard let cell = view as? AudioPreviewCell else { preconditionFailure("Unexpected preview cell") }
+                cell.update(row: row, player: player)
+            }, sortable: false)]
+        } ?? []
+        return previewColumns + definitions.map { column, title, width in
             let identifier = column?.rawValue ?? statusIdentifier
             return PagedTableColumn(identifier: identifier, title: title, width: width, makeCell: { LibraryBrowserCell() }, updateCell: { view, row in
                 guard let cell = view as? LibraryBrowserCell else { preconditionFailure("Unexpected Library cell") }
