@@ -143,7 +143,7 @@ final class SeratoMembershipSnapshotTests: XCTestCase {
     }
 
     func testMissingEmptyAndCorruptSources() async throws {
-        for (payload, expected) in [(nil, SeratoMembershipSnapshotError.sourceUnavailable), (Data(), .malformedSource), (Data("otrk".utf8), .malformedSource)] {
+        for (payload, expected) in [(nil, SeratoMembershipSnapshotError.sourceMissing), (Data(), .malformedSource), (Data("otrk".utf8), .malformedSource)] {
             let locator = try fixture(payload)
             await expectFailure(expected, reader: SeratoMembershipSnapshotReader(locator: locator, watchdog: SeratoWatchdog { [] }))
         }
