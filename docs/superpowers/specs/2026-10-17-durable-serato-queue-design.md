@@ -209,7 +209,11 @@ OperationEngine.swift, SeratoWriteEligibility.swift, SyncCheckpointStore.swift, 
   behind another pass's unfinished row until the next sync.
 - A rename batch applies its renames in order, so old → middle → new lands at the
   final path instead of stopping at the middle one.
-- A row counts as possibly landed only when its last attempt recorded no error.
+- A row counts as possibly landed once a write for it returned from its I/O,
+  even if a later validation in the same transaction threw (`io_started`); `may_have_landed` keeps that
+  across a later failed retry, and an attempt stopped before I/O never sets it.
+  Migration 016 sets `may_have_landed` for rows attempted without a recorded
+  error, the rule rows were read by before the marker existed.
 - Undo refuses to remove an indexed row once its membership changed, so only
   `removeFile` (duplicate cleanup) removes a row with queued work; the file ID is
   `AUTOINCREMENT`, so a re-indexed row never matches the removed row's tokens.
