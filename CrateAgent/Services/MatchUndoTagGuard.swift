@@ -26,10 +26,50 @@ enum MatchUndoTagGuard {
         let identity: AudioFileReadIdentity
     }
 
+    struct Request: Sendable {
+        let fileID: Int64
+        let path: String
+        let applied: ApplyMusicBrainzMatchPayload
+    }
+
+    /// Reads at most `concurrency` files at a time off the caller's actor, so
+    /// undoing a large batch does not hold up other engine work. When several
+    /// files are refused, the first request's error is the one thrown.
+    static func readAll(_ requests: [Request], reader: @escaping OperationEngine.FileTagReader, concurrency: Int = 4) async throws -> [Read] {
+        var outcomes = [Result<Read, Error>?](repeating: nil, count: requests.count)
+        try await withThrowingTaskGroup(of: (Int, Result<Read, Error>).self) { group in
+            var next = 0
+            func startNext() {
+                guard next < requests.count else { return }
+                let index = next
+                let request = requests[index]
+                group.addTask {
+                    (index, Result(catching: { try read(fileID: request.fileID, path: request.path, applied: request.applied, reader: reader) }))
+                }
+                next += 1
+            }
+            for _ in 0 ..< concurrency {
+                startNext()
+            }
+            while let (index, outcome) = try await group.next() {
+                outcomes[index] = outcome
+                startNext()
+            }
+        }
+        return try outcomes.map { outcome in
+            guard let outcome else { throw CancellationError() }
+            return try outcome.get()
+        }
+    }
+
     static func read(fileID: Int64, path: String, applied: ApplyMusicBrainzMatchPayload,
                      reader: OperationEngine.FileTagReader) throws -> Read
     {
-        let identity = try AudioFileReadIdentity.read(at: path)
+        let identity: AudioFileReadIdentity
+        do { identity = try AudioFileReadIdentity.read(at: path) }
+        catch let error as CocoaError where [.fileReadNoSuchFile, .fileReadUnsupportedScheme].contains(error.code) {
+            throw OperationEngineError.undoFileUnavailable(fileId: fileID, path: path)
+        }
         let live = try reader(path)
         try identity.requireUnchanged(at: path)
         let conflicts = conflictingFields(live: live, applied: applied)

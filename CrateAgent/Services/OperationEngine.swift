@@ -1626,10 +1626,11 @@ public actor OperationEngine {
                 }
             }
         }
-        return try matches.map { match in
+        let requests = try matches.map { match in
             guard let path = paths[match.fileID] else { throw OperationEngineError.fileNotFound(fileId: match.fileID) }
-            return try MatchUndoTagGuard.read(fileID: match.fileID, path: path, applied: match.applied, reader: fileTagReader)
+            return MatchUndoTagGuard.Request(fileID: match.fileID, path: path, applied: match.applied)
         }
+        return try await MatchUndoTagGuard.readAll(requests, reader: fileTagReader)
     }
 
     /// Throws `undoSupersededByLaterMatch` if any match-affecting event in the
@@ -4738,6 +4739,9 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// The audio file changed between undo's tag check and its commit, so
     /// the check no longer describes the file the inverse would rewrite.
     case undoFileChangedWhileChecking(fileId: Int64)
+    /// Undo or redo of a match needs to read the audio file it would
+    /// rewrite, and the file is missing or its volume is offline.
+    case undoFileUnavailable(fileId: Int64, path: String)
     case metadataChanged(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
@@ -4777,6 +4781,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
         case let .undoWouldOverwriteFileTags(fileId, fields):
             "Can't undo this MusicBrainz change for file id \(fileId): its audio file's \(fields.joined(separator: ", ")) changed since, and undoing would overwrite that edit."
+        case let .undoFileUnavailable(fileId, path):
+            "Can't undo this MusicBrainz change for file id \(fileId): \((path as NSString).lastPathComponent) is missing or its drive is offline. Reconnect it, then undo again."
         case let .undoFileChangedWhileChecking(fileId):
             "Can't undo this MusicBrainz change for file id \(fileId): its audio file changed while undo was checking it. Try again."
         case let .metadataChanged(fileId):

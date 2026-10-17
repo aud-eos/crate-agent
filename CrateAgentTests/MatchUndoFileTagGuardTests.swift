@@ -75,6 +75,21 @@ final class MatchUndoFileTagGuardTests: XCTestCase {
         XCTAssertEqual(try readAudioTags(filePath: file.path).title, "Matched title")
     }
 
+    func testUndoOfAMissingFileNamesTheFile() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await matched(fixture)
+        try FileManager.default.removeItem(atPath: file.path)
+
+        do {
+            _ = try await fixture.engine.undoBatch("match")
+            XCTFail("Undo ran without the file it restores")
+        } catch let OperationEngineError.undoFileUnavailable(fileID, path) {
+            XCTAssertEqual(fileID, file.id)
+            XCTAssertEqual(path, file.path)
+        }
+    }
+
     private func matched(_ fixture: SeratoRemovalFixture, year: Int? = nil) async throws -> FileRecord {
         let file = try await fixture.add("track.wav", bytes: FinalRemovalIntegrationTests.wav())
         try fixture.save(paths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: file.path)])
