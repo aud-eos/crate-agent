@@ -78,9 +78,7 @@ final class OperationEngineTests: XCTestCase {
             }
         )
         state.watchdog = watchdog
-        let locator = SeratoLibraryLocator(
-            seratoDirectory: seratoDirectory ?? URL(fileURLWithPath: "/dev/null")
-        )
+        let locator = try seratoDirectory.map(SeratoLibraryLocator.init(seratoDirectory:)) ?? makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
@@ -284,6 +282,7 @@ final class OperationEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: subcratesDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: smartCratesDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        try OperationEngineTests.synthesizeDatabaseV2BytesForTest(withTrackPaths: []).write(to: seratoDirectory.appendingPathComponent("database V2"))
 
         let regularCrate = subcratesDirectory.appendingPathComponent("Regular.crate")
         try OperationEngineTests.synthesizeCrateBytesForTest(
@@ -338,13 +337,12 @@ final class OperationEngineTests: XCTestCase {
         // garbage `.crate`, and a valid `database V2`. The fixture
         // builder handles the directory + bytes — this test only
         // describes WHAT it needs.
-        let (seratoDirectory, goodCrate, databaseV2Optional) =
+        let (seratoDirectory, goodCrate, databaseV2) =
             try Self.makeTemporarySeratoLibrary(
                 withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/old.mp3"))],
                 corruptedCrateNames: ["Bad"],
                 databaseV2Paths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
             )
-        let databaseV2 = try XCTUnwrap(databaseV2Optional)
         defer {
             try? FileManager.default.removeItem(at: seratoDirectory.deletingLastPathComponent())
         }
@@ -708,46 +706,6 @@ final class OperationEngineTests: XCTestCase {
         XCTAssertEqual(droppedRecord?.title, "Drop Title")
     }
 
-    func testAddTrackToSeratoBootstrapsDatabaseV2IfMissing() async throws {
-        // Serato has never run on this machine → no database V2.
-        // The mutation should create a fresh one with our otrk.
-        let rootDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("crate-agent-test-bootstrap-\(UUID().uuidString)", isDirectory: true)
-        let seratoDirectoryUrl = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: rootDirectory) }
-        // Note: don't create the _Serato_ directory — applySeratoAddTrack
-        // creates it on demand.
-
-        let (engine, database, _) = try await MainActor.run {
-            try makeEngine(seratoDirectory: seratoDirectoryUrl, seratoIsRunning: false)
-        }
-        try await engine.apply(.indexNewFile(IndexNewFilePayload(
-            path: audioFixture.path("/Users/testuser/Music/A/first.mp3"),
-            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
-            metadata: SeratoMetadata(artist: "First")
-        )))
-        try await prepareAudioFixtures(in: database)
-        let fileId = try await database.writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                               arguments: [self.audioFixture.path("/Users/testuser/Music/A/first.mp3")])
-        }!
-        try await prepareAudioFixtures(in: database, membership: .pendingImport)
-        try await engine.apply(.addTrackToSerato(AddTrackToSeratoPayload(
-            fileId: fileId,
-            metadata: SeratoMetadata(artist: "First")
-        )))
-
-        let databaseV2Url = seratoDirectoryUrl.appendingPathComponent("database V2")
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: databaseV2Url.path),
-            "database V2 should have been bootstrapped"
-        )
-        let records = try readDatabaseRecords(databasePath: databaseV2Url.path)
-        XCTAssertEqual(records.count, 1)
-        XCTAssertEqual(records[0].path, SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/first.mp3")))
-        XCTAssertEqual(records[0].artist, "First")
-    }
-
     func testDrainAppliesQueuedRewrites() async throws {
         let (seratoDirectoryUrl, crateFileUrl, _) = try Self.makeTemporarySeratoLibrary(
             withCratePaths: [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audioFixture.path("/Users/testuser/Music/A/old.mp3"))]
@@ -812,14 +770,14 @@ final class OperationEngineTests: XCTestCase {
     /// Optional knobs for the fault-tolerance + recovery tests:
     /// - `corruptedCrateNames` — sibling `.crate` files filled
     ///   with garbage bytes to exercise per-crate fault tolerance.
-    /// - `databaseV2Paths` — when non-nil, also writes a valid
-    ///   `database V2` containing those paths, returned alongside
-    ///   the crate URL.
+    /// - `databaseV2Paths` — the tracks of the library's `database V2`,
+    ///   none by default. A Serato library always has one, and queued
+    ///   renames wait while it is missing (#192).
     private static func makeTemporarySeratoLibrary(
         withCratePaths cratePaths: [String],
         corruptedCrateNames: [String] = [],
-        databaseV2Paths: [String]? = nil
-    ) throws -> (seratoDirectoryUrl: URL, crateFileUrl: URL, databaseV2Url: URL?) {
+        databaseV2Paths: [String] = []
+    ) throws -> (seratoDirectoryUrl: URL, crateFileUrl: URL, databaseV2Url: URL) {
         let rootDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("crate-agent-test-\(UUID().uuidString)", isDirectory: true)
         let seratoDirectory = rootDirectory.appendingPathComponent("_Serato_", isDirectory: true)
@@ -842,14 +800,8 @@ final class OperationEngineTests: XCTestCase {
             try Data(repeating: 0xFF, count: 64).write(to: url)
         }
 
-        // Optional valid `database V2` for tests that drive
-        // `applySeratoRename` and need a V2 to inspect after.
-        var databaseV2Url: URL?
-        if let v2Paths = databaseV2Paths {
-            let url = seratoDirectory.appendingPathComponent("database V2")
-            try synthesizeDatabaseV2BytesForTest(withTrackPaths: v2Paths).write(to: url)
-            databaseV2Url = url
-        }
+        let databaseV2Url = seratoDirectory.appendingPathComponent("database V2")
+        try synthesizeDatabaseV2BytesForTest(withTrackPaths: databaseV2Paths).write(to: databaseV2Url)
 
         return (seratoDirectory, crateFileUrl, databaseV2Url)
     }
@@ -2294,7 +2246,7 @@ final class EventHistoryQueryTests: XCTestCase {
     private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = try makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
@@ -3367,7 +3319,7 @@ final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
     private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = try makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
@@ -3567,7 +3519,7 @@ final class LibraryHygieneCaseRunnerTests: XCTestCase {
     private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = try makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
@@ -3736,7 +3688,7 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
     private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = try makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
@@ -3873,7 +3825,7 @@ final class LibraryHygieneRunnerTests: XCTestCase {
     private func makeEngine() throws -> (OperationEngine, LibraryDatabase) {
         let database = try LibraryDatabase.openInMemory()
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = try makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
