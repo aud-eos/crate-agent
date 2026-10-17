@@ -170,7 +170,8 @@ item they verified, so the event records which item justified it. A failed reche
 is row-level staleness (`FileTrashLocationError.itemChanged`): the filesystem
 coordinator requests reconciliation and the reconciler leaves that row for the
 Trash event or next pass; neither fails its batch. A known path that now holds a
-different file requests reconciliation instead of writing a state. A removal
+different file requests reconciliation; a missing or trashed row keeps its state
+until then, and an available row becomes `unknown`. A removal
 event at that Trash path, or any reconciliation that finds the indexed path
 missing, keeps the row trashed only while that exact item still verifies;
 otherwise it becomes missing. A trashed row

@@ -156,9 +156,12 @@ public actor FilesystemSyncCoordinator {
     }
 
     /// A trashed row keeps its indexed path, so only its recorded Trash item proves the audio still exists.
-    /// Nil when the indexed path holds a different file: reconciliation is requested instead of a write.
+    /// When the indexed path holds a different file, reconciliation is requested: an available row
+    /// loses eligibility (`unknown`), while a missing or trashed row keeps its state (nil, no write).
     private func currentAvailability(of file: FileRecord) async throws -> (availability: FileAvailability, trashLocation: FileMetadata?)? {
-        guard let availability = try identityAvailability(file) else { return nil }
+        guard let availability = try identityAvailability(file) else {
+            return file.fileAvailability == .missing || file.fileAvailability == .trashed ? nil : (.unknown, nil)
+        }
         guard availability == .missing, let fileID = file.id else { return (availability, nil) }
         let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
         let observed = try FileTrashLocation.availability(of: location, resolver: availabilityResolver)
