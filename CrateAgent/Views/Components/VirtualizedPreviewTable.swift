@@ -20,7 +20,7 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
     let selectAll: () -> Void
     let enabled: Bool
     let density: AppDensity
-    var sort: ((String, Bool) -> Void)? = nil
+    var sort: ((String, Bool) -> Void)?
     var isSelectable: (Row) -> Bool = { _ in true }
 
     func makeCoordinator() -> Coordinator {
@@ -76,17 +76,17 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
                 table.addTableColumn(tableColumn)
             }
             table.toggleFocusedRow = { [weak self] in
-                guard let self, let table = self.table, self.configuration.enabled,
+                guard let self, let table = self.table, configuration.enabled,
                       table.selectedRow >= 0, table.selectedRow < self.configuration.rowCount else { return }
-                let row = self.configuration.row(table.selectedRow)
-                guard self.configuration.isSelectable(row) else { return }
-                self.configuration.setSelected(row.id, !self.configuration.isSelected(row.id))
-                self.refreshVisibleCheckboxes()
+                let row = configuration.row(table.selectedRow)
+                guard configuration.isSelectable(row) else { return }
+                configuration.setSelected(row.id, !configuration.isSelected(row.id))
+                refreshVisibleCheckboxes()
             }
             table.selectMatchingRows = { [weak self] in
-                guard let self, self.configuration.enabled else { return }
-                self.configuration.selectAll()
-                self.refreshVisibleCheckboxes()
+                guard let self, configuration.enabled else { return }
+                configuration.selectAll()
+                refreshVisibleCheckboxes()
             }
             scrollView.documentView = table
             return scrollView
@@ -161,9 +161,9 @@ struct VirtualizedPreviewTable<Row: Identifiable>: NSViewRepresentable {
             let dataID = configuration.dataID
             let identifier = row.id
             checkbox.onPress = { [weak self] in
-                guard let self, selectable, self.configuration.enabled, self.configuration.dataID == dataID else { return }
-                self.configuration.setSelected(identifier, !self.configuration.isSelected(identifier))
-                self.refreshVisibleCheckboxes()
+                guard let self, selectable, configuration.enabled, configuration.dataID == dataID else { return }
+                configuration.setSelected(identifier, !configuration.isSelected(identifier))
+                refreshVisibleCheckboxes()
             }
         }
 

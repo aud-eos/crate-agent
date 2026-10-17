@@ -182,10 +182,8 @@ public actor FilesystemSyncCoordinator {
             pendingMoves[fileID] = pending.destinations.isEmpty ? nil : pending
             return
         }
-        if !pending.destinations.contains(where: { $0.metadata.path == path }) {
-            if pending.destinations.count < 2 {
-                pending.destinations.append(Destination(metadata: metadata, readIdentity: readIdentity))
-            }
+        if !pending.destinations.contains(where: { $0.metadata.path == path }), pending.destinations.count < 2 {
+            pending.destinations.append(Destination(metadata: metadata, readIdentity: readIdentity))
         }
         pendingMoves[fileID] = pending
         guard pending.destinations.count < 2 else { throw SeratoReconciliationError.ambiguousIdentity(path) }

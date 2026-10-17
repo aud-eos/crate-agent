@@ -17,9 +17,9 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     let eventId: Int64
     let originalIdentity: FileMetadata
     var originalReferencePaths: [String] = []
-    var externalBaseline: SeratoMetadata? = nil
-    var requiredKeeper: FileActionAuthority? = nil
-    var cleanupReceipt: DuplicateCleanupReceipt? = nil
+    var externalBaseline: SeratoMetadata?
+    var requiredKeeper: FileActionAuthority?
+    var cleanupReceipt: DuplicateCleanupReceipt?
 }
 
 enum SeratoWriteEligibility {

@@ -32,7 +32,7 @@ final class LibraryBrowserModel: ObservableObject {
         }.store(in: &subscriptions)
         results.$updateID.dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in
             guard let self, let snapshot = results.snapshot else { return }
-            self.selection.updateVisibleIdentities(self.results.cachedRows.map { row in snapshot.identity(for: row) })
+            selection.updateVisibleIdentities(results.cachedRows.map { row in snapshot.identity(for: row) })
         }.store(in: &subscriptions)
     }
 
@@ -134,27 +134,27 @@ final class LibraryBrowserModel: ObservableObject {
                     isRefreshing = false
                 }
             }
-            while self.dirty, self.active, self.session == requestedSession, !Task.isCancelled {
-                self.dirty = false
-                let reset = self.resetViewport
-                self.resetViewport = false
-                let version = self.queryVersion
-                let currentQuery = self.query
-                let fallback = reset ? 0 : self.results.viewport.lowerBound
-                let anchor = reset ? nil : self.results.row(at: fallback)?.id
+            while dirty, active, session == requestedSession, !Task.isCancelled {
+                dirty = false
+                let reset = resetViewport
+                resetViewport = false
+                let version = queryVersion
+                let currentQuery = query
+                let fallback = reset ? 0 : results.viewport.lowerBound
+                let anchor = reset ? nil : results.row(at: fallback)?.id
                 do {
-                    let snapshot = try await LibraryPagedSnapshot.open(pool: self.pool, query: currentQuery)
-                    guard self.active, self.session == requestedSession, version == self.queryVersion, !Task.isCancelled else {
-                        self.resetViewport = self.resetViewport || reset
+                    let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: currentQuery)
+                    guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else {
+                        resetViewport = resetViewport || reset
                         continue
                     }
-                    await self.results.open(snapshot, anchorID: anchor, fallbackIndex: fallback, focusID: reset ? nil : self.focusedID, focusFallback: reset ? nil : self.focusedIndex)
-                    guard self.active, self.session == requestedSession, version == self.queryVersion, !Task.isCancelled else { continue }
-                    self.selection.updateScope(snapshot, visibleIdentities: self.results.cachedRows.map { row in snapshot.identity(for: row) })
-                    self.selection.reconcile(in: snapshot)
-                    self.error = nil
+                    await results.open(snapshot, anchorID: anchor, fallbackIndex: fallback, focusID: reset ? nil : focusedID, focusFallback: reset ? nil : focusedIndex)
+                    guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }
+                    selection.updateScope(snapshot, visibleIdentities: results.cachedRows.map { row in snapshot.identity(for: row) })
+                    selection.reconcile(in: snapshot)
+                    error = nil
                 } catch {
-                    guard self.active, self.session == requestedSession, version == self.queryVersion, !Task.isCancelled else { continue }
+                    guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }
                     self.error = error.localizedDescription
                 }
             }

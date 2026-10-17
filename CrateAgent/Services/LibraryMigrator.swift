@@ -75,17 +75,17 @@ public actor LibraryMigrator {
         public var errorDescription: String? {
             switch self {
             case .noPlans:
-                return "Nothing to migrate — every tracked file is already under the new root."
+                "Nothing to migrate — every tracked file is already under the new root."
             case .sameRoot:
-                return "Source and destination are the same folder."
+                "Source and destination are the same folder."
             case let .crossVolumeUnsupported(reason):
-                return "Cross-volume migration isn't supported yet (\(reason))."
+                "Cross-volume migration isn't supported yet (\(reason))."
             case .sourceNoLongerExists:
-                return "Source no longer exists."
+                "Source no longer exists."
             case .destinationAlreadyExists:
-                return "Destination already exists — re-scan and retry."
+                "Destination already exists — re-scan and retry."
             case let .cannotInspectSource(path):
-                return "Cannot inspect \(path). Check that the audio is available, then re-scan."
+                "Cannot inspect \(path). Check that the audio is available, then re-scan."
             }
         }
     }
@@ -111,8 +111,8 @@ public actor LibraryMigrator {
     /// `findMoves` is `nonisolated static` so the destination
     /// preview UI can call it without round-tripping through the
     /// actor — pure path arithmetic, no engine access.
-    public nonisolated static func findMoves<F: HygieneFileSource>(
-        in files: [F],
+    public nonisolated static func findMoves(
+        in files: [some HygieneFileSource],
         oldRoot: URL,
         newRoot: URL
     ) -> [Destination] {
@@ -123,8 +123,7 @@ public actor LibraryMigrator {
         var plans: [Destination] = []
         var claimed: Set<String> = []
         for file in files {
-            guard let fileId = file.id else { continue }
-            guard requiresMove(file.path, oldPrefix: oldPrefix, newPrefix: newPrefix) else { continue }
+            guard let fileId = file.id, requiresMove(file.path, oldPrefix: oldPrefix, newPrefix: newPrefix) else { continue }
             let relative = String(file.path.dropFirst(oldPrefix.count))
             // Skip if the file is already at the canonical
             // location under the new root — covers the rerun case.
@@ -153,8 +152,8 @@ public actor LibraryMigrator {
         }
     }
 
-    public nonisolated static func prepareMoves<F: HygieneFileSource>(
-        in files: [F], oldRoot: URL, newRoot: URL
+    public nonisolated static func prepareMoves(
+        in files: [some HygieneFileSource], oldRoot: URL, newRoot: URL
     ) throws -> [Plan] {
         try findMoves(in: files, oldRoot: oldRoot, newRoot: newRoot).map { destination in
             try Task.checkCancellation()

@@ -434,7 +434,7 @@ public actor OperationEngine {
             return results
         }
 
-        let pendingWrites = executionResults.flatMap { $0.seratoWrites }
+        let pendingWrites = executionResults.flatMap(\.seratoWrites)
         try await routeSeratoWrites(pendingWrites, batchId: batchId)
 
         return executionResults.compactMap(\.eventId)
@@ -830,11 +830,10 @@ public actor OperationEngine {
                 }
             }
         }
-        let pathByFileId: [Int64: String]
-        if pathDependentFileIds.isEmpty {
-            pathByFileId = [:]
+        let pathByFileId: [Int64: String] = if pathDependentFileIds.isEmpty {
+            [:]
         } else {
-            pathByFileId = filesByID.mapValues(\.path)
+            filesByID.mapValues(\.path)
         }
 
         // Re-sync must project each file's CURRENT external state, not blindly
@@ -1118,11 +1117,11 @@ public actor OperationEngine {
              .musicBrainzMatchReverted, .fileRenamed:
             // Renames are re-targeted to the file's CURRENT path on resync (see
             // `resyncWrites`), so they need the DB lookup too.
-            return true
+            true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
              .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
-            return false
+            false
         }
     }
 
@@ -1516,7 +1515,7 @@ public actor OperationEngine {
                 blockedEvents.insert(queued.eventId)
                 continue
             }
-            guard !(await seratoWatchdog.isSeratoRunning) else { break }
+            guard await !(seratoWatchdog.isSeratoRunning) else { break }
             let next = try await eligibleWrites([queued]).first ?? queued
             if disposition == .eligible, try await isEligible(next) {
                 do {
@@ -1603,7 +1602,7 @@ public actor OperationEngine {
     }
 
     private static func eligibleWrites(_ writes: [GuardedSeratoWrite], in database: GRDB.Database) throws -> [GuardedSeratoWrite] {
-        let files = try fetchFiles(fileIDs: writes.map { $0.token.fileId }, in: database)
+        let files = try fetchFiles(fileIDs: writes.map(\.token.fileId), in: database)
             .reduce(into: [Int64: FileRecord]()) { files, file in
                 if let fileID = file.id {
                     files[fileID] = file
@@ -1655,7 +1654,7 @@ public actor OperationEngine {
 
     private func requireExternalWriteEligibility(_ writes: [GuardedSeratoWrite]) async throws {
         let eligible = try await eligibleWrites(writes)
-        guard eligible.count == writes.count, !(await seratoWatchdog.isSeratoRunning), readiness?.permitsExternalWrites != false else {
+        guard eligible.count == writes.count, await !(seratoWatchdog.isSeratoRunning), readiness?.permitsExternalWrites != false else {
             throw ExternalWriteInterruption.deferred
         }
     }
@@ -1733,7 +1732,7 @@ public actor OperationEngine {
         var applied = Set<Int64>()
         var superseded = partition.superseded
         for (index, group) in groups.enumerated() {
-            guard !(await seratoWatchdog.isSeratoRunning) else {
+            guard await !(seratoWatchdog.isSeratoRunning) else {
                 let remainder = groups[index...].flatMap { $0 }
                 pendingSeratoWrites.append(contentsOf: remainder)
                 queueDepthSubject.send(pendingSeratoWrites.count)
@@ -3452,14 +3451,14 @@ public actor OperationEngine {
         return writes
     }
 
-    static func insertEvent<ForwardPayload: Encodable, InversePayload: Encodable>(
+    static func insertEvent(
         batchId: String,
         timestamp: Int64,
         fileId: Int64?,
         trackId: Int64? = nil,
         eventType: EventType,
-        forwardPayload: ForwardPayload,
-        inversePayload: InversePayload,
+        forwardPayload: some Encodable,
+        inversePayload: some Encodable,
         in db: GRDB.Database
     ) throws -> Int64 {
         let encoder = JSONEncoder()
@@ -4117,33 +4116,33 @@ public enum OperationEngineError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case let .fileNotFound(fileId):
-            return "Mutation referenced file id \(fileId), which is not in the database."
+            "Mutation referenced file id \(fileId), which is not in the database."
         case .insertDidNotReturnRowId:
-            return "Database insert did not produce a row id — schema or driver invariant broken."
+            "Database insert did not produce a row id — schema or driver invariant broken."
         case let .eventPayloadDecodingFailed(eventId, batchId, eventType, underlying):
-            return "Cannot decode event \(eventId.map(String.init) ?? "unknown") (\(eventType.rawValue)) in batch \(batchId): \(underlying)"
+            "Cannot decode event \(eventId.map(String.init) ?? "unknown") (\(eventType.rawValue)) in batch \(batchId): \(underlying)"
         case .payloadEncodingFailed:
-            return "Could not encode mutation payload as UTF-8 JSON."
+            "Could not encode mutation payload as UTF-8 JSON."
         case let .seratoEnumerationFailed(directory, underlying):
-            return "Failed to enumerate Serato crate files in \(directory): \(underlying)"
+            "Failed to enumerate Serato crate files in \(directory): \(underlying)"
         case let .seratoRewriteFailed(path, underlying):
-            return "Failed to rewrite Serato library file \(path): \(underlying)"
+            "Failed to rewrite Serato library file \(path): \(underlying)"
         case let .fileTagWriteFailed(path, underlying):
-            return "Failed to write audio tags to \(path): \(underlying)"
+            "Failed to write audio tags to \(path): \(underlying)"
         case let .trashFailed(path, underlying):
-            return "Failed to move \(path) to Trash: \(underlying)"
+            "Failed to move \(path) to Trash: \(underlying)"
         case let .batchNotFound(batchId):
-            return "No events were found for batch \(batchId); nothing to undo."
+            "No events were found for batch \(batchId); nothing to undo."
         case let .undoNotSupported(eventType):
-            return "Events of type \(eventType.rawValue) can't be undone yet."
+            "Events of type \(eventType.rawValue) can't be undone yet."
         case let .missingPreviousTrackIdentifiers(fileId):
-            return "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
+            "Cannot revert MusicBrainz match for file id \(fileId): the pre-existing track row has no previous identifiers snapshot to restore."
         case let .fingerprintRecordingConflict(fileId, existingMBID, incomingMBID):
-            return "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
+            "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
-            return "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
+            "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
         case let .externalSyncIncomplete(batchId, underlying):
-            return "Batch \(batchId) was applied, but some Serato/file writes did not land: \(underlying). Re-sync the batch to finish applying them."
+            "Batch \(batchId) was applied, but some Serato/file writes did not land: \(underlying). Re-sync the batch to finish applying them."
         }
     }
 }

@@ -161,7 +161,7 @@ private final class FingerprintBacklogFixture: @unchecked Sendable {
         let sampleRate = 44100
         let sampleCount = sampleRate * 120
         var bytes = Data()
-        func append<Value: FixedWidthInteger>(_ value: Value) {
+        func append(_ value: some FixedWidthInteger) {
             var encoded = value.littleEndian
             withUnsafeBytes(of: &encoded) { raw in bytes.append(contentsOf: raw) }
         }

@@ -19,7 +19,7 @@ import os.log
 /// Serato quits — same operation in both contexts.
 public actor LibraryScanner {
     public struct ScanProgress: Sendable, Equatable {
-        public var completedFileCount: Int? = nil
+        public var completedFileCount: Int?
         public let seratoReferenceCount: Int
         public let filesIndexed: Int
         public let filesMetadataUpdated: Int
@@ -266,11 +266,10 @@ public actor LibraryScanner {
         } else {
             files = try await FileRecord.loadIdentityProjections(database: database)
         }
-        let analysis: SeratoConflictAnalysis
-        if let suppliedAnalysis {
-            analysis = suppliedAnalysis
+        let analysis: SeratoConflictAnalysis = if let suppliedAnalysis {
+            suppliedAnalysis
         } else {
-            analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+            try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
         }
         try analysis.validate(snapshot)
         try await reader.validate(snapshot)

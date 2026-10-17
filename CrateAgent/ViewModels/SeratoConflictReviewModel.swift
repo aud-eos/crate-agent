@@ -33,7 +33,7 @@ final class SeratoConflictReviewModel: ObservableObject {
             guard let self else { return }
             self.conflicts = conflicts
             if !conflicts.contains(where: { conflict in conflict.id == self.selectedConflictID }) {
-                self.selectedConflictID = conflicts.first?.id
+                selectedConflictID = conflicts.first?.id
             }
         }.store(in: &subscriptions)
         session.$conflictsAreStale.assign(to: &$isStale)
@@ -90,11 +90,10 @@ final class SeratoConflictReviewModel: ObservableObject {
             case .inaccessible, .offline, .unknown, .failed: uncertain = true
             }
         }
-        let diagnosis: String
-        switch identities.count {
-        case 0: diagnosis = "No live file was verified. Do not assume the audio is deleted."
-        case 1: diagnosis = "The verified references resolve to one physical file. Preserve its audio and your preferred metadata and crate memberships."
-        default: diagnosis = "The references resolve to distinct physical files. Inspect each file before choosing which library references to retain."
+        let diagnosis = switch identities.count {
+        case 0: "No live file was verified. Do not assume the audio is deleted."
+        case 1: "The verified references resolve to one physical file. Preserve its audio and your preferred metadata and crate memberships."
+        default: "The references resolve to distinct physical files. Inspect each file before choosing which library references to retain."
         }
         return diagnosis + (uncertain ? " Some locations could not be inspected. Restore access before deciding an entry is stale." : "")
     }

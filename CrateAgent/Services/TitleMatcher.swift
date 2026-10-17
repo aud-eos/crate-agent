@@ -172,11 +172,7 @@ public enum TitleMatcher {
     private static func trailingDashSegment(in title: String) -> String? {
         guard let lastNonWhitespaceCharacter = title.trimmingCharacters(in: .whitespaces).last,
               lastNonWhitespaceCharacter != ")",
-              lastNonWhitespaceCharacter != "]"
-        else {
-            return nil
-        }
-        guard let regex = try? NSRegularExpression(pattern: #"\s[-–]\s+(.+)$"#) else { return nil }
+              lastNonWhitespaceCharacter != "]", let regex = try? NSRegularExpression(pattern: #"\s[-–]\s+(.+)$"#) else { return nil }
         let range = NSRange(title.startIndex..., in: title)
         guard let match = regex.firstMatch(in: title, range: range),
               match.numberOfRanges > 1,

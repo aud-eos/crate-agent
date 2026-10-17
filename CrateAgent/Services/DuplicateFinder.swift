@@ -23,15 +23,14 @@ import Foundation
 ///   (`fingerprint_status = 'done'`); pending / failed rows are
 ///   excluded from perceptual grouping.
 public enum DuplicateFinder {
-
     public enum Mode: String, Sendable, Equatable, CaseIterable {
         case byteLevel
         case perceptual
 
         public var displayName: String {
             switch self {
-            case .byteLevel: return "Byte-level"
-            case .perceptual: return "Perceptual"
+            case .byteLevel: "Byte-level"
+            case .perceptual: "Perceptual"
             }
         }
     }
@@ -44,8 +43,13 @@ public enum DuplicateFinder {
         public let mode: Mode
         public let files: [FileRecord]
 
-        public var id: String { "\(mode.rawValue):\(groupKey)" }
-        public var size: Int { files.count }
+        public var id: String {
+            "\(mode.rawValue):\(groupKey)"
+        }
+
+        public var size: Int {
+            files.count
+        }
     }
 
     /// Find groups according to `mode`. Files that don't have the
@@ -76,7 +80,9 @@ public enum DuplicateFinder {
             // Sort groups by descending size then by groupKey for
             // a deterministic, "biggest issues first" layout.
             .sorted { lhs, rhs in
-                if lhs.size != rhs.size { return lhs.size > rhs.size }
+                if lhs.size != rhs.size {
+                    return lhs.size > rhs.size
+                }
                 return lhs.groupKey < rhs.groupKey
             }
     }

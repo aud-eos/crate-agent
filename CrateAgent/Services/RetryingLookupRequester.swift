@@ -115,9 +115,9 @@ public struct RetryingLookupRequester: Sendable {
         case .notConnectedToInternet, .cannotFindHost, .cannotConnectToHost,
              .dnsLookupFailed, .networkConnectionLost,
              .dataNotAllowed, .internationalRoamingOff:
-            return true
+            true
         default:
-            return false
+            false
         }
     }
 
@@ -159,7 +159,8 @@ public struct RetryingLookupRequester: Sendable {
             guard let date = formatter.date(from: value) else { continue }
             if index == 1,
                let futureLimit = calendar.date(byAdding: .year, value: 50, to: referenceDate),
-               date > futureLimit {
+               date > futureLimit
+            {
                 return calendar.date(byAdding: .year, value: -100, to: date)
             }
             return date

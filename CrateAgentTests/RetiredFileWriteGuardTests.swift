@@ -101,11 +101,10 @@ final class RetiredFileWriteGuardTests: XCTestCase {
                     }
                 }
                 fixture.closeSerato()
-                let outcome: ResyncOutcome
-                if bulk {
-                    outcome = try await fixture.engine.resyncSeratoForBatch("race")
+                let outcome: ResyncOutcome = if bulk {
+                    try await fixture.engine.resyncSeratoForBatch("race")
                 } else {
-                    outcome = try await fixture.engine.drainPendingSeratoUpdates()
+                    try await fixture.engine.drainPendingSeratoUpdates()
                 }
                 await fulfillment(of: [mutationCommitted], timeout: 10)
                 XCTAssertEqual(outcome.appliedCount, 0)
@@ -256,13 +255,12 @@ final class RetiredFileWriteGuardTests: XCTestCase {
             }
             let v2Before = try Data(contentsOf: v2URL)
             let crateBefore = try Data(contentsOf: fixture.crate)
-            let mutation: TrackMutation
-            switch variant {
-            case "add": mutation = .addTrackToSerato(AddTrackToSeratoPayload(fileId: fixture.fileID, metadata: SeratoMetadata(title: "stale")))
-            case "rename": mutation = .renameFile(RenameFilePayload(fileId: fixture.fileID, newPath: fixture.root.appendingPathComponent("renamed.mp3").path))
-            case "remove": mutation = .removeTrackFromSerato(RemoveTrackFromSeratoPayload(fileId: fixture.fileID))
-            case "crates": mutation = .removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fixture.fileID))
-            default: mutation = .trashFile(TrashFilePayload(fileId: fixture.fileID))
+            let mutation: TrackMutation = switch variant {
+            case "add": .addTrackToSerato(AddTrackToSeratoPayload(fileId: fixture.fileID, metadata: SeratoMetadata(title: "stale")))
+            case "rename": .renameFile(RenameFilePayload(fileId: fixture.fileID, newPath: fixture.root.appendingPathComponent("renamed.mp3").path))
+            case "remove": .removeTrackFromSerato(RemoveTrackFromSeratoPayload(fileId: fixture.fileID))
+            case "crates": .removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fixture.fileID))
+            default: .trashFile(TrashFilePayload(fileId: fixture.fileID))
             }
             try await fixture.engine.apply(mutation, batchId: variant)
             try await fixture.transition(.retired)

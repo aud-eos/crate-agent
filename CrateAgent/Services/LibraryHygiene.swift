@@ -63,7 +63,7 @@ public enum LibraryHygiene {
     /// Internal whitespace is preserved — "Aphex   Twin" (collapsed
     /// double-space) is a separate concern (case/style normalization)
     /// and lives in a future analyzer.
-    public static func findWhitespaceIssues<F: HygieneFileSource>(in files: [F]) -> [WhitespaceIssue] {
+    public static func findWhitespaceIssues(in files: [some HygieneFileSource]) -> [WhitespaceIssue] {
         var issues: [WhitespaceIssue] = []
         for file in files {
             guard let fileId = file.id else { continue }
@@ -131,8 +131,8 @@ public enum LibraryHygiene {
     /// shows the user exactly what will land if they apply.
     /// Empty find string returns no matches (avoids the "match
     /// everything, rewrite to nothing" footgun).
-    public static func findAndReplaceMatches<F: HygieneFileSource>(
-        in files: [F],
+    public static func findAndReplaceMatches(
+        in files: [some HygieneFileSource],
         query: FindAndReplaceQuery
     ) -> [FindAndReplaceMatch] {
         guard !query.find.isEmpty else { return [] }
@@ -165,8 +165,8 @@ public enum LibraryHygiene {
     /// the find/replace matches that apply to it. Mirrors
     /// `mergedTrimmedMetadata` so the runner reuses one mutation
     /// per file regardless of how many fields matched.
-    public static func mergedFindReplaceMetadata<F: HygieneFileSource>(
-        forFile file: F,
+    public static func mergedFindReplaceMetadata(
+        forFile file: some HygieneFileSource,
         matches: [FindAndReplaceMatch]
     ) -> SeratoMetadata {
         var artist = file.artist
@@ -247,16 +247,15 @@ public enum LibraryHygiene {
     /// casings. Returns one CaseInconsistencyGroup per field × per
     /// case-insensitive value with >1 variant; groups with a single
     /// consistent spelling are not reported (nothing to fix).
-    public static func findCaseInconsistencies<F: HygieneFileSource>(
-        in files: [F]
+    public static func findCaseInconsistencies(
+        in files: [some HygieneFileSource]
     ) -> [CaseInconsistencyGroup] {
         var groups: [CaseInconsistencyGroup] = []
         for field in SeratoMetadataField.allCases {
             // (lowercased key) -> (cased spelling -> [fileId])
             var bucketed: [String: [String: [Int64]]] = [:]
             for file in files {
-                guard let fileId = file.id else { continue }
-                guard let raw = field.read(from: file), !raw.isEmpty else { continue }
+                guard let fileId = file.id, let raw = field.read(from: file), !raw.isEmpty else { continue }
                 let key = raw.lowercased()
                 bucketed[key, default: [:]][raw, default: []].append(fileId)
             }
@@ -328,8 +327,7 @@ public enum LibraryHygiene {
             guard let canonical = canonicalFor(group) else { continue }
             for variant in group.variants where variant.value != canonical {
                 for fileId in variant.fileIds {
-                    guard let file = filesById[fileId] else { continue }
-                    guard let raw = group.field.read(from: file) else { continue }
+                    guard let file = filesById[fileId], let raw = group.field.read(from: file) else { continue }
                     if raw == variant.value {
                         fixes.append(CaseFix(
                             fileId: fileId,
@@ -383,8 +381,8 @@ public enum LibraryHygiene {
 
     /// Roll up the count of missing rows per field. One pass over
     /// the file list; cheap enough to run on every tab activation.
-    public static func missingFieldSummaries<F: HygieneFileSource>(
-        in files: [F]
+    public static func missingFieldSummaries(
+        in files: [some HygieneFileSource]
     ) -> [MissingFieldSummary] {
         var counts: [SeratoMetadataField: Int] = [:]
         for file in files {
@@ -405,13 +403,12 @@ public enum LibraryHygiene {
     /// Detailed list of every file missing the specified field.
     /// Used to render the preview list once the user has picked a
     /// field to fill. Sorted by path for deterministic UI ordering.
-    public static func missingFieldEntries<F: HygieneFileSource>(
+    public static func missingFieldEntries(
         forField field: SeratoMetadataField,
-        in files: [F]
+        in files: [some HygieneFileSource]
     ) -> [MissingFieldEntry] {
         files.compactMap { file -> MissingFieldEntry? in
-            guard let fileId = file.id else { return nil }
-            guard isMissing(field.read(from: file)) else { return nil }
+            guard let fileId = file.id, isMissing(field.read(from: file)) else { return nil }
             return MissingFieldEntry(fileId: fileId, path: file.path, field: field)
         }
         .sorted { $0.path < $1.path }
@@ -420,8 +417,8 @@ public enum LibraryHygiene {
     /// Compose the SeratoMetadata snapshot for one file when filling
     /// in a missing field. Sets exactly one field on the otherwise-
     /// preserved snapshot.
-    public static func mergedMissingFieldMetadata<F: HygieneFileSource>(
-        forFile file: F,
+    public static func mergedMissingFieldMetadata(
+        forFile file: some HygieneFileSource,
         field: SeratoMetadataField,
         value: String
     ) -> SeratoMetadata {
@@ -455,8 +452,8 @@ public enum LibraryHygiene {
     /// Compose the SeratoMetadata snapshot for one file given the
     /// case fixes against it. Same shape as the other mergedXxx
     /// helpers so the runner can route through `applyMergedMetadata`.
-    public static func mergedCaseMetadata<F: HygieneFileSource>(
-        forFile file: F,
+    public static func mergedCaseMetadata(
+        forFile file: some HygieneFileSource,
         fixes: [CaseFix]
     ) -> SeratoMetadata {
         var artist = file.artist
@@ -492,8 +489,8 @@ public enum LibraryHygiene {
     /// given the issues against it. Used by the runner to compose
     /// one `setMetadata` payload per file regardless of how many
     /// fields needed trimming.
-    public static func mergedTrimmedMetadata<F: HygieneFileSource>(
-        forFile file: F,
+    public static func mergedTrimmedMetadata(
+        forFile file: some HygieneFileSource,
         issues: [WhitespaceIssue]
     ) -> SeratoMetadata {
         var artist = file.artist
@@ -546,17 +543,17 @@ public enum SeratoMetadataField: String, CaseIterable, Sendable {
     case length
     case label
 
-    public func read<F: HygieneFileSource>(from file: F) -> String? {
+    public func read(from file: some HygieneFileSource) -> String? {
         switch self {
-        case .artist: return file.artist
-        case .title: return file.title
-        case .album: return file.album
-        case .genre: return file.genre
-        case .bpm: return file.bpm
-        case .musicalKey: return file.musicalKey
-        case .comment: return file.comment
-        case .length: return file.length
-        case .label: return file.label
+        case .artist: file.artist
+        case .title: file.title
+        case .album: file.album
+        case .genre: file.genre
+        case .bpm: file.bpm
+        case .musicalKey: file.musicalKey
+        case .comment: file.comment
+        case .length: file.length
+        case .label: file.label
         }
     }
 
@@ -565,15 +562,15 @@ public enum SeratoMetadataField: String, CaseIterable, Sendable {
     /// settings preview.
     public var displayName: String {
         switch self {
-        case .artist: return "Artist"
-        case .title: return "Title"
-        case .album: return "Album"
-        case .genre: return "Genre"
-        case .bpm: return "BPM"
-        case .musicalKey: return "Key"
-        case .comment: return "Comment"
-        case .length: return "Length"
-        case .label: return "Label"
+        case .artist: "Artist"
+        case .title: "Title"
+        case .album: "Album"
+        case .genre: "Genre"
+        case .bpm: "BPM"
+        case .musicalKey: "Key"
+        case .comment: "Comment"
+        case .length: "Length"
+        case .label: "Label"
         }
     }
 }
@@ -785,9 +782,9 @@ public actor LibraryHygieneRunner {
     ///
     /// All three carry the pre-fix `previousMetadata` so each is
     /// individually invertible — see the matching engine extensions.
-    private func applyMergedMetadata<F: HygieneFileSource>(
+    private func applyMergedMetadata(
         fileId: Int64,
-        file: F,
+        file: some HygieneFileSource,
         merged: SeratoMetadata,
         batchId: String
     ) async throws {

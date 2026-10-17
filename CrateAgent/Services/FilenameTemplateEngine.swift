@@ -63,7 +63,7 @@ public enum FilenameTemplateEngine {
             let char = template[index]
             if char == "$" {
                 let after = template.index(after: index)
-                if after < template.endIndex && template[after] == "$" {
+                if after < template.endIndex, template[after] == "$" {
                     // Literal `$$` -> `$`. Matches Beets / shell convention.
                     output.append("$")
                     index = template.index(after: after)
@@ -116,17 +116,16 @@ public enum FilenameTemplateEngine {
             return sanitize(fileExtension)
         }
         guard let field = metadataFieldsByIdentifier[identifier] else { return "" }
-        let rawValue: String?
-        switch field {
-        case .artist: rawValue = metadata.artist
-        case .title: rawValue = metadata.title
-        case .album: rawValue = metadata.album
-        case .genre: rawValue = metadata.genre
-        case .bpm: rawValue = metadata.bpm
-        case .musicalKey: rawValue = metadata.musicalKey
-        case .comment: rawValue = metadata.comment
-        case .label: rawValue = metadata.label
-        case .length: rawValue = metadata.length
+        let rawValue: String? = switch field {
+        case .artist: metadata.artist
+        case .title: metadata.title
+        case .album: metadata.album
+        case .genre: metadata.genre
+        case .bpm: metadata.bpm
+        case .musicalKey: metadata.musicalKey
+        case .comment: metadata.comment
+        case .label: metadata.label
+        case .length: metadata.length
         }
         return sanitize(rawValue ?? "")
     }

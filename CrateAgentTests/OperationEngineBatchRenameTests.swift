@@ -9,7 +9,7 @@ final class OperationEngineBatchRenameTests: XCTestCase {
         defer { fixture.cleanup() }
         var files: [FileRecord] = []
         for filename in ["one.mp3", "two.mp3", "three.mp3"] {
-            try files.append(await fixture.add(filename))
+            try await files.append(fixture.add(filename))
         }
         try fixture.save(paths: files.map { SeratoLibraryLocator.seratoRelativePath(fromAbsolute: $0.path) })
         let destinations = files.map { fixture.directory.appendingPathComponent("moved").appendingPathComponent(($0.path as NSString).lastPathComponent).path }

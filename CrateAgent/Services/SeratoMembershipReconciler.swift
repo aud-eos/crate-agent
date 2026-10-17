@@ -9,7 +9,7 @@ struct ReconciliationSummary: Sendable, Equatable {
     var supersededWrites: Int = 0
     var pathConflictCount: Int = 0
     var conflictBlockedWriteCount: Int = 0
-    var duplicateCleanupMessage: String? = nil
+    var duplicateCleanupMessage: String?
 }
 
 enum SeratoReconciliationError: LocalizedError {
@@ -19,8 +19,8 @@ enum SeratoReconciliationError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .ambiguousIdentity(path):
-            return "Cannot safely associate \(path) with one indexed file. Resolve duplicate paths or identities in Serato, then retry sync."
-        case .alreadyReconciling: return "Library reconciliation is already running. Retry after it finishes."
+            "Cannot safely associate \(path) with one indexed file. Resolve duplicate paths or identities in Serato, then retry sync."
+        case .alreadyReconciling: "Library reconciliation is already running. Retry after it finishes."
         }
     }
 }
@@ -70,17 +70,15 @@ actor SeratoMembershipReconciler {
         try await reader.validate(snapshot)
         let savedPaths = Set(snapshot.records.map { record in SeratoPath.normalized(record.path) })
         let directAuthorization = suppliedAnalysis == nil ? await operationEngine.captureConflictScope() : nil
-        let files: [FileRecord]
-        if let plan {
-            files = plan.indexedFiles
+        let files: [FileRecord] = if let plan {
+            plan.indexedFiles
         } else {
-            files = try await FileRecord.loadIdentityProjections(database: database)
+            try await FileRecord.loadIdentityProjections(database: database)
         }
-        let analysis: SeratoConflictAnalysis
-        if let suppliedAnalysis {
-            analysis = suppliedAnalysis
+        let analysis: SeratoConflictAnalysis = if let suppliedAnalysis {
+            suppliedAnalysis
         } else {
-            analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+            try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
         }
         try analysis.validate(snapshot)
         try await reader.validate(snapshot)
@@ -141,7 +139,7 @@ actor SeratoMembershipReconciler {
                 if saved {
                     membership = .active
                 } else if membership != .pendingImport, !ownedRemoval,
-                          try !(await hasApplicableRename(file, observedAvailability: observed, savedPaths: savedPaths))
+                          try await !hasApplicableRename(file, observedAvailability: observed, savedPaths: savedPaths)
                 {
                     membership = .retired
                 }
@@ -197,8 +195,7 @@ actor SeratoMembershipReconciler {
         var moves: [Int64: FileMetadata] = [:]
         for path in paths.sorted() where byPath[path] == nil {
             try Task.checkCancellation()
-            guard scope.conflictingPath(for: SeratoConflictTarget(paths: [path])) == nil else { continue }
-            guard let basic = FileMetadataCollector.collect(at: path),
+            guard scope.conflictingPath(for: SeratoConflictTarget(paths: [path])) == nil, let basic = FileMetadataCollector.collect(at: path),
                   try availability.inspect(path: path, volumeID: basic.volumeUuid) == .available else { continue }
             let identity = try FileMetadataCollector.collectVerified(at: path)
             guard scope.conflictingPath(for: SeratoConflictTargets.identity(identity)) == nil else { continue }

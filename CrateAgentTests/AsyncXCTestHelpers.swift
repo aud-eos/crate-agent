@@ -4,8 +4,8 @@ import XCTest
 /// take an `async throws` autoclosure. Shared across lookup-client test
 /// files (`AcoustIDClientTests`, `MusicBrainzClientTests`) rather than
 /// duplicated per file.
-func XCTAssertThrowsErrorAsync<T>(
-    _ expression: @autoclosure () async throws -> T,
+func XCTAssertThrowsErrorAsync(
+    _ expression: @autoclosure () async throws -> some Any,
     file: StaticString = #filePath,
     line: UInt = #line,
     _ errorHandler: (Error) -> Void = { _ in }

@@ -175,8 +175,8 @@ final class AutoTagSession: ObservableObject {
                 }
                 for try await files in observation.values(in: database.writer) {
                     guard !Task.isCancelled, let self else { return }
-                    self.membershipFiles = Dictionary(uniqueKeysWithValues: files.compactMap { file in file.id.map { ($0, file) } })
-                    self.updateProcessingErrors()
+                    membershipFiles = Dictionary(uniqueKeysWithValues: files.compactMap { file in file.id.map { ($0, file) } })
+                    updateProcessingErrors()
                 }
             } catch { self?.actionError = "Could not verify library membership: \(error.localizedDescription)" }
         }

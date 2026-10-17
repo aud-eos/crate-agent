@@ -19,7 +19,7 @@ struct AutoTagSelectionRow: View, Equatable {
     let title: String?
     var libraryMembership: LibraryMembership = .legacyUnverified
     var fileAvailability: FileAvailability = .unknown
-    var processingBlockReason: String? = nil
+    var processingBlockReason: String?
     let isSelected: Bool
     let onToggle: () -> Void
 

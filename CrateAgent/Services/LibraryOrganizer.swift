@@ -57,7 +57,7 @@ public actor LibraryOrganizer {
         let id: Int64
         let missingFields: [SeratoMetadataField]
         let isOutsideMusicFolder: Bool
-        var conflictReason: String? = nil
+        var conflictReason: String?
     }
 
     struct Preview: Sendable {
@@ -80,11 +80,11 @@ public actor LibraryOrganizer {
         public var errorDescription: String? {
             switch self {
             case .noPlans:
-                return "Nothing to organize — every file is already in its canonical location."
+                "Nothing to organize — every file is already in its canonical location."
             case .sourceNoLongerExists:
-                return "Source file no longer exists."
+                "Source file no longer exists."
             case .destinationAlreadyExists:
-                return "Destination already exists — re-scan and retry."
+                "Destination already exists — re-scan and retry."
             }
         }
     }
@@ -108,14 +108,14 @@ public actor LibraryOrganizer {
     /// `findMoves` is `nonisolated static` so the view can call it
     /// without round-tripping through the actor — pure computation,
     /// no engine access.
-    public nonisolated static func findMoves<F: HygieneFileSource>(
-        in files: [F], musicFolder: URL, template: String
+    public nonisolated static func findMoves(
+        in files: [some HygieneFileSource], musicFolder: URL, template: String
     ) -> [Plan] {
         findMoves(in: files, musicFolder: musicFolder, template: template, checkCancellation: {})
     }
 
-    public nonisolated static func findMoves<F: HygieneFileSource>(
-        in files: [F],
+    public nonisolated static func findMoves(
+        in files: [some HygieneFileSource],
         musicFolder: URL,
         template: String,
         checkCancellation: () throws -> Void
@@ -123,8 +123,8 @@ public actor LibraryOrganizer {
         try preview(in: files, musicFolder: musicFolder, template: template, checkCancellation: checkCancellation).plans
     }
 
-    nonisolated static func preview<F: HygieneFileSource>(
-        in files: [F], musicFolder: URL, template: String,
+    nonisolated static func preview(
+        in files: [some HygieneFileSource], musicFolder: URL, template: String,
         readiness: LibrarySyncReadiness? = nil,
         checkCancellation: () throws -> Void
     ) rethrows -> Preview {

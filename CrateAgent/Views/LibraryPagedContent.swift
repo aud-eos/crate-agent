@@ -11,7 +11,7 @@ struct LibraryPagedContent: View {
     @ObservedObject var model: LibraryBrowserModel
     let density: AppDensity
     let showsFilenames: Bool
-    var readiness: LibrarySyncReadiness? = nil
+    var readiness: LibrarySyncReadiness?
     let onAction: (Int64, LibraryBrowserAction) -> Void
 
     private var enabled: Bool {
@@ -59,7 +59,7 @@ struct LibraryPagedContent: View {
             table
         } else if model.isRefreshing || model.results.isLoading {
             ProgressView("Loading library…").frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if model.error == nil && model.results.error == nil {
+        } else if model.error == nil, model.results.error == nil {
             AppEmptyState(title: model.query.search.isEmpty ? "No tracks in this view" : ListControlLabels.noMatches,
                           detail: model.query.search.isEmpty ? "Import tracks or choose another library status." : ListControlLabels.resetSearch,
                           systemImage: "music.note.list")

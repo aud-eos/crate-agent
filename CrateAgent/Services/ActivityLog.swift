@@ -16,7 +16,6 @@ import Foundation
 /// dominant case (the bottom strip) only needs `latest`.
 @MainActor
 public final class ActivityLog: ObservableObject {
-
     public struct Entry: Identifiable, Equatable, Sendable {
         public let id: UUID
         public let timestamp: Date
@@ -49,13 +48,13 @@ public final class ActivityLog: ObservableObject {
 
         public var displayName: String {
             switch self {
-            case .hygiene:      return "Cleanup"
-            case .duplicate:    return "Duplicates"
-            case .rename:       return "Rename"
-            case .fingerprint:  return "Fingerprint"
-            case .sync:         return "Sync"
-            case .scan:         return "Scan"
-            case .general:      return "App"
+            case .hygiene: "Cleanup"
+            case .duplicate: "Duplicates"
+            case .rename: "Rename"
+            case .fingerprint: "Fingerprint"
+            case .sync: "Sync"
+            case .scan: "Scan"
+            case .general: "App"
             }
         }
     }

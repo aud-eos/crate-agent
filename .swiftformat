@@ -1,2 +1,5 @@
 # The XCTest helper evaluates an async autoclosure; its inner await must remain.
 --async-capturing XCTAssertThrowsErrorAsync
+--swiftversion 5.10
+# Rewrites `try await reader { ... }!` into XCTUnwrap(try ...), which cannot host the async call.
+--disable noForceUnwrapInTests

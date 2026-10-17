@@ -7,7 +7,7 @@ public enum FileLibraryStateMutationError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case let .staleRevision(fileId, expected, actual):
-            return "File \(fileId) membership changed: expected revision \(expected), found \(actual). Refresh before retrying."
+            "File \(fileId) membership changed: expected revision \(expected), found \(actual). Refresh before retrying."
         }
     }
 }
@@ -18,8 +18,8 @@ enum FileLibraryStateMutation {
                          eventType: .fileLibraryStateChanged, forwardPayload: payload, in: database)
     }
 
-    static func updateAndLog<Payload: Encodable>(_ payload: SetFileLibraryStatePayload, batchId: String, timestamp: Int64,
-                                                 startsImportIntent: Bool, eventType: EventType, forwardPayload: Payload, in database: GRDB.Database) throws -> Int64?
+    static func updateAndLog(_ payload: SetFileLibraryStatePayload, batchId: String, timestamp: Int64,
+                             startsImportIntent: Bool, eventType: EventType, forwardPayload: some Encodable, in database: GRDB.Database) throws -> Int64?
     {
         guard var file = try FileRecord.fetchOne(database, key: payload.fileId) else {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)

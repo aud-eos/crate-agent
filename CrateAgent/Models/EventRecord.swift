@@ -13,8 +13,8 @@ import GRDB
 /// breaks; without the event itself, history breaks. Both fields are
 /// load-bearing per the project's event-sourcing invariant.
 public struct EventRecord: Codable, FetchableRecord, MutablePersistableRecord,
-    Hashable, Identifiable {
-
+    Hashable, Identifiable
+{
     public static let databaseTableName = "events"
     public static let databaseColumnDecodingStrategy =
         DatabaseColumnDecodingStrategy.convertFromSnakeCase
@@ -30,7 +30,9 @@ public struct EventRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var payloadJson: String
     public var inversePayloadJson: String
 
-    public var id: Int64? { eventId }
+    public var id: Int64? {
+        eventId
+    }
 
     public init(
         eventId: Int64? = nil,
@@ -63,7 +65,8 @@ public struct EventRecord: Codable, FetchableRecord, MutablePersistableRecord,
 /// stored representation; it must stay stable across releases — never
 /// rename a case after it has appeared in a shipped database.
 public enum EventType: String, Codable, DatabaseValueConvertible,
-    Hashable, Sendable {
+    Hashable, Sendable
+{
     case fileLocationObserved = "file_location_observed"
     case fileIdentityObserved = "file_identity_observed"
     case fileLibraryStateChanged = "file_library_state_changed"
@@ -99,10 +102,10 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
             // that write throws mid-`undoBatch` the file/Serato keep the applied
             // metadata with no recovery unless the reverted event can be
             // re-synced (finding #3999974011).
-            return true
+            true
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
-            return false
+            false
         }
     }
 }

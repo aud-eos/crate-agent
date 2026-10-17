@@ -247,11 +247,10 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 SyncRevisionAccounting.current?.begin(at: baseRevision)
                 let ownRevisionStart = SyncRevisionAccounting.current?.changes ?? 0
                 validationWasSuperseded = false
-                let stats: SyncStatValidation?
-                if let checkpointStore, let baseRevision, header != nil, request != .forceRefresh {
-                    stats = try await checkpointStore.validateFileStats(expectedRevision: baseRevision)
+                let stats: SyncStatValidation? = if let checkpointStore, let baseRevision, header != nil, request != .forceRefresh {
+                    try await checkpointStore.validateFileStats(expectedRevision: baseRevision)
                 } else {
-                    stats = nil
+                    nil
                 }
                 let cachedSource: SeratoSnapshotAuthorization?
                 if let header, header.watchRoots == watchRoots, request != .forceRefresh {
@@ -288,11 +287,10 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 catch SyncCheckpointError.malformed where request == .forceRefresh { checkpoint = nil }
                 catch is DecodingError where request == .forceRefresh { checkpoint = nil }
                 phase = .parsing
-                let snapshot: SeratoMembershipSnapshot
-                if cachedSource != nil, let checkpoint {
-                    snapshot = try reader.cachedSnapshot(records: checkpoint.records.map { record in try record.record() })
+                let snapshot: SeratoMembershipSnapshot = if cachedSource != nil, let checkpoint {
+                    try reader.cachedSnapshot(records: checkpoint.records.map { record in try record.record() })
                 } else {
-                    snapshot = try await reader.read()
+                    try await reader.read()
                 }
                 var validatedSnapshot = snapshot
                 var files = try await scanner.identityProjectionsForConflictAnalysis()
@@ -325,21 +323,20 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     }
                     try await operationEngine.restoreObservedSeratoMetadata(baselines, authorization: reader.authorization(for: snapshot))
                 }
-                let plan: LibraryRefreshPlan?
-                if checkpointStore != nil {
-                    plan = try await LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: stats?.validatedFileIDs ?? [])
+                let plan: LibraryRefreshPlan? = if checkpointStore != nil {
+                    try await LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: stats?.validatedFileIDs ?? [])
                         .makePlan(request: request, snapshot: snapshot, indexedFiles: files,
                                   previousRecords: checkpoint?.records.map { record in try record.record() } ?? [],
                                   dirtyFileIDs: dirty?.fileIDs ?? [], dirtyPaths: dirty?.paths ?? [], analysis: analysis)
                 } else {
-                    plan = nil
+                    nil
                 }
                 var summary = try await reconciler.reconcile(snapshot, analysis: analysis, plan: plan)
                 cumulativeChanges.retired += summary.retired
                 cumulativeChanges.reactivated += summary.reactivated
                 phase = .refreshing
                 try await refreshMetadata(snapshot, analysis: analysis, plan: plan)
-                evidence.merge(await scanner.evidenceAfterLastScan()) { _, refreshed in refreshed }
+                await evidence.merge(scanner.evidenceAfterLastScan()) { _, refreshed in refreshed }
                 try await reader.validate(snapshot)
                 try Task.checkCancellation()
                 if requested {
@@ -444,11 +441,10 @@ final class SeratoLibrarySyncSession: ObservableObject {
     }
 
     private func analyze(_ snapshot: SeratoMembershipSnapshot, authorization: LibrarySyncReadiness.Authorization, files suppliedFiles: [FileRecord]? = nil) async throws -> SeratoConflictAnalysis {
-        let files: [FileRecord]
-        if let suppliedFiles {
-            files = suppliedFiles
+        let files: [FileRecord] = if let suppliedFiles {
+            suppliedFiles
         } else {
-            files = try await scanner.identityProjectionsForConflictAnalysis()
+            try await scanner.identityProjectionsForConflictAnalysis()
         }
         let analysis = try await conflictAnalyzer.analyze(snapshot: snapshot, files: files)
         try await reader.validate(snapshot)
