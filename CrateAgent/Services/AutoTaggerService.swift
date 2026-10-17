@@ -733,6 +733,43 @@ final class AutoTaggerService: ObservableObject {
         return stale
     }
 
+    /// Confirmed payloads that would re-identify a fingerprint row another file already links to
+    /// a different recording (D-C). Evaluated in apply order against a read-only projection of the
+    /// batch, so a collision between two rows of the same batch is found too. The caller excludes
+    /// and reports these, as with `staleFileIDs`, instead of letting one collision roll back the
+    /// whole batch inside the engine's transaction.
+    func fingerprintConflictFileIDs(for payloads: [ApplyMusicBrainzMatchPayload]) async throws -> Set<Int64> {
+        guard !payloads.isEmpty else { return [] }
+        return try await database.writer.read { database in
+            var projectedRows: [Data: (track: TrackRecord, fileIDs: Set<Int64>)] = [:]
+            var conflicts: Set<Int64> = []
+            for payload in payloads {
+                var projected: (track: TrackRecord, fileIDs: Set<Int64>)
+                if let row = projectedRows[payload.fingerprintHash] {
+                    projected = row
+                } else {
+                    let track = try TrackRecord.filter(Column("fingerprint_hash") == payload.fingerprintHash).fetchOne(database)
+                    let linkedFileIDs = try track?.id.map { trackID in
+                        try Int64.fetchAll(database, FileRecord.select(Column("id")).filter(Column("track_id") == trackID))
+                    } ?? []
+                    projected = (track ?? TrackRecord(fingerprintHash: payload.fingerprintHash), Set(linkedFileIDs))
+                }
+                let otherFileIDs = projected.fileIDs.subtracting([payload.fileID])
+                guard projected.track.conflictingRecording(replacingWith: payload.recordingMBID, otherFilesReference: { !otherFileIDs.isEmpty }) == nil else {
+                    conflicts.insert(payload.fileID)
+                    continue
+                }
+                for fingerprintHash in projectedRows.keys {
+                    projectedRows[fingerprintHash]?.fileIDs.remove(payload.fileID)
+                }
+                projected.track.musicbrainzRecordingId = payload.recordingMBID
+                projected.fileIDs.insert(payload.fileID)
+                projectedRows[payload.fingerprintHash] = projected
+            }
+            return conflicts
+        }
+    }
+
     // MARK: - Database
 
     func membershipTokens(for fileIDs: [Int64]) -> [Int64: FileMembershipToken] {

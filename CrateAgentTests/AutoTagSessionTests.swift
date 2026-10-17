@@ -1,5 +1,6 @@
 import Combine
 @testable import CrateAgent
+import CryptoKit
 import GRDB
 import SwiftUI
 import XCTest
@@ -195,6 +196,31 @@ final class AutoTagSessionTests: XCTestCase {
         XCTAssertTrue(fixture.session.confirmedFileIDs.isEmpty)
         XCTAssertEqual(fixture.session.appliedFileIDs, [fixture.fileIDs[0], fixture.fileIDs[2]])
         XCTAssertTrue(fixture.session.lastResult?.contains("Skipped 1") == true)
+    }
+
+    func testApplyExcludesOnlyFingerprintCollisionsAndAppliesCleanRows() async throws {
+        let started = SessionGate()
+        let release = SessionGate()
+        await release.open()
+        let recorder = SessionApplyRecorder(started: started, release: release, failExternally: false)
+        let fixture = try SessionFixture(fileCount: 3, apply: { mutations, batchID in try await recorder.apply(mutations, batchID: batchID) })
+        let colliding = fixture.fileIDs[1]
+        try await fixture.database.writer.write { database in
+            var track = TrackRecord(fingerprintHash: Data(SHA256.hash(data: FingerprintEncoder.serialize([2]))), musicbrainzRecordingId: "already-linked")
+            try track.insert(database)
+            var dependent = FileRecord(path: "/fixture/dependent.mp3", volumeUuid: "TEST", inode: 99, fileSize: 1000, mtime: 10)
+            dependent.trackId = track.id
+            try dependent.insert(database)
+        }
+        fixture.session.selectVisibleFileIDs(fixture.fileIDs)
+        await fixture.session.startScan()
+        fixture.session.approveAllSuggested()
+        await fixture.session.applyConfirmed()
+        let applied = await recorder.fileIDsByBatch
+        XCTAssertEqual(applied, [[fixture.fileIDs[0], fixture.fileIDs[2]]])
+        XCTAssertEqual(fixture.session.confirmedFileIDs, [colliding])
+        XCTAssertTrue(fixture.session.lastResult?.contains("Skipped 1 file(s) whose fingerprint is already linked") == true,
+                      fixture.session.lastResult ?? "no result")
     }
 
     func testActualPresentationCanBeRemovedAndRecreatedDuringScan() async throws {
