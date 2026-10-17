@@ -2,7 +2,8 @@ import Foundation
 
 /// Splits one 120 s fingerprint cluster into groups of files whose decoded
 /// audio matches. A group of identical PCM is `.confirmed`; one joined by a
-/// cross-format fingerprint match is `.crossFormat` and never pre-selected.
+/// full-length fingerprint match between files whose PCM differs (another
+/// format or another encoding) is `.needsListening` and never pre-selected.
 /// Files that match no other file, or could not be decoded, are kept and
 /// never offered for cleanup.
 enum DuplicateAudioConfirmation {
@@ -55,7 +56,7 @@ enum DuplicateAudioConfirmation {
                 kept.append(Kept(file: decoded[component[0]].file, reason: .audioDiffers))
             } else {
                 let isIdentical = Set(component.map { index in decoded[index].audio.pcmDigest }).count == 1
-                confirmed.append((component.map { index in decoded[index].file }, isIdentical ? .confirmed : .crossFormat))
+                confirmed.append((component.map { index in decoded[index].file }, isIdentical ? .confirmed : .needsListening))
             }
         }
         let audioByID = decoded.reduce(into: [Int64: DuplicateAudioEvidence.DecodedAudio]()) { audio, member in

@@ -56,8 +56,9 @@ reads the file.
 
 Perceptual duplicates are checked by decoding: only files with identical decoded
 audio are offered together. Files that share a fingerprint but differ in audio,
-such as Clean and Dirty edits, are listed as kept. Copies in different formats are
-shown but never pre-selected; listen and check each one yourself.
+such as Clean and Dirty edits, are listed as kept. Copies in another format or
+encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
+listen and check each one yourself.
 
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;

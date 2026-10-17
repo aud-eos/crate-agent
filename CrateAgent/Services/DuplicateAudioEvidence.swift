@@ -19,23 +19,24 @@ public enum DuplicateAudioEvidence: Hashable, Sendable {
     public enum Relation: Sendable, Equatable {
         /// Identical decoded PCM: the only basis for pre-selecting cleanup.
         case identical
-        /// Different formats with an identical full-length fingerprint and
-        /// durations within half a second. Clean and Dirty edits can pass
-        /// this, so it is never proof: cleanup needs an explicit choice.
-        case crossFormatMatch
+        /// Different PCM (another format, or another encoding of one format)
+        /// with an identical full-length fingerprint and durations within
+        /// half a second. Clean and Dirty edits can pass this, so it is never
+        /// proof: cleanup needs an explicit choice.
+        case fingerprintMatch
         case different
     }
 
-    static let crossFormatDurationToleranceSeconds = 0.5
+    static let fingerprintMatchDurationToleranceSeconds = 0.5
 
     static func relation(_ lhs: DecodedAudio, _ rhs: DecodedAudio) -> Relation {
         if lhs.pcmDigest == rhs.pcmDigest {
             return .identical
         }
-        if lhs.format != rhs.format, lhs.fullFingerprintDigest == rhs.fullFingerprintDigest,
-           abs(lhs.durationSeconds - rhs.durationSeconds) <= crossFormatDurationToleranceSeconds
+        if lhs.fullFingerprintDigest == rhs.fullFingerprintDigest,
+           abs(lhs.durationSeconds - rhs.durationSeconds) <= fingerprintMatchDurationToleranceSeconds
         {
-            return .crossFormatMatch
+            return .fingerprintMatch
         }
         return .different
     }
@@ -47,8 +48,8 @@ enum DuplicateAudioRequirement: Sendable, Equatable {
     /// Byte-level cleanup, which matches on content hashes.
     case none
     case identical
-    /// The user explicitly selected this file in a cross-format group.
-    case identicalOrExplicitCrossFormat
+    /// The user explicitly selected this file in a group needing listening.
+    case identicalOrExplicitFingerprintMatch
 }
 
 /// The size, mtime and inode a digest was computed from.
@@ -163,7 +164,7 @@ enum AudioDigestStore {
             throw DuplicateAudioCheckError.notConfirmed(path: target.identity.path)
         }
         switch (DuplicateAudioEvidence.relation(targetAudio, keeperAudio), requirement) {
-        case (.identical, _), (.crossFormatMatch, .identicalOrExplicitCrossFormat): return
+        case (.identical, _), (.fingerprintMatch, .identicalOrExplicitFingerprintMatch): return
         default: throw DuplicateAudioCheckError.notConfirmed(path: target.identity.path)
         }
     }

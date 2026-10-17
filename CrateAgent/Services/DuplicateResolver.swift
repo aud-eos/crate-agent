@@ -96,7 +96,7 @@ public actor DuplicateResolver {
     /// may hold lightweight projections; the full rows are fetched by
     /// id here, and a row whose revision or physical identity no
     /// longer matches the reviewed one is reported as superseded.
-    /// A cross-format group trashes only `explicitlySelectedFileIDs`; every
+    /// A group needing listening trashes only `explicitlySelectedFileIDs`; every
     /// other group trashes all non-keepers.
     @discardableResult
     public func resolve(
@@ -112,13 +112,13 @@ public actor DuplicateResolver {
             guard group.mode == .byteLevel else { throw ResolverError.audioNotConfirmed }
             audioRequirement = .none
         case .confirmed: audioRequirement = .identical
-        case .crossFormat: audioRequirement = .identicalOrExplicitCrossFormat
+        case .needsListening: audioRequirement = .identicalOrExplicitFingerprintMatch
         case .checking, .differs: throw ResolverError.audioNotConfirmed
         }
 
         let reviewedTargets = group.files.compactMap { file in
             file.id.flatMap { identifier in
-                identifier == keeperId || (group.audioCheck == .crossFormat && !explicitlySelectedFileIDs.contains(identifier))
+                identifier == keeperId || (group.audioCheck == .needsListening && !explicitlySelectedFileIDs.contains(identifier))
                     ? nil : (fileID: identifier, file: file)
             }
         }

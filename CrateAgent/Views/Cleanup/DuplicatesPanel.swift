@@ -24,9 +24,9 @@ struct DuplicatesPanel: View {
     /// (DuplicateKeeperPicker.chooseDefaultKeeper). Per-group radio
     /// taps write into this dictionary.
     @State private var keeperOverrides: [String: Int64] = [:]
-    /// Per cross-format group, the files the user explicitly checked for
-    /// Trash. Cross-format groups never pre-select anything.
-    @State private var crossFormatSelections: [String: Set<Int64>] = [:]
+    /// Per group needing listening, the files the user explicitly checked
+    /// for Trash. Such groups never pre-select anything.
+    @State private var listeningSelections: [String: Set<Int64>] = [:]
     @State private var isScanning: Bool = false
     @State private var isResolving: Bool = false
     @State private var actionError: String?
@@ -246,14 +246,14 @@ struct DuplicatesPanel: View {
     }
 
     /// Files a resolve of `group` would move to Trash: every non-keeper,
-    /// or in a cross-format group only the ones the user checked.
+    /// or in a group needing listening only the ones the user checked.
     private func trashCount(for group: ScannedGroup) -> Int {
-        group.audioCheck == .crossFormat ? explicitSelection(for: group).count : max(0, group.size - 1)
+        group.audioCheck == .needsListening ? explicitSelection(for: group).count : max(0, group.size - 1)
     }
 
     private func explicitSelection(for group: ScannedGroup) -> Set<Int64> {
         guard let keeper = group.files.first(where: { file in file.id == effectiveKeeperId(for: group) }) else { return [] }
-        return (crossFormatSelections[group.id] ?? []).filter { identifier in
+        return (listeningSelections[group.id] ?? []).filter { identifier in
             guard identifier != keeper.id, let file = group.files.first(where: { file in file.id == identifier }) else { return false }
             return group.audioRelation(of: file, toKeeper: keeper) != .different
         }
@@ -279,7 +279,7 @@ struct DuplicatesPanel: View {
                     Button {
                         pendingResolveGroup = group
                     } label: {
-                        Label(group.audioCheck == .crossFormat ? "Trash \(trashCount(for: group)) selected" : "Trash \(trashCount(for: group)) copies",
+                        Label(group.audioCheck == .needsListening ? "Trash \(trashCount(for: group)) selected" : "Trash \(trashCount(for: group)) copies",
                               systemImage: "trash")
                             .labelStyle(.titleAndIcon)
                     }
@@ -292,8 +292,8 @@ struct DuplicatesPanel: View {
             if let reason = conflictReason(group) {
                 Text(reason).font(.callout).foregroundStyle(.orange)
             }
-            if group.audioCheck == .crossFormat {
-                Text("Different formats: audio can't be compared exactly. Listen before removing. Nothing here is selected for Trash until you check it.")
+            if group.audioCheck == .needsListening {
+                Text("These files sound alike but their audio isn't identical. Listen before removing. Nothing here is selected for Trash until you check it.")
                     .font(.callout)
                     .foregroundStyle(.orange)
             }
@@ -346,8 +346,8 @@ struct DuplicatesPanel: View {
             return "\(group.size) files · perceptual match · checking audio"
         case .confirmed:
             return "\(group.size) copies · perceptual match · identical audio"
-        case .crossFormat:
-            return "\(group.size) files · perceptual match · different formats"
+        case .needsListening:
+            return "\(group.size) files · perceptual match · listen before removing"
         case .differs:
             return "\(group.keptFiles.count) files · perceptual match · audio differs"
         }
@@ -429,8 +429,8 @@ struct DuplicatesPanel: View {
                     .help(file.path)
                 if isKeeper {
                     StatusBadge(title: "Keeper", systemImage: "checkmark.circle", tint: .accentColor)
-                } else if group.audioCheck == .crossFormat, let identifier = file.id {
-                    crossFormatChoice(file: file, fileID: identifier, group: group)
+                } else if group.audioCheck == .needsListening, let identifier = file.id {
+                    listeningChoice(file: file, fileID: identifier, group: group)
                 }
                 HStack(spacing: density.spacing) {
                     Text(Self.byteCountFormatter.string(fromByteCount: file.fileSize))
@@ -463,28 +463,45 @@ struct DuplicatesPanel: View {
     }
 
     @ViewBuilder
-    private func crossFormatChoice(file: DuplicateFileRow, fileID: Int64, group: ScannedGroup) -> some View {
+    private func listeningChoice(file: DuplicateFileRow, fileID: Int64, group: ScannedGroup) -> some View {
         let keeper = group.files.first { candidate in candidate.id == effectiveKeeperId(for: group) }
-        if let keeper, group.audioRelation(of: file, toKeeper: keeper) == .different {
-            Text("Audio differs from the keeper, so it can't be moved to Trash here.")
+        let relation = keeper.flatMap { keeper in group.audioRelation(of: file, toKeeper: keeper) } ?? .different
+        if relation == .different {
+            Text("Audio differs from the keeper, so it's kept.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         } else {
-            Toggle("Move to Trash", isOn: Binding(
-                get: { crossFormatSelections[group.id]?.contains(fileID) ?? false },
-                set: { isOn in
-                    var selection = crossFormatSelections[group.id] ?? []
-                    if isOn {
-                        selection.insert(fileID)
-                    } else {
-                        selection.remove(fileID)
+            let note = listeningNote(relation: relation, fileID: fileID, keeperID: keeper?.id, group: group)
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(relation == .identical ? Color.secondary : Color.orange)
+                Toggle("Move to Trash", isOn: Binding(
+                    get: { listeningSelections[group.id]?.contains(fileID) ?? false },
+                    set: { isOn in
+                        var selection = listeningSelections[group.id] ?? []
+                        if isOn {
+                            selection.insert(fileID)
+                        } else {
+                            selection.remove(fileID)
+                        }
+                        listeningSelections[group.id] = selection
                     }
-                    crossFormatSelections[group.id] = selection
-                }
-            ))
-            .toggleStyle(.checkbox)
-            .help("Different formats can't be compared exactly. Listen to both files before choosing this one.")
+                ))
+                .toggleStyle(.checkbox)
+                .help(note)
+            }
         }
+    }
+
+    private func listeningNote(relation: DuplicateAudioEvidence.Relation, fileID: Int64, keeperID: Int64?, group: ScannedGroup) -> String {
+        if relation == .identical {
+            return "Identical audio to the keeper."
+        }
+        let sameFormat = keeperID.flatMap { identifier in group.audio[identifier]?.format } == group.audio[fileID]?.format
+        return sameFormat
+            ? "Different encoding: audio isn't identical. Listen before removing."
+            : "Different formats: audio can't be compared exactly. Listen before removing."
     }
 
     @ViewBuilder
@@ -598,7 +615,7 @@ struct DuplicatesPanel: View {
             // surviving groups while pruning stale ones.
             let currentIds = Set(groups.map(\.id))
             keeperOverrides = keeperOverrides.filter { entry in currentIds.contains(entry.key) }
-            crossFormatSelections = crossFormatSelections.filter { entry in currentIds.contains(entry.key) }
+            listeningSelections = listeningSelections.filter { entry in currentIds.contains(entry.key) }
             if groups.contains(where: { group in group.audioCheck == .checking }) {
                 startAudioCheck()
             }

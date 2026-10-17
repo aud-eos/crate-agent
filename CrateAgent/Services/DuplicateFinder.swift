@@ -20,8 +20,9 @@ import GRDB
 ///   (first 120 s), then splits each cluster by decoded audio
 ///   (`DuplicateAudioEvidence.relation`). Different versions such as Clean
 ///   and Dirty edits can share a 120 s fingerprint. Identical decoded PCM
-///   is the only basis for pre-selecting cleanup; files of different formats
-///   that share a full-length fingerprint and duration are grouped but
+///   is the only basis for pre-selecting cleanup; files whose PCM differs
+///   (another format or encoding) but share a full-length fingerprint and
+///   duration are grouped for listening, but are
 ///   never pre-selected. Unmatched or undecodable files are kept. A cluster
 ///   with a digest still pending is shown as checking and offers nothing.
 ///   Only files with a finished fingerprint are clustered.
@@ -45,10 +46,10 @@ public enum DuplicateFinder {
         case checking
         /// Every file in `files` decodes to identical PCM.
         case confirmed
-        /// Files match across formats only by full-length fingerprint and
-        /// duration, which is not proof: nothing is pre-selected and each
-        /// file must be chosen explicitly.
-        case crossFormat
+        /// Some files match only by full-length fingerprint and duration
+        /// (another format or encoding), which is not proof: nothing is
+        /// pre-selected and each file must be chosen explicitly.
+        case needsListening
         /// No two files in the fingerprint cluster share their audio.
         case differs
     }
@@ -90,7 +91,7 @@ public enum DuplicateFinder {
 
         /// Whether any file here may be moved to Trash at all.
         public var offersCleanup: Bool {
-            files.count > 1 && [.notRequired, .confirmed, .crossFormat].contains(audioCheck)
+            files.count > 1 && [.notRequired, .confirmed, .needsListening].contains(audioCheck)
         }
 
         /// Whether every non-keeper is selected for Trash by default.

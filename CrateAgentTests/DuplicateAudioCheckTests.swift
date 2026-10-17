@@ -30,27 +30,33 @@ final class DuplicateAudioCheckTests: XCTestCase {
         XCTAssertEqual(checked.first?.keptFiles.map(\.reason), [.audioDiffers])
     }
 
-    func testCrossFormatMatchIsNeverPreselectedAndNeedsAnExplicitChoiceAtTheBoundary() async throws {
+    func testFingerprintMatchWithoutIdenticalPCMIsNeverPreselectedAndNeedsAnExplicitChoiceAtTheBoundary() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
         let sixteenBit = try await addFingerprinted(fixture, "master-16.wav", wav(frequency: 440, bitsPerSample: 16))
         let twentyFourBit = try await addFingerprinted(fixture, "master-24.wav", wav(frequency: 440, bitsPerSample: 24))
-        try fixture.save(paths: [sixteenBit.path, twentyFourBit.path].map(SeratoLibraryLocator.seratoRelativePath))
+        let reencoded = try await addFingerprinted(fixture, "reencode-24.wav", wav(frequency: 440, bitsPerSample: 24, lowBits: 2))
+        try fixture.save(paths: [sixteenBit.path, twentyFourBit.path, reencoded.path].map(SeratoLibraryLocator.seratoRelativePath))
         try await DuplicateAudioVerifier(database: fixture.database).verifyPendingFiles()
 
         let groups = try await perceptualGroups(fixture)
-        XCTAssertEqual(groups.map(\.audioCheck), [.crossFormat])
+        XCTAssertEqual(groups.map(\.audioCheck), [.needsListening], "Another format and another encoding of one format both need listening")
         XCTAssertEqual(groups.first?.preselectsCleanup, false)
+        let group = try XCTUnwrap(groups.first)
+        let sameFormatKeeper = try XCTUnwrap(group.files.first { file in file.id == twentyFourBit.id })
+        let sameFormatTarget = try XCTUnwrap(group.files.first { file in file.id == reencoded.id })
+        XCTAssertEqual(group.audioRelation(of: sameFormatTarget, toKeeper: sameFormatKeeper), .fingerprintMatch,
+                       "A same-format file whose PCM differs can still be chosen by hand")
 
         let trash = fixture.directory.appendingPathComponent("trash", isDirectory: true)
         try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
         let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator, fileTrasher: { path in
             try FileManager.default.moveItem(atPath: path, toPath: trash.appendingPathComponent((path as NSString).lastPathComponent).path)
         })
-        let unselected = try await engine.resolveDuplicate(target: fixture.row(twentyFourBit), keeper: fixture.row(sixteenBit),
-                                                           batchID: "cross-format-unselected", audioRequirement: .identical)
+        let unselected = try await engine.resolveDuplicate(target: fixture.row(reencoded), keeper: fixture.row(twentyFourBit),
+                                                           batchID: "fingerprint-match-unselected", audioRequirement: .identical)
         guard case .failed = unselected else { return XCTFail("Expected the boundary to refuse, got \(unselected)") }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: twentyFourBit.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reencoded.path))
     }
 
     private func addFingerprinted(_ fixture: SeratoRemovalFixture, _ name: String, _ bytes: Data) async throws -> FileRecord {
@@ -66,16 +72,17 @@ final class DuplicateAudioCheckTests: XCTestCase {
         try await fixture.database.writer.read { connection in try DuplicateFinder.findDuplicates(in: connection, mode: .perceptual) }
     }
 
-    /// Ten seconds of a mono sine. 24-bit files carry one extra low bit, so
-    /// their PCM differs from the 16-bit master while sounding the same.
+    /// Ten seconds of a mono sine. 24-bit files carry `lowBits` below the
+    /// 16-bit range, so their PCM differs from the 16-bit master, and from
+    /// each other, while sounding the same.
     /// `title` adds a RIFF INFO tag chunk.
-    private func wav(frequency: Double, bitsPerSample: Int = 16, title: String? = nil) -> Data {
+    private func wav(frequency: Double, bitsPerSample: Int = 16, lowBits: Int32 = 1, title: String? = nil) -> Data {
         let sampleRate = 44100
         let bytesPerSample = bitsPerSample / 8
         var samples = Data()
         for index in 0 ..< sampleRate * 10 {
             let value = Int32(sin(2 * Double.pi * frequency * Double(index) / Double(sampleRate)) * 20000)
-            let encoded = bitsPerSample == 24 ? (value << 8) | 1 : value
+            let encoded = bitsPerSample == 24 ? (value << 8) | lowBits : value
             samples += little(encoded).prefix(bytesPerSample)
         }
         var info = Data()
