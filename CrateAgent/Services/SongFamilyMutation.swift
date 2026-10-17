@@ -134,6 +134,7 @@ public struct SongFamilyChange: Codable, Sendable, Equatable {
 /// title, else by file name.
 public enum SongFamilyError: LocalizedError, Equatable {
     case familyNotFound
+    case familyNoLongerShown(family: String)
     case trackNotFound
     case recordingUnidentified(file: String)
     case fileRetired(file: String)
@@ -157,6 +158,8 @@ public enum SongFamilyError: LocalizedError, Equatable {
         switch self {
         case .familyNotFound:
             "This song family no longer exists."
+        case let .familyNoLongerShown(family):
+            "The song family of “\(family)” has fewer than two recordings left in the library, so it no longer shows. Group the recordings again instead."
         case .trackNotFound:
             "A chosen recording is no longer in the library."
         case let .recordingUnidentified(file):
@@ -240,7 +243,7 @@ enum SongFamilyMutation {
             return SongFamilyChange(operation: operation, familyId: familyID, before: before, after: after)
 
         case let .attach(familyID, members):
-            try requireFamily(familyID, in: database)
+            try requireLiveFamily(familyID, in: database)
             let trackIDs = try resolve(members, in: database)
             guard !trackIDs.isEmpty else { throw SongFamilyError.tooFewMembers }
             let dissolving = try familiesToDissolve(for: trackIDs, joining: familyID, batchId: batchId, in: database)
@@ -266,7 +269,7 @@ enum SongFamilyMutation {
             let merged = Set(mergedFamilyIds)
             guard !merged.isEmpty, !merged.contains(familyID) else { throw SongFamilyError.invalidMerge }
             for id in [familyID] + merged.sorted() {
-                try requireFamily(id, in: database)
+                try requireLiveFamily(id, in: database)
             }
             let before = try capture(familyIds: merged.union([familyID]), trackIds: [], in: database)
             var after = before
@@ -279,7 +282,7 @@ enum SongFamilyMutation {
         case let .split(familyID, trackIds):
             let moving = Set(trackIds)
             guard try versionKeys(of: moving, in: database).count >= 2 else { throw SongFamilyError.tooFewMembers }
-            try requireFamily(familyID, in: database)
+            try requireLiveFamily(familyID, in: database)
             var before = try capture(familyIds: [familyID], trackIds: moving, in: database)
             try requireMembers(moving, of: familyID, in: before, database: database)
             let live = try liveVersions(in: before, database: database)
@@ -299,7 +302,7 @@ enum SongFamilyMutation {
             return SongFamilyChange(operation: operation, familyId: splitID, before: before, after: after)
 
         case let .setRepresentative(familyID, trackID):
-            try requireFamily(familyID, in: database)
+            try requireLiveFamily(familyID, in: database)
             let before = try capture(familyIds: [familyID], trackIds: [], in: database)
             if let trackID {
                 try requireMembers([trackID], of: familyID, in: before, database: database)
@@ -466,6 +469,17 @@ enum SongFamilyMutation {
 
     private static func requireFamily(_ familyID: Int64, in database: GRDB.Database) throws {
         guard try SongFamilyRecord.exists(database, key: familyID) else { throw SongFamilyError.familyNotFound }
+    }
+
+    /// A family with fewer than two live versions no longer shows, so
+    /// changing it would revive it behind the user's back.
+    private static func requireLiveFamily(_ familyID: Int64, in database: GRDB.Database) throws {
+        guard let family = try SongFamilyRecord.fetchOne(database, key: familyID) else { throw SongFamilyError.familyNotFound }
+        let members = TrackRecord.filter(Column("work_id") == familyID)
+        guard try Set(versionsByTrack(members.filter(sql: liveTrackSQL), in: database).values).count >= 2 else {
+            let named = try family.representativeTrackId ?? Int64.fetchOne(database, members.select(Column("id")).order(Column("id")))
+            throw try SongFamilyError.familyNoLongerShown(family: named.map { trackID in try name(ofTrack: trackID, in: database) } ?? "Untitled recording")
+        }
     }
 
     /// The other families the recordings belong to, which the change

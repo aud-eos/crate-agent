@@ -58,7 +58,8 @@ rules:
    recordings: `create` and `split` need two versions, and a family with
    fewer than two live versions is dissolved as far as the user can tell: `family(id:)` returns nil
    and Library offers no family commands for it, while its assignments wait for
-   files to return.
+   files to return. `attach`, `merge`, `split` and `setRepresentative` refuse
+   such a family with `familyNoLongerShown` instead of reviving it.
 5. **Membership never moves silently.** Adding a recording that is already in
    the family is a no-op. A recording in another family with two or more live
    members is refused with `memberAlreadyInFamily`, which names that family's
@@ -98,8 +99,11 @@ an active, available file are preferred. Among those, the saved choice wins.
 Otherwise members are ranked in tiers:
 
 1. a title marked Main, Original or Album Version (`(Original Mix)`,
-   `[Main Version]`, `(Album Version)`);
-2. a bare title, with no version annotation;
+   `[Main Version]`, `(Album Version)`), unless the same annotation names
+   another version (`(Original Instrumental)`, `(Main Dub)`);
+2. a bare title, with no version annotation. A featured-artist credit
+   (`(feat. Wizkid)`, `(with Drake)`), a remaster note (`- 2011 Remaster`) or a
+   bare year doesn't count as one;
 3. a Dirty or Explicit edit with no other qualifier (`(Dirty)`, `[Explicit]`);
 4. anything else.
 

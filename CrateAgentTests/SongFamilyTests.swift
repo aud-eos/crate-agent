@@ -242,6 +242,26 @@ final class SongFamilyTests: XCTestCase {
         }
         try await chosen.append(service.family(id: familyID)?.representativeTrackId)
         XCTAssertEqual(chosen, [album, plain, dirty])
+
+        let featuredInstrumental = try await addTrack(title: "One Dance (feat. Wizkid) (Instrumental)", musicBrainzMatched: true)
+        let originalInstrumental = try await addTrack(title: "One Dance (Original Instrumental)", musicBrainzMatched: true)
+        let remaster = try await addTrack(title: "One Dance (feat. Wizkid) - 2011 Remaster", musicBrainzMatched: false)
+        let credited = try await service.create([.track(featuredInstrumental), .track(originalInstrumental), .track(remaster)])
+        let creditedFamily = try await service.family(id: XCTUnwrap(credited.familyId))
+        XCTAssertEqual(creditedFamily?.representativeTrackId, remaster)
+    }
+
+    func testAFamilyNoLongerShownIsRefusedRatherThanRevivedByAnAttach() async throws {
+        let tracks = try await addTracks(count: 3)
+        let created = try await service.create([.track(tracks[0]), .track(tracks[1])])
+        let familyID = try XCTUnwrap(created.familyId)
+        try await retire(file(ofTrack: tracks[1]))
+
+        await XCTAssertThrowsErrorAsync(try await service.attach([.track(tracks[2])], to: familyID)) { error in
+            XCTAssertEqual(error as? SongFamilyError, .familyNoLongerShown(family: "Version 0"))
+        }
+        let attached = try await membership(ofTrack: tracks[2])
+        XCTAssertNil(attached)
     }
 
     func testARecordingLeftAloneInItsFamilyCanBeRegroupedAndUndoRestoresThatFamily() async throws {
