@@ -69,7 +69,14 @@ hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE /path/to/tas
 mkdir -p /private/tmp/crate-agent-task6-volume
 hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume -nobrowse
 touch /private/tmp/crate-agent-task6-volume/.task6-test-volume
+touch /private/tmp/crate-agent-task6-volume/.trash-seed
+swift -e 'import Foundation; try FileManager.default.trashItem(at: URL(fileURLWithPath: CommandLine.arguments[1]), resultingItemURL: nil)' \
+  /private/tmp/crate-agent-task6-volume/.trash-seed
 ```
+
+The last step creates the volume's `.Trashes/<uid>`. On a fresh volume,
+`FileManager.url(for: .trashDirectory, …, create: true)` fails with "feature not
+supported" until a native trash has created that directory.
 
 Tests trash files only into that volume's own `.Trashes`, never the user's Trash.
 The mount is machine-wide, so it un-skips these tests for every concurrent suite;
