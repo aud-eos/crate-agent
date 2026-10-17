@@ -33,6 +33,8 @@ pub enum TagError {
     Read(String),
     #[error("could not write tags: {0}")]
     Write(String),
+    #[error("year {0} is outside the writable range")]
+    InvalidYear(u32),
 }
 
 /// Tag fields extracted from an audio file. All fields are optional —
@@ -166,7 +168,7 @@ pub fn write_tags(path: impl AsRef<Path>, update: &AudioTagUpdate) -> Result<(),
         .primary_tag_mut()
         .expect("primary tag was inserted above if it didn't exist");
 
-    apply_update_to_tag(tag, update);
+    apply_update_to_tag(tag, update)?;
 
     let opts = WriteOptions::new().remove_others(true);
     tagged_file
@@ -178,7 +180,7 @@ pub fn write_tags(path: impl AsRef<Path>, update: &AudioTagUpdate) -> Result<(),
 
 /// Pull-out so the apply logic is unit-testable against a free-
 /// standing `Tag` without needing real file I/O.
-fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) {
+fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) -> Result<(), TagError> {
     if let Some(value) = &update.artist {
         tag.set_artist(value.clone());
     }
@@ -209,9 +211,7 @@ fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) {
         // added value in place (which `year: None` would do).
         tag.remove_date();
     } else if let Some(year) = update.year {
-        // `Timestamp::year` is a `u16`; release years never approach that
-        // range, but clamp rather than panic on an out-of-range input.
-        let year = u16::try_from(year).unwrap_or(u16::MAX);
+        let year = u16::try_from(year).map_err(|_| TagError::InvalidYear(year))?;
         // Edit ONLY the year component: start from the file's existing date so
         // a full recording date like `1994-05-09` keeps its month/day when the
         // user applies a different year. Rebuilding from `Timestamp::default()`
@@ -225,6 +225,7 @@ fn apply_update_to_tag(tag: &mut Tag, update: &AudioTagUpdate) {
         timestamp.year = year;
         tag.set_date(timestamp);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -422,6 +423,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_year_beyond_tag_range_without_writing() {
+        let tmpdir = std::env::temp_dir().join("crate-agent-test-reject-year");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("year.wav");
+        write_silent_wav(&path, 2).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let update = AudioTagUpdate {
+            year: Some(u32::from(u16::MAX) + 1),
+            ..AudioTagUpdate::default()
+        };
+        let result = write_tags(&path, &update);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(matches!(result, Err(TagError::InvalidYear(65_536))));
+        assert_eq!(
+            after, original,
+            "a rejected year must leave the file untouched"
+        );
+    }
+
+    #[test]
     fn writes_and_reads_year() {
         let tmpdir = std::env::temp_dir().join("crate-agent-test-write-year");
         std::fs::create_dir_all(&tmpdir).unwrap();
@@ -458,7 +482,7 @@ mod tests {
             artist: Some(String::new()),
             ..Default::default()
         };
-        apply_update_to_tag(&mut tag, &update);
+        apply_update_to_tag(&mut tag, &update).unwrap();
 
         assert!(
             tag.artist().is_none_or(|value| value.is_empty()),
@@ -484,7 +508,7 @@ mod tests {
         assert_eq!(tag.date().map(|timestamp| timestamp.year), Some(1994));
 
         // year: None must NOT clear the existing date.
-        apply_update_to_tag(&mut tag, &AudioTagUpdate::default());
+        apply_update_to_tag(&mut tag, &AudioTagUpdate::default()).unwrap();
         assert_eq!(
             tag.date().map(|timestamp| timestamp.year),
             Some(1994),

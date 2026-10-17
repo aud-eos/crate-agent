@@ -20,4 +20,9 @@ final class FingerprintEncoderTests: XCTestCase {
     func testEmptyBytesReturnNil() {
         XCTAssertNil(FingerprintEncoder.base64(fromStoredBytes: Data()))
     }
+
+    func testCorruptByteCountReturnsNilInsteadOfATruncatedFingerprint() {
+        let corrupt = FingerprintEncoder.serialize([0x0102_0304, 0x0506_0708]).dropLast()
+        XCTAssertNil(FingerprintEncoder.base64(fromStoredBytes: Data(corrupt)))
+    }
 }
