@@ -36,21 +36,22 @@ namespace crate_agent_core {
   u32 rewrite_database_path(string database_path, string old_path, string new_path);
 
   // Bulk variant: apply every rename in `renames` to `database V2` in
-  // one read + one write. Returns the total number of otrks rewritten
-  // (an otrk matching a rename in the batch counts once). For an
+  // one read + one write. Reports the number of otrks rewritten (an
+  // otrk matching a rename in the batch counts once) and each rename
+  // whose record is not at its final path afterwards. For an
   // Organize batch moving N tracks, this collapses N full reads + N
   // full writes of a multi-MB file into one of each.
   [Throws=CoreError]
-  u32 batch_rewrite_database_paths(
+  SeratoBatchWriteResult batch_rewrite_database_paths(
     string database_path,
     sequence<SeratoPathRename> renames
   );
 
   // Bulk variant of `rewrite_crate_path`. Same semantics applied
   // per-crate-file — one read + one write of the crate file regardless
-  // of how many renames apply within it.
+  // of how many renames apply within it — and the same unmatched report.
   [Throws=CoreError]
-  u32 batch_rewrite_crate_paths(
+  SeratoBatchWriteResult batch_rewrite_crate_paths(
     string crate_path,
     sequence<SeratoPathRename> renames
   );
@@ -112,11 +113,12 @@ namespace crate_agent_core {
   // side twin of `batch_rewrite_database_paths`. Used by the SP-2
   // Auto-Tag apply, which confirms many MusicBrainz matches at once;
   // each would otherwise read+rewrite the multi-MB file on its own.
-  // Returns the number of otrks actually changed.
+  // Reports the number of otrks actually changed and each requested
+  // path with no record.
   //
   // Same SeratoWatchdog gating as update_database_record.
   [Throws=CoreError]
-  u32 batch_update_database_records(
+  SeratoBatchWriteResult batch_update_database_records(
     string database_path,
     sequence<SeratoTrackMetadataUpdate> updates
   );
@@ -177,6 +179,15 @@ namespace crate_agent_core {
 dictionary SeratoPathRename {
   string old_path;
   string new_path;
+};
+
+// What a Serato batch write did. `unmatched_indices` lists, in order, the
+// position of each request whose track the file does not hold afterwards
+// (for a rename, at its final path), so "nothing to change" is
+// distinguishable from "no such track" (#105).
+dictionary SeratoBatchWriteResult {
+  u32 rewritten_count;
+  sequence<u32> unmatched_indices;
 };
 
 // One track's metadata update in a `batch_update_database_records`
@@ -285,4 +296,7 @@ interface CoreError {
   SeratoFormat(string message);
   Fingerprint(string message);
   Tag(string message);
+  // A Serato library file was replaced, but the rename may not be durable.
+  // The write landed; retrying rewrites the same bytes.
+  LandedNotDurable(string message);
 };
