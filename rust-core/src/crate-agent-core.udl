@@ -285,4 +285,7 @@ interface CoreError {
   SeratoFormat(string message);
   Fingerprint(string message);
   Tag(string message);
+  // A Serato library file was replaced, but the rename may not be durable.
+  // The write landed; retrying rewrites the same bytes.
+  LandedNotDurable(string message);
 };

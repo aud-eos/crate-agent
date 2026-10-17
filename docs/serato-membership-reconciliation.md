@@ -360,7 +360,15 @@ attempt's mark (`may_have_landed`), and an attempt never clears a mark it did no
 set. Upgrading keeps a row attempted without a recorded error as possibly landed,
 as it was read before the marker existed. A saved value matching an edit that
 never reached I/O, or whose every I/O call threw, is the user's own Serato edit
-and wins. A failed segment fails all of its rows together
+and wins. That a thrown I/O call did not land holds because every Serato
+library write (`database V2`, Subcrates and SmartCrates) replaces its file
+atomically: the bytes go to a temporary file in the same directory, which is
+flushed and then renamed over the target, so a write that throws before the
+rename leaves the previous bytes in place (#193). If only the directory flush
+after the rename fails, the writer throws `LandedNotDurable`: the new bytes are
+in place, so the engine records the I/O as returned before rethrowing, and the
+row stays visible and retries the same bytes. Each rewrite first removes
+`.crate-agent-*.tmp` files a crashed rewrite left in that directory. A failed segment fails all of its rows together
 and blocks their dependents; a row whose target becomes conflicted at the write
 boundary is blocked alone with its dependents, and the rest of the segment applies.
 

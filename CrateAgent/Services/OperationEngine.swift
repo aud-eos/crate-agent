@@ -2291,7 +2291,15 @@ public actor OperationEngine {
                 try SeratoWriteQueue.clearIOStarted(unwritten, in: database)
                 return .failure(interruption)
             }
-            let result = try operation(database, progress)
+            let result: Output
+            do { result = try operation(database, progress) }
+            catch let error as CoreError {
+                // The file was replaced; only its directory flush failed.
+                if case .LandedNotDurable = error {
+                    progress.recordReturned()
+                }
+                throw error
+            }
             if completing {
                 try Self.completeQueuedWrites(writes, locator: locator, in: database)
             }
@@ -2625,13 +2633,16 @@ public actor OperationEngine {
                 var pending = additions
                 if !FileManager.default.fileExists(atPath: databaseV2Path) {
                     try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
-                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+                    try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path), options: .atomic)
                     io.recordReturned()
                     pending.removeFirst()
                 }
                 if !pending.isEmpty {
                     _ = try addWriter(databaseV2Path, pending)
                 }
+            } catch let CoreError.LandedNotDurable(message) {
+                io.recordReturned()
+                throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: message)
             } catch {
                 throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: String(describing: error))
             }

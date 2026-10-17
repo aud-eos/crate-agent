@@ -42,6 +42,9 @@ fingerprint-core = { path = "fingerprint-core" }
 # accepts. Unified Accessor API across formats.
 lofty = "0.24"
 
+# Same-directory temporary files for atomic Serato library rewrites (#193).
+tempfile = "3.27"
+
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
 
