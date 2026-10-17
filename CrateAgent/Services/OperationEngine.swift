@@ -1543,20 +1543,6 @@ public actor OperationEngine {
             throw OperationEngineError.batchNotFound(batchId: batchId)
         }
 
-        // Out-of-order undo guard (finding #3999974010 / follow-up). A
-        // MusicBrainz match in this batch cannot be cleanly reverted if the
-        // same file was re-matched — or reverted — by a LATER event in a
-        // DIFFERENT batch: undoing it would unlink the file from its current
-        // match and rewrite its audio tags past that match. The authoritative
-        // signal is the event log, NOT the fingerprint row's identity/reference
-        // state — a same-batch sibling (a different file sharing the row) and a
-        // cross-batch re-match of THIS file (even to the same recording, a
-        // different release) leave identical row state, yet one must undo and
-        // the other must be rejected. Checked before any mutation so the atomic
-        // undo fails clean, and History surfaces it so the user undoes the
-        // newer match first (LIFO).
-        try await assertNoLaterMatchSupersedes(events: events, batchId: batchId)
-
         // Pre-decode every inverse before mutating anything. If any
         // event in the batch is non-reversible, we fail clean — no
         // partial undo state lands in the DB.
@@ -1573,6 +1559,9 @@ public actor OperationEngine {
         // one inverse hit a fileNotFound mid-loop.
         let results = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: undoBatchId) { database, moves in
             try authorization?.check()
+            // Inside the transaction that applies the inverses, so an apply
+            // that lands while undo is suspended cannot slip past it (#107).
+            try Self.requireNoLaterMatchSupersedes(events: events, in: database)
             for event in events {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
@@ -1626,7 +1615,7 @@ public actor OperationEngine {
     /// guarded symmetrically: it is rejected when a field the match touched no
     /// longer holds the value the revert restored, since redoing would write
     /// the match value back over a later edit.
-    private func assertNoLaterMatchSupersedes(events: [EventRecord], batchId _: String) async throws {
+    private static func requireNoLaterMatchSupersedes(events: [EventRecord], in db: GRDB.Database) throws {
         let matchEvents = events.filter {
             $0.eventType == .musicBrainzMatchApplied || $0.eventType == .musicBrainzMatchReverted
         }
@@ -1636,16 +1625,11 @@ public actor OperationEngine {
 
         // Per-file MATCH-event history (for the LIFO stack), plus each file's
         // CURRENT row (for the value comparison), read together.
-        let (history, currentFiles): ([EventRecord], [Int64: FileRecord]) = try await database.writer.read { db in
-            let history = try Self.fetchFileEvents(fileIDs: fileIds,
-                                                   eventTypes: [.musicBrainzMatchApplied, .musicBrainzMatchReverted], in: db)
-            let files = try Self.fetchFiles(fileIDs: fileIds, in: db)
-                .reduce(into: [Int64: FileRecord]()) { accumulator, file in
-                    if let id = file.id {
-                        accumulator[id] = file
-                    }
-                }
-            return (history, files)
+        let history = try fetchFileEvents(fileIDs: fileIds, eventTypes: [.musicBrainzMatchApplied, .musicBrainzMatchReverted], in: db)
+        let currentFiles = try fetchFiles(fileIDs: fileIds, in: db).reduce(into: [Int64: FileRecord]()) { accumulator, file in
+            if let id = file.id {
+                accumulator[id] = file
+            }
         }
         var historyByFile: [Int64: [EventRecord]] = [:]
         for event in history {
