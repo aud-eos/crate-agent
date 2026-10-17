@@ -357,13 +357,19 @@ public actor OperationEngine {
     /// any caller that produces N>1 related mutations should take —
     /// for N renames the cost goes from N writer transactions and N
     /// actor hops to one of each.
+    ///
+    /// `expectedMetadata` rejects the batch with `metadataChanged` when a
+    /// row's metadata no longer matches the snapshot the caller derived
+    /// its values from.
     @discardableResult
     public func applyBatch(
         _ mutations: [TrackMutation],
         batchId: String,
-        expectedMembershipTokens: [Int64: FileMembershipToken]? = nil
+        expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+        expectedMetadata: [Int64: SeratoMetadata] = [:]
     ) async throws -> [Int64] {
-        try await executeBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens)
+        try await executeBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
+                               expectedMetadata: expectedMetadata)
     }
 
     func applyFilesystemObservations(_ mutations: [TrackMutation], batchId: String,
@@ -409,6 +415,7 @@ public actor OperationEngine {
 
     private func executeBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
     {
@@ -419,6 +426,11 @@ public actor OperationEngine {
             try authorization?.check()
             try scopeAuthorization?.check()
             try moveExpectation?.validate(in: db)
+            for (fileID, metadata) in expectedMetadata {
+                guard try FileRecord.fetchOne(db, key: fileID)?.seratoMetadata == metadata else {
+                    throw OperationEngineError.metadataChanged(fileId: fileID)
+                }
+            }
             let results = try mutations.map { mutation in
                 if let expectedMembershipTokens, let fileID = mutation.tokenFileID {
                     guard let token = expectedMembershipTokens[fileID] else {
@@ -4105,6 +4117,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// rather than silently corrupting the current state (findings #3999114450,
     /// #3999974010). Detected from the event log in `undoBatch`.
     case undoSupersededByLaterMatch(fileId: Int64)
+    case metadataChanged(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
     /// threw afterward. Distinct from a pre-commit throw so the caller
@@ -4141,6 +4154,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
             "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
+        case let .metadataChanged(fileId):
+            "File id \(fileId) metadata changed after it was reviewed. Re-scan before applying."
         case let .externalSyncIncomplete(batchId, underlying):
             "Batch \(batchId) was applied, but some Serato/file writes did not land: \(underlying). Re-sync the batch to finish applying them."
         }
