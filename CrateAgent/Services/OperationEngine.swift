@@ -48,6 +48,13 @@ public actor OperationEngine {
     public typealias SeratoMetadataBatchWriter =
         @Sendable (_ databasePath: String, _ updates: [SeratoTrackMetadataUpdate]) throws -> UInt32
 
+    /// Injectable database-V2 add writer. Production wires in the Rust
+    /// `batchAddTracksToDatabase` FFI, which registers every queued
+    /// import in one read + write of the library. Returns the number
+    /// of otrks appended.
+    public typealias SeratoAddTrackBatchWriter =
+        @Sendable (_ databasePath: String, _ additions: [SeratoTrackAddition]) throws -> UInt32
+
     /// Injectable file-to-Trash mover. Production uses
     /// `FileManager.trashItem`; tests inject a no-op or recorder so
     /// the resolution flow can be exercised without actually moving
@@ -60,6 +67,7 @@ public actor OperationEngine {
     private let seratoLocator: SeratoLibraryLocator
     private let fileTagWriter: FileTagWriter
     private let seratoMetadataBatchWriter: SeratoMetadataBatchWriter
+    private let seratoAddTrackBatchWriter: SeratoAddTrackBatchWriter
     private let fileTrasher: FileTrasher
     private let activityLog: ActivityLog?
     private let mutationContext: MutationContext
@@ -128,6 +136,9 @@ public actor OperationEngine {
         seratoMetadataBatchWriter: @escaping SeratoMetadataBatchWriter = { databasePath, updates in
             try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
         },
+        seratoAddTrackBatchWriter: @escaping SeratoAddTrackBatchWriter = { databasePath, additions in
+            try batchAddTracksToDatabase(databasePath: databasePath, additions: additions)
+        },
         fileTrasher: @escaping FileTrasher = { path in
             let url = URL(fileURLWithPath: path)
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
@@ -141,6 +152,7 @@ public actor OperationEngine {
         self.seratoLocator = seratoLocator
         self.fileTagWriter = fileTagWriter
         self.seratoMetadataBatchWriter = seratoMetadataBatchWriter
+        self.seratoAddTrackBatchWriter = seratoAddTrackBatchWriter
         self.fileTrasher = fileTrasher
         self.activityLog = activityLog
         mutationContext = MutationContext(readiness: readiness, locator: seratoLocator)
@@ -1959,7 +1971,7 @@ public actor OperationEngine {
             do {
                 try await requireExternalWriteEligibility(rows)
                 try await recordAttempt(rows)
-                try await applyConsecutiveSeratoWrites(rows.map(\.write), guardedWrites: rows)
+                try await applyConsecutiveSeratoWrites(rows)
                 try await completeQueuedWrites(rows)
                 run.applied.formUnion(rows.map(\.eventId))
                 return rows
@@ -2282,33 +2294,8 @@ public actor OperationEngine {
             try await applySeratoRename(rename, guardedWrites: guardedWrites)
         case let .metadataUpdate(update):
             try await applySeratoMetadataUpdate(update, guardedWrites: guardedWrites)
-        case let .addTrack(add):
-            let scopeAuthorization = readiness?.captureScope()
-            try await applySeratoAddTrack(add, guardedWrites: guardedWrites)
-            guard let guardedWrite = guardedWrites.first else {
-                throw OperationEngineError.insertDidNotReturnRowId
-            }
-            let libraryID = try seratoLocator.supportedLibraryIdentity()
-            let context = mutationContext
-            try await database.writer.write { database in
-                guard try SeratoWriteQueue.state(of: guardedWrite, in: database) == .current, let queueID = guardedWrite.queueID else {
-                    throw ExternalWriteInterruption.stale(Set(guardedWrite.queueID.map { queueID in [queueID] } ?? []))
-                }
-                guard let file = try FileRecord.fetchOne(database, key: guardedWrite.token.fileId),
-                      SeratoWriteEligibility.permits(guardedWrite, file: file)
-                else {
-                    throw ExternalWriteInterruption.superseded([queueID])
-                }
-                try scopeAuthorization?.check()
-                _ = try Self.executeAndLog(
-                    context: context,
-                    mutation: .setFileLibraryState(.init(fileId: guardedWrite.token.fileId, expectedRevision: guardedWrite.token.revision,
-                                                         state: FileLibraryState(membership: .active, availability: file.fileAvailability, libraryID: libraryID, retiredAt: nil))),
-                    batchId: "import-confirmed:\(guardedWrite.eventId)", in: database
-                )
-                try Self.completeQueuedWrites([guardedWrite], locator: context.locator, in: database)
-                try scopeAuthorization?.check()
-            }
+        case .addTrack:
+            try await applySeratoAddTracks(guardedWrites)
         case let .fileTagWrite(write):
             try await applyFileTagWrite(write, guardedWrites: guardedWrites)
         case let .removeFromDatabase(removal):
@@ -2467,44 +2454,66 @@ public actor OperationEngine {
         }
     }
 
-    private func applySeratoAddTrack(_ add: SeratoPendingAddTrack, guardedWrites: [GuardedSeratoWrite]) async throws {
+    /// Registers every queued add in `rows` with Serato in one `database V2`
+    /// pass, then confirms each import in the same transaction, so a row
+    /// that went stale or was superseded is rejected before the write and
+    /// its siblings retry without it.
+    private func applySeratoAddTracks(_ rows: [GuardedSeratoWrite]) async throws {
+        let adds = rows.compactMap { row -> (row: GuardedSeratoWrite, add: SeratoPendingAddTrack)? in
+            guard case let .addTrack(add) = row.write else { return nil }
+            return (row, add)
+        }
+        guard let firstAdd = adds.first else { return }
         let databaseV2Path = seratoLocator.databaseV2Url.path
-        let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
-            fromAbsolute: add.absolutePath
-        )
-
         let seratoDirectory = seratoLocator.seratoDirectory
-        let bootstrapBytes = freshDatabaseV2Bytes(withTrackPath: seratoRelativePath, metadata: add.metadata)
-        do {
-            try await performExternalWrite(guardedWrites) { _ in
+        let additions = adds.map { entry in
+            SeratoTrackAddition(
+                trackPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: entry.add.absolutePath),
+                metadata: SeratoMetadataUpdate(
+                    artist: entry.add.metadata.artist,
+                    title: entry.add.metadata.title,
+                    album: entry.add.metadata.album,
+                    genre: entry.add.metadata.genre,
+                    bpm: entry.add.metadata.bpm,
+                    key: entry.add.metadata.musicalKey,
+                    comment: entry.add.metadata.comment,
+                    length: entry.add.metadata.length,
+                    label: entry.add.metadata.label
+                )
+            )
+        }
+        let bootstrapBytes = freshDatabaseV2Bytes(withTrackPath: additions[0].trackPath, metadata: firstAdd.add.metadata)
+        let addWriter = seratoAddTrackBatchWriter
+        let scopeAuthorization = readiness?.captureScope()
+        let context = mutationContext
+        try await performExternalWrite(adds.map(\.row), completing: true) { database in
+            do {
+                var pending = additions
                 if !FileManager.default.fileExists(atPath: databaseV2Path) {
                     try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
                     try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
-                    return
+                    pending.removeFirst()
                 }
-                _ = try addTrackToDatabase(
-                    databasePath: databaseV2Path,
-                    trackPath: seratoRelativePath,
-                    metadata: SeratoMetadataUpdate(
-                        artist: add.metadata.artist,
-                        title: add.metadata.title,
-                        album: add.metadata.album,
-                        genre: add.metadata.genre,
-                        bpm: add.metadata.bpm,
-                        key: add.metadata.musicalKey,
-                        comment: add.metadata.comment,
-                        length: add.metadata.length,
-                        label: add.metadata.label
-                    )
+                if !pending.isEmpty {
+                    _ = try addWriter(databaseV2Path, pending)
+                }
+            } catch {
+                throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: String(describing: error))
+            }
+            try scopeAuthorization?.check()
+            let libraryID = try context.locator.supportedLibraryIdentity()
+            for (row, _) in adds {
+                guard let file = try FileRecord.fetchOne(database, key: row.token.fileId) else {
+                    throw OperationEngineError.fileNotFound(fileId: row.token.fileId)
+                }
+                _ = try Self.executeAndLog(
+                    context: context,
+                    mutation: .setFileLibraryState(.init(fileId: row.token.fileId, expectedRevision: row.token.revision,
+                                                         state: FileLibraryState(membership: .active, availability: file.fileAvailability, libraryID: libraryID, retiredAt: nil))),
+                    batchId: "import-confirmed:\(row.eventId)", in: database
                 )
             }
-        } catch let error as ExternalWriteInterruption {
-            throw error
-        } catch {
-            throw OperationEngineError.seratoRewriteFailed(
-                path: databaseV2Path,
-                underlying: String(describing: error)
-            )
+            try scopeAuthorization?.check()
         }
     }
 
@@ -2747,10 +2756,11 @@ public actor OperationEngine {
         }
     }
 
-    /// Apply a batch's Serato writes with the two full-`database V2`
+    /// Apply a batch's Serato writes with the full-`database V2`
     /// rewrite kinds coalesced into one read+write pass each:
     ///
     /// - Renames: consecutive `.rename` runs → one `applySeratoRenameBatch`.
+    /// - Adds: consecutive `.addTrack` runs → one `applySeratoAddTracks`.
     /// - Metadata updates: EVERY `.metadataUpdate` in the batch → one
     ///   `applySeratoMetadataUpdateBatch`. A MusicBrainz match emits a
     ///   `.metadataUpdate` + `.fileTagWrite` pair per row, so the
@@ -2762,16 +2772,14 @@ public actor OperationEngine {
     ///
     /// Without this, a 200-row Auto-Tag apply would trigger 200 serial
     /// full-library `database V2` rewrites.
-    private func applyConsecutiveSeratoWrites(
-        _ writes: [SeratoPendingWrite], guardedWrites: [GuardedSeratoWrite]
-    ) async throws {
+    private func applyConsecutiveSeratoWrites(_ guardedWrites: [GuardedSeratoWrite]) async throws {
         var metadataUpdates: [SeratoPendingMetadataUpdate] = []
-        var remaining: [SeratoPendingWrite] = []
-        for write in writes {
-            if case let .metadataUpdate(update) = write {
+        var remaining: [GuardedSeratoWrite] = []
+        for row in guardedWrites {
+            if case let .metadataUpdate(update) = row.write {
                 metadataUpdates.append(update)
             } else {
-                remaining.append(write)
+                remaining.append(row)
             }
         }
 
@@ -2781,15 +2789,23 @@ public actor OperationEngine {
 
         var index = 0
         while index < remaining.count {
-            if case .rename = remaining[index] {
+            switch remaining[index].write {
+            case .rename:
                 var renames: [SeratoPendingRename] = []
-                while index < remaining.count, case let .rename(rename) = remaining[index] {
+                while index < remaining.count, case let .rename(rename) = remaining[index].write {
                     renames.append(rename)
                     index += 1
                 }
                 try await applySeratoRenameBatch(renames, guardedWrites: guardedWrites)
-            } else {
-                try await applySeratoWrite(remaining[index], guardedWrites: guardedWrites)
+            case .addTrack:
+                var adds: [GuardedSeratoWrite] = []
+                while index < remaining.count, case .addTrack = remaining[index].write {
+                    adds.append(remaining[index])
+                    index += 1
+                }
+                try await applySeratoAddTracks(adds)
+            default:
+                try await applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites)
                 index += 1
             }
         }

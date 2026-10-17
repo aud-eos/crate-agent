@@ -121,18 +121,19 @@ namespace crate_agent_core {
     sequence<SeratoTrackMetadataUpdate> updates
   );
 
-  // Append a new track to Serato's `database V2`. Used by crate-
-  // agent's drag-drop import flow to register a file with Serato
-  // without going through Serato's own UI. Returns 1 if the track
-  // was added, 0 if Serato already has it. Writes the file back if
-  // an add happened.
+  // Append tracks to Serato's `database V2`. Used by crate-agent's
+  // import flow to register files with Serato without going through
+  // Serato's own UI. Serato's existing paths are collected once, so a
+  // batch costs one pass and one read + write of the file however many
+  // tracks it adds. Additions Serato already holds (or that repeat an
+  // earlier addition) are skipped. Returns the number appended; writes
+  // the file back only if that is non-zero.
   //
   // Same SeratoWatchdog gating as update_database_record.
   [Throws=CoreError]
-  u32 add_track_to_database(
+  u32 batch_add_tracks_to_database(
     string database_path,
-    string track_path,
-    SeratoMetadataUpdate metadata
+    sequence<SeratoTrackAddition> additions
   );
 
   // Decode an audio file and return its Chromaprint perceptual
@@ -185,6 +186,13 @@ dictionary SeratoPathRename {
 dictionary SeratoTrackMetadataUpdate {
   string track_path;
   SeratoMetadataUpdate update;
+};
+
+// One track in a `batch_add_tracks_to_database` call: the
+// Serato-relative `pfil` path and the metadata its new otrk carries.
+dictionary SeratoTrackAddition {
+  string track_path;
+  SeratoMetadataUpdate metadata;
 };
 
 // Full track-level metadata extracted from a Serato `database V2`
