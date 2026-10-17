@@ -231,10 +231,32 @@ struct AutoTagReviewRow: View {
     private var recordingButton: some View {
         Button("Choose recording…", action: onChooseRecording)
             .disabled(!canChooseRecording)
-            .help("Inspect the recordings returned by this audio lookup. Changing recording resets field and release choices.")
+            .help(model.candidate.evidence.isMetadataSearch
+                ? "Inspect the recordings found by the artist/title search. Changing recording resets field and release choices."
+                : "Inspect the recordings returned by this audio lookup. Changing recording resets field and release choices.")
     }
 
+    @ViewBuilder
     private var matchExplanation: some View {
+        if case let .metadataSearch(textScore) = model.candidate.evidence {
+            VStack(alignment: .leading, spacing: density.detailSpacing) {
+                Text("Text match: \(Int((textScore * 100).rounded()))%")
+                    .font(.headline)
+                    .help(AutoTagMessages.metadataScoreHelp)
+                Label {
+                    Text(AutoTagMessages.metadataCandidateNotice)
+                } icon: {
+                    Image(systemName: "text.magnifyingglass").foregroundStyle(.orange)
+                }
+            }
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+        } else {
+            fingerprintExplanation
+        }
+    }
+
+    private var fingerprintExplanation: some View {
         VStack(alignment: .leading, spacing: density.detailSpacing) {
             Text("Audio match: \(Int(((assessment?.score ?? model.candidate.score) * 100).rounded()))%")
                 .font(.headline)

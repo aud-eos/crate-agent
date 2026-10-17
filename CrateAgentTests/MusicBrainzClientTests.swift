@@ -204,6 +204,33 @@ final class MusicBrainzClientTests: XCTestCase {
         XCTAssertNotEqual(cache.data(forKey: cacheKey), Data("not valid json".utf8), "the healthy response must be re-cached over the corrupt bytes")
     }
 
+    func testSearchSendsEscapedPhraseQueryDecodesHitsAndCachesOnlyNonEmptyResults() async throws {
+        let loader = MusicBrainzSequenceLoader(bodies: [Data(#"{"recordings":[]}"#.utf8), fixture("mb_recording_search.json")])
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory())
+
+        let empty = try await client.searchRecordings(artist: #"A "Guy""#, title: "Voodoo + Ray")
+        XCTAssertTrue(empty.isEmpty)
+        let hits = try await client.searchRecordings(artist: #"A "Guy""#, title: "Voodoo + Ray")
+        _ = try await client.searchRecordings(artist: #"A "Guy""#, title: "Voodoo + Ray")
+
+        XCTAssertEqual(loader.requests.count, 2, "An empty answer is retried; a non-empty one is served from the cache")
+        let components = try XCTUnwrap(loader.requests.first?.url.flatMap { url in URLComponents(url: url, resolvingAgainstBaseURL: false) })
+        XCTAssertEqual(components.path, "/ws/2/recording")
+        XCTAssertTrue(components.percentEncodedQuery?.contains("Voodoo%20%2B%20Ray") == true, "A literal + must not become a space")
+        XCTAssertEqual(components.queryItems?.first { item in item.name == "query" }?.value, #"recording:"Voodoo + Ray" AND artist:"A \"Guy\"""#)
+        XCTAssertEqual(hits.map(\.title), ["Voodoo Ray", "Voodoo Ray (Intro)", "Voodoo Ray (Remix)"])
+        XCTAssertEqual(hits[1].disambiguation, "DJ intro edit")
+        XCTAssertEqual(hits[0].creditedArtistName, "A Guy Called Gerald")
+    }
+
+    func testMalformedSearchBodyFailsAsTransport() async {
+        let loader = StubLoader(status: 200, body: Data(#"{"recordings":[{"title":"No identity"}]}"#.utf8))
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory(), appVersion: "1.2.3")
+        await XCTAssertThrowsErrorAsync(try await client.searchRecordings(artist: "Artist", title: "Song")) {
+            guard case .transport = $0 as? LookupError else { return XCTFail("expected .transport, got \($0)") }
+        }
+    }
+
     func testNotFoundMapsToTransportError() async {
         let loader = StubLoader(status: 404, body: Data())
         let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory(), appVersion: "1.2.3")

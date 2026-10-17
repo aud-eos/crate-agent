@@ -1,0 +1,56 @@
+{
+  "created": "2026-10-17T08:00:00.000Z",
+  "count": 3,
+  "offset": 0,
+  "recordings": [
+    {
+      "id": "0c3a2f1e-1111-4a2b-9c3d-000000000001",
+      "score": 100,
+      "title": "Voodoo Ray",
+      "length": 400000,
+      "artist-credit": [
+        {
+          "name": "A Guy Called Gerald",
+          "artist": {
+            "id": "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c",
+            "name": "A Guy Called Gerald",
+            "sort-name": "Gerald, A Guy Called"
+          }
+        }
+      ],
+      "first-release-date": "1988",
+      "releases": [
+        {
+          "id": "e2f3a4b5-2222-3333-4444-555566667777",
+          "title": "Voodoo Ray",
+          "status": "Official",
+          "release-group": { "id": "9f8e7d6c-9999-8888-7777-666655554444", "primary-type": "Single" }
+        }
+      ]
+    },
+    {
+      "id": "0c3a2f1e-1111-4a2b-9c3d-000000000002",
+      "score": 92,
+      "title": "Voodoo Ray (Intro)",
+      "disambiguation": "DJ intro edit",
+      "length": 380000,
+      "artist-credit": [
+        {
+          "name": "A Guy Called Gerald",
+          "artist": { "id": "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c", "name": "A Guy Called Gerald" }
+        }
+      ]
+    },
+    {
+      "id": "0c3a2f1e-1111-4a2b-9c3d-000000000003",
+      "score": 85,
+      "title": "Voodoo Ray (Remix)",
+      "artist-credit": [
+        {
+          "name": "A Guy Called Gerald",
+          "artist": { "id": "3d232476-51f7-4c30-8b1b-3f2f6f4d1a2c", "name": "A Guy Called Gerald" }
+        }
+      ]
+    }
+  ]
+}

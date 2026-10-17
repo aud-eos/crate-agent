@@ -10,7 +10,10 @@ import GRDB
 /// → encode it for AcoustID → read the file's full-track duration → look up
 /// AcoustID → resolve the winning recording's ID → fetch the MusicBrainz
 /// recording → assemble a `MatchCandidate` (release via `ReleaseSelector`,
-/// year via Ruling F) → classify by AcoustID confidence.
+/// year via Ruling F) → classify by AcoustID confidence. When AcoustID
+/// answers successfully with no recordings and the file has both embedded
+/// artist and title tags, MusicBrainz is searched by that text instead;
+/// those candidates are always `.weak` and never bulk-approvable.
 ///
 /// A single file's failure (a bad fingerprint, a transport error, a rate
 /// limit) never aborts the rest of the pass — it becomes that row's
@@ -170,15 +173,19 @@ final class AutoTaggerService: ObservableObject {
         return try Self.assembleCandidate(alternative: alternative, recording: recording, baseline: baseline)
     }
 
+    /// Nil for metadata-search candidates: an assessment describes audio
+    /// evidence, and its absence keeps them out of bulk approval.
     func matchAssessment(fileID: Int64, recordingID: String) -> RecordingMatchAssessment? {
         guard let alternatives = recordingAlternatives[fileID],
-              let alternative = alternatives.alternative(for: recordingID, details: recordingDetails[fileID] ?? [:]) else { return nil }
+              let alternative = alternatives.alternative(for: recordingID, details: recordingDetails[fileID] ?? [:]),
+              !alternative.evidence.isMetadataSearch else { return nil }
         return alternatives.assessment(for: alternative, details: recordingDetails[fileID] ?? [:])
     }
 
     func matchAssessment(for candidate: MatchCandidate) -> RecordingMatchAssessment? {
-        guard let assessment = matchAssessment(fileID: candidate.fileID, recordingID: candidate.recordingMBID) else { return nil }
-        return RecordingMatchAssessment(score: candidate.score, plausibleRecordingCount: assessment.plausibleRecordingCount)
+        guard case let .fingerprint(_, score) = candidate.evidence,
+              let assessment = matchAssessment(fileID: candidate.fileID, recordingID: candidate.recordingMBID) else { return nil }
+        return RecordingMatchAssessment(score: score, plausibleRecordingCount: assessment.plausibleRecordingCount)
     }
 
     private func ensureCurrent(generation: Int, authorization: LibrarySyncReadiness.Authorization? = nil) throws {
@@ -409,13 +416,28 @@ final class AutoTaggerService: ObservableObject {
 
         try ensureCurrent(generation: generation)
         try await requireCurrent(membershipToken)
-        let alternatives = RecordingAlternatives(results: acoustIDResults)
+        var alternatives = RecordingAlternatives(results: acoustIDResults)
+        var selected: RecordingAlternative?
+        if let firstRecordingID = acoustIDResults.first(where: { result in !result.recordingIDs.isEmpty })?.recordingIDs.first {
+            selected = alternatives.entries.first { alternative in alternative.recordingID == firstRecordingID }
+        } else if let query = MetadataSearchQuery(artist: tags.artist, title: tags.title) {
+            // A successful AcoustID answer with no recordings; failures threw above.
+            let hits = try await withMusicBrainzErrors { [musicBrainzClient] in
+                try await musicBrainzClient.searchRecordings(artist: query.artist, title: query.baseTitle)
+            }
+            try ensureCurrent(generation: generation)
+            try await requireCurrent(membershipToken)
+            for hit in hits {
+                recordingDetails[fileID, default: [:]][hit.id] = hit
+            }
+            alternatives = RecordingAlternatives(metadataMatches: MetadataMatchRanker.rank(hits, for: query))
+            selected = alternatives.entries.first
+        }
         recordingAlternatives[fileID] = alternatives
         let baseline = LookupBaseline(fileID: fileID, membershipToken: membershipToken, fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
                                       freshness: lookupFreshness, tags: tags)
         lookupBaselines[fileID] = baseline
-        guard let firstRecordingID = acoustIDResults.first(where: { result in !result.recordingIDs.isEmpty })?.recordingIDs.first,
-              let selected = alternatives.entries.first(where: { alternative in alternative.recordingID == firstRecordingID }) else { return .noMatch }
+        guard let selected else { return .noMatch }
 
         let recording = try await loadRecording(mbid: selected.recordingID)
         try ensureCurrent(generation: generation)
@@ -427,8 +449,14 @@ final class AutoTaggerService: ObservableObject {
     }
 
     private func loadRecording(mbid: String) async throws -> MBRecording {
+        try await withMusicBrainzErrors { [musicBrainzClient] in try await musicBrainzClient.recording(mbid: mbid) }
+    }
+
+    /// A MusicBrainz 401 must not read as a rejected AcoustID key, which
+    /// would halt the pass; it fails only this row.
+    private func withMusicBrainzErrors<Value: Sendable>(_ request: @Sendable () async throws -> Value) async throws -> Value {
         do {
-            return try await musicBrainzClient.recording(mbid: mbid)
+            return try await request()
         } catch LookupError.unauthorized {
             throw LookupError.transport(Self.musicBrainzUnauthorizedMessage)
         }
@@ -444,8 +472,7 @@ final class AutoTaggerService: ObservableObject {
         let artistCredit = recording.artistCredit.first
         return MatchCandidate(
             fileID: baseline.fileID,
-            score: alternative.score,
-            acoustID: alternative.acoustID,
+            evidence: alternative.evidence,
             recordingMBID: recording.id ?? alternative.recordingID,
             artistMBID: artistCredit?.artist.id,
             fingerprintHash: baseline.fingerprintHash,
@@ -471,8 +498,11 @@ final class AutoTaggerService: ObservableObject {
         )
     }
 
+    /// Metadata-search candidates are always `.weak`: text similarity is
+    /// never strong evidence.
     private static func classify(_ candidate: MatchCandidate, ambiguousRecording: Bool = false) -> RowState {
-        (candidate.score >= strongScoreThreshold && !ambiguousRecording) ? .strong(candidate) : .weak(candidate)
+        guard case let .fingerprint(_, score) = candidate.evidence else { return .weak(candidate) }
+        return (score >= strongScoreThreshold && !ambiguousRecording) ? .strong(candidate) : .weak(candidate)
     }
 
     /// A MusicBrainz partial date's leading year (`"1988-05-09"` → `1988`).
@@ -793,11 +823,12 @@ protocol AcoustIDLookupClient: Sendable {
 
 extension AcoustIDClient: AcoustIDLookupClient {}
 
-/// Seam over `MusicBrainzClient.recording` so tests can stub MusicBrainz
+/// Seam over `MusicBrainzClient` so tests can stub MusicBrainz
 /// without a real network call.
 protocol MusicBrainzLookupClient: Sendable {
     func recording(mbid: String) async throws -> MBRecording
     func recordingDetails(mbid: String) async throws -> MBRecordingDetails
+    func searchRecordings(artist: String, title: String) async throws -> [MBRecordingDetails]
 }
 
 extension MusicBrainzLookupClient {
