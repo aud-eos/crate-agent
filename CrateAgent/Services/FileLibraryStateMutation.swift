@@ -55,11 +55,12 @@ enum FileLibraryStateMutation {
         return try OperationEngine.insertEvent(batchId: batchId, timestamp: timestamp, fileId: file.id, trackId: file.trackId, eventType: eventType, forwardPayload: forwardPayload, inversePayload: inverse, in: database)
     }
 
-    /// A recorded Trash item belongs only to a trashed row, so every other state clears it.
+    /// A recorded Trash item belongs to a trashed row. Offline and inaccessible say nothing
+    /// about whether that item still exists, so they keep it for the next check.
     private static func nextTrashLocation(_ payload: SetFileLibraryStatePayload, previous: FileMetadata?) throws -> FileMetadata? {
         guard payload.state.availability == .trashed else {
             guard payload.trashLocation == nil else { throw FileLibraryStateMutationError.trashLocationWithoutTrash(fileId: payload.fileId) }
-            return nil
+            return payload.state.availability == .offline || payload.state.availability == .inaccessible ? previous : nil
         }
         guard let location = payload.trashLocation else { return previous }
         guard try FileTrashLocation.availability(of: location, resolver: FileAvailabilityResolver()) == .trashed else {

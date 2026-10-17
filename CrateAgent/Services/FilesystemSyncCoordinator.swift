@@ -146,8 +146,7 @@ public actor FilesystemSyncCoordinator {
         let availability = try availabilityResolver.inspect(path: observation.path, volumeID: metadata.volumeUuid)
         var trashLocation: FileMetadata?
         if availability == .trashed {
-            let location = try FileMetadataCollector.collectVerified(at: observation.path)
-            guard FileIdentityObservationMutation.matchesContent(existing, identity: location) else {
+            guard let location = try FileTrashLocation.capture(at: observation.path, for: existing) else {
                 requiresReconciliation = true
                 return
             }
@@ -159,7 +158,7 @@ public actor FilesystemSyncCoordinator {
     /// A trashed row keeps its indexed path, so only its recorded Trash item proves the audio still exists.
     private func currentAvailability(of file: FileRecord) async throws -> FileAvailability {
         let availability = try inspectKnownIdentity(file)
-        guard availability == .missing, file.fileAvailability == .trashed, let fileID = file.id else { return availability }
+        guard availability == .missing, let fileID = file.id else { return availability }
         let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
         return try FileTrashLocation.availability(of: location, resolver: availabilityResolver)
     }
@@ -170,10 +169,10 @@ public actor FilesystemSyncCoordinator {
             try FileTrashLocation.fileIDs(at: path, in: connection)
                 .compactMap { fileID in try FileRecord.fetchOne(connection, key: fileID) }
         }
-        for file in trashedFiles where file.fileAvailability == .trashed {
+        for file in trashedFiles {
             try await operationEngine.requireUnconflicted(.file(file))
             let availability = try await currentAvailability(of: file)
-            guard availability != .trashed else { continue }
+            guard availability != file.fileAvailability else { continue }
             try await observe(file: file, availability: availability, metadata: nil, batchID: batchID)
         }
     }

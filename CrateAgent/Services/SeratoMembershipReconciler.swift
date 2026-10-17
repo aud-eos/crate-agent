@@ -111,7 +111,7 @@ actor SeratoMembershipReconciler {
             if observed == .offline {
                 summary.skippedUnsupported += 1
             }
-            if observed == .missing, file.fileAvailability == .trashed {
+            if observed == .missing {
                 let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
                 observed = try FileTrashLocation.availability(of: location, resolver: availability)
             }

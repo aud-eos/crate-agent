@@ -149,10 +149,15 @@ destinations without enumerating Trash or scanning it per missing row. A verifie
 Trash destination marks the indexed original path as trashed; it never becomes a
 V2 rename target. The verified Trash item (path, volume, inode, size, mtime and sampled
 content hash) is persisted in `file_trash_locations` by the same journaled
-library-state mutation, which clears it whenever the row leaves `.trashed`
-(restore, re-import, replacement, missing). A removal event at that Trash path, or
-any reconciliation that finds the indexed path missing, keeps the row trashed only
-while that exact item still verifies; otherwise it becomes missing. A trashed row
+library-state mutation. Without Full Disk Access a Trash item can be stat-able but
+unreadable; it is then recorded by its stat identity alone, and later checks compare
+only the fields that were captured, so a permission failure never reads as an
+emptied Trash. The mutation clears the item when the row becomes available or
+missing (restore, re-import, replacement). It keeps the item through offline and
+inaccessible, which say nothing about whether the item still exists. A removal
+event at that Trash path, or any reconciliation that finds the indexed path
+missing, keeps the row trashed only while that exact item still verifies;
+otherwise it becomes missing. A trashed row
 without a persisted item (recorded before this table existed) cannot be verified
 and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the

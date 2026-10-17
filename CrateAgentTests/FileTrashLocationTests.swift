@@ -34,6 +34,48 @@ final class FileTrashLocationTests: XCTestCase {
         let location = try await fixture.location(restored)
         XCTAssertNil(location)
     }
+
+    func testTrashItemUnreadableWhenObservedIsRecordedByStatIdentity() async throws {
+        let fixture = try await TrashedFilesFixture(names: ["denied.mp3"], unreadable: true)
+        defer { fixture.cleanup() }
+        let denied = fixture.files[0]
+        let location = try await fixture.location(denied)
+        let recorded = try XCTUnwrap(location, "an unreadable Trash item is still recorded")
+        XCTAssertNil(recorded.lightweightHash)
+        XCTAssertEqual(try FileTrashLocation.availability(of: recorded, resolver: FileAvailabilityResolver()), .trashed)
+        try FileManager.default.removeItem(atPath: denied.trashPath)
+        XCTAssertEqual(try FileTrashLocation.availability(of: recorded, resolver: FileAvailabilityResolver()), .missing)
+    }
+
+    func testTrashItemThatBecomesUnreadableStaysTrashed() async throws {
+        let fixture = try await TrashedFilesFixture(names: ["later-denied.mp3"])
+        defer { fixture.cleanup() }
+        let item = fixture.files[0]
+        let location = try await fixture.location(item)
+        let recorded = try XCTUnwrap(location)
+        XCTAssertNotNil(recorded.lightweightHash)
+        XCTAssertEqual(chmod(item.trashPath, 0), 0)
+        XCTAssertEqual(try FileTrashLocation.availability(of: recorded, resolver: FileAvailabilityResolver()), .trashed,
+                       "a permission failure must not read as an emptied Trash")
+    }
+
+    func testInaccessibleTrashedRowKeepsItsLocationAndReturnsToTrashed() async throws {
+        let fixture = try await TrashedFilesFixture(names: ["locked.mp3"])
+        defer { fixture.cleanup() }
+        let item = fixture.files[0]
+        let row = try await fixture.row(item)
+        let inaccessible = FileLibraryState(membership: row.libraryMembership, availability: .inaccessible, libraryID: row.seratoLibraryId,
+                                            retiredAt: row.retiredAt)
+        _ = try await fixture.engine.applyFilesystemObservations(
+            [.setFileLibraryState(.init(fileId: item.fileID, expectedRevision: row.membershipRevision, state: inaccessible))],
+            batchId: "inaccessible", moveExpectation: nil
+        )
+        let retained = try await fixture.location(item)
+        XCTAssertNotNil(retained, "an inaccessible check says nothing about whether the Trash item still exists")
+        try await fixture.coordinator.handleObservations([.init(path: item.trashPath, isFile: true, wasRemoved: true)])
+        let rechecked = try await fixture.row(item)
+        XCTAssertEqual(rechecked.fileAvailability, .trashed)
+    }
 }
 
 /// Indexed files moved to the native Trash of the task-owned APFS volume and observed there.
@@ -46,10 +88,11 @@ private final class TrashedFilesFixture {
 
     let directory: URL
     let database: LibraryDatabase
+    let engine: OperationEngine
     let coordinator: FilesystemSyncCoordinator
     private(set) var files: [TrashedFile] = []
 
-    init(names: [String]) async throws {
+    init(names: [String], unreadable: Bool = false) async throws {
         let ownedVolume = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume")
         guard FileManager.default.fileExists(atPath: ownedVolume.appendingPathComponent(".task6-test-volume").path) else {
             throw XCTSkip("Requires task-owned APFS volume")
@@ -58,7 +101,7 @@ private final class TrashedFilesFixture {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let database = try LibraryDatabase.openInMemory()
         self.database = database
-        let engine = await MainActor.run {
+        engine = await MainActor.run {
             OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
                             seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
         }
@@ -74,6 +117,9 @@ private final class TrashedFilesFixture {
                 file.fileAvailability = .available
                 try file.insert(connection)
                 return try XCTUnwrap(file.id)
+            }
+            if unreadable {
+                XCTAssertEqual(chmod(source.path, 0), 0)
             }
             var resultingURL: NSURL?
             try FileManager.default.trashItem(at: source, resultingItemURL: &resultingURL)

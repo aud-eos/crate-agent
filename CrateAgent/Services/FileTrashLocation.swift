@@ -29,15 +29,43 @@ enum FileTrashLocation {
         path.precomposedStringWithCanonicalMapping
     }
 
-    /// Availability of a trashed row whose indexed path no longer exists.
+    /// The verified identity of `file`'s item in Trash, or nil when that item is not `file`.
+    /// Without Full Disk Access, Trash items can be stat-able but unreadable; such an item
+    /// is recorded by its stat identity alone instead of failing the observation.
+    static func capture(at path: String, for file: FileRecord) throws -> FileMetadata? {
+        let readIdentity = try AudioFileReadIdentity.read(at: path)
+        guard let location = FileMetadataCollector.collect(at: path, includeLightweightHash: true) else {
+            throw SeratoMembershipSnapshotError.sourceChanged
+        }
+        try readIdentity.requireUnchanged(at: path)
+        let matches = location.lightweightHash == nil
+            ? file.fileSize == location.fileSize && file.inode == location.inode && file.volumeUuid == location.volumeUuid
+            && file.mtime == location.mtime
+            : FileIdentityObservationMutation.matchesContent(file, identity: location)
+        return matches ? location : nil
+    }
+
+    /// Availability of a row whose indexed path no longer exists. Only a recorded Trash item
+    /// that still verifies keeps it trashed; an unreadable item is never taken as gone.
     static func availability(of location: FileMetadata?, resolver: FileAvailabilityResolver) throws -> FileAvailability {
         guard let location else { return .missing }
         switch try resolver.inspect(path: location.path, volumeID: location.volumeUuid) {
         case .trashed:
-            return FileMetadataCollector.collect(at: location.path, includeLightweightHash: true) == location ? .trashed : .missing
+            guard let current = FileMetadataCollector.collect(at: location.path, includeLightweightHash: location.lightweightHash != nil)
+            else { return .missing }
+            return stillIdentifies(location, current: current) ? .trashed : .missing
         case .offline: return .offline
         case .inaccessible: return .inaccessible
         case .available, .missing, .unknown: return .missing
         }
+    }
+
+    /// Compares only what was captured: a content hash that can no longer be read is a
+    /// permission failure, so the stat identity decides.
+    private static func stillIdentifies(_ location: FileMetadata, current: FileMetadata) -> Bool {
+        guard current.volumeUuid == location.volumeUuid, current.inode == location.inode, current.fileSize == location.fileSize,
+              current.mtime == location.mtime else { return false }
+        guard let recordedHash = location.lightweightHash, let currentHash = current.lightweightHash else { return true }
+        return recordedHash == currentHash
     }
 }
