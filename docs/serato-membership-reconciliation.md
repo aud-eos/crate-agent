@@ -341,6 +341,14 @@ preserve original UTF-8 bytes, metadata, and physical-file observations. Only
 conflicted spellings are inspected for diagnostics; analysis does not decode audio
 or fingerprint the library.
 
+The Rust writers for `database V2`, Subcrates and SmartCrates use the same rule:
+a rename, metadata update, removal, addition or held-path check matches a stored
+path by its NFC form, so a decomposed spelling Finder stored matches a composed
+request, and the reverse. Matching never rewrites a path field's bytes; only a
+rename replaces the matched field, with the requested destination. A record that
+spells a path differently but equivalently is a conflict, which the scope above
+keeps away from those writers.
+
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared
 recording row also check its track ID. Presence evidence still includes every
