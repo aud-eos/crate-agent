@@ -477,7 +477,7 @@ public actor OperationEngine {
     private func readinessAuthorization(for mutations: [TrackMutation]) throws -> LibrarySyncReadiness.Authorization? {
         let requiresReady = mutations.contains { mutation in
             switch mutation {
-            case .indexNewFile, .beginFileImport, .addTrackToSerato, .songFamily: false
+            case .indexNewFile, .beginFileImport, .addTrackToSerato: false
             default: true
             }
         }
@@ -1026,7 +1026,8 @@ public actor OperationEngine {
         case .fileTrashed: .trashFile
         case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
-             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored: nil
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked: nil
         }
     }
 
@@ -1445,7 +1446,8 @@ public actor OperationEngine {
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
              .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
-             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             false
         }
     }
@@ -1542,7 +1544,8 @@ public actor OperationEngine {
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
-             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             return []
         }
     }
@@ -1792,6 +1795,10 @@ public actor OperationEngine {
         case .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
             return try .songFamily(.restore(decoder.decode(RestoreSongFamiliesPayload.self, from: inverseJsonData)))
+        case .songFamilyRecordingLinked:
+            return try .songFamily(.unlinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
+        case .songFamilyRecordingUnlinked:
+            return try .songFamily(.relinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
         }
     }
 
@@ -3652,10 +3659,11 @@ public actor OperationEngine {
             guard let existingId = existingTrack.id else {
                 throw OperationEngineError.insertDidNotReturnRowId
             }
-            // Undo retains an empty fingerprint row for FK stability. Reusing
-            // that unreferenced row must seed kept fields just like creation.
-            let isEmptyOrphan = try existingTrack == TrackRecord(id: existingId, fingerprintHash: payload.fingerprintHash)
-                && FileRecord.filter(Column("track_id") == existingId).fetchCount(db) == 0
+            // Undo retains an empty fingerprint row for FK stability, and song
+            // grouping links a file to one. Reusing a bare row no other file
+            // depends on must seed kept fields just like creation.
+            let isEmptyOrphan = try existingTrack.isBare
+                && !FileRecord.hasOtherFilesReferencingTrack(existingId, excluding: payload.fileID, in: db)
             existingTrack.acoustidId = payload.acoustID
             existingTrack.musicbrainzRecordingId = payload.recordingMBID
             existingTrack.musicbrainzReleaseId = payload.releaseMBID

@@ -47,15 +47,18 @@ public struct SongFamilyService: Sendable {
         self.database = database
     }
 
-    /// Groups at least two distinct recordings. Throws
-    /// `SongFamilyError.memberAlreadyInFamily` instead of reassigning a member;
-    /// offer `merge` for that conflict.
+    /// Groups at least two distinct recordings, first linking any unlinked
+    /// file to the recording its fingerprint identifies. Throws
+    /// `SongFamilyError.memberAlreadyInFamily` instead of reassigning a member
+    /// (offer `merge`), and `fingerprintCollision` instead of sharing a
+    /// recording another file or MusicBrainz already claims.
     public func create(_ members: [SongFamilyMember], representative: SongFamilyMember? = nil) async throws -> SongFamilyResult {
-        try await apply(.create(members: members, representative: representative), familyId: nil)
+        try await apply(.create(members: members, representative: representative), linking: members, familyId: nil)
     }
 
+    /// Adds recordings; ones already in this family are left as they are.
     public func attach(_ members: [SongFamilyMember], to familyId: Int64) async throws -> SongFamilyResult {
-        try await apply(.attach(familyId: familyId, members: members), familyId: familyId)
+        try await apply(.attach(familyId: familyId, members: members), linking: members, familyId: familyId)
     }
 
     /// Removing members that leaves fewer than two recordings dissolves the family.
@@ -89,23 +92,25 @@ public struct SongFamilyService: Sendable {
         }
     }
 
-    private func apply(_ operation: SongFamilyOperation, familyId: Int64?) async throws -> SongFamilyResult {
+    /// Runs the file links and the membership change as one batch, so one
+    /// undo reverses both and a refused change leaves no link behind.
+    private func apply(_ operation: SongFamilyOperation, linking members: [SongFamilyMember] = [], familyId: Int64?) async throws -> SongFamilyResult {
         let batchID = UUID().uuidString
-        guard let eventID = try await engine.apply(.songFamily(operation), batchId: batchID) else {
-            return SongFamilyResult(batchId: batchID, familyId: familyId)
+        let links = members.compactMap { member -> TrackMutation? in
+            guard case let .file(fileID) = member else { return nil }
+            return .songFamily(.linkRecording(fileId: fileID))
         }
+        _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID)
         let change = try await database.writer.read { database in
-            guard let event = try EventRecord.fetchOne(database, key: eventID) else {
-                throw OperationEngineError.batchNotFound(batchId: batchID)
-            }
-            return try JSONDecoder().decode(SongFamilyChange.self, from: Data(event.payloadJson.utf8))
+            try EventRecord.filter(Column("batch_id") == batchID && Column("event_type") == operation.eventType.rawValue).fetchOne(database)
+                .map { event in try JSONDecoder().decode(SongFamilyChange.self, from: Data(event.payloadJson.utf8)) }
         }
-        return SongFamilyResult(batchId: batchID, familyId: change.familyId)
+        return SongFamilyResult(batchId: batchID, familyId: change.map(\.familyId) ?? familyId)
     }
 
     static func fetchFamily(id: Int64, in database: GRDB.Database) throws -> SongFamily? {
         guard let record = try SongFamilyRecord.fetchOne(database, key: id) else { return nil }
-        let tracks = try TrackRecord.filter(Column("work_id") == id).order(Column("id")).fetchAll(database)
+        let tracks = try TrackRecord.filter(Column("work_id") == id).filter(sql: SongFamilyMutation.liveTrackSQL).order(Column("id")).fetchAll(database)
         let files = try Row.fetchAll(database, sql: """
         SELECT id, track_id, artist, title, (\(FileProcessingEligibility.processableSQL)) AS available
         FROM files WHERE track_id IN (SELECT id FROM tracks WHERE work_id = ?)

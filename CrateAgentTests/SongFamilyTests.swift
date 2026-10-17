@@ -1,4 +1,5 @@
 @testable import CrateAgent
+import CryptoKit
 import GRDB
 import XCTest
 
@@ -20,8 +21,8 @@ final class SongFamilyTests: XCTestCase {
         service = SongFamilyService(engine: engine, database: database)
     }
 
-    func testEncodingsCountOnceAndUndoRedoRestoresMaterializedLinks() async throws {
-        let matched = try await addTrack(title: "Song", musicBrainzMatched: true)
+    func testFilesSharingARecordingCountOnceAndUndoRedoRestoresGroupingLinks() async throws {
+        let matched = try await addTrack(title: "Song", musicBrainzMatched: true, withFile: false)
         let flac = try await addFile(title: "Song", trackID: matched)
         let mp3 = try await addFile(title: "Song", trackID: matched)
         let unmatched = try await addFile(title: "Song (Instrumental)", fingerprint: Data("instrumental".utf8))
@@ -33,6 +34,11 @@ final class SongFamilyTests: XCTestCase {
         XCTAssertEqual(family?.members.first?.fileIds, [flac, mp3])
         let materialized = try await trackID(ofFile: unmatched)
         XCTAssertNotNil(materialized)
+
+        let linkHistory = try await database.writer.read { connection in
+            try EventRecord.filter(Column("file_id") == unmatched).fetchCount(connection)
+        }
+        XCTAssertEqual(linkHistory, 1)
 
         let undo = try await engine.undoBatch(created.batchId)
         let undoneFamily = try await service.family(id: familyID)
@@ -47,6 +53,62 @@ final class SongFamilyTests: XCTestCase {
         let redoneLink = try await trackID(ofFile: unmatched)
         XCTAssertEqual(redone?.versionCount, 2)
         XCTAssertEqual(redoneLink, materialized)
+    }
+
+    func testGroupingRefusesAFingerprintAnotherFileClaimedAndLeavesNoLink() async throws {
+        let fingerprint = Data("shared-first-120-seconds".utf8)
+        let dirtyTrack = try await addTrack(title: "Song (Dirty)", musicBrainzMatched: true, fingerprintHash: Data(SHA256.hash(data: fingerprint)),
+                                            withFile: false)
+        let dirty = try await addFile(title: "Song (Dirty)", trackID: dirtyTrack)
+        let clean = try await addFile(title: "Song (Clean)", fingerprint: fingerprint)
+
+        await XCTAssertThrowsErrorAsync(try await service.create([.file(dirty), .file(clean)])) { error in
+            XCTAssertEqual(error as? SongFamilyError, .fingerprintCollision(fileId: clean, trackId: dirtyTrack, otherFileId: dirty))
+        }
+        let cleanLink = try await trackID(ofFile: clean)
+        let dirtyMembership = try await membership(ofTrack: dirtyTrack)
+        XCTAssertNil(cleanLink)
+        XCTAssertNil(dirtyMembership)
+    }
+
+    func testAMemberThatLosesItsFileStopsCountingUntilTheFileReturns() async throws {
+        let tracks = try await addTracks(count: 2)
+        let created = try await service.create(tracks.map(SongFamilyMember.track))
+        let familyID = try XCTUnwrap(created.familyId)
+        let movedFile = try await file(ofTrack: tracks[1])
+        let rematch = try await engine.apply(.applyMusicBrainzMatch(matchPayload(fileID: movedFile, fingerprintHash: Data("re-fingerprinted".utf8))),
+                                             batchId: "rematch")
+        XCTAssertNotNil(rematch)
+        let withoutFile = try await service.family(id: familyID)
+        XCTAssertEqual(withoutFile?.versionCount, 1)
+
+        _ = try await service.attach([.file(movedFile)], to: familyID)
+        _ = try await service.attach([.file(movedFile)], to: familyID)
+        let reattached = try await service.family(id: familyID)
+        XCTAssertEqual(reattached?.versionCount, 2)
+
+        try await engine.undoBatch("rematch")
+        let restored = try await service.family(id: familyID)
+        XCTAssertEqual(restored?.members.map(\.trackId), [tracks[0], tracks[1]])
+    }
+
+    func testUndoingAGroupKeepsTheLinkALaterMatchClaimed() async throws {
+        let fingerprint = Data("clean-edit".utf8)
+        let main = try await addTracks(count: 1)
+        let clean = try await addFile(title: "Song (Clean)", fingerprint: fingerprint)
+        let created = try await service.create([.track(main[0]), .file(clean)])
+        let groupedLink = try await trackID(ofFile: clean)
+        let groupedRecording = try XCTUnwrap(groupedLink)
+        _ = try await engine.apply(.applyMusicBrainzMatch(matchPayload(fileID: clean, fingerprintHash: Data(SHA256.hash(data: fingerprint)),
+                                                                       currentFileTitle: "Song (Clean)")), batchId: "match")
+
+        try await engine.undoBatch(created.batchId)
+        let link = try await trackID(ofFile: clean)
+        let recording = try await database.writer.read { connection in try TrackRecord.fetchOne(connection, key: groupedRecording) }
+        XCTAssertEqual(link, groupedRecording)
+        XCTAssertNil(recording?.workId)
+        XCTAssertEqual(recording?.title, "Song (Clean)")
+        XCTAssertNotNil(recording?.musicbrainzRecordingId)
     }
 
     func testMemberOfAnotherFamilyIsRejectedUntilMergedAndUndoSeparatesThem() async throws {
@@ -123,9 +185,7 @@ final class SongFamilyTests: XCTestCase {
         let remix = try await addTrack(title: "Song (Remix)", musicBrainzMatched: true)
         let original = try await addTrack(title: "Song (Original Mix)", musicBrainzMatched: false)
         let plain = try await addTrack(title: "Song", musicBrainzMatched: true)
-        let remixFile = try await addFile(title: "Song (Remix)", trackID: remix)
-        _ = try await addFile(title: "Song (Original Mix)", trackID: original)
-        _ = try await addFile(title: "Song", trackID: plain)
+        let remixFile = try await file(ofTrack: remix)
         let created = try await service.create([.track(remix), .track(original), .track(plain)])
         let familyID = try XCTUnwrap(created.familyId)
         let automatic = try await service.family(id: familyID)
@@ -140,11 +200,11 @@ final class SongFamilyTests: XCTestCase {
         XCTAssertEqual(saved?.representativeTrackId, remix)
 
         try await database.writer.write { connection in
-            try connection.execute(sql: "UPDATE files SET library_membership = ? WHERE id = ?", arguments: [LibraryMembership.retired.rawValue, remixFile])
+            try connection.execute(sql: "UPDATE files SET file_availability = ? WHERE id = ?", arguments: [FileAvailability.missing.rawValue, remixFile])
         }
-        let retired = try await service.family(id: familyID)
-        XCTAssertEqual(retired?.representativeTrackId, plain)
-        XCTAssertEqual(retired?.savedRepresentativeTrackId, remix)
+        let missing = try await service.family(id: familyID)
+        XCTAssertEqual(missing?.representativeTrackId, plain)
+        XCTAssertEqual(missing?.savedRepresentativeTrackId, remix)
     }
 
     // MARK: - Fixture
@@ -159,14 +219,30 @@ final class SongFamilyTests: XCTestCase {
         return tracks
     }
 
-    private func addTrack(title: String, musicBrainzMatched: Bool) async throws -> Int64 {
+    private func addTrack(title: String, musicBrainzMatched: Bool, fingerprintHash: Data? = nil, withFile: Bool = true) async throws -> Int64 {
         nextFingerprint += 1
-        let hash = Data("track-\(nextFingerprint)".utf8)
-        return try await database.writer.write { connection in
+        let hash = fingerprintHash ?? Data("track-\(nextFingerprint)".utf8)
+        let trackID = try await database.writer.write { connection in
             var track = TrackRecord(fingerprintHash: hash, musicbrainzRecordingId: musicBrainzMatched ? UUID().uuidString : nil, title: title)
             try track.insert(connection)
             return try XCTUnwrap(track.id)
         }
+        if withFile {
+            _ = try await addFile(title: title, trackID: trackID)
+        }
+        return trackID
+    }
+
+    private func file(ofTrack trackID: Int64) async throws -> Int64 {
+        try await database.writer.read { connection in
+            try XCTUnwrap(Int64.fetchOne(connection, sql: "SELECT id FROM files WHERE track_id = ? ORDER BY id", arguments: [trackID]))
+        }
+    }
+
+    private func matchPayload(fileID: Int64, fingerprintHash: Data, currentFileTitle: String? = nil) -> ApplyMusicBrainzMatchPayload {
+        ApplyMusicBrainzMatchPayload(fileID: fileID, acoustID: nil, recordingMBID: UUID().uuidString, releaseMBID: nil, artistMBID: nil, isrc: nil,
+                                     fingerprintHash: fingerprintHash, artist: nil, title: nil, album: nil, year: nil,
+                                     currentFileTitle: currentFileTitle)
     }
 
     private func addFile(title: String, trackID: Int64? = nil, fingerprint: Data? = nil) async throws -> Int64 {
