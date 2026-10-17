@@ -76,7 +76,8 @@ struct LibraryBrowserView: View {
             let coordinator = services.importCoordinator
             Task { @MainActor in
                 let result = await coordinator.importDroppedItems(droppedUrls)
-                loadError = result.blockedFiles.isEmpty ? nil : result.blockedFiles.joined(separator: "\n")
+                let notices = result.blockedFiles + result.filesNotAdded + result.filesAlreadyImporting
+                loadError = notices.isEmpty ? nil : notices.joined(separator: "\n")
                 if result.filesPendingSync > 0 {
                     lastImportSummary = "\(result.filesImported) imported; \(result.filesPendingSync) pending sync; \(result.filesSkipped) skipped"
                     services.syncSession.reportFailure(
