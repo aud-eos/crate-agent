@@ -101,6 +101,15 @@ its verified physical identity and fingerprint basis, preserving revision,
 recording links, and Serato-mirrored metadata. Genuine replacements still invalidate
 the prior association.
 
+Because owned tag writes leave the mirrored columns alone, undo and redo of a
+MusicBrainz match guard their audio-tag inverse by the file itself
+(`MatchUndoTagGuard`). Before the transaction, each matched file's tags are read
+under an `AudioFileReadIdentity`. Every field the match wrote must still hold the
+matched value or the pre-match value; any other value is a later edit, and the undo
+is refused for those fields only. The transaction rechecks that identity, so a file
+that changes after the read fails the undo, and nothing commits. A queued apply that
+never reached the file still undoes, because its file holds the pre-match value.
+
 `reader.authorization(for:)` captures source identity, the reader's latest
 generation, and the watchdog's closed lifecycle revision. The engine's
 `applyObservedBatch` checks this authorization inside its serialized transaction
@@ -370,8 +379,17 @@ starts a new registration. Every other write is its own segment. Edits to the sa
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
-to rows whose last attempt recorded no error: a saved value matching an unsent
-edit, or one whose write threw, is the user's own Serato edit and wins. A failed segment fails all of its rows together
+to rows whose write may have landed. The writer boundary commits an `io_started`
+mark before its I/O transaction. It clears the mark only when no write for the
+row returned from its I/O: the attempt stopped at the boundary, failed before
+reaching it, or every I/O call threw. A writer that validates or records after
+its I/O (Trash, audio tags, V2 removal, imports) reports the moment that I/O
+returns, so a later throw keeps the mark. A later attempt keeps an earlier
+attempt's mark (`may_have_landed`), and an attempt never clears a mark it did not
+set. Upgrading keeps a row attempted without a recorded error as possibly landed,
+as it was read before the marker existed. A saved value matching an edit that
+never reached I/O, or whose every I/O call threw, is the user's own Serato edit
+and wins. A failed segment fails all of its rows together
 and blocks their dependents; a row whose target becomes conflicted at the write
 boundary is blocked alone with its dependents, and the rest of the segment applies.
 
@@ -385,8 +403,8 @@ When no baseline was observed, a queued edit takes the pre-edit values its event
 journaled (`previousMetadata`) as the baseline for the fields it writes; a field
 an earlier queued edit still owes takes that edit's baseline instead. A queued
 edit whose baseline is still unknown learns the fields of an earlier edit of ours
-once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its last
-attempt left no error; a failed Trash attempt is not proof the audio moved.
+once that edit lands, so it applies instead of being dropped as uncertain. An interrupted cleanup Trash finishes on restart only when its
+write may have landed by that rule; a failed Trash attempt is not proof the audio moved.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, or legacy unrecoverable) once, and turns to a
