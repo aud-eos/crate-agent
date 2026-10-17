@@ -139,6 +139,11 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
             .fetchCount(db) > 0
     }
 
+    /// How the user knows the file: its title, else its file name.
+    var displayName: String {
+        title.flatMap { title in title.isEmpty ? nil : title } ?? (path as NSString).lastPathComponent
+    }
+
     /// The lowest-id file still in the library, other than `excludingFileId`,
     /// that links to `trackId`. A retired file keeps its link but no longer
     /// claims the recording for grouping.
