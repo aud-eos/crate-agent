@@ -178,9 +178,17 @@ final class MusicBrainzMutationTests: XCTestCase {
 
         private let lock = NSLock()
         private var storedCalls: [Call] = []
+        private var storedDisk = AudioTags.none
         var calls: [Call] {
             lock.lock(); defer { lock.unlock() }
             return storedCalls
+        }
+
+        /// The tags every file holds before any recorded write, as when
+        /// something other than crate-agent set them.
+        var disk: AudioTags {
+            get { lock.withLock { storedDisk } }
+            set { lock.withLock { storedDisk = newValue } }
         }
 
         func record(_ path: String, _ update: AudioTagUpdate) {
@@ -189,8 +197,13 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
 
         func tags(at path: String) -> AudioTags {
-            AudioTags.none.applying(calls.filter { $0.path == path }.map(\.update))
+            disk.applying(calls.filter { $0.path == path }.map(\.update))
         }
+    }
+
+    private func tagUpdate(artist: String? = nil, title: String? = nil, album: String? = nil, year: UInt32? = nil) -> AudioTagUpdate {
+        AudioTagUpdate(artist: artist, title: title, album: album, genre: nil, bpm: nil, musicalKey: nil, comment: nil, label: nil,
+                       year: year, clearYear: false)
     }
 
     private let sampleFingerprintBytes = Data("chromaprint-sample-fingerprint".utf8)
@@ -211,7 +224,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             state.isRunning ? ["com.serato.djpro"] : []
         })
         state.watchdog = watchdog
-        let locator = SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null"))
+        let locator = try makeEmptySeratoLibrary()
         let engine = OperationEngine(
             database: database,
             seratoWatchdog: watchdog,
@@ -1654,6 +1667,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         let (engine, database, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
         }
+        recorder.disk = AudioTags.none.applying([tagUpdate(artist: "Disk Artist", title: "Same Title", year: 1994)])
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
                 fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
@@ -1663,10 +1677,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             batchId: "already-on-disk"
         )
 
-        let forward = try XCTUnwrap(recorder.calls.first?.update)
-        XCTAssertEqual(forward.artist, "New Artist")
-        XCTAssertNil(forward.title)
-        XCTAssertNil(forward.year)
+        XCTAssertEqual(recorder.calls.first?.update, tagUpdate(artist: "New Artist"))
         try await database.writer.read { db in
             let file = try XCTUnwrap(FileRecord.fetchOne(db, key: fileId))
             let track = try XCTUnwrap(TrackRecord.fetchOne(db, key: XCTUnwrap(file.trackId)))
@@ -1675,12 +1686,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
 
         try await engine.undoBatch("already-on-disk")
-        XCTAssertEqual(recorder.calls.count, 2)
-        let restore = try XCTUnwrap(recorder.calls.last?.update)
-        XCTAssertEqual(restore.artist, "Disk Artist")
-        XCTAssertNil(restore.title)
-        XCTAssertNil(restore.year)
-        XCTAssertFalse(restore.clearYear)
+        XCTAssertEqual(recorder.calls.map(\.update), [tagUpdate(artist: "New Artist"), tagUpdate(artist: "Disk Artist")])
     }
 
     func testUndoLeavesALaterEditToAFieldTheMatchDidNotRewrite() async throws {
@@ -1688,6 +1694,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         let (engine, _, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
         }
+        recorder.disk = AudioTags.none.applying([tagUpdate(artist: "Disk Artist", title: "Same Title")])
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
                 fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
@@ -1699,9 +1706,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(title: "Later Edit"))), batchId: "edit")
 
         try await engine.undoBatch("match")
-        let restore = try XCTUnwrap(recorder.calls.last?.update)
-        XCTAssertEqual(restore.artist, "Disk Artist")
-        XCTAssertNil(restore.title)
+        XCTAssertEqual(recorder.calls.last?.update, tagUpdate(artist: "Disk Artist"))
     }
 
     func testQueuedTagEditKeepsAMatchFieldThatEqualsTheCapturedValue() async throws {
@@ -1728,6 +1733,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         let (engine, _, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
         }
+        recorder.disk = AudioTags.none.applying([tagUpdate(artist: "Nas", title: "Halftime", album: "Illmatic", year: 1994)])
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
                 fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
@@ -1739,19 +1745,27 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertTrue(recorder.calls.isEmpty)
     }
 
-    func testAFileRewrittenSinceReviewGetsEveryAppliedField() async throws {
+    func testTagsChangedBeforeAQueuedConfirmRunsGetTheMatchBack() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, _, fileId) = try await MainActor.run {
-            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder, seratoIsRunning: true)
         }
+        recorder.disk = AudioTags.none.applying([tagUpdate(artist: "Nas", title: "Halftime", album: "Illmatic", year: 1994)])
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
                 fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
-                artist: nil, title: "Halftime", album: nil, year: nil, currentFileTitle: "Halftime", expectedMtime: 2
+                artist: "Nas", title: "Halftime", album: "Illmatic", year: 1994,
+                currentFileYear: 1994, currentFileArtist: "Nas", currentFileTitle: "Halftime", currentFileAlbum: "Illmatic"
             )),
-            batchId: "rewritten-since-review"
+            batchId: "exact-confirm-while-running"
         )
-        XCTAssertEqual(recorder.calls.last?.update.title, "Halftime")
+        // Serato rewrites the tags from its cached copy before it quits.
+        recorder.disk = AudioTags.none.applying([tagUpdate(artist: "Nas", title: "Serato Title", album: "Illmatic", year: 1990)])
+
+        await runningState?.stop()
+        try await engine.drainPendingSeratoUpdates()
+
+        XCTAssertEqual(recorder.calls.map(\.update), [tagUpdate(title: "Halftime", year: 1994)])
     }
 
     func testRedoRefusesALaterEditToAFieldTheMatchDidNotRewrite() async throws {

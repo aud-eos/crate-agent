@@ -277,8 +277,20 @@ Successful explicit adds and snapshots use the same volume UUID plus canonical
 directory ownership identifier. Add confirmation remains the engine's existing
 `import-confirmed:<eventID>` transaction. Failed adds retain pending membership.
 An immediate add failure also retains the original guarded add as a durable
-`serato_write_queue` row and reports a pending-sync import result. The Library drop flow publishes
-the failure through the shared sync status and Retry Sync action. Retry performs
+`serato_write_queue` row and reports a pending-sync import result. A drop journals
+each file in its own batch, so each stays separately undoable, then applies all of
+the drop's queued adds in one scoped pass. Consecutive adds share one `database V2`
+rewrite per 200 files, and each file's result comes from its own queue rows and
+dispositions (#187). A file that changes before its add runs is reported as not
+added and stays pending, with no Retry Sync, since nothing is left to retry;
+dropping it again observes the changed file and starts a new import. Only an
+import that never finished (pending or legacy-unverified) adopts a changed file
+this way: a retired or removed row still refuses a replacement at its path. When
+readiness is closed, that observation is refused and the file is reported with
+the readiness reason. A file listed twice in one drop, such as a folder and a
+file inside it, is imported once, and a file a still-running drop is importing
+is reported as already being imported by an overlapping drop. The Library drop
+flow publishes a failed add through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or
 changing the original event payloads/inverses. Failed or unattempted adds are
 retained once per event; already completed adds are not queued again. The normal
@@ -354,6 +366,14 @@ single key. Code that must keep Serato occurrences distinct keys them by
 `Data(path.utf8)` or by occurrence index, as `SeratoConflictAnalyzer` and
 `LibraryRefreshPlan` do. It applies `SeratoPath.normalized` only after conflict
 analysis has run.
+
+The Rust writers for `database V2`, Subcrates and SmartCrates use the same rule:
+a rename, metadata update, removal, addition or held-path check matches a stored
+path by its NFC form, so a decomposed spelling Finder stored matches a composed
+request, and the reverse. Matching never rewrites a path field's bytes; only a
+rename replaces the matched field, with the requested destination. Two records whose
+spellings are equivalent form a conflict, which the scope above
+keeps away from those writers.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared
@@ -442,15 +462,31 @@ rename whose track neither `database V2` nor any crate holds at its final path
 afterwards, completes as `noSeratoRecord` in the transaction that removes its
 row, and does not advance the external baseline: the Rust batch writers report
 each unmatched path, so a write with nothing to change is told apart from one
-with no entry, and Re-sync counts it as not written (#105). A missing
-`database V2` is not evidence that a track is absent and keeps its tolerant
-behavior.
+with no entry, and Re-sync counts it as not written (#105).
+
+A missing `database V2` is not evidence that a track is absent (#192), and
+crate-agent never creates it. While it is missing, every queued Serato library
+write waits: adds and imports, metadata updates, renames, and removals from
+`database V2` and crates, with the later rows that depend on them. Audio-tag
+writes and Trash, which touch no Serato library file, still drain. No
+`Subcrates` or `SmartCrates` file is rewritten either, so the three file sets
+never disagree about a track. The check runs per drain segment, after
+readiness and conflict deferral, and again at each writer; once a pass finds
+the file missing, the rest of its Serato library writes wait too. Every held row
+records one `seratoDatabaseMissing` error naming the path and how many changes
+the pass held, and the drain or Re-sync fails with it, so the sync status shows
+it and **Retry Sync** applies the rows once the file is back. On a Mac where
+Serato has never run, sync itself reports `sourceMissing`: open Serato once to
+create its library. Discarding queued changes instead is #163.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
 warning. An outcome this version does not recognize, such as one recorded by a
 newer build, is counted as not applied rather than blocking readiness. History marks a batch with the number of its changes that were not
-applied.
+applied and one reason line per disposition. Its Show files button pages the
+affected files through `EventHistoryQuery.loadNotAppliedFiles`, each with its
+own reasons; a file whose events project onto Serato or audio-tag writes can be
+re-synced alone through `OperationEngine.resyncSeratoForBatch(_:fileID:)`.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.

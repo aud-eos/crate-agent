@@ -31,7 +31,7 @@ public final class AppServices: ObservableObject {
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
     public let activityLog: ActivityLog
-    let audioPreview = AudioPreviewPlayer()
+    let trackPlayer = TrackPlayer()
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession

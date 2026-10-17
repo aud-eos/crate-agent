@@ -18,6 +18,8 @@ final class PagedNSTableView: NSTableView {
     var selectMatchingRows: (() -> Void)?
     var menuAtRow: ((Int) -> NSMenu?)?
     var focusChanged: ((Int) -> Void)?
+    /// Handles Space for the focused row instead of toggling its selection.
+    var spaceAction: ((Int) -> Bool)?
 
     func focusRow(_ index: Int, modifiers: NSEvent.ModifierFlags, selecting: Bool) {
         guard index >= 0, index < numberOfRows else { return }
@@ -47,7 +49,9 @@ final class PagedNSTableView: NSTableView {
         case 121: next = min(numberOfRows - 1, selectedRow + step)
         case 116: next = max(0, selectedRow - step)
         case 49:
-            selectionIntent?(selectedRow, [.command])
+            if spaceAction?(selectedRow) != true {
+                selectionIntent?(selectedRow, [.command])
+            }
             return
         default:
             super.keyDown(with: event)

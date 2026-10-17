@@ -9,6 +9,16 @@ enum SeratoWriteKind: String, Codable, Sendable {
     case removeFromDatabase
     case removeFromCrates
     case trashFile
+
+    /// Writes to Serato's library files (database V2, crates, smart crates),
+    /// which all wait together while `database V2` is missing (#192). Audio
+    /// tags and Trash are not Serato library files.
+    var writesSeratoLibrary: Bool {
+        switch self {
+        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates: true
+        case .fileTagWrite, .trashFile: false
+        }
+    }
 }
 
 extension SeratoPendingWrite: Codable {
@@ -386,11 +396,77 @@ enum SeratoWriteDispositions {
         return result
     }
 
-    /// Not-applied event counts per History batch.
-    static func notAppliedCounts(in database: Database) throws -> [String: Int] {
-        try Row.fetchAll(database, sql: "SELECT batch_id, COUNT(DISTINCT event_id) AS count FROM serato_write_dispositions GROUP BY batch_id")
-            .reduce(into: [String: Int]()) { counts, row in counts[row["batch_id"]] = row["count"] }
+    /// Per History batch: not-applied changes by disposition, each event
+    /// counted once per disposition, the distinct events overall, and the
+    /// files they touch.
+    static func notAppliedByBatch(_ batchIDs: [String], in database: Database) throws -> [String: NotAppliedBatchCounts] {
+        guard !batchIDs.isEmpty else { return [:] }
+        let placeholders = batchIDs.map { _ in "?" }.joined(separator: ",")
+        var result: [String: NotAppliedBatchCounts] = [:]
+        for row in try Row.fetchAll(database, sql: """
+        SELECT d.batch_id, COUNT(DISTINCT d.event_id) AS changes, COUNT(DISTINCT COALESCE(e.file_id, -d.event_id)) AS files
+        FROM serato_write_dispositions d LEFT JOIN events e ON e.event_id = d.event_id
+        WHERE d.batch_id IN (\(placeholders)) GROUP BY d.batch_id
+        """, arguments: StatementArguments(batchIDs)) {
+            result[row["batch_id"]] = NotAppliedBatchCounts(changes: row["changes"], files: row["files"])
+        }
+        for row in try Row.fetchAll(database, sql: """
+        SELECT batch_id, disposition, COUNT(DISTINCT event_id) AS count FROM serato_write_dispositions
+        WHERE batch_id IN (\(placeholders)) GROUP BY batch_id, disposition
+        """, arguments: StatementArguments(batchIDs)) {
+            let batchID: String = row["batch_id"]
+            if let disposition = SeratoWriteDisposition(rawValue: row["disposition"]) {
+                result[batchID]?.byDisposition.counts[disposition] = row["count"]
+            } else {
+                result[batchID]?.byDisposition.unrecognized += row["count"] as Int
+            }
+        }
+        return result
     }
+
+    /// One page of a batch's not-applied changes grouped by file, ordered by
+    /// path; changes whose event has no file each form their own entry.
+    static func notAppliedFiles(batchID: String, limit: Int, offset: Int, in database: Database) throws -> [NotAppliedFileRecord] {
+        try Row.fetchAll(database, sql: """
+        SELECT e.file_id, MIN(d.event_id) AS first_event_id, f.path,
+               GROUP_CONCAT(DISTINCT d.event_id || ':' || d.disposition) AS dispositions, GROUP_CONCAT(DISTINCT e.event_type) AS event_types
+        FROM serato_write_dispositions d
+        LEFT JOIN events e ON e.event_id = d.event_id
+        LEFT JOIN files f ON f.id = e.file_id
+        WHERE d.batch_id = ?
+        GROUP BY COALESCE(e.file_id, -d.event_id)
+        ORDER BY f.path IS NULL, f.path, first_event_id
+        LIMIT ? OFFSET ?
+        """, arguments: [batchID, limit, offset]).map { row in
+            var byDisposition = SeratoWriteDispositionCounts()
+            for pair in (row["dispositions"] as String?)?.split(separator: ",") ?? [] {
+                let raw = pair.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+                if let disposition = SeratoWriteDisposition(rawValue: raw) {
+                    byDisposition.counts[disposition, default: 0] += 1
+                } else {
+                    byDisposition.unrecognized += 1
+                }
+            }
+            let eventTypes = (row["event_types"] as String?)?.split(separator: ",").map(String.init) ?? []
+            return NotAppliedFileRecord(fileID: row["file_id"], firstEventID: row["first_event_id"], path: row["path"],
+                                        byDisposition: byDisposition, eventTypes: eventTypes)
+        }
+    }
+}
+
+struct NotAppliedBatchCounts: Sendable, Equatable {
+    var changes: Int
+    var files: Int
+    var byDisposition = SeratoWriteDispositionCounts()
+}
+
+struct NotAppliedFileRecord: Sendable, Equatable {
+    let fileID: Int64?
+    let firstEventID: Int64
+    let path: String?
+    /// This file's not-applied changes, each event counted once per disposition.
+    let byDisposition: SeratoWriteDispositionCounts
+    let eventTypes: [String]
 }
 
 /// Duplicate cleanup is a durable state machine: the intent row is created in
