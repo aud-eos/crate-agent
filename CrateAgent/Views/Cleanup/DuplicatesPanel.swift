@@ -51,7 +51,7 @@ struct DuplicatesPanel: View {
     /// the results of a newer one (live updates and Rescan overlap).
     @State private var scanGeneration = 0
     /// The running digest check for the shown mode, if any.
-    @State private var checkTask: (mode: DuplicateFinder.Mode, task: Task<Void, Never>)?
+    @State private var checkTask: (mode: DuplicateFinder.Mode, id: UUID, task: Task<Void, Never>)?
     /// Coalesces bursts of fingerprint writes into one rescan.
     private static let liveRescanInterval: Duration = .milliseconds(1500)
 
@@ -640,6 +640,7 @@ struct DuplicatesPanel: View {
         }
         checkTask?.task.cancel()
         let verifier = services.duplicateEvidenceVerifier
+        let checkID = UUID()
         let task = Task(priority: .utility) {
             let failure: Error?
             do {
@@ -648,14 +649,14 @@ struct DuplicatesPanel: View {
             } catch {
                 failure = error
             }
-            if checkTask?.mode == mode {
+            if checkTask?.id == checkID {
                 checkTask = nil
             }
             if let failure, !(failure is CancellationError) {
                 actionError = "Duplicate check stopped: \(failure.localizedDescription). Use Rescan to try again."
             }
         }
-        checkTask = (mode, task)
+        checkTask = (mode, checkID, task)
     }
 
     /// The id of the file we'd keep for this group — user's override

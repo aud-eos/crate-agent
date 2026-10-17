@@ -52,6 +52,21 @@ pub enum FingerprintError {
     UnsupportedAudioConfig(String),
 }
 
+/// A failed read (EIO, a drive dropping mid-decode) may succeed later, so it
+/// stays an I/O error; a stream that ends early is a property of the file.
+impl From<SymphoniaError> for FingerprintError {
+    fn from(err: SymphoniaError) -> Self {
+        match err {
+            SymphoniaError::IoError(io_err)
+                if io_err.kind() != std::io::ErrorKind::UnexpectedEof =>
+            {
+                FingerprintError::Io(io_err)
+            }
+            other => FingerprintError::Decode(other.to_string()),
+        }
+    }
+}
+
 /// How much of a file's audio `fingerprint_file_with_extent` feeds to
 /// Chromaprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,7 +279,7 @@ impl AudioSource {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .map_err(|err| FingerprintError::Decode(err.to_string()))?;
+            .map_err(FingerprintError::from)?;
 
         let track = format
             .default_track(TrackType::Audio)
@@ -300,7 +315,7 @@ impl AudioSource {
 
         let decoder = codecs
             .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
-            .map_err(|err| FingerprintError::Decode(err.to_string()))?;
+            .map_err(FingerprintError::from)?;
 
         Ok(Self {
             format,
@@ -322,11 +337,7 @@ impl AudioSource {
         mut sink: impl FnMut(DecodeEvent<'_, '_>),
     ) -> Result<u64, FingerprintError> {
         let mut frames_decoded: u64 = 0;
-        while let Some(packet) = self
-            .format
-            .next_packet()
-            .map_err(|err| FingerprintError::Decode(err.to_string()))?
-        {
+        while let Some(packet) = self.format.next_packet().map_err(FingerprintError::from)? {
             if packet.track_id != self.track_id {
                 continue;
             }
@@ -341,7 +352,7 @@ impl AudioSource {
                 Err(SymphoniaError::DecodeError(_)) => sink(DecodeEvent::Skipped {
                     packet_timestamp: packet.pts.get(),
                 }),
-                Err(other) => return Err(FingerprintError::Decode(other.to_string())),
+                Err(other) => return Err(other.into()),
             }
         }
         Ok(frames_decoded)
@@ -405,6 +416,20 @@ mod tests {
 
     const SAMPLE_RATE: u32 = 44_100;
     const CHANNELS: u16 = 1;
+
+    #[test]
+    fn read_failures_stay_retryable_but_truncated_streams_do_not() {
+        let dropped_drive = SymphoniaError::IoError(std::io::Error::from_raw_os_error(5));
+        assert!(matches!(
+            FingerprintError::from(dropped_drive),
+            FingerprintError::Io(_)
+        ));
+        let truncated = SymphoniaError::IoError(std::io::ErrorKind::UnexpectedEof.into());
+        assert!(matches!(
+            FingerprintError::from(truncated),
+            FingerprintError::Decode(_)
+        ));
+    }
 
     /// Generate `duration_seconds` of a sine wave at `frequency_hz`,
     /// quantized to signed 16-bit PCM.
