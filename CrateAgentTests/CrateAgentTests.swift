@@ -2727,6 +2727,41 @@ final class FingerprintWorkerTests: XCTestCase {
                        "the new row must inherit the twin's exact fingerprint bytes")
     }
 
+    func testInvalidDoneTwinIsNotCopiedAndRetriedRowIsDecoded() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        let hash = Data([0xBA, 0xD0])
+        try await database.writer.write { db in
+            var record = FileRecord(path: "/Music/A/invalid-done.mp3", volumeUuid: "v1", inode: 300, fileSize: 1024, mtime: 1_700_000_000,
+                                    lightweightHash: hash, chromaprintFingerprint: Data([0x01, 0x02, 0x03]), fingerprintStatus: .done)
+            record.libraryMembership = .active
+            record.fileAvailability = .available
+            try record.insert(db)
+        }
+        try await insertPendingFileWithHash(path: "/Music/A/retried.mp3", in: database, inode: 301, lightweightHash: hash)
+
+        let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { _ in [0xFEED] })
+        _ = try await worker.processAllPendingOnce()
+
+        let retried = try await database.writer.read { db in
+            try FileRecord.filter(Column("path") == "/Music/A/retried.mp3").fetchOne(db)!
+        }
+        XCTAssertEqual(retried.fingerprintStatus, .done)
+        XCTAssertEqual(retried.chromaprintFingerprint, FingerprintEncoder.serialize([0xFEED]),
+                       "an invalid done twin must not be copied; the row is decoded itself")
+    }
+
+    func testDecoderReturningNoHashesMarksRowFailed() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        try await insertPendingFile(path: "/Music/A/silent.mp3", in: database, inode: 1)
+
+        let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { _ in [] })
+        _ = try await worker.processAllPendingOnce()
+
+        let failures = try await database.writer.read { db in try WorkerCoverageQuery.files(in: .failed, database: db) }
+        XCTAssertEqual(failures.map(\.path), ["/Music/A/silent.mp3"])
+        XCTAssertEqual(failures.first?.detail, WorkerMessages.noFingerprintProduced)
+    }
+
     func testFilesWithoutHashFingerprintIndependently() async throws {
         // A pending row with no lightweight_hash can't be grouped or
         // looked up. The worker fingerprints it the old-fashioned way.

@@ -17,6 +17,8 @@ that are easy to confuse:
   label without such bytes is reported as **invalid**, not as coverage. Files that
   are unavailable, still awaiting Serato confirmation, or removed from Serato are
   counted separately as not eligible.
+  Byte-twin copying uses only usable fingerprints, so an invalid result is never
+  copied to another file. A decoder that returns no hashes is recorded as a failure.
 - **Deferred Serato writes**: the durable write queue, with why it is waiting.
 
 ## Files needing attention

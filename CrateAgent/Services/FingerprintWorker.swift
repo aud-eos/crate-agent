@@ -441,7 +441,7 @@ public actor FingerprintWorker {
         SELECT file_size, lightweight_hash, chromaprint_fingerprint
         FROM files
         WHERE fingerprint_status = 'done'
-          AND chromaprint_fingerprint IS NOT NULL
+          AND NOT (\(WorkerCoverageQuery.invalidDoneSQL))
           AND (file_size, lightweight_hash) IN (VALUES \(placeholders))
         \(excludeClause)
         """
@@ -502,6 +502,9 @@ public actor FingerprintWorker {
         }
         do {
             let hashes = try function(file.path)
+            guard !hashes.isEmpty else {
+                return ProcessResult(fileId: fileId, path: file.path, outcome: .failure(WorkerMessages.noFingerprintProduced))
+            }
             return ProcessResult(
                 fileId: fileId,
                 path: file.path,
