@@ -47,6 +47,11 @@ search and filter changes, and the count shows selected files outside the filter
 New matches never join an earlier selection automatically. Right-click actions
 still operate on the clicked file.
 
+The play button at the start of each Library row, and beside each file in
+**Cleanup → Duplicates**, previews the audio. Only one file plays at a time;
+starting another, pressing stop, or leaving the screen ends it. Previewing only
+reads the file.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing

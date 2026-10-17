@@ -29,9 +29,12 @@ struct LibraryBrowserView: View {
             if let loadError {
                 ActionErrorMessage(message: loadError).padding(density.pagePadding)
             }
+            AudioPreviewFailureMessage(player: services.audioPreview).padding(.horizontal, density.pagePadding)
             ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
             if let model {
-                LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness) { identifier, action in
+                LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness,
+                                    preview: services.audioPreview)
+                { identifier, action in
                     Task { await perform(action, for: identifier) }
                 }
             } else if loadError == nil {
@@ -57,7 +60,7 @@ struct LibraryBrowserView: View {
         .task { await initializeModel() }
         .onChange(of: debouncedSearch) { _, _ in updateQuery() }
         .onChange(of: statusFilter) { _, _ in updateQuery() }
-        .onDisappear { model?.stop(); model = nil }
+        .onDisappear { model?.stop(); model = nil; services.audioPreview.stop() }
         .alert("Restart required", isPresented: $showRestartAlert) {
             Button("OK", role: .cancel) {}
         } message: {

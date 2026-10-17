@@ -12,6 +12,7 @@ struct LibraryPagedContent: View {
     let density: AppDensity
     let showsFilenames: Bool
     var readiness: LibrarySyncReadiness?
+    var preview: AudioPreviewPlayer?
     let onAction: (Int64, LibraryBrowserAction) -> Void
 
     private var enabled: Bool {
@@ -69,7 +70,7 @@ struct LibraryPagedContent: View {
     }
 
     private var table: some View {
-        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness),
+        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, preview: preview),
                    accessibilityLabel: "Library files", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
                    isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
                    onSelect: { rows, selected in
