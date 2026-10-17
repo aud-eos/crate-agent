@@ -239,6 +239,8 @@ private struct MoveFixture {
         }
         let database = database
         let serato = directory.appendingPathComponent("Serato")
+        try FileManager.default.createDirectory(at: serato, withIntermediateDirectories: true)
+        try SeratoTestEncoding.library(paths: []).write(to: serato.appendingPathComponent("database V2"))
         engine = await MainActor.run {
             OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }), seratoLocator: SeratoLibraryLocator(seratoDirectory: serato))
         }
