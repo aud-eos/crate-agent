@@ -60,6 +60,8 @@ struct LibraryBrowserView: View {
             }
         }
         .task { await initializeModel() }
+        .onAppear(perform: applySearchRequest)
+        .onChange(of: services.librarySearchRequest) { _, _ in applySearchRequest() }
         .onChange(of: debouncedSearch) { _, _ in updateQuery() }
         .onChange(of: statusFilter) { _, _ in updateQuery() }
         .onDisappear { model?.stop(); model = nil; services.audioPreview.stop() }
@@ -137,9 +139,6 @@ struct LibraryBrowserView: View {
                     .font(.callout)
                     .foregroundStyle(.red)
                     .lineLimit(1)
-                Button("Retry Fingerprinting") {
-                    services.retryFingerprinting()
-                }
             } else if let fingerprintProgress = services.fingerprintProgress,
                       fingerprintProgress.totalPending > 0
             {
@@ -157,19 +156,12 @@ struct LibraryBrowserView: View {
 
             Spacer()
 
-            if isRescanning {
-                Button("Stop Sync", role: .cancel) {
-                    services.stopLibraryRescan()
-                }
-            } else {
-                Button {
-                    services.requestLibraryRescan()
-                } label: {
-                    Label("Re-scan File Info", systemImage: "arrow.clockwise")
-                }
-                .seratoWriteGated(help: "Read Serato's saved library and refresh indexed file information.",
-                                  runningHelp: "Close Serato before re-scanning file info.")
+            Button {
+                services.open(.workers)
+            } label: {
+                Label(WorkerMessages.sectionTitle, systemImage: MainWindowView.Section.workers.iconName)
             }
+            .help("Re-scan file info, stop a scan, and retry fingerprinting in Workers.")
 
             Text("Watching: \(services.watchedMusicFolder.path)")
                 .font(.callout)
@@ -189,6 +181,12 @@ struct LibraryBrowserView: View {
         }
         .padding(.horizontal, density.pagePadding)
         .padding(.vertical, density.rowPadding)
+    }
+
+    private func applySearchRequest() {
+        guard let request = services.consumeLibrarySearchRequest() else { return }
+        statusFilter = .active
+        searchText = request
     }
 
     private var isRescanning: Bool {

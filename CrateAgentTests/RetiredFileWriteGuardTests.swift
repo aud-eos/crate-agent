@@ -280,7 +280,7 @@ final class RetiredFileWriteGuardTests: XCTestCase {
         let fixture = try await Fixture.make()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         try await fixture.engine.apply(.writeFileTags(WriteFileTagsPayload(fileId: fixture.fileID, metadata: SeratoMetadata(title: "stale"))), batchId: "unavailable")
-        try await fixture.transition(.active, availability: .trashed)
+        try await fixture.transition(.active, availability: .missing)
         fixture.closeSerato()
         let outcome = try await fixture.engine.drainPendingSeratoUpdates()
         XCTAssertEqual(outcome.supersededCount, 1)

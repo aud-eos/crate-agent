@@ -16,7 +16,7 @@ The "apply track mutation" primitive in `OperationEngine` is the single chokepoi
 
 Why this exists: without the chokepoint, every feature reinvents (a) the Serato-running guard, (b) the SQLite transaction, (c) the event log entry. Two of those three would always get forgotten. The chokepoint guarantees consistency.
 
-How to apply: when adding a new feature that modifies tracks, add a `TrackMutation` case and implement its apply / inverse logic. Do not write a parallel path that goes around `OperationEngine`.
+How to apply: when adding a new feature that modifies tracks, add a `TrackMutation` case and implement its apply / inverse logic. Do not write a parallel path that goes around `OperationEngine`. A new case also needs a complete `SeratoConflictTargets.mutation` projection (and `write` for a new `SeratoPendingWrite`): every current, previous, destination and reference path, physical identity and shared `track_id` it can write. The switch is exhaustive, so the compiler demands a case, but a case that names only `fileId` silently under-protects path-conflicted files. `processingFileID` is not a substitute.
 
 Async validation is not authorization for a later commit: another actor can retire
 the file, replace its identity, or supersede a saved snapshot during suspension.
@@ -55,6 +55,8 @@ How to apply: anything touching the files above goes through `OperationEngine`, 
 Why this exists: paths change (rename, move, re-encode); fingerprints don't (within Chromaprint's perceptual tolerance). If we used path-as-identity, every feature past sub-project 1 would break the moment a user renamed a track.
 
 How to apply: new features that need to refer to "the same recording" should use `track_id`, not `path` or `file_id`. The `files ←→ tracks` relationship is many-to-one (multiple files can encode the same recording — FLAC and MP3 of the same song); use the right side of that relationship.
+
+`tracks.fingerprint_hash` is the SHA-256 of one file's stored, 120-second-capped Chromaprint bytes. It is an exact-match key, not a perceptual one. A FLAC and an MP3 of the same song normally get separate `tracks` rows. Only an applied Auto-Tag match (`applyMusicBrainzMatch`) creates a `tracks` row or sets `files.track_id`, so most files have `track_id == nil`. Until Pillar C adds perceptual/work identity, treat a shared MusicBrainz recording ID as the cross-encode "same recording" signal, and handle a missing `track_id` explicitly.
 
 Physical I/O must verify that its actual target still matches the original authorized file; a current row or reused path alone is insufficient. `SeratoWriteEligibility` shares this check across queued effects, while destructive move compensation requires `OwnedAudioIdentity`'s complete digest and precise change identity. See [physical effects and cleanup](docs/serato-membership-reconciliation.md#physical-effects-and-duplicate-cleanup).
 

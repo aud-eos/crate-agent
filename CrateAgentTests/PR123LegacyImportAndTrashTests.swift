@@ -51,32 +51,32 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         let handler = FilesystemSyncBatchHandler(coordinator: coordinator, session: session)
         let processed = expectation(description: "Native Trash destination captured and checkpointed")
         processed.assertForOverFulfill = false
+        let emptied = replaying ? nil : expectation(description: "Removing the Trash item marks the retained path missing")
+        emptied?.assertForOverFulfill = false
         let initialCheckpoint = replaying ? expectation(description: "Owned marker establishes a real stream cursor") : nil
         initialCheckpoint?.assertForOverFulfill = false
         let probe = NativeTrashPipelineProbe()
-        let processor = FilesystemEventProcessor(handler: { batch in
-            await probe.record(batch)
-            try await handler.handle(batch)
-        }, checkpoint: { eventID in
-            let row = try await fixture.database.writer.read { try FileRecord.fetchOne($0, key: file.id) }
-            await probe.checkpoint(eventID)
-            if replaying, await probe.snapshot().paths.contains(where: { $0.hasSuffix("checkpoint-marker.txt") }) {
-                initialCheckpoint?.fulfill()
-            }
-            if row?.fileAvailability == .trashed {
-                processed.fulfill()
-            }
-        })
-        let stream = AsyncStream<FilesystemEventBatch>.makeStream()
-        let delivery = Task {
-            for await batch in stream.stream {
-                do { try await processor.enqueue(batch) }
-                catch { XCTFail("Native event pipeline failed: \(error)") }
-            }
+        // Each watcher restarts delivery sequencing, so each one gets a fresh processor, as on app restart.
+        let makeProcessor = {
+            FilesystemEventProcessor(handler: { batch in
+                await probe.record(batch)
+                try await handler.handle(batch)
+            }, checkpoint: { eventID in
+                let row = try await fixture.database.writer.read { try FileRecord.fetchOne($0, key: file.id) }
+                await probe.checkpoint(eventID)
+                if replaying, await probe.snapshot().paths.contains(where: { $0.hasSuffix("checkpoint-marker.txt") }) {
+                    initialCheckpoint?.fulfill()
+                }
+                if row?.fileAvailability == .trashed {
+                    processed.fulfill()
+                }
+                if row?.fileAvailability == .missing, await probe.trashItemRemoved {
+                    emptied?.fulfill()
+                }
+            })
         }
-        var watcher = FSEventsWatcher(watchedPaths: configuration.watchedPaths, coalescingLatency: 0.05) { stream.continuation.yield($0) }
-        try watcher.start()
-        defer { watcher.stop(); stream.continuation.finish(); delivery.cancel() }
+        var pipeline = try NativeEventPipeline(watchedPaths: configuration.watchedPaths, processor: makeProcessor())
+        defer { pipeline.stop() }
         try await Task.sleep(nanoseconds: 200_000_000)
         var resumeCursor: UInt64?
         if let initialCheckpoint {
@@ -84,7 +84,7 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
             await fulfillment(of: [initialCheckpoint], timeout: 5)
             resumeCursor = await probe.snapshot().checkpoints.last
             XCTAssertGreaterThan(try XCTUnwrap(resumeCursor), 0)
-            watcher.stop()
+            await pipeline.finish()
         }
         var resultingURL: NSURL?
         try FileManager.default.trashItem(at: source, resultingItemURL: &resultingURL)
@@ -93,13 +93,9 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: destination) }
         if let resumeCursor {
             let since = configuration.resumeEventID { $0 == configuration.checkpointKey ? resumeCursor : nil }
-            watcher = FSEventsWatcher(watchedPaths: configuration.watchedPaths, sinceWhen: since, coalescingLatency: 0.05) { stream.continuation.yield($0) }
-            try watcher.start()
+            pipeline = try NativeEventPipeline(watchedPaths: configuration.watchedPaths, sinceWhen: since, processor: makeProcessor())
         }
         await fulfillment(of: [processed], timeout: 5)
-        watcher.stop()
-        stream.continuation.finish()
-        await delivery.value
         let observed = await probe.snapshot()
         XCTAssertTrue(observed.paths.contains { SeratoPath.normalized($0) == SeratoPath.normalized(destination.path) })
         XCTAssertFalse(observed.checkpoints.isEmpty)
@@ -112,6 +108,27 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         XCTAssertEqual(try savedPaths(fixture), [file.path])
         let events = try await fixture.database.writer.read { try EventRecord.fetchAll($0) }
         XCTAssertFalse(events.contains { $0.eventType == .fileRenamed })
+        let location = try await trashLocation(of: file, fixture: fixture)
+        XCTAssertEqual(location.map { SeratoPath.normalized($0.path) }, SeratoPath.normalized(destination.path))
+        XCTAssertEqual(location?.inode, identity.inode)
+
+        await probe.removeTrashItem()
+        try FileManager.default.removeItem(at: destination)
+        if let emptied {
+            await fulfillment(of: [emptied], timeout: 5)
+        } else {
+            await pipeline.finish()
+            let restartedScanner = LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator)
+            let restarted = SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler, scanner: restartedScanner,
+                                                     operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: readiness)
+            try await restarted.synchronize()
+        }
+        let removed = try await fixture.row(file)
+        XCTAssertEqual(removed.fileAvailability, .missing)
+        XCTAssertEqual(removed.path, file.path)
+        let clearedLocation = try await trashLocation(of: file, fixture: fixture)
+        XCTAssertNil(clearedLocation)
+        XCTAssertEqual(try savedPaths(fixture), [file.path])
     }
 
     func testWatchConfigurationCreatesOwnedTrashAndScopesCombinedCursor() throws {
@@ -401,14 +418,56 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         }
     }
 
+    private func trashLocation(of file: FileRecord, fixture: SeratoRemovalFixture) async throws -> FileMetadata? {
+        let fileID = try XCTUnwrap(file.id)
+        return try await fixture.database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
+    }
+
     private func savedPaths(_ fixture: SeratoRemovalFixture) throws -> [String] {
         try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).map { SeratoPath.normalized($0.path) }
+    }
+}
+
+private final class NativeEventPipeline {
+    private let watcher: FSEventsWatcher
+    private let continuation: AsyncStream<FilesystemEventBatch>.Continuation
+    private let delivery: Task<Void, Never>
+
+    init(watchedPaths: [String], sinceWhen: FSEventStreamEventId = FSEventsWatcher.sinceNow, processor: FilesystemEventProcessor) throws {
+        let stream = AsyncStream<FilesystemEventBatch>.makeStream()
+        continuation = stream.continuation
+        delivery = Task {
+            for await batch in stream.stream {
+                do { try await processor.enqueue(batch) }
+                catch { XCTFail("Native event pipeline failed: \(error)") }
+            }
+        }
+        let continuation = continuation
+        watcher = FSEventsWatcher(watchedPaths: watchedPaths, sinceWhen: sinceWhen, coalescingLatency: 0.05) { continuation.yield($0) }
+        try watcher.start()
+    }
+
+    func finish() async {
+        watcher.stop()
+        continuation.finish()
+        await delivery.value
+    }
+
+    func stop() {
+        watcher.stop()
+        continuation.finish()
+        delivery.cancel()
     }
 }
 
 private actor NativeTrashPipelineProbe {
     private var observations: [FSEventsObservation] = []
     private var checkpoints: [UInt64] = []
+    private(set) var trashItemRemoved = false
+
+    func removeTrashItem() {
+        trashItemRemoved = true
+    }
 
     func record(_ batch: FilesystemEventBatch) {
         observations += batch.observations
