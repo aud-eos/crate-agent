@@ -101,6 +101,15 @@ its verified physical identity and fingerprint basis, preserving revision,
 recording links, and Serato-mirrored metadata. Genuine replacements still invalidate
 the prior association.
 
+Because owned tag writes leave the mirrored columns alone, undo and redo of a
+MusicBrainz match guard their audio-tag inverse by the file itself
+(`MatchUndoTagGuard`). Before the transaction, each matched file's tags are read
+under an `AudioFileReadIdentity`. Every field the match wrote must still hold the
+matched value or the pre-match value; any other value is a later edit, and the undo
+is refused for those fields only. The transaction rechecks that identity, so a file
+that changes after the read fails the undo, and nothing commits. A queued apply that
+never reached the file still undoes, because its file holds the pre-match value.
+
 `reader.authorization(for:)` captures source identity, the reader's latest
 generation, and the watchdog's closed lifecycle revision. The engine's
 `applyObservedBatch` checks this authorization inside its serialized transaction

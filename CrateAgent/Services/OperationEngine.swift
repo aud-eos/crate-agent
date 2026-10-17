@@ -39,6 +39,10 @@ public actor OperationEngine {
     /// real audio files on disk.
     public typealias FileTagWriter = @Sendable (String, AudioTagUpdate) throws -> Void
 
+    /// Injectable audio-file tag reader, the read half of the same boundary:
+    /// a test that fakes the writer fakes the reader to match it.
+    public typealias FileTagReader = @Sendable (String) throws -> AudioTags
+
     /// Injectable database-V2 metadata batch writer. Production wires
     /// in the Rust `batchUpdateDatabaseRecords` FFI (one file read +
     /// one file write covering every track in the batch); tests inject
@@ -59,6 +63,7 @@ public actor OperationEngine {
     private let seratoWatchdog: SeratoWatchdog
     private let seratoLocator: SeratoLibraryLocator
     private let fileTagWriter: FileTagWriter
+    private let fileTagReader: FileTagReader
     private let seratoMetadataBatchWriter: SeratoMetadataBatchWriter
     private let fileTrasher: FileTrasher
     private let activityLog: ActivityLog?
@@ -125,6 +130,7 @@ public actor OperationEngine {
         fileTagWriter: @escaping FileTagWriter = { path, update in
             try writeAudioTags(filePath: path, update: update)
         },
+        fileTagReader: @escaping FileTagReader = { path in try readAudioTags(filePath: path) },
         seratoMetadataBatchWriter: @escaping SeratoMetadataBatchWriter = { databasePath, updates in
             try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
         },
@@ -140,6 +146,7 @@ public actor OperationEngine {
         self.seratoWatchdog = seratoWatchdog
         self.seratoLocator = seratoLocator
         self.fileTagWriter = fileTagWriter
+        self.fileTagReader = fileTagReader
         self.seratoMetadataBatchWriter = seratoMetadataBatchWriter
         self.fileTrasher = fileTrasher
         self.activityLog = activityLog
@@ -1550,6 +1557,10 @@ public actor OperationEngine {
             try Self.decodeInverseMutation(event: event)
         }
 
+        // Ordering is checked first so a superseded match reports that, not
+        // the newer match's tags; both checks run again inside the transaction.
+        try await database.writer.read { database in try Self.requireNoLaterMatchSupersedes(events: events, in: database) }
+        let tagReads = try await readMatchFileTags(events)
         let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
         let context = mutationContext
         // One transaction for every inverse mutation in the batch.
@@ -1562,6 +1573,15 @@ public actor OperationEngine {
             // Inside the transaction that applies the inverses, so an apply
             // that lands while undo is suspended cannot slip past it (#107).
             try Self.requireNoLaterMatchSupersedes(events: events, in: database)
+            for read in tagReads {
+                guard try FileRecord.fetchOne(database, key: read.fileID)?.path == read.path else {
+                    throw FileProcessingEligibilityError.superseded(fileId: read.fileID)
+                }
+                do { try read.identity.requireUnchanged(at: read.path) }
+                catch SeratoMembershipSnapshotError.sourceChanged {
+                    throw OperationEngineError.undoFileChangedWhileChecking(fileId: read.fileID)
+                }
+            }
             for event in events {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
@@ -1579,6 +1599,35 @@ public actor OperationEngine {
         }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
         return undoBatchId
+    }
+
+    /// Reads the live tags of every file whose match this undo reverses or
+    /// redoes, refusing when the inverse would overwrite a later tag edit.
+    private func readMatchFileTags(_ events: [EventRecord]) async throws -> [MatchUndoTagGuard.Read] {
+        let decoder = JSONDecoder()
+        var matches: [(fileID: Int64, applied: ApplyMusicBrainzMatchPayload)] = []
+        for event in events {
+            guard let fileID = event.fileId else { continue }
+            switch event.eventType {
+            case .musicBrainzMatchApplied:
+                try matches.append((fileID, Self.decodeEventPayload(ApplyMusicBrainzMatchPayload.self, event: event, decoder: decoder)))
+            case .musicBrainzMatchReverted:
+                try matches.append((fileID, Self.decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder).applied))
+            default: continue
+            }
+        }
+        guard !matches.isEmpty else { return [] }
+        let paths = try await database.writer.read { database in
+            try Self.fetchFiles(fileIDs: matches.map(\.fileID), in: database).reduce(into: [Int64: String]()) { paths, file in
+                if let fileID = file.id {
+                    paths[fileID] = file.path
+                }
+            }
+        }
+        return try matches.map { match in
+            guard let path = paths[match.fileID] else { throw OperationEngineError.fileNotFound(fileId: match.fileID) }
+            return try MatchUndoTagGuard.read(fileID: match.fileID, path: path, applied: match.applied, reader: fileTagReader)
+        }
     }
 
     /// Throws `undoSupersededByLaterMatch` if any match-affecting event in the
@@ -3934,7 +3983,7 @@ public actor OperationEngine {
         // For each text field the forward wrote, restore that target's snapshot
         // value, or "" to clear a field the match added from empty.
         let dbSnapshot = applied.previousMetadata ?? .empty
-        let fileSnapshot = applied.previousFileTags ?? applied.previousMetadata ?? .empty
+        let fileSnapshot = applied.fileTagRestoreSnapshot
 
         let v2Metadata = SeratoMetadata(
             artist: applied.artist != nil ? (dbSnapshot.artist ?? "") : nil,
@@ -4629,6 +4678,13 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// rather than silently corrupting the current state (findings #3999114450,
     /// #3999974010). Detected from the event log in `undoBatch`.
     case undoSupersededByLaterMatch(fileId: Int64)
+    /// Undo or redo of a match was refused because the audio file's tags no
+    /// longer hold either end of the match for these fields: a later tag edit
+    /// that the inverse would overwrite (#111).
+    case undoWouldOverwriteFileTags(fileId: Int64, fields: [String])
+    /// The audio file changed between undo's tag check and its commit, so
+    /// the check no longer describes the file the inverse would rewrite.
+    case undoFileChangedWhileChecking(fileId: Int64)
     case metadataChanged(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
@@ -4666,6 +4722,10 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
             "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
+        case let .undoWouldOverwriteFileTags(fileId, fields):
+            "Can't undo this MusicBrainz change for file id \(fileId): its audio file's \(fields.joined(separator: ", ")) changed since, and undoing would overwrite that edit."
+        case let .undoFileChangedWhileChecking(fileId):
+            "Can't undo this MusicBrainz change for file id \(fileId): its audio file changed while undo was checking it. Try again."
         case let .metadataChanged(fileId):
             "File id \(fileId) metadata changed after it was reviewed. Re-scan before applying."
         case let .externalSyncIncomplete(batchId, underlying):
