@@ -57,26 +57,6 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         try await verifyNavigationDuringSync(fixture)
     }
 
-    func testScratchUpgradeBackfill() async throws {
-        let fixture = try await LibraryStartupPerformanceFixture()
-        defer { try? fixture.cleanup() }
-        let session = fixture.makeSession(checkpointed: true)
-        try await session.synchronize()
-        try await fixture.database.writer.write { database in try database.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL") }
-        let upgraded = fixture.makeSession(checkpointed: true)
-        let counters = LibrarySyncMetrics()
-        let start = ContinuousClock.now
-        try await LibrarySyncMetrics.$current.withValue(counters) { try await upgraded.synchronize() }
-        let upgrade = start.duration(to: .now)
-        let remaining = try await fixture.database.writer.read { database in try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM files WHERE mtime_nanoseconds IS NULL") ?? -1 }
-        let events = try await fixture.database.writer.read { database in try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM events") ?? -1 }
-        let next = fixture.makeSession(checkpointed: true)
-        let nextStart = ContinuousClock.now
-        try await next.synchronize()
-        let after = nextStart.duration(to: .now)
-        print("UPGRADE_BACKFILL upgrade=\(upgrade) remaining=\(remaining) events=\(events) hash=\(counters.snapshot().lightweightHashReads) stats=\(counters.snapshot().stats) tags=\(counters.snapshot().audioTagReads) phases=\(counters.phaseDurations()) next=\(after)")
-    }
-
     private func verifyNavigationDuringSync(_ fixture: LibraryStartupPerformanceFixture) async throws {
         let barrier = SessionBarrier()
         let reader = SeratoMembershipSnapshotReader(locator: fixture.locator, watchdog: fixture.watchdog, afterParsing: { await barrier.pauseFirst() })

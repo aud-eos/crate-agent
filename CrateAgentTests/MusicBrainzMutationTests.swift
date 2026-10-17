@@ -255,6 +255,10 @@ final class MusicBrainzMutationTests: XCTestCase {
         return (engine, database, fileId)
     }
 
+    private func indexedFreshness(of fileId: Int64, in database: LibraryDatabase) async throws -> FileFreshnessSnapshot {
+        try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db, key: fileId)).freshness }
+    }
+
     private func fullPayload(
         fileID: Int64,
         fingerprintHash: Data,
@@ -271,7 +275,8 @@ final class MusicBrainzMutationTests: XCTestCase {
         // Match `makeEngineWithFile`'s indexed identity so the D-A staleness
         // check passes by default; a stale-candidate test overrides these.
         expectedFileSize: Int64 = 1,
-        expectedMtime: Int64 = 1
+        expectedMtime: Int64 = 1,
+        reviewed: FileFreshnessSnapshot? = nil
     ) -> ApplyMusicBrainzMatchPayload {
         ApplyMusicBrainzMatchPayload(
             fileID: fileID,
@@ -281,8 +286,10 @@ final class MusicBrainzMutationTests: XCTestCase {
             artistMBID: "art",
             isrc: "ISRC123",
             fingerprintHash: fingerprintHash,
-            expectedFileSize: expectedFileSize,
-            expectedMtime: expectedMtime,
+            expectedFileSize: reviewed?.fileSize ?? expectedFileSize,
+            expectedMtime: reviewed?.mtime ?? expectedMtime,
+            expectedMtimeNanoseconds: reviewed?.mtimeNanoseconds,
+            expectedInode: reviewed?.inode,
             artist: artist,
             title: title,
             album: album,
@@ -1703,11 +1710,12 @@ final class MusicBrainzMutationTests: XCTestCase {
         let (engine, database, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
         }
+        let reviewed = try await indexedFreshness(of: fileId, in: database)
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
                 fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
                 artist: "New Artist", title: "Same Title", album: nil, year: 1994,
-                currentFileYear: 1994, currentFileArtist: "Disk Artist", currentFileTitle: "Same Title"
+                currentFileYear: 1994, currentFileArtist: "Disk Artist", currentFileTitle: "Same Title", reviewed: reviewed
             )),
             batchId: "already-on-disk"
         )
@@ -1734,14 +1742,15 @@ final class MusicBrainzMutationTests: XCTestCase {
 
     func testUndoLeavesALaterEditToAFieldTheMatchDidNotRewrite() async throws {
         let recorder = FileTagWriterRecorder()
-        let (engine, _, fileId) = try await MainActor.run {
+        let (engine, database, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
         }
+        let reviewed = try await indexedFreshness(of: fileId, in: database)
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
                 fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
                 artist: "New Artist", title: "Same Title", album: nil, year: nil,
-                currentFileArtist: "Disk Artist", currentFileTitle: "Same Title"
+                currentFileArtist: "Disk Artist", currentFileTitle: "Same Title", reviewed: reviewed
             )),
             batchId: "match"
         )
@@ -1774,14 +1783,15 @@ final class MusicBrainzMutationTests: XCTestCase {
 
     func testExactConfirmOfValuesAlreadyOnDiskWritesNoTags() async throws {
         let recorder = FileTagWriterRecorder()
-        let (engine, _, fileId) = try await MainActor.run {
+        let (engine, database, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
         }
+        let reviewed = try await indexedFreshness(of: fileId, in: database)
         try await engine.apply(
             .applyMusicBrainzMatch(fullPayload(
                 fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
                 artist: "Nas", title: "Halftime", album: "Illmatic", year: 1994,
-                currentFileYear: 1994, currentFileArtist: "Nas", currentFileTitle: "Halftime", currentFileAlbum: "Illmatic"
+                currentFileYear: 1994, currentFileArtist: "Nas", currentFileTitle: "Halftime", currentFileAlbum: "Illmatic", reviewed: reviewed
             )),
             batchId: "exact-confirm"
         )

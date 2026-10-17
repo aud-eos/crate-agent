@@ -3737,7 +3737,7 @@ public actor OperationEngine {
     /// review was rewritten after the capture (a tag write that landed while
     /// apply was suspended), so then nothing is left out.
     private static func fileTagFieldsAlreadyOnDisk(_ payload: ApplyMusicBrainzMatchPayload, file: FileRecord, in db: GRDB.Database) throws -> Set<MatchFileTagField> {
-        guard payload.expectedFileSize == file.fileSize, payload.expectedMtime == file.mtime else { return [] }
+        guard payload.expectedFreshness?.describesSameFile(as: file.freshness) == true else { return [] }
         let queuedTagWrite = try SeratoWriteQueue.fetch(fileID: payload.fileID, in: db).contains { queued in queued.write.kind == .fileTagWrite }
         guard !queuedTagWrite else { return [] }
         let unchanged = SeratoMetadata(
