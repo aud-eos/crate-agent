@@ -141,6 +141,8 @@ public enum SongFamilyError: LocalizedError, Equatable {
     /// identity source already claims; grouping never shares or rewrites it.
     case fingerprintCollision(file: String, otherFile: String?)
     case linkChanged(file: String)
+    /// A file the command was authorized for changed after it was shown.
+    case changedSinceShown(file: String)
     /// The recording belongs to a family that still has two or more live
     /// versions, named here.
     case memberAlreadyInFamily(recording: String, familyVersions: [String])
@@ -170,6 +172,8 @@ public enum SongFamilyError: LocalizedError, Equatable {
             "“\(file)” has the same audio fingerprint as a recording crate-agent already identified, so it treats them as one recording and can't group them as separate versions."
         case let .linkChanged(file):
             "“\(file)” was linked to a different recording since this was recorded."
+        case let .changedSinceShown(file):
+            "“\(file)” changed after it was shown. Review it and try again."
         case let .memberAlreadyInFamily(recording, familyVersions):
             "“\(recording)” is already in a song family with \(familyVersions.map { version in "“\(version)”" }.formatted(.list(type: .and))). Merge the families instead."
         case let .notAMember(recording):
@@ -445,6 +449,13 @@ enum SongFamilyMutation {
     /// count as versions; a member that lost its last file keeps its
     /// assignment so restoring the file restores the member.
     static let liveTrackSQL = "EXISTS (SELECT 1 FROM files WHERE files.track_id = tracks.id AND \(FileProcessingEligibility.activeSQL))"
+
+    /// The families the user can see, with their live version counts as
+    /// `family_id, versions`: every family with two or more live versions.
+    static let liveFamiliesSQL = """
+    SELECT work_id AS family_id, COUNT(*) AS versions FROM tracks
+    WHERE work_id IS NOT NULL AND \(liveTrackSQL) GROUP BY work_id HAVING COUNT(*) >= 2
+    """
 
     private static func liveTracks(in snapshot: SongFamilySnapshot, database: GRDB.Database) throws -> Set<Int64> {
         let trackIDs = snapshot.assignments.map(\.trackId)

@@ -86,10 +86,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         """
         let live = SongFamilyMutation.liveTrackSQL
         return """
-        WITH live_families AS MATERIALIZED (
-            SELECT work_id AS family_id, COUNT(*) AS versions FROM tracks
-            WHERE work_id IS NOT NULL AND \(live) GROUP BY work_id HAVING COUNT(*) >= 2
-        ),
+        WITH live_families AS MATERIALIZED (\(SongFamilyMutation.liveFamiliesSQL)),
         family_files AS MATERIALIZED (
             SELECT files.id, files.membership_revision, files.title, tracks.work_id AS family_id, files.track_id AS recording_id,
                    tracks.musicbrainz_recording_id AS recording_mbid, \(sortKey) AS sort_key, \(familyColumns)

@@ -27,7 +27,9 @@ public struct SongFamily: Equatable, Sendable, Identifiable {
     }
 }
 
-/// A file's recording and the family that recording belongs to, if any.
+/// A file's recording and the family that recording belongs to, if Library
+/// shows that family: one with fewer than two live versions reads as none, so
+/// Merge never pulls a hidden family in and Add takes its recording over.
 public struct SongFamilyFileMembership: Equatable, Sendable {
     public let fileId: Int64
     public let trackId: Int64?
@@ -110,17 +112,20 @@ public struct SongFamilyService: Sendable {
         let ids = "[" + fileIds.map(String.init).joined(separator: ",") + "]"
         return try await database.writer.read { database in
             try Row.fetchAll(database, sql: """
-            SELECT files.id, files.track_id, tracks.work_id FROM files LEFT JOIN tracks ON tracks.id = files.track_id
+            WITH live_families AS (\(SongFamilyMutation.liveFamiliesSQL))
+            SELECT files.id, files.track_id, live_families.family_id FROM files LEFT JOIN tracks ON tracks.id = files.track_id
+            LEFT JOIN live_families ON live_families.family_id = tracks.work_id
             WHERE files.id IN (SELECT value FROM json_each(?)) ORDER BY files.id
             """, arguments: [ids]).map { row in
-                SongFamilyFileMembership(fileId: row["id"], trackId: row["track_id"], familyId: row["work_id"])
+                SongFamilyFileMembership(fileId: row["id"], trackId: row["track_id"], familyId: row["family_id"])
             }
         }
     }
 
     /// Runs the file links and the membership change as one batch, so one
     /// undo reverses both and a refused change leaves no link behind. Every
-    /// `authority` token must still be current inside that transaction.
+    /// `authority` token must still be current inside that transaction; a
+    /// stale one is refused by the file's name.
     private func apply(_ operation: SongFamilyOperation, linking members: [SongFamilyMember] = [], familyId: Int64?,
                        authority: [FileMembershipToken]) async throws -> SongFamilyResult
     {
@@ -129,7 +134,13 @@ public struct SongFamilyService: Sendable {
             guard case let .file(fileID) = member else { return nil }
             return .songFamily(.linkRecording(fileId: fileID))
         }
-        _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID, authorizingMembershipTokens: authority)
+        do {
+            _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID, authorizingMembershipTokens: authority)
+        } catch let FileProcessingEligibilityError.superseded(fileID) where authority.contains(where: { token in token.fileId == fileID }) {
+            let name = try await database.writer.read { database in try FileRecord.fetchOne(database, key: fileID)?.displayName }
+            guard let name else { throw FileProcessingEligibilityError.superseded(fileId: fileID) }
+            throw SongFamilyError.changedSinceShown(file: name)
+        }
         let change = try await database.writer.read { database in
             try EventRecord.filter(Column("batch_id") == batchID && Column("event_type") == operation.eventType.rawValue).fetchOne(database)
                 .map { event in try JSONDecoder().decode(SongFamilyChange.self, from: Data(event.payloadJson.utf8)) }

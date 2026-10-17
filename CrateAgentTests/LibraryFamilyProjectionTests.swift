@@ -135,10 +135,46 @@ final class LibraryFamilyProjectionTests: XCTestCase {
         }
 
         await XCTAssertThrowsErrorAsync(try await actions.perform(.remove, on: target)) { error in
-            guard case FileProcessingEligibilityError.superseded(self.instrumental) = error else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertEqual(error as? SongFamilyError, .changedSinceShown(file: "Song (Instrumental)"))
         }
         let family = try await pool.read { connection in try Int64.fetchAll(connection, sql: "SELECT id FROM tracks WHERE work_id = ?", arguments: [self.familyID]) }
         XCTAssertEqual(family.count, 3)
+    }
+
+    @MainActor
+    func testMergeLeavesAFamilyLibraryNoLongerShows() async throws {
+        let engine = OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
+        let actions = LibraryFamilyActions(families: SongFamilyService(engine: engine, database: database))
+        let hidden = try await pool.write { connection in
+            var family = SongFamilyRecord()
+            try family.insert(connection)
+            let hiddenID = try XCTUnwrap(family.id)
+            for (title, membership) in [("Hidden (Dub)", LibraryMembership.active), ("Hidden (Edit)", .retired)] {
+                var track = TrackRecord(fingerprintHash: Data(title.utf8), title: title, workId: hiddenID)
+                try track.insert(connection)
+                var file = FileRecord(path: "/Music/\(title).mp3", volumeUuid: "volume", inode: 100 + Int64(title.count), fileSize: 1, mtime: 1,
+                                      trackId: track.id, title: title)
+                file.libraryMembership = membership
+                file.fileAvailability = .available
+                try file.insert(connection)
+            }
+            return hiddenID
+        }
+        let dub = try await pool.read { connection in
+            try XCTUnwrap(Int64.fetchOne(connection, sql: "SELECT id FROM files WHERE title = 'Hidden (Dub)'"))
+        }
+        let shown = try await rows(LibraryBrowseQuery())
+        let mainRow = try XCTUnwrap(shown.first { row in row.id == main })
+        let target = LibraryFamilyActionTarget(clicked: mainRow, files: [.init(id: main, revision: 0), .init(id: dub, revision: 0)])
+
+        await XCTAssertThrowsErrorAsync(try await actions.perform(.mergeSelected, on: target)) { error in
+            XCTAssertEqual(error as? LibraryFamilyActionError, .nothingToChange)
+        }
+        let hiddenMembers = try await pool.read { connection in
+            try Int64.fetchOne(connection, sql: "SELECT COUNT(*) FROM tracks WHERE work_id = ?", arguments: [hidden])
+        }
+        XCTAssertEqual(hiddenMembers, 2)
     }
 
     func testAFamilyLeftWithOneLiveVersionIsShownAsStandaloneRowsWithoutFamilyCommands() async throws {

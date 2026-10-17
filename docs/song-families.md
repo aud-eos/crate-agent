@@ -147,7 +147,12 @@ replaced, and returns when it is available again.
     the command, naming the file, instead of being left out.
   - Each targeted file is passed to `SongFamilyService` as authority
     (`applyBatch(authorizingMembershipTokens:)`), so a file whose membership
-    changes before the transaction refuses the whole change.
+    changes before the transaction refuses the whole change, naming the file
+    (`SongFamilyError.changedSinceShown`).
+  - Commands read a targeted file's family the way Library shows it
+    (`SongFamilyService.memberships(ofFiles:)`): a file in a family with
+    fewer than two live versions counts as standalone. **Merge** never pulls
+    such a hidden family in, and **Add** takes its recording over (rule 5).
   - `LibraryFamilyActions` and `LibraryBrowserModel.familyActionTarget(for:)`
     are the API the view calls.
 - **Empty libraries.** The family columns and the global Include alternates
