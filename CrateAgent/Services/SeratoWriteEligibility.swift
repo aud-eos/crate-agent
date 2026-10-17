@@ -32,6 +32,12 @@ extension GuardedSeratoWrite {
     func knowsBaseline(of field: String) -> Bool {
         externalBaseline != nil && baselineKnownFields?.contains(field) != false
     }
+
+    /// `recordAttempt` clears the error before I/O and a thrown write records
+    /// one, so only an attempt that recorded no error can have landed.
+    var mayHaveLanded: Bool {
+        attempts > 0 && lastError == nil
+    }
 }
 
 enum SeratoWriteEligibility {

@@ -163,9 +163,11 @@ final class DurableSeratoQueueTests: XCTestCase {
             ("Serato relaunched", true, true),
             ("Serato relaunched, baseline unknown", true, false),
             ("Serato saved B itself", false, true),
+            ("Serato saved B after a failed send", false, true),
         ]
         for testCase in cases {
             let label = testCase.interruption
+            let seratoSavedB = label.hasPrefix("Serato saved B")
             let fixture = try SeratoRemovalFixture()
             defer { fixture.cleanup() }
             let file = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav())
@@ -184,11 +186,20 @@ final class DurableSeratoQueueTests: XCTestCase {
                 try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: title), isSeratoAuthoritative: false)))
                 try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: title))))
             }
-            if label == "Serato saved B itself" {
+            if label == "Serato saved B after a failed send" {
+                // A thrown write recorded its error, so it cannot have landed.
+                setRunning(fixture, false)
+                let failing = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                              seratoMetadataBatchWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) })
+                do { _ = try await failing.drainPendingSeratoUpdates(); XCTFail("\(label): the failing writer accepted the edits") }
+                catch {}
+                setRunning(fixture, true)
+            }
+            if seratoSavedB {
                 try setV2(fixture, path: file.path, title: "Queued B")
             }
             setRunning(fixture, false)
-            if label == "Serato saved B itself" {
+            if seratoSavedB {
                 let session = makeSession(fixture, engine: fixture.engine)
                 try await session.synchronize()
                 XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first?.title, "Queued B", label)
@@ -389,6 +400,149 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fixture.locator.databaseV2Url), library, "Neither saved record may be rewritten while the rename is blocked")
         let queued = try await fixture.engine.pendingSeratoWriteCount
         XCTAssertEqual(queued, 1)
+    }
+
+    /// #117: Finder moves the file twice while its tags are queued; the drain
+    /// must reach the file at its final path and carry every Serato surface
+    /// through both renames, old → middle → new.
+    func testQueuedTagWriteFollowsChainedFinderRenamesToEveryLibrarySurface() async throws {
+        for source in ["fresh match", "hygiene fill"] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("old.wav", bytes: FinalRemovalIntegrationTests.wav())
+            let fileID = try XCTUnwrap(file.id)
+            try save(fixture, paths: [file.path])
+            let crates = try saveCrates(fixture, paths: [file.path])
+            try await makeSession(fixture, engine: fixture.engine).synchronize()
+            let title = source == "fresh match" ? "Matched title" : "Filled title"
+            if source == "fresh match" {
+                let fingerprint = try await makeMatchable(fixture, fileID: fileID)
+                setRunning(fixture, true)
+                try await fixture.engine.apply(.applyMusicBrainzMatch(matchPayload(file, fingerprint: fingerprint, title: title)), batchId: "queued-match")
+            } else {
+                setRunning(fixture, true)
+                let current = try await fixture.row(file)
+                try await LibraryHygieneRunner(operationEngine: fixture.engine)
+                    .applyMissingFieldFill(field: .title, value: title, fileIds: [fileID], files: [current], batchId: "queued-hygiene")
+            }
+            let queued = try await fixture.engine.pendingSeratoWriteCount
+            XCTAssertGreaterThan(queued, 0, source)
+            let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
+            var currentPath = file.path
+            for name in ["middle.wav", "new.wav"] {
+                let destination = fixture.directory.appendingPathComponent(name).path
+                try FileManager.default.moveItem(atPath: currentPath, toPath: destination)
+                try await coordinator.handleObservations([.init(path: destination, isFile: true, wasRenamed: true)])
+                currentPath = destination
+            }
+            setRunning(fixture, false)
+
+            let recorder = BoundaryRecorder()
+            let relaunched = recordingEngine(fixture, recorder: recorder)
+            let session = makeSession(fixture, engine: relaunched)
+            try await session.synchronize()
+
+            XCTAssertEqual(try readAudioTags(filePath: currentPath).title, title, source)
+            XCTAssertEqual(recorder.tagWrites, 1, source)
+            let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
+            XCTAssertEqual(records.map { record in SeratoPath.normalized(record.path) }, [currentPath], source)
+            XCTAssertEqual(records.first?.title, title, source)
+            for (url, _) in crates {
+                XCTAssertEqual(try readCratePaths(cratePath: url.path).map(SeratoPath.normalized), [currentPath], source)
+            }
+            let remaining = try await relaunched.pendingSeratoWriteCount
+            XCTAssertEqual(remaining, 0, source)
+            guard case let .ready(summary) = session.state else { return XCTFail("\(source): sync did not reach ready: \(session.state)") }
+            XCTAssertEqual(summary.notAppliedWrites.total, 0, source)
+        }
+    }
+
+    /// #117: removing a row leaves its queued work naming that row. Indexing
+    /// the same audio again creates a new row, which must not inherit it.
+    /// Undo refuses to remove an indexed row once its membership changed, so
+    /// the row is removed with `removeFile` directly, as duplicate cleanup does.
+    func testReindexedFileCannotInheritItsRemovedRowsQueuedWork() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let independent = try await fixture.add("independent.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let path = fixture.directory.appendingPathComponent("reindexed.wav").path
+        let audio = FinalRemovalIntegrationTests.wav(sample: 3)
+        try audio.write(to: URL(fileURLWithPath: path))
+        // Both rows reach the same membership revision, so only the file ID
+        // tells the removed row's queued work from the new row's.
+        let owner = try await fixture.reader.read().libraryID
+        let removedID = try await indexAndActivate(fixture, path: path, owner: owner)
+        try save(fixture, paths: [independent.path, path])
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        setRunning(fixture, true)
+        try await fixture.engine.apply(.writeFileTags(.init(fileId: removedID, metadata: .init(title: "Never inherited"))))
+        try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(independent.id), metadata: .init(title: "Independent title"))))
+        try await fixture.engine.apply(.removeFile(.init(fileId: removedID)))
+        _ = try await indexAndActivate(fixture, path: path, owner: owner)
+        setRunning(fixture, false)
+
+        let recorder = BoundaryRecorder()
+        let relaunched = recordingEngine(fixture, recorder: recorder)
+        let session = makeSession(fixture, engine: relaunched)
+        try await session.synchronize()
+
+        XCTAssertEqual(recorder.tagWrites, 0)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), audio)
+        let record = try XCTUnwrap(readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first { record in
+            SeratoPath.normalized(record.path) == independent.path
+        })
+        XCTAssertEqual(record.title, "Independent title")
+        let remaining = try await relaunched.pendingSeratoWriteCount
+        XCTAssertEqual(remaining, 0)
+        guard case let .ready(summary) = session.state else { return XCTFail("Sync did not reach ready: \(session.state)") }
+        XCTAssertEqual(summary.notAppliedWrites, SeratoWriteDispositionCounts(counts: [.superseded: 1]))
+    }
+
+    /// #117: a rename lands while a drain, or the immediate pass of another
+    /// edit, still owes an earlier write to the same file. The rename waits
+    /// for that write instead of overtaking it, and must still reach Serato
+    /// once the earlier pass finishes.
+    func testRenameDuringAnotherPassOnTheSameFileStillReachesSerato() async throws {
+        for draining in [false, true] {
+            let label = draining ? "during a drain" : "during an immediate pass"
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("before.wav", bytes: FinalRemovalIntegrationTests.wav())
+            let fileID = try XCTUnwrap(file.id)
+            try save(fixture, paths: [file.path])
+            let crates = try saveCrates(fixture, paths: [file.path])
+            try await makeSession(fixture, engine: fixture.engine).synchronize()
+            let renamed = fixture.directory.appendingPathComponent("after.wav").path
+            let concurrentRename = ConcurrentRename()
+            let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                         seratoMetadataBatchWriter: { databasePath, updates in
+                                             let result = try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+                                             concurrentRename.startOnce()
+                                             return result
+                                         })
+            concurrentRename.prepare {
+                try await engine.apply(.renameFile(.init(fileId: fileID, newPath: renamed, previousPath: file.path, physicalMove: true)), batchId: "concurrent-rename")
+            }
+            setRunning(fixture, draining)
+            let current = try await fixture.row(file)
+            try await LibraryHygieneRunner(operationEngine: engine)
+                .applyMissingFieldFill(field: .title, value: "Filled title", fileIds: [fileID], files: [current], batchId: "hygiene-pass")
+            if draining {
+                setRunning(fixture, false)
+                _ = try await engine.drainPendingSeratoUpdates()
+            }
+            try await concurrentRename.finished()
+
+            XCTAssertEqual(try readAudioTags(filePath: renamed).title, "Filled title", label)
+            let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
+            XCTAssertEqual(records.map { record in SeratoPath.normalized(record.path) }, [renamed], label)
+            XCTAssertEqual(records.first?.title, "Filled title", label)
+            for (url, _) in crates {
+                XCTAssertEqual(try readCratePaths(cratePath: url.path).map(SeratoPath.normalized), [renamed], label)
+            }
+            let remaining = try await engine.pendingSeratoWriteCount
+            XCTAssertEqual(remaining, 0, "\(label): the rename was left queued with Serato closed")
+        }
     }
 
     func testSeratoSessionEditsWinAcrossRestartAndFastStartup() async throws {
@@ -623,6 +777,17 @@ final class DurableSeratoQueueTests: XCTestCase {
                                          artist: "Matched artist", title: title, album: nil, year: nil)
     }
 
+    private func indexAndActivate(_ fixture: SeratoRemovalFixture, path: String, owner: String) async throws -> Int64 {
+        let identity = try FileMetadataCollector.collectVerified(at: path)
+        try await fixture.engine.apply(.indexNewFile(.init(path: path, volumeUuid: identity.volumeUuid, inode: identity.inode, fileSize: identity.fileSize,
+                                                           mtime: identity.mtime, lightweightHash: identity.lightweightHash)))
+        let indexed = try await fixture.database.writer.read { database in try XCTUnwrap(FileRecord.filter(Column("path") == path).fetchOne(database)) }
+        let fileID = try XCTUnwrap(indexed.id)
+        try await fixture.engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: indexed.membershipRevision,
+                                                                  state: FileLibraryState(membership: .active, availability: .available, libraryID: owner, retiredAt: nil))))
+        return fileID
+    }
+
     private func save(_ fixture: SeratoRemovalFixture, paths: [String]) throws {
         try fixture.save(paths: paths.map(SeratoLibraryLocator.seratoRelativePath))
     }
@@ -653,6 +818,31 @@ private final class LockedTestFlag: @unchecked Sendable {
             stored = true
             return true
         }
+    }
+}
+
+/// Starts an operation from inside a writer boundary, where it cannot run
+/// until the boundary's transaction commits, and lets the test await it.
+private final class ConcurrentRename: @unchecked Sendable {
+    private struct NeverStarted: Error {}
+    private let lock = NSLock()
+    private var operation: (@Sendable () async throws -> Void)?
+    private var task: Task<Void, Error>?
+
+    func prepare(_ operation: @escaping @Sendable () async throws -> Void) {
+        lock.withLock { self.operation = operation }
+    }
+
+    func startOnce() {
+        lock.withLock {
+            guard task == nil, let operation else { return }
+            task = Task { try await operation() }
+        }
+    }
+
+    func finished() async throws {
+        guard let task = lock.withLock({ task }) else { throw NeverStarted() }
+        try await task.value
     }
 }
 
