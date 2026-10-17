@@ -5,6 +5,14 @@
 An encoded valid empty library can retire online members owned by that library.
 Crate membership does not participate in this decision.
 
+Only `read_database_records_strict` (`DatabaseV2::strict_track_records`) may supply
+evidence that something is absent from Serato. The permissive
+`read_database_records` / `track_records` path silently skips `otrk` entries without
+a `pfil`, and the legacy `LibraryScanner.scan(progress:)` turns a missing
+`database V2` into an empty record list. Both are acceptable for display-only imports and
+wrong for retirement, duplicate cleanup or any other decision that a track is no
+longer in Serato.
+
 The reconciler reads identity projections in pages of 256, without fingerprint
 blobs, and checks only indexed locations and paths in the saved snapshot. It does
 not enumerate a music folder or Trash. Ownership mismatches and offline volumes
@@ -348,6 +356,12 @@ Canonical path comparison groups Unicode-equivalent spellings, while diagnostics
 preserve original UTF-8 bytes, metadata, and physical-file observations. Only
 conflicted spellings are inspected for diagnostics; analysis does not decode audio
 or fingerprint the library.
+Swift `String` equality, `Set<String>` and `String`-keyed dictionaries compare by
+canonical equivalence, so an NFC and an NFD spelling of one path collapse to a
+single key. Code that must keep Serato occurrences distinct keys them by
+`Data(path.utf8)` or by occurrence index, as `SeratoConflictAnalyzer` and
+`LibraryRefreshPlan` do. It applies `SeratoPath.normalized` only after conflict
+analysis has run.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared
@@ -470,6 +484,12 @@ Schema-only migrations add versioned saved occurrences, file evidence, a slim st
 projection, dirty-row tracking, durable physical-move fences, and the durable Serato write queue. Raw path bytes
 and occurrence multiplicity are preserved. SQLite triggers advance a revision for
 relevant file changes; fingerprint progress alone does not invalidate the cache.
+The invalidation triggers created by `AddSyncCheckpointMigration`
+(`011_add_sync_checkpoint`) name the relevant `files` columns explicitly. A new
+`files` column that affects membership, identity, availability, Serato-mirrored
+metadata or recording links must ship with a migration that recreates those triggers
+to include it. Otherwise an unchanged launch keeps stale cached state. Columns that
+only record fingerprint progress stay out of the list.
 
 An unchanged pass reads the header and slim stat projection, validates entry/target
 identity and volume UUID, checks source identity and the database revision, and
@@ -498,3 +518,10 @@ the start of each sync: a replayable event is rebuilt into queue rows from its
 journal, a destructive one is recorded as `legacyUnrecoverable`, and the fence is
 deleted in the same transaction. The checkpoint is derived evidence; queued intent
 lives in the queue.
+Any code that performs a physical or Serato-side effect records its fence with
+`SyncCheckpointStore.beginEffect` in a transaction that commits before the effect
+starts. It clears the fence only after the effect completes or is explicitly
+superseded. A fence written inside the effect's own rollback transaction does not
+survive a crash, so the next launch could take the clean fast path over a
+half-applied write. `PhysicalFileMoveTransaction` and the engine's guarded Serato
+write paths follow this pattern.

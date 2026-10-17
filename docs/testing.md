@@ -22,6 +22,20 @@ detection still blocks live services, but those configurations share the normal
 app's AppKit preferences domain. The host-isolation regression test rejects that
 configuration.
 
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`.
+A newer push to the same PR cancels the older run.
+
+- **Ubuntu:** `make format-check`, `make lint` and `make test-rust`. SwiftFormat
+  is pinned by `SWIFTFORMAT_VERSION`; bump it together with a local reformat.
+- **macOS 26 with Xcode 26.6:** `make build-rust`, `make xcodeproj` and the full
+  Swift suite in the Test configuration. It mounts the disposable APFS volume
+  described below first, so the volume-dependent tests run instead of skipping.
+
+Cargo builds and SPM checkouts are cached. A failing Swift run uploads its
+`.xcresult` bundle as an artifact.
+
 ## Adding tests
 
 - Exercise launcher transitions through `ApplicationLauncher`, injecting a
@@ -55,7 +69,14 @@ hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE /path/to/tas
 mkdir -p /private/tmp/crate-agent-task6-volume
 hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume -nobrowse
 touch /private/tmp/crate-agent-task6-volume/.task6-test-volume
+touch /private/tmp/crate-agent-task6-volume/.trash-seed
+swift -e 'import Foundation; try FileManager.default.trashItem(at: URL(fileURLWithPath: CommandLine.arguments[1]), resultingItemURL: nil)' \
+  /private/tmp/crate-agent-task6-volume/.trash-seed
 ```
+
+The last step creates the volume's `.Trashes/<uid>`. On a fresh volume,
+`FileManager.url(for: .trashDirectory, …, create: true)` fails with "feature not
+supported" until a native trash has created that directory.
 
 Tests trash files only into that volume's own `.Trashes`, never the user's Trash.
 The mount is machine-wide, so it un-skips these tests for every concurrent suite;
