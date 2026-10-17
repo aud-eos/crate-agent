@@ -46,6 +46,7 @@ enum FingerprintPersistence {
         fileID: Int64,
         fingerprint: Data?,
         status: FingerprintStatus,
+        failureReason: String? = nil,
         freshnessBasis: FileFreshnessSnapshot? = nil,
         requirePendingStatus: Bool = false,
         expectedMembershipToken: FileMembershipToken? = nil,
@@ -65,25 +66,47 @@ enum FingerprintPersistence {
                 UPDATE files
                 SET chromaprint_fingerprint = ?,
                     fingerprint_status = ?,
+                    fingerprint_failure = ?,
                     fingerprinted_size = ?,
                     fingerprinted_mtime = ?,
                     fingerprinted_mtime_nanoseconds = ?,
                     fingerprinted_inode = ?
                 WHERE id = ?\(pendingGuard)
                 """,
-                arguments: [fingerprint, status.rawValue, basis.fileSize, basis.mtime, basis.mtimeNanoseconds, basis.inode, fileID]
+                arguments: [fingerprint, status.rawValue, failureReason, basis.fileSize, basis.mtime, basis.mtimeNanoseconds, basis.inode, fileID]
             )
         } else {
             try db.execute(
                 sql: """
                 UPDATE files
                 SET chromaprint_fingerprint = ?,
-                    fingerprint_status = ?
+                    fingerprint_status = ?,
+                    fingerprint_failure = ?
                 WHERE id = ?\(pendingGuard)
                 """,
-                arguments: [fingerprint, status.rawValue, fileID]
+                arguments: [fingerprint, status.rawValue, failureReason, fileID]
             )
         }
         return db.changesCount > 0
+    }
+
+    /// Returns failed and invalid `done` rows to `pending` so the worker recomputes them;
+    /// valid fingerprints and files that cannot be processed are left alone. Nil retries
+    /// every such row.
+    @discardableResult static func requeueForRetry(fileIDs: [Int64]?, in db: Database) throws -> Int {
+        var sql = """
+        UPDATE files
+        SET fingerprint_status = 'pending', chromaprint_fingerprint = NULL, fingerprint_failure = NULL
+        WHERE \(FileProcessingEligibility.processableSQL)
+          AND (fingerprint_status = 'failed' OR (\(WorkerCoverageQuery.invalidDoneSQL)))
+        """
+        var arguments = StatementArguments()
+        if let fileIDs {
+            guard !fileIDs.isEmpty else { return 0 }
+            sql += " AND id IN (\(databaseQuestionMarks(count: fileIDs.count)))"
+            arguments = StatementArguments(fileIDs)
+        }
+        try db.execute(sql: sql, arguments: arguments)
+        return db.changesCount
     }
 }

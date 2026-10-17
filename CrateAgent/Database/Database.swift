@@ -121,6 +121,9 @@ public final class LibraryDatabase {
         AddSyncCheckpointMigration.register(in: &migrator)
         AddSyncStatProjectionMigration.register(in: &migrator)
         AddDurableSeratoQueueMigration.register(in: &migrator)
+        AddSeratoWriteLandedMarkerMigration.register(in: &migrator)
+        AddFileTrashLocationsMigration.register(in: &migrator)
+        AddFingerprintFailureReasonMigration.register(in: &migrator)
         AddSubsecondFileIdentityMigration.register(in: &migrator)
         return migrator
     }

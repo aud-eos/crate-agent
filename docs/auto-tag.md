@@ -104,7 +104,7 @@ audio in Serato can reactivate the retained entry; an old Auto-Tag result does n
 gain permission to write after retirement or content replacement. Start a new
 scan for that file. Unavailable review errors include the filename.
 
-Use **Re-scan File Info** in Library to check Serato's complete saved library.
+Use **Re-scan File Info** in Workers to check Serato's complete saved library.
 The scan stays idle at startup and does not restart when Serato closes. Auto-Tag
 remains blocked until a scan succeeds. A missing, unreadable, or corrupt Serato
 database leaves processing blocked and shows **Retry Sync**; it never means the library is empty. Missing

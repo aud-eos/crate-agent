@@ -44,6 +44,23 @@ isolated fixtures. A green suite alone is not evidence that new test code respec
 that contract.
 
 
+## Owned APFS volume fixture
+
+Native Trash, cross-volume and case-alias tests skip unless a disposable APFS
+volume is mounted at `/private/tmp/crate-agent-task6-volume` with a
+`.task6-test-volume` marker. It must be case-insensitive (plain `APFS`):
+
+```sh
+hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE /path/to/task6.sparseimage
+mkdir -p /private/tmp/crate-agent-task6-volume
+hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume -nobrowse
+touch /private/tmp/crate-agent-task6-volume/.task6-test-volume
+```
+
+Tests trash files only into that volume's own `.Trashes`, never the user's Trash.
+The mount is machine-wide, so it un-skips these tests for every concurrent suite;
+detach it (`hdiutil detach /private/tmp/crate-agent-task6-volume`) when done.
+
 ## Paged Library fixture
 
 `LibraryPagingTests` creates one temporary WAL database with 30,000 synthetic
@@ -197,8 +214,8 @@ These are warm-fixture measurements, not a promise for every disk or library.
 
 Owner-app smoke check: launch against an already indexed library, navigate/search
 while validation runs, then relaunch unchanged; change one Serato title and close
-Serato; verify that title updates and unrelated rows remain available. Exercise
-**Re-scan File Info**, **Stop Sync**, and **Retry Sync**. Inspect any file-info errors
+Serato; verify that title updates and unrelated rows remain available. In Workers,
+exercise **Re-scan File Info**, **Stop Sync**, and **Retry Sync**. Inspect any file-info errors
 and path conflicts before attempting processing on affected files.
 
 ## Planning large-library work
