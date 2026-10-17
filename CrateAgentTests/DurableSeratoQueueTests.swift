@@ -219,7 +219,6 @@ final class DurableSeratoQueueTests: XCTestCase {
                 catch {}
                 try await fixture.database.writer.write { database in
                     try database.execute(sql: "DROP TRIGGER crash_after_io")
-                    try database.execute(sql: "UPDATE serato_write_queue SET last_error = NULL")
                 }
                 if label.hasSuffix("failed retry") {
                     // The retry's error must not erase that the crashed attempt may have landed B.
@@ -321,19 +320,16 @@ final class DurableSeratoQueueTests: XCTestCase {
             if trashSucceeded {
                 try await fixture.database.writer.write { database in
                     try database.execute(sql: """
-                    CREATE TEMP TRIGGER crash_after_trash BEFORE DELETE ON serato_write_queue WHEN OLD.kind = 'trashFile'
-                    BEGIN SELECT RAISE(ABORT, 'process exited after moving audio to Trash'); END
+                    CREATE TEMP TRIGGER fail_after_trash BEFORE DELETE ON duplicate_cleanup_intents
+                    BEGIN SELECT RAISE(ABORT, 'the Trash transaction failed after moving audio to Trash'); END
                     """)
                 }
             }
             let group = DuplicateFinder.DuplicateGroup(groupKey: "interrupted", mode: .byteLevel, files: [keeper, target])
             _ = try await DuplicateResolver(operationEngine: first, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "interrupted-trash")
             if trashSucceeded {
-                // A process that exits inside the Trash transaction never records a failure.
-                try await fixture.database.writer.write { database in
-                    try database.execute(sql: "DROP TRIGGER crash_after_trash")
-                    try database.execute(sql: "UPDATE serato_write_queue SET last_error = NULL")
-                }
+                // A throw after the Trash, inside its transaction, does not prove the audio stayed put.
+                try await fixture.database.writer.write { database in try database.execute(sql: "DROP TRIGGER fail_after_trash") }
                 XCTAssertEqual(recorder.trashed, [target.path])
             } else {
                 try FileManager.default.moveItem(atPath: target.path, toPath: fixture.directory.appendingPathComponent("moved-by-user.wav").path)

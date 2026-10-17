@@ -351,10 +351,16 @@ writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
 to rows whose write may have landed. The writer boundary commits an `io_started`
-mark before its I/O transaction, and clears it when the attempt stopped before any
-I/O or every write for the row threw. A later attempt keeps an earlier attempt's
-mark (`may_have_landed`). A saved value matching an edit that never reached I/O,
-or whose every write threw, is the user's own Serato edit and wins. A failed segment fails all of its rows together
+mark before its I/O transaction. It clears the mark only when no write for the
+row returned from its I/O: the attempt stopped at the boundary, failed before
+reaching it, or every I/O call threw. A writer that validates or records after
+its I/O (Trash, audio tags, V2 removal, imports) reports the moment that I/O
+returns, so a later throw keeps the mark. A later attempt keeps an earlier
+attempt's mark (`may_have_landed`), and an attempt never clears a mark it did not
+set. Upgrading keeps a row attempted without a recorded error as possibly landed,
+as it was read before the marker existed. A saved value matching an edit that
+never reached I/O, or whose every I/O call threw, is the user's own Serato edit
+and wins. A failed segment fails all of its rows together
 and blocks their dependents; a row whose target becomes conflicted at the write
 boundary is blocked alone with its dependents, and the rest of the segment applies.
 

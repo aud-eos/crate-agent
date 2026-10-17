@@ -36,8 +36,8 @@ extension GuardedSeratoWrite {
     }
 
     /// The writer boundary marks a row before its I/O and clears the mark
-    /// when the attempt stopped before any I/O or every write for the row
-    /// threw; a later attempt keeps an earlier one's mark.
+    /// only when no write for the row returned from its I/O; a later attempt
+    /// keeps an earlier one's mark.
     var mayHaveLanded: Bool {
         earlierAttemptMayHaveLanded || ioStarted
     }

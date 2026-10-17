@@ -18,7 +18,7 @@ final class MatchUndoFileTagGuardTests: XCTestCase {
             do {
                 _ = try await fixture.engine.undoBatch("match")
                 XCTAssertEqual(blockedFields, [], "Undo overwrote the later \(blockedFields) edit")
-            } catch let OperationEngineError.undoWouldOverwriteFileTags(_, fields) {
+            } catch let OperationEngineError.undoWouldOverwriteFileTags(_, fields, _) {
                 XCTAssertEqual(fields, blockedFields)
             }
 
@@ -42,8 +42,9 @@ final class MatchUndoFileTagGuardTests: XCTestCase {
         do {
             _ = try await fixture.engine.undoBatch(undo)
             XCTFail("Redo overwrote the external year edit")
-        } catch let OperationEngineError.undoWouldOverwriteFileTags(_, fields) {
+        } catch let OperationEngineError.undoWouldOverwriteFileTags(_, fields, direction) {
             XCTAssertEqual(fields, ["year"])
+            XCTAssertEqual(direction, .redo)
         }
         XCTAssertEqual(try readAudioTags(filePath: file.path).year, 2005)
     }
@@ -75,18 +76,32 @@ final class MatchUndoFileTagGuardTests: XCTestCase {
         XCTAssertEqual(try readAudioTags(filePath: file.path).title, "Matched title")
     }
 
-    func testUndoOfAMissingFileNamesTheFile() async throws {
-        let fixture = try SeratoRemovalFixture()
-        defer { fixture.cleanup() }
-        let file = try await matched(fixture)
-        try FileManager.default.removeItem(atPath: file.path)
+    func testUndoOfAFileItCannotReachNamesTheFileAndWhy() async throws {
+        for missing in [true, false] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await matched(fixture)
+            let directory = (file.path as NSString).deletingLastPathComponent
+            if missing {
+                try FileManager.default.removeItem(atPath: file.path)
+            } else {
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: directory)
+            }
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory) }
 
-        do {
-            _ = try await fixture.engine.undoBatch("match")
-            XCTFail("Undo ran without the file it restores")
-        } catch let OperationEngineError.undoFileUnavailable(fileID, path) {
-            XCTAssertEqual(fileID, file.id)
-            XCTAssertEqual(path, file.path)
+            do {
+                _ = try await fixture.engine.undoBatch("match")
+                XCTFail("Undo ran without the file it restores")
+            } catch let OperationEngineError.undoFileUnavailable(fileID, path, _) {
+                XCTAssertTrue(missing, "A file undo could not read for lack of permission was reported missing")
+                XCTAssertEqual(fileID, file.id)
+                XCTAssertEqual(path, file.path)
+            } catch let OperationEngineError.undoFileUnreadable(fileID, path, reason, _) {
+                XCTAssertFalse(missing)
+                XCTAssertEqual(fileID, file.id)
+                XCTAssertEqual(path, file.path)
+                XCTAssertEqual(reason, "permission denied")
+            }
         }
     }
 

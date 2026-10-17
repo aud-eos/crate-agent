@@ -83,7 +83,7 @@ public actor OperationEngine {
     /// until that pass releases it.
     private var claimedQueueIDs: [Int64: UUID] = [:]
     /// Per queue row, how far the current attempt's external writes got.
-    private var attemptIO: [Int64: ExternalIOProgress.Stage] = [:]
+    private var attemptIO: [Int64: AttemptIOStage] = [:]
     private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
     private var isDraining = false
     /// One pass over queued rows runs at a time. A scoped pass leaves a row
@@ -1591,10 +1591,7 @@ public actor OperationEngine {
                 guard try FileRecord.fetchOne(database, key: read.fileID)?.path == read.path else {
                     throw FileProcessingEligibilityError.superseded(fileId: read.fileID)
                 }
-                do { try read.identity.requireUnchanged(at: read.path) }
-                catch SeratoMembershipSnapshotError.sourceChanged {
-                    throw OperationEngineError.undoFileChangedWhileChecking(fileId: read.fileID)
-                }
+                try MatchUndoTagGuard.requireUnchanged(read)
             }
             for event in events {
                 guard let fileID = event.fileId else { continue }
@@ -1619,14 +1616,14 @@ public actor OperationEngine {
     /// redoes, refusing when the inverse would overwrite a later tag edit.
     private func readMatchFileTags(_ events: [EventRecord]) async throws -> [MatchUndoTagGuard.Read] {
         let decoder = JSONDecoder()
-        var matches: [(fileID: Int64, applied: ApplyMusicBrainzMatchPayload)] = []
+        var matches: [(fileID: Int64, direction: MatchHistoryDirection, applied: ApplyMusicBrainzMatchPayload)] = []
         for event in events {
             guard let fileID = event.fileId else { continue }
             switch event.eventType {
             case .musicBrainzMatchApplied:
-                try matches.append((fileID, Self.decodeEventPayload(ApplyMusicBrainzMatchPayload.self, event: event, decoder: decoder)))
+                try matches.append((fileID, .undo, Self.decodeEventPayload(ApplyMusicBrainzMatchPayload.self, event: event, decoder: decoder)))
             case .musicBrainzMatchReverted:
-                try matches.append((fileID, Self.decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder).applied))
+                try matches.append((fileID, .redo, Self.decodeEventPayload(RevertMusicBrainzMatchPayload.self, event: event, decoder: decoder).applied))
             default: continue
             }
         }
@@ -1640,7 +1637,7 @@ public actor OperationEngine {
         }
         let requests = try matches.map { match in
             guard let path = paths[match.fileID] else { throw OperationEngineError.fileNotFound(fileId: match.fileID) }
-            return MatchUndoTagGuard.Request(fileID: match.fileID, path: path, applied: match.applied)
+            return MatchUndoTagGuard.Request(fileID: match.fileID, path: path, direction: match.direction, applied: match.applied)
         }
         return try await MatchUndoTagGuard.readAll(requests, reader: fileTagReader)
     }
@@ -2184,11 +2181,12 @@ public actor OperationEngine {
         }
     }
 
-    /// A row none of whose writes returned cannot have landed: each one that
-    /// reached I/O threw. A row with a write that returned keeps its mark.
+    /// A row none of whose writes' I/O returned cannot have landed: each one
+    /// that reached I/O threw from it. Only a mark this attempt set is
+    /// cleared; any other may be an earlier process's that is not folded yet.
     private func recordFailure(_ writes: [GuardedSeratoWrite], error: Error) async throws {
         let message = error.localizedDescription
-        let unwritten = writes.compactMap(\.queueID).filter { queueID in attemptIO[queueID] != .returned }
+        let unwritten = writes.compactMap(\.queueID).filter { queueID in attemptIO[queueID] == .marked }
         try await database.writer.write { database in
             try SeratoWriteQueue.recordFailure(writes, message: message, in: database)
             try SeratoWriteQueue.clearIOStarted(unwritten, in: database)
@@ -2250,18 +2248,37 @@ public actor OperationEngine {
     private func performExternalWrite<Output: Sendable>(
         _ writes: [GuardedSeratoWrite], completing: Bool = false, operation: @escaping @Sendable (GRDB.Database) throws -> Output
     ) async throws -> Output {
+        try await performExternalWrite(writes, completing: completing) { database, io in
+            let result = try operation(database)
+            io.recordReturned()
+            return result
+        }
+    }
+
+    /// For a writer that validates or records after its I/O: it reports
+    /// through `io` the moment its I/O returns, so a later throw cannot make
+    /// that I/O look as if it never landed.
+    private func performExternalWrite<Output: Sendable>(
+        _ writes: [GuardedSeratoWrite], completing: Bool = false, operation: @escaping @Sendable (GRDB.Database, ExternalIOProgress) throws -> Output
+    ) async throws -> Output {
         let watchdog = seratoWatchdog
         let readiness = readiness
         let drainAuthorization = LibrarySyncReadiness.drainAuthorization
         let locator = seratoLocator
         let queueIDs = writes.compactMap(\.queueID)
-        let unstarted = queueIDs.filter { queueID in attemptIO[queueID] == nil }
-        try await database.writer.write { database in try SeratoWriteQueue.markIOStarting(queueIDs, in: database) }
+        let unmarked = queueIDs.filter { queueID in attemptIO[queueID] == nil }
+        if !unmarked.isEmpty {
+            try await database.writer.write { database in try SeratoWriteQueue.markIOStarting(unmarked, in: database) }
+            for queueID in unmarked {
+                attemptIO[queueID] = .marked
+            }
+        }
+        let unwritten = queueIDs.filter { queueID in attemptIO[queueID] == .marked }
         let progress = ExternalIOProgress()
         defer {
-            if let stage = progress.stage {
-                for queueID in queueIDs where attemptIO[queueID] != .returned {
-                    attemptIO[queueID] = stage
+            if progress.returned {
+                for queueID in queueIDs {
+                    attemptIO[queueID] = .returned
                 }
             }
         }
@@ -2270,17 +2287,20 @@ public actor OperationEngine {
             do {
                 try Self.requireExternalWriteBoundary(writes, watchdog: watchdog, readiness: readiness, drainAuthorization: drainAuthorization, in: database)
             } catch let interruption as ExternalWriteInterruption {
-                // Nothing was written, so these rows' marks must not survive.
-                try SeratoWriteQueue.clearIOStarted(unstarted, in: database)
+                // Nothing was written, so this attempt's marks for rows no write reached must not survive.
+                try SeratoWriteQueue.clearIOStarted(unwritten, in: database)
                 return .failure(interruption)
             }
-            progress.record(.entered)
-            let result = try operation(database)
-            progress.record(.returned)
+            let result = try operation(database, progress)
             if completing {
                 try Self.completeQueuedWrites(writes, locator: locator, in: database)
             }
             return .success(result)
+        }
+        if case .failure = outcome {
+            for queueID in unwritten {
+                attemptIO[queueID] = nil
+            }
         }
         return try outcome.get()
     }
@@ -2324,19 +2344,23 @@ public actor OperationEngine {
         try Self.requireUnconflicted(writes, readiness: readiness, in: database)
     }
 
-    /// How far one external write got, set on the database queue and read
-    /// back on the actor once the write returns or throws.
-    private final class ExternalIOProgress: @unchecked Sendable {
-        enum Stage: Equatable { case entered, returned }
-        private let lock = NSLock()
-        private var stored: Stage?
+    /// `marked`: this attempt committed the row's `io_started` mark.
+    /// `returned`: a write for the row returned from its I/O, so it may have
+    /// landed however the rest of its transaction ended.
+    private enum AttemptIOStage: Equatable { case marked, returned }
 
-        var stage: Stage? {
+    /// Whether one external write's I/O returned, set on the database queue
+    /// and read back on the actor once the write returns or throws.
+    private final class ExternalIOProgress: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored = false
+
+        var returned: Bool {
             lock.withLock { stored }
         }
 
-        func record(_ stage: Stage) {
-            lock.withLock { stored = stage }
+        func recordReturned() {
+            lock.withLock { stored = true }
         }
     }
 
@@ -2417,12 +2441,13 @@ public actor OperationEngine {
     private func applyTrashFileOperation(_ trash: SeratoPendingTrash, guardedWrites: [GuardedSeratoWrite]) async throws {
         let trasher = fileTrasher
         let context = mutationContext
-        try await performExternalWrite(guardedWrites, completing: true) { database in
+        try await performExternalWrite(guardedWrites, completing: true) { database, io in
             do {
                 try trasher(trash.absolutePath)
             } catch {
                 throw OperationEngineError.trashFailed(path: trash.absolutePath, underlying: String(describing: error))
             }
+            io.recordReturned()
             guard let targetFileID = guardedWrites.first?.cleanupTargetFileID else { return }
             guard let intent = try DuplicateCleanupStore.fetch(targetFileID: targetFileID, in: database) else {
                 throw FileProcessingEligibilityError.superseded(fileId: targetFileID)
@@ -2452,8 +2477,9 @@ public actor OperationEngine {
             fromAbsolute: removal.absolutePath
         )
         do {
-            _ = try await performExternalWrite(guardedWrites, completing: true) { database in
+            _ = try await performExternalWrite(guardedWrites, completing: true) { database, io in
                 let removed = try removeTrackFromDatabase(databasePath: databaseV2Path, trackPath: seratoRelativePath)
+                io.recordReturned()
                 if let cleanupTarget {
                     guard try !readDatabaseRecordsStrict(databasePath: databaseV2Path).contains(where: { record in SeratoPath.normalized(record.path) == SeratoPath.normalized(removal.absolutePath) }) else {
                         throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: "Duplicate reference removal did not complete.")
@@ -2541,13 +2567,14 @@ public actor OperationEngine {
         )
         let tagWriter = fileTagWriter
         do {
-            try await performExternalWrite(guardedWrites, completing: true) { database in
+            try await performExternalWrite(guardedWrites, completing: true) { database, io in
                 guard let guardedWrite = guardedWrites.first,
                       let file = try FileRecord.fetchOne(database, key: guardedWrite.token.fileId)
                 else {
                     throw OperationEngineError.insertDidNotReturnRowId
                 }
                 try tagWriter(write.absolutePath, update)
+                io.recordReturned()
                 let identity = try FileMetadataCollector.collectVerified(at: write.absolutePath)
                 try FileIdentityObservationMutation.recordOwnedTagWrite(previous: file, identity: identity, eventID: guardedWrite.eventId, in: database)
             }
@@ -2593,12 +2620,13 @@ public actor OperationEngine {
         let addWriter = seratoAddTrackBatchWriter
         let scopeAuthorization = readiness?.captureScope()
         let context = mutationContext
-        try await performExternalWrite(adds.map(\.row), completing: true) { database in
+        try await performExternalWrite(adds.map(\.row), completing: true) { database, io in
             do {
                 var pending = additions
                 if !FileManager.default.fileExists(atPath: databaseV2Path) {
                     try FileManager.default.createDirectory(at: seratoDirectory, withIntermediateDirectories: true)
                     try bootstrapBytes.write(to: URL(fileURLWithPath: databaseV2Path))
+                    io.recordReturned()
                     pending.removeFirst()
                 }
                 if !pending.isEmpty {
@@ -2607,6 +2635,7 @@ public actor OperationEngine {
             } catch {
                 throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: String(describing: error))
             }
+            io.recordReturned()
             try scopeAuthorization?.check()
             let libraryID = try context.locator.supportedLibraryIdentity()
             for (row, _) in adds {
@@ -4721,6 +4750,25 @@ struct SeratoPendingAddTrack: Codable, Sendable, Equatable {
 
 // MARK: - Errors
 
+/// Undoing a match event, or undoing its revert, which redoes the match.
+public enum MatchHistoryDirection: Sendable, Equatable {
+    case undo, redo
+
+    var verb: String {
+        switch self {
+        case .undo: "undo"
+        case .redo: "redo"
+        }
+    }
+
+    var gerund: String {
+        switch self {
+        case .undo: "undoing"
+        case .redo: "redoing"
+        }
+    }
+}
+
 public enum OperationEngineError: LocalizedError, Equatable {
     case fileNotFound(fileId: Int64)
     case insertDidNotReturnRowId
@@ -4751,13 +4799,16 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// Undo or redo of a match was refused because the audio file's tags no
     /// longer hold either end of the match for these fields: a later tag edit
     /// that the inverse would overwrite (#111).
-    case undoWouldOverwriteFileTags(fileId: Int64, fields: [String])
+    case undoWouldOverwriteFileTags(fileId: Int64, fields: [String], direction: MatchHistoryDirection)
     /// The audio file changed between undo's tag check and its commit, so
     /// the check no longer describes the file the inverse would rewrite.
-    case undoFileChangedWhileChecking(fileId: Int64)
+    case undoFileChangedWhileChecking(fileId: Int64, direction: MatchHistoryDirection)
     /// Undo or redo of a match needs to read the audio file it would
     /// rewrite, and the file is missing or its volume is offline.
-    case undoFileUnavailable(fileId: Int64, path: String)
+    case undoFileUnavailable(fileId: Int64, path: String, direction: MatchHistoryDirection)
+    /// Undo or redo of a match could not read the audio file it would
+    /// rewrite for a reason other than its absence, such as permissions.
+    case undoFileUnreadable(fileId: Int64, path: String, reason: String, direction: MatchHistoryDirection)
     case metadataChanged(fileId: Int64)
     /// The DB transaction committed (the batch IS applied and
     /// journaled) but one or more external Serato/audio-tag writes
@@ -4795,12 +4846,14 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
             "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
-        case let .undoWouldOverwriteFileTags(fileId, fields):
-            "Can't undo this MusicBrainz change for file id \(fileId): its audio file's \(fields.joined(separator: ", ")) changed since, and undoing would overwrite that edit."
-        case let .undoFileUnavailable(fileId, path):
-            "Can't undo this MusicBrainz change for file id \(fileId): \((path as NSString).lastPathComponent) is missing or its drive is offline. Reconnect it, then undo again."
-        case let .undoFileChangedWhileChecking(fileId):
-            "Can't undo this MusicBrainz change for file id \(fileId): its audio file changed while undo was checking it. Try again."
+        case let .undoWouldOverwriteFileTags(fileId, fields, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): its audio file's \(fields.joined(separator: ", ")) changed since, and \(direction.gerund) would overwrite that edit."
+        case let .undoFileUnavailable(fileId, path, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): \((path as NSString).lastPathComponent) is missing or its drive is offline. Reconnect it, then \(direction.verb) again."
+        case let .undoFileUnreadable(fileId, path, reason, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): \(path) can't be read (\(reason))."
+        case let .undoFileChangedWhileChecking(fileId, direction):
+            "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): its audio file changed while \(direction.verb) was checking it. Try again."
         case let .metadataChanged(fileId):
             "File id \(fileId) metadata changed after it was reviewed. Re-scan before applying."
         case let .externalSyncIncomplete(batchId, underlying):
