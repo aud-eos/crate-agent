@@ -9,10 +9,20 @@ struct ConflictPhysicalIdentity: Hashable, Sendable {
         self.inode = inode
     }
 
-    init(_ file: FileRecord) {
+    init(_ file: some SeratoConflictTargetFile) {
         self.init(volumeID: file.volumeUuid, inode: UInt64(bitPattern: file.inode))
     }
 }
+
+/// The file fields a Serato path-conflict lookup reads.
+public protocol SeratoConflictTargetFile {
+    var id: Int64? { get }
+    var path: String { get }
+    var volumeUuid: String { get }
+    var inode: Int64 { get }
+}
+
+extension FileRecord: SeratoConflictTargetFile {}
 
 struct SeratoConflictTarget: Sendable {
     var fileIDs: Set<Int64> = []
@@ -20,7 +30,7 @@ struct SeratoConflictTarget: Sendable {
     var physicalIdentities: Set<ConflictPhysicalIdentity> = []
     var sharedTrackIDs: Set<Int64> = []
 
-    mutating func include(_ file: FileRecord) {
+    mutating func include(_ file: some SeratoConflictTargetFile) {
         if let fileID = file.id {
             fileIDs.insert(fileID)
         }
@@ -30,7 +40,7 @@ struct SeratoConflictTarget: Sendable {
         }
     }
 
-    static func file(_ file: FileRecord) -> Self {
+    static func file(_ file: some SeratoConflictTargetFile) -> Self {
         var target = Self()
         target.include(file)
         return target

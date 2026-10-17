@@ -70,6 +70,16 @@ and error/retry races, and native table tests cover deferred selection and conte
 IDs independently of Library's row type.
 
 
+## Duplicate scan fixture
+
+`DuplicateScanPerformanceTests` builds a temporary WAL database with 30,000
+processable files: 32-byte lightweight hashes on all of them, 4 KB Chromaprint
+fingerprints on 24,000, 300 byte-level pairs and 400 perceptual pairs. It runs
+both duplicate modes plus fingerprint coverage, asserts that only the 1,400
+group members are decoded, and asserts a 1 s budget. `DUPLICATE_SCAN` output
+is attached as evidence. Before SQL grouping, the same fixture took 1.34 s to
+load every full row and group it in Swift; the SQL scan takes about 0.17 s.
+
 ## Local builds while using the Mac
 
 Use one native build at a time, keep the same DerivedData location between runs,

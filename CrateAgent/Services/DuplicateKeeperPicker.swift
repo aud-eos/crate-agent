@@ -2,7 +2,7 @@ import Foundation
 
 /// Ranks the files in a `DuplicateFinder.DuplicateGroup` and picks
 /// the one we'd default to keeping if the user resolves the group.
-/// Pure logic, no I/O — all inputs are columns already on FileRecord.
+/// Pure logic, no I/O — all inputs are `DuplicateFileSource` columns.
 ///
 /// Rules in priority order:
 ///
@@ -24,13 +24,12 @@ public enum DuplicateKeeperPicker {
     /// file's id; the UI uses this to seed its radio selection and
     /// lets the user override per-group.
     public static func chooseDefaultKeeper(
-        for group: DuplicateFinder.DuplicateGroup,
+        for group: DuplicateFinder.DuplicateGroup<some DuplicateFileSource>,
         musicFolder: URL
     ) -> Int64? {
         group.files
-            .compactMap { file -> (FileRecord, Int64)? in
-                guard let identifier = file.id else { return nil }
-                return (file, identifier)
+            .compactMap { file in
+                file.id.map { identifier in (file, identifier) }
             }
             .max { lhs, rhs in
                 rank(lhs.0, musicFolder: musicFolder)
@@ -40,11 +39,11 @@ public enum DuplicateKeeperPicker {
 
     // MARK: - Ranking (testable)
 
-    /// Total ordering on FileRecord. `lhs < rhs` means "rhs is the
+    /// Total ordering on duplicate candidates. `lhs < rhs` means "rhs is the
     /// stronger keeper candidate." Implemented as a lexicographic
     /// tuple comparison so all four tiers participate; later tiers
     /// only matter when earlier tiers tie.
-    static func rank(_ file: FileRecord, musicFolder: URL) -> RankKey {
+    static func rank(_ file: some DuplicateFileSource, musicFolder: URL) -> RankKey {
         RankKey(
             qualityTier: qualityTier(for: file),
             bitrate: file.bitrateKbps ?? 0,
@@ -59,7 +58,7 @@ public enum DuplicateKeeperPicker {
     /// Format-tier score. Lossless formats rank above lossy ones; all
     /// lossless formats are considered equal (their bitrate field is
     /// meaningless to compare). Unknown extensions rank below lossy.
-    static func qualityTier(for file: FileRecord) -> Int {
+    static func qualityTier(for file: some DuplicateFileSource) -> Int {
         let ext = (file.path as NSString).pathExtension.lowercased()
         if losslessExtensions.contains(ext) {
             return 2
@@ -85,7 +84,7 @@ public enum DuplicateKeeperPicker {
     /// folder, files in deeper nested subdirectories, and files
     /// with no recoverable artist all return false.
     static func pathMatchesArtistBucket(
-        file: FileRecord,
+        file: some DuplicateFileSource,
         musicFolder: URL
     ) -> Bool {
         let musicFolderPath = musicFolder.standardized.path

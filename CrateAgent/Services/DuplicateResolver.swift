@@ -70,13 +70,16 @@ public actor DuplicateResolver {
     }
 
     private let operationEngine: OperationEngine
+    private let database: LibraryDatabase
     private let activityLog: ActivityLog?
 
     public init(
         operationEngine: OperationEngine,
+        database: LibraryDatabase,
         activityLog: ActivityLog? = nil
     ) {
         self.operationEngine = operationEngine
+        self.database = database
         self.activityLog = activityLog
     }
 
@@ -86,33 +89,49 @@ public actor DuplicateResolver {
     }
 
     /// Resolve one duplicate group by trashing every file except
-    /// the chosen keeper and cleaning the Serato references.
+    /// the chosen keeper and cleaning the Serato references. Groups
+    /// may hold lightweight projections; the full rows are fetched by
+    /// id here, and a row whose revision or physical identity no
+    /// longer matches the reviewed one is reported as superseded.
     @discardableResult
     public func resolve(
-        group: DuplicateFinder.DuplicateGroup,
+        group: DuplicateFinder.DuplicateGroup<some DuplicateFileSource>,
         keeperId: Int64,
         batchId: String? = nil
     ) async throws -> Outcome {
-        guard let keeper = group.files.first(where: { file in file.id == keeperId }) else { throw ResolverError.keeperNotInGroup }
+        guard let reviewedKeeper = group.files.first(where: { file in file.id == keeperId }) else { throw ResolverError.keeperNotInGroup }
 
-        let toTrash: [FileRecord] = group.files.compactMap { file -> FileRecord? in
-            guard let identifier = file.id, identifier != keeperId else { return nil }
-            return file
+        let reviewedTargets = group.files.compactMap { file in
+            file.id.flatMap { identifier in identifier == keeperId ? nil : (fileID: identifier, file: file) }
         }
-        guard !toTrash.isEmpty else { throw ResolverError.noFilesToTrash }
+        guard !reviewedTargets.isEmpty else { throw ResolverError.noFilesToTrash }
+        let currentByID = try await database.writer.read { connection in
+            try FileRecord.fetchAll(connection, keys: group.files.compactMap(\.id))
+        }.reduce(into: [Int64: FileRecord]()) { records, record in
+            if let identifier = record.id {
+                records[identifier] = record
+            }
+        }
+        func current(_ fileID: Int64, reviewed: some DuplicateFileSource) throws -> FileRecord {
+            guard let record = currentByID[fileID], record.membershipRevision == reviewed.membershipRevision,
+                  record.identity == reviewed.identity
+            else { throw FileProcessingEligibilityError.superseded(fileId: fileID) }
+            return record
+        }
 
         let effectiveBatchId = batchId ?? "duplicate-resolution-\(UUID().uuidString)"
 
-        await note("Resolving duplicate group: trashing \(toTrash.count) non-keeper\(toTrash.count == 1 ? "" : "s")…")
+        await note("Resolving duplicate group: trashing \(reviewedTargets.count) non-keeper\(reviewedTargets.count == 1 ? "" : "s")…")
 
         var trashedCount = 0
         var pendingCount = 0
         var failureCount = 0
         var errors: [String] = []
-        for file in toTrash {
-            let fileId = file.id!
+        for (fileId, reviewed) in reviewedTargets {
             do {
-                let result = try await operationEngine.resolveDuplicate(target: file, keeper: keeper, batchID: effectiveBatchId)
+                let result = try await operationEngine.resolveDuplicate(
+                    target: current(fileId, reviewed: reviewed), keeper: current(keeperId, reviewed: reviewedKeeper), batchID: effectiveBatchId
+                )
                 switch result {
                 case .completed: trashedCount += 1
                 case .pending: pendingCount += 1
