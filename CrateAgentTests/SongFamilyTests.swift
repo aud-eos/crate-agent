@@ -68,7 +68,7 @@ final class SongFamilyTests: XCTestCase {
         let clean = try await addFile(title: "Song (Clean)", fingerprint: fingerprint)
 
         await XCTAssertThrowsErrorAsync(try await service.create([.file(dirty), .file(clean)])) { error in
-            XCTAssertEqual(error as? SongFamilyError, .fingerprintCollision(fileId: clean, trackId: dirtyTrack, otherFileId: dirty))
+            XCTAssertEqual(error as? SongFamilyError, .fingerprintCollision(file: "Song (Clean)", otherFile: "Song (Dirty)"))
         }
         let cleanLink = try await trackID(ofFile: clean)
         let dirtyMembership = try await membership(ofTrack: dirtyTrack)
@@ -85,7 +85,7 @@ final class SongFamilyTests: XCTestCase {
                                              batchId: "rematch")
         XCTAssertNotNil(rematch)
         let withoutFile = try await service.family(id: familyID)
-        XCTAssertEqual(withoutFile?.versionCount, 1)
+        XCTAssertNil(withoutFile)
 
         _ = try await service.attach([.file(movedFile)], to: familyID)
         _ = try await service.attach([.file(movedFile)], to: familyID)
@@ -124,7 +124,7 @@ final class SongFamilyTests: XCTestCase {
         let otherID = try XCTUnwrap(other.familyId)
 
         await XCTAssertThrowsErrorAsync(try await service.attach([.track(tracks[2])], to: targetID)) { error in
-            XCTAssertEqual(error as? SongFamilyError, .memberAlreadyInFamily(trackId: tracks[2], familyId: otherID))
+            XCTAssertEqual(error as? SongFamilyError, .memberAlreadyInFamily(recording: "Version 2", familyVersions: ["Version 2", "Version 3"]))
         }
         let merged = try await service.merge([otherID], into: targetID)
         let mergedFamily = try await service.family(id: targetID)
@@ -212,6 +212,45 @@ final class SongFamilyTests: XCTestCase {
         XCTAssertEqual(missing?.savedRepresentativeTrackId, remix)
     }
 
+    func testARecordingLeftAloneInItsFamilyCanBeRegroupedAndUndoRestoresThatFamily() async throws {
+        let tracks = try await addTracks(count: 3)
+        let first = try await service.create([.track(tracks[0]), .track(tracks[1])])
+        let firstID = try XCTUnwrap(first.familyId)
+        try await retire(file(ofTrack: tracks[1]))
+
+        let regrouped = try await service.create([.track(tracks[0]), .track(tracks[2])])
+        let regroupedMembership = try await membership(ofTrack: tracks[0])
+        XCTAssertEqual(regroupedMembership, regrouped.familyId)
+
+        try await engine.undoBatch(regrouped.batchId)
+        let restored = try await [membership(ofTrack: tracks[0]), membership(ofTrack: tracks[1])]
+        XCTAssertEqual(restored, [firstID, firstID])
+    }
+
+    func testGroupingARetiredFileIsRefusedByItsTitle() async throws {
+        let main = try await addTracks(count: 1)
+        let retired = try await addFile(title: "Song (Clean)", fingerprint: Data("retired-clean".utf8))
+        try await retire(retired)
+
+        await XCTAssertThrowsErrorAsync(try await service.create([.track(main[0]), .file(retired)])) { error in
+            XCTAssertEqual(error as? SongFamilyError, .fileRetired(file: "Song (Clean)"))
+        }
+    }
+
+    func testUndoingAGroupKeepsTheLinkOfAFileRetiredSince() async throws {
+        let main = try await addTracks(count: 1)
+        let clean = try await addFile(title: "Song (Clean)", fingerprint: Data("later-retired".utf8))
+        let created = try await service.create([.track(main[0]), .file(clean)])
+        let groupedLink = try await trackID(ofFile: clean)
+        try await retire(clean)
+
+        try await engine.undoBatch(created.batchId)
+        let link = try await trackID(ofFile: clean)
+        let mainMembership = try await membership(ofTrack: main[0])
+        XCTAssertEqual(link, groupedLink)
+        XCTAssertNil(mainMembership)
+    }
+
     // MARK: - Fixture
 
     private var nextFingerprint = 0
@@ -267,6 +306,12 @@ final class SongFamilyTests: XCTestCase {
 
     private func trackID(ofFile fileID: Int64) async throws -> Int64? {
         try await database.writer.read { connection in try FileRecord.fetchOne(connection, key: fileID)?.trackId }
+    }
+
+    private func retire(_ fileID: Int64) async throws {
+        try await database.writer.write { connection in
+            try connection.execute(sql: "UPDATE files SET library_membership = ? WHERE id = ?", arguments: [LibraryMembership.retired.rawValue, fileID])
+        }
     }
 
     private func membership(ofTrack trackID: Int64) async throws -> Int64? {

@@ -55,10 +55,12 @@ public struct SongFamilyService: Sendable {
     }
 
     /// Groups at least two distinct recordings, first linking any unlinked
-    /// file to the recording its fingerprint identifies. Throws
-    /// `SongFamilyError.memberAlreadyInFamily` instead of reassigning a member
-    /// (offer `merge`), and `fingerprintCollision` instead of sharing a
-    /// recording another file or MusicBrainz already claims.
+    /// file to the recording its fingerprint identifies. A recording whose
+    /// family has fewer than two live versions is taken over, dissolving that
+    /// family until undo. Throws `SongFamilyError.memberAlreadyInFamily`
+    /// instead of reassigning a member of a live family (offer `merge`), and
+    /// `fingerprintCollision` instead of sharing a recording another file or
+    /// MusicBrainz already claims.
     public func create(_ members: [SongFamilyMember], representative: SongFamilyMember? = nil,
                        authority: [FileMembershipToken] = []) async throws -> SongFamilyResult
     {
@@ -90,6 +92,9 @@ public struct SongFamilyService: Sendable {
         try await apply(.setRepresentative(familyId: familyId, trackId: trackId), familyId: familyId, authority: authority)
     }
 
+    /// Nil for a family with fewer than two live versions: it is dissolved
+    /// as far as the user can tell, though it keeps its members so returning
+    /// files restore it.
     public func family(id: Int64) async throws -> SongFamily? {
         try await database.writer.read { database in try Self.fetchFamily(id: id, in: database) }
     }
@@ -141,7 +146,7 @@ public struct SongFamilyService: Sendable {
         SELECT tracks.id AS track_id, tracks.musicbrainz_recording_id AS recording_mbid, files.id AS file_id,
                COALESCE(files.title, tracks.title) AS title, COALESCE(files.artist, tracks.artist) AS artist,
                COALESCE(\(FileProcessingEligibility.processableSQL), 0) AS available, tracks.id IS ? AS saved
-        FROM tracks LEFT JOIN files ON files.track_id = tracks.id
+        FROM tracks LEFT JOIN files ON files.track_id = tracks.id AND \(FileProcessingEligibility.activeSQL)
         WHERE tracks.work_id = ? AND \(SongFamilyMutation.liveTrackSQL)
         ORDER BY \(order)
         """, arguments: [record.representativeTrackId, id])
@@ -155,7 +160,7 @@ public struct SongFamilyService: Sendable {
                 isAvailable: trackRows.contains { row in row["available"] as Bool }
             ))
         }
-        guard let representative = rows.first.map({ row in row["track_id"] as Int64 }) else { return nil }
+        guard members.count >= 2, let representative = rows.first.map({ row in row["track_id"] as Int64 }) else { return nil }
         members.sort { first, second in (first.trackId == representative ? 0 : 1, first.trackId) < (second.trackId == representative ? 0 : 1, second.trackId) }
         return SongFamily(id: id, savedRepresentativeTrackId: record.representativeTrackId, representativeTrackId: representative, members: members)
     }

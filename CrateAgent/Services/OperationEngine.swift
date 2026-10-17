@@ -1611,7 +1611,9 @@ public actor OperationEngine {
                 }
                 try MatchUndoTagGuard.requireUnchanged(read)
             }
-            for event in events {
+            // A grouping link's inverse checks that grouping still owns the
+            // link itself, and keeps it otherwise (docs/song-families.md).
+            for event in events where !event.eventType.isSongFamilyRecordingLink {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
                       file.libraryMembership != .retired,
