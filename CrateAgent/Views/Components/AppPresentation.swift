@@ -3,12 +3,12 @@ import SwiftUI
 struct LibrarySyncStatusView: View {
     let state: SeratoLibrarySyncSession.State
     let retry: () -> Void
-    var phase: SeratoLibrarySyncSession.SyncPhase? = nil
+    var phase: SeratoLibrarySyncSession.SyncPhase?
     var fileInfoFailures: [String] = []
-    var progress: LibraryScanner.ScanProgress? = nil
+    var progress: LibraryScanner.ScanProgress?
     @State private var reviewingFileInfo = false
     var hasConflicts = false
-    var review: (() -> Void)? = nil
+    var review: (() -> Void)?
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
 
     var body: some View {

@@ -266,8 +266,7 @@ public final class AppServices: ObservableObject {
     }
 
     func retrySync() {
-        guard !filesystemDeliveryStopped else { return }
-        guard retryTask == nil else { return }
+        guard !filesystemDeliveryStopped, retryTask == nil else { return }
         if !startupCoordinator.completed {
             startupCoordinator.start(retryingFailedCleanup: true); return
         }

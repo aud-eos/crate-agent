@@ -100,10 +100,10 @@ public actor FingerprintWorker {
         self.runID = runID
         lastError = nil
 
-        let database = self.database
-        let concurrency = self.concurrency
-        let fingerprintFunction = self.fingerprintFunction
-        let pollIntervalNanos = self.pollIntervalNanos
+        let database = database
+        let concurrency = concurrency
+        let fingerprintFunction = fingerprintFunction
+        let pollIntervalNanos = pollIntervalNanos
         let workerRef = self
         workTask = Task.detached(priority: .background) {
             await workerRef.runLoop(
@@ -146,10 +146,10 @@ public actor FingerprintWorker {
                 fingerprintFunction: fingerprintFunction
             )
         }
-        return try Progress(
+        return try await Progress(
             totalDone: totalDone,
             totalFailed: totalFailed,
-            totalPending: await fetchPendingCount(),
+            totalPending: fetchPendingCount(),
             lastFingerprintedPath: nil
         )
     }
@@ -327,9 +327,9 @@ public actor FingerprintWorker {
         totalDone += doneCount
         totalFailed += failedCount
 
-        try emitProgress(
+        try await emitProgress(
             lastPath: lastPath,
-            pending: await fetchPendingCount()
+            pending: fetchPendingCount()
         )
     }
 

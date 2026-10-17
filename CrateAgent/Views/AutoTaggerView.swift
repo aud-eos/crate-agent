@@ -2,7 +2,7 @@ import SwiftUI
 
 struct AutoTaggerView: View {
     @ObservedObject var session: AutoTagSession
-    var readiness: LibrarySyncReadiness? = nil
+    var readiness: LibrarySyncReadiness?
     var conflictRevision: UInt64 = 0
     @EnvironmentObject private var seratoWatchdog: SeratoWatchdog
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable

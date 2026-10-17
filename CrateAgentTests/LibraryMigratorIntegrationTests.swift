@@ -161,7 +161,7 @@ final class LibraryMigratorIntegrationTests: XCTestCase {
             for failedStore in 0 ..< 3 {
                 var files: [FileRecord] = []
                 for index in 0 ..< count {
-                    try files.append(await fixture.add("resync-\(count)-\(failedStore)-\(index).mp3"))
+                    try await files.append(fixture.add("resync-\(count)-\(failedStore)-\(index).mp3"))
                 }
                 let plans = try preview(files, fixture: fixture)
                 let crates = try saveSeratoPaths(files.map(\.path), fixture: fixture)

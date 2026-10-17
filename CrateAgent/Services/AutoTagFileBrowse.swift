@@ -41,11 +41,10 @@ enum AutoTagFileBrowse {
             .map { column in "trim(COALESCE(\(column), ''), :whitespace) = ''" }
             .joined(separator: " OR ")
         let unmatched = "trim(COALESCE(tracks.musicbrainz_recording_id, ''), :whitespace) = ''"
-        let predicate: String
-        switch filter {
-        case .either: predicate = "(\(missingFields)) OR (\(unmatched))"
-        case .missingMetadata: predicate = missingFields
-        case .unmatched: predicate = unmatched
+        let predicate: String = switch filter {
+        case .either: "(\(missingFields)) OR (\(unmatched))"
+        case .missingMetadata: missingFields
+        case .unmatched: unmatched
         }
         let source = """
         FROM files LEFT JOIN tracks ON tracks.id = files.track_id

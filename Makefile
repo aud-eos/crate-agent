@@ -16,7 +16,7 @@ DERIVED_DATA_PATH := $(CURDIR)/build-output/DerivedData
 APP_PATH := $(DERIVED_DATA_PATH)/Build/Products/Debug/CrateAgent.app
 
 .PHONY: help install-deps doctor build build-rust xcodeproj \
-        test test-rust test-swift run clean format lint
+        test test-rust test-swift run clean format format-check lint
 
 help: ## Print this help summary
 	@echo "crate-agent — make targets"
@@ -37,6 +37,7 @@ help: ## Print this help summary
 	@echo ""
 	@echo "  Format / lint"
 	@echo "    make format         cargo fmt + swiftformat"
+	@echo "    make format-check   Fail if cargo fmt or swiftformat would change files"
 	@echo "    make lint           cargo clippy (warnings = errors)"
 	@echo ""
 	@echo "  Misc"
@@ -130,6 +131,12 @@ format:
 	else \
 	    echo "(swiftformat not installed; skipping Swift formatting)"; \
 	fi
+
+format-check:
+	@echo "==> cargo fmt --check..."
+	$(CARGO) fmt --manifest-path rust-core/Cargo.toml --all -- --check
+	@echo "==> swiftformat --lint..."
+	swiftformat CrateAgent CrateAgentTests --lint
 
 lint:
 	@echo "==> cargo clippy (warnings = errors)..."

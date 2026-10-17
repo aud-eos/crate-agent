@@ -4,7 +4,6 @@ import XCTest
 /// Unit tests for `EventHistoryQuery`'s Re-sync eligibility derivations
 /// (findings #3999114447 / #3999974013).
 final class EventHistoryQueryResyncEligibilityTests: XCTestCase {
-
     // MARK: - canResyncBatch: any replayable-Serato-projection event type
 
     func testCanResyncTrueForAutoTagOnlyBatch() {

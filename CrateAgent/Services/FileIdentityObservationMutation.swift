@@ -6,7 +6,7 @@ struct FileObservationExpectation: Sendable {
     let revision: Int64
     let identity: FileMetadata
     let state: FileLibraryState
-    var metadata: SeratoMetadata? = nil
+    var metadata: SeratoMetadata?
 
     func validate(in database: GRDB.Database) throws {
         guard let current = try FileRecord.fetchOne(database, key: fileId),

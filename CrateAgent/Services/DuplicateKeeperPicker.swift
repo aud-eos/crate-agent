@@ -20,7 +20,6 @@ import Foundation
 ///    the most-recently-edited copy, flip the comparator.
 /// 4. **Lexicographic path** — deterministic last-resort tiebreaker.
 public enum DuplicateKeeperPicker {
-
     /// Pick a default keeper from the group's files. Returns the
     /// file's id; the UI uses this to seed its radio selection and
     /// lets the user override per-group.
@@ -28,7 +27,7 @@ public enum DuplicateKeeperPicker {
         for group: DuplicateFinder.DuplicateGroup,
         musicFolder: URL
     ) -> Int64? {
-        return group.files
+        group.files
             .compactMap { file -> (FileRecord, Int64)? in
                 guard let identifier = file.id else { return nil }
                 return (file, identifier)
@@ -53,7 +52,7 @@ public enum DuplicateKeeperPicker {
             // Older mtime → higher rank → comes "last" in
             // `.max(by:)` semantics. Negate to invert.
             mtimeRank: -file.mtime,
-            invertedPath: file.path  // alphabetical earlier = stronger
+            invertedPath: file.path // alphabetical earlier = stronger
         )
     }
 
@@ -62,8 +61,12 @@ public enum DuplicateKeeperPicker {
     /// meaningless to compare). Unknown extensions rank below lossy.
     static func qualityTier(for file: FileRecord) -> Int {
         let ext = (file.path as NSString).pathExtension.lowercased()
-        if losslessExtensions.contains(ext) { return 2 }
-        if lossyExtensions.contains(ext) { return 1 }
+        if losslessExtensions.contains(ext) {
+            return 2
+        }
+        if lossyExtensions.contains(ext) {
+            return 1
+        }
         return 0
     }
 

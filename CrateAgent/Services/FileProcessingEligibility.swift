@@ -41,17 +41,17 @@ public extension QueryInterfaceRequest where RowDecoder == FileRecord {
 extension TrackMutation {
     var processingFileID: Int64? {
         switch self {
-        case .indexNewFile, .observeFileLocation, .observeFileIdentity, .observeFileMetadata, .setFileLibraryState, .beginFileImport, .removeFile: return nil
-        case let .setMetadata(payload): return payload.isSeratoAuthoritative == true ? nil : payload.fileId
-        case let .renameFile(payload): return payload.fileId
-        case let .commitMetadataToSerato(payload): return payload.fileId
-        case let .addTrackToSerato(payload): return payload.fileId
-        case let .writeFileTags(payload): return payload.fileId
-        case let .trashFile(payload): return payload.fileId
-        case let .removeTrackFromSerato(payload): return payload.fileId
-        case let .removeFileFromCrates(payload): return payload.fileId
-        case let .applyMusicBrainzMatch(payload): return payload.fileID
-        case let .revertMusicBrainzMatch(payload): return payload.applied.fileID
+        case .indexNewFile, .observeFileLocation, .observeFileIdentity, .observeFileMetadata, .setFileLibraryState, .beginFileImport, .removeFile: nil
+        case let .setMetadata(payload): payload.isSeratoAuthoritative == true ? nil : payload.fileId
+        case let .renameFile(payload): payload.fileId
+        case let .commitMetadataToSerato(payload): payload.fileId
+        case let .addTrackToSerato(payload): payload.fileId
+        case let .writeFileTags(payload): payload.fileId
+        case let .trashFile(payload): payload.fileId
+        case let .removeTrackFromSerato(payload): payload.fileId
+        case let .removeFileFromCrates(payload): payload.fileId
+        case let .applyMusicBrainzMatch(payload): payload.fileID
+        case let .revertMusicBrainzMatch(payload): payload.applied.fileID
         }
     }
 

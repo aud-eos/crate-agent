@@ -26,8 +26,8 @@ enum FilesystemWatcherError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case let .creationFailed(paths): return "Could not create filesystem observation for \(paths.joined(separator: ", "))."
-        case let .startFailed(paths): return "Could not start filesystem observation for \(paths.joined(separator: ", "))."
+        case let .creationFailed(paths): "Could not create filesystem observation for \(paths.joined(separator: ", "))."
+        case let .startFailed(paths): "Could not start filesystem observation for \(paths.joined(separator: ", "))."
         }
     }
 }

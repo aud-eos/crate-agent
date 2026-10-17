@@ -40,9 +40,9 @@ struct OrganizePreviewSnapshot: Sendable {
 
         var status: String {
             switch disposition {
-            case .move: return "Ready"
-            case let .pathConflict(reason): return reason
-            case let .needsMetadata(fields): return OrganizeMessages.needsMetadata(fields)
+            case .move: "Ready"
+            case let .pathConflict(reason): reason
+            case let .needsMetadata(fields): OrganizeMessages.needsMetadata(fields)
             }
         }
     }

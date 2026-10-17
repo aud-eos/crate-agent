@@ -1,9 +1,8 @@
+@testable import CrateAgent
 import GRDB
 import XCTest
-@testable import CrateAgent
 
 final class EventsBatchAggIndexTests: XCTestCase {
-
     func testIndexExistsAfterMigration() async throws {
         let database = try LibraryDatabase.openInMemory()
         let exists: Bool = try await database.writer.read { connection in
@@ -25,17 +24,17 @@ final class EventsBatchAggIndexTests: XCTestCase {
             let rows = try Row.fetchAll(
                 connection,
                 sql: """
-                    EXPLAIN QUERY PLAN
-                    SELECT
-                        batch_id,
-                        MIN(timestamp),
-                        GROUP_CONCAT(event_type),
-                        COUNT(*)
-                    FROM events
-                    GROUP BY batch_id
-                    ORDER BY MIN(timestamp) DESC
-                    LIMIT ?
-                    """,
+                EXPLAIN QUERY PLAN
+                SELECT
+                    batch_id,
+                    MIN(timestamp),
+                    GROUP_CONCAT(event_type),
+                    COUNT(*)
+                FROM events
+                GROUP BY batch_id
+                ORDER BY MIN(timestamp) DESC
+                LIMIT ?
+                """,
                 arguments: [200]
             )
             return rows

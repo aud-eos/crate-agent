@@ -36,7 +36,7 @@ struct BatchSelectionControls: View {
     let scopeCount: Int
     let coverage: BatchSelection.Coverage
     let enabled: Bool
-    var scopeLabel: String? = nil
+    var scopeLabel: String?
     let setSelected: (Bool) -> Void
     let clear: () -> Void
 
@@ -70,7 +70,7 @@ struct ResultListHeader<Row: Identifiable & Equatable>: View {
             if results.droppedSelectionCount > 0 {
                 Text("\(results.droppedSelectionCount) selected proposals changed or disappeared and were deselected. Review the updated results.").font(.callout)
             }
-            if !results.rows.isEmpty && results.visibleRows.isEmpty {
+            if !results.rows.isEmpty, results.visibleRows.isEmpty {
                 Text(ListControlLabels.noMatches).font(.callout)
             }
         }.padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)

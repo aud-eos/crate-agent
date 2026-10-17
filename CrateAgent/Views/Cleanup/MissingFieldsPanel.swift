@@ -54,7 +54,7 @@ struct MissingFieldsPanel: View {
     private var summaryBar: some View {
         if isScanning {
             ProgressView("Scanning library…")
-        } else if actionError != nil && files.isEmpty {
+        } else if actionError != nil, files.isEmpty {
             EmptyView()
         } else if summaries.isEmpty {
             hygienePlaceholder(

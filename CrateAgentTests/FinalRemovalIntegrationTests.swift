@@ -337,12 +337,11 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             let fileID = try XCTUnwrap(target.id)
             fixture.lifecycle.running = true
             fixture.watchdog.refresh()
-            let mutation: TrackMutation
-            switch operation {
-            case "trash": mutation = .trashFile(.init(fileId: fileID))
-            case "add": mutation = .addTrackToSerato(.init(fileId: fileID, metadata: .init(title: "Wrong recording")))
-            case "database removal": mutation = .removeTrackFromSerato(.init(fileId: fileID))
-            default: mutation = .removeFileFromCrates(.init(fileId: fileID))
+            let mutation: TrackMutation = switch operation {
+            case "trash": .trashFile(.init(fileId: fileID))
+            case "add": .addTrackToSerato(.init(fileId: fileID, metadata: .init(title: "Wrong recording")))
+            case "database removal": .removeTrackFromSerato(.init(fileId: fileID))
+            default: .removeFileFromCrates(.init(fileId: fileID))
             }
             try await engine.apply(mutation)
             let replacement = Self.wav(sample: 5)
@@ -668,7 +667,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
 
     static func wav(sample: UInt8 = 0, durationSeconds: Int = 1) -> Data {
         let sampleBytes = Data(repeating: sample, count: 88200 * durationSeconds)
-        func little<Value: FixedWidthInteger>(_ value: Value) -> Data {
+        func little(_ value: some FixedWidthInteger) -> Data {
             var encoded = value.littleEndian
             return withUnsafeBytes(of: &encoded) { Data($0) }
         }
