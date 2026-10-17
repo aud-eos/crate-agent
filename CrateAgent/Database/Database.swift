@@ -121,6 +121,7 @@ public final class LibraryDatabase {
         AddSyncCheckpointMigration.register(in: &migrator)
         AddSyncStatProjectionMigration.register(in: &migrator)
         AddDurableSeratoQueueMigration.register(in: &migrator)
+        AddSeratoWriteLandedMarkerMigration.register(in: &migrator)
         AddSongFamiliesMigration.register(in: &migrator)
         return migrator
     }

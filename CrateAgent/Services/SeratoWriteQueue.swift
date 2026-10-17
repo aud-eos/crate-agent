@@ -89,7 +89,7 @@ enum SeratoWriteQueueError: LocalizedError {
 /// transaction as the mutation that produced it and deleted in the writer
 /// transaction that performs (or supersedes) its I/O.
 enum SeratoWriteQueue {
-    private static let columns = "queue_id, event_id, kind, file_id, membership_revision, payload, cleanup_target_file_id, attempts, last_error"
+    private static let columns = "queue_id, event_id, kind, file_id, membership_revision, payload, cleanup_target_file_id, attempts, last_error, may_have_landed, io_started"
 
     @discardableResult
     static func insert(_ write: GuardedSeratoWrite, cleanupTargetFileID: Int64? = nil, locator: SeratoLibraryLocator,
@@ -246,10 +246,29 @@ enum SeratoWriteQueue {
         try Int.fetchOne(database, sql: "SELECT COUNT(DISTINCT event_id) FROM serato_write_queue") ?? 0
     }
 
+    /// A new attempt keeps whether the previous one may have landed before
+    /// it starts its own I/O marker over.
     static func recordAttempt(_ writes: [GuardedSeratoWrite], in database: Database) throws {
         for queueID in writes.compactMap(\.queueID) {
-            try database.execute(sql: "UPDATE serato_write_queue SET attempts = attempts + 1, last_attempt_at = ?, last_error = NULL WHERE queue_id = ?",
+            try database.execute(sql: """
+                                 UPDATE serato_write_queue SET may_have_landed = may_have_landed OR io_started, io_started = 0,
+                                   attempts = attempts + 1, last_attempt_at = ?, last_error = NULL WHERE queue_id = ?
+                                 """,
                                  arguments: [now(), queueID])
+        }
+    }
+
+    /// Committed before the transaction that performs external I/O, so a
+    /// process that dies during that I/O leaves the rows marked.
+    static func markIOStarting(_ queueIDs: [Int64], in database: Database) throws {
+        for queueID in queueIDs {
+            try database.execute(sql: "UPDATE serato_write_queue SET io_started = 1 WHERE queue_id = ?", arguments: [queueID])
+        }
+    }
+
+    static func clearIOStarted(_ queueIDs: some Collection<Int64>, in database: Database) throws {
+        for queueID in queueIDs {
+            try database.execute(sql: "UPDATE serato_write_queue SET io_started = 0 WHERE queue_id = ?", arguments: [queueID])
         }
     }
 
@@ -285,6 +304,8 @@ enum SeratoWriteQueue {
         write.queuedPayload = bytes
         write.attempts = row["attempts"]
         write.lastError = row["last_error"]
+        write.earlierAttemptMayHaveLanded = row["may_have_landed"]
+        write.ioStarted = row["io_started"]
         write.cleanupTargetFileID = row["cleanup_target_file_id"]
         return write
     }
