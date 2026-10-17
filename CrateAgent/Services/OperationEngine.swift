@@ -71,6 +71,15 @@ public actor OperationEngine {
     private var claimedQueueIDs: [Int64: UUID] = [:]
     private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
     private var isDraining = false
+    /// One pass over queued rows runs at a time. A scoped pass leaves a row
+    /// that depends on another pass's unfinished row for a later drain, and
+    /// with Serato closed and readiness open no drain comes until the next
+    /// sync, so overlapping passes would strand it (#117).
+    private var externalPassActive = false
+    private var externalPassWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Set inside a pass, so a pass started from within one (a cleanup step
+    /// a drain advances) runs as part of it instead of waiting for it.
+    @TaskLocal private static var runsInsideExternalPass = false
 
     private enum ExternalWriteInterruption: Error {
         case deferred
@@ -695,10 +704,10 @@ public actor OperationEngine {
         var reduction = QueuedMetadataReduction(overlay: overlay, journaledBaseline: baseline)
         var ownWrittenFields = Set<String>()
         var earlierIntended: [String: Set<String?>] = [:]
-        // Only a row whose I/O was attempted can have landed; an unattempted
-        // row's value in Serato is an external edit that happens to match it.
+        // Only a row whose I/O may have landed can explain a saved value; any
+        // other row's value in Serato is an external edit that happens to match it.
         let intents: [[String: String?]] = queued.map { guarded in
-            guard guarded.attempts > 0, case let .metadataUpdate(update) = guarded.write else { return [:] }
+            guard guarded.mayHaveLanded, case let .metadataUpdate(update) = guarded.write else { return [:] }
             return metadataFieldMap(update.metadata).mapValues { value in value.isEmpty ? nil : value }
         }
         for (position, guarded) in queued.enumerated() {
@@ -947,11 +956,10 @@ public actor OperationEngine {
             for intent in try DuplicateCleanupStore.fetchAll(in: database) {
                 guard intent.step < intent.mutations.count, case .trashFile = intent.mutations[intent.step] else { continue }
                 let targetID = intent.target.token.fileId
-                // A recorded error means the last attempt reported failure, so a
-                // missing path proves nothing about this engine's Trash.
+                // A missing path after a failed attempt proves nothing about this engine's Trash.
                 let attempted = try SeratoWriteQueue.fetch(cleanupTargetFileID: targetID, in: database).first { write in
                     if case .trashFile = write.write {
-                        write.attempts > 0 && write.lastError == nil
+                        write.mayHaveLanded
                     } else {
                         false
                     }
@@ -1774,6 +1782,27 @@ public actor OperationEngine {
     @discardableResult
     public func drainPendingSeratoUpdates(retryingFailedCleanup: Bool = false) async throws -> ResyncOutcome {
         guard readiness?.permitsExternalWrites != false else { throw LibrarySyncReadinessError.synchronizationRequired }
+        return try await exclusiveExternalPass { try await drainQueue(retryingFailedCleanup: retryingFailedCleanup) }
+    }
+
+    private func exclusiveExternalPass<Result: Sendable>(_ pass: () async throws -> Result) async throws -> Result {
+        if Self.runsInsideExternalPass {
+            return try await pass()
+        }
+        while externalPassActive {
+            await withCheckedContinuation { continuation in externalPassWaiters.append(continuation) }
+        }
+        externalPassActive = true
+        defer {
+            externalPassActive = false
+            if !externalPassWaiters.isEmpty {
+                externalPassWaiters.removeFirst().resume()
+            }
+        }
+        return try await Self.$runsInsideExternalPass.withValue(true) { try await pass() }
+    }
+
+    private func drainQueue(retryingFailedCleanup: Bool) async throws -> ResyncOutcome {
         try await recoverInterruptedEffects()
         if retryingFailedCleanup {
             try await database.writer.write { database in try DuplicateCleanupStore.clearFailures(in: database) }
@@ -2218,6 +2247,10 @@ public actor OperationEngine {
     /// Applies the given rows now in dependency-ordered segments, the same way
     /// a drain does. Rows outside the scope are left for the drain.
     private func processScopedRows(_ queueIDs: Set<Int64>) async throws -> ResyncOutcome {
+        try await exclusiveExternalPass { try await processScopedRowsExclusively(queueIDs) }
+    }
+
+    private func processScopedRowsExclusively(_ queueIDs: Set<Int64>) async throws -> ResyncOutcome {
         let partition = try await partitionScopedRows(queueIDs)
         var run = SegmentRun()
         for write in partition.superseded {

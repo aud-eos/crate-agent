@@ -324,18 +324,22 @@ rebases later queued edits of the same file onto the values it wrote, and a stri
 observation treats a saved value equal to an earlier queued edit as that edit
 landing, so the newest edit still applies after an interruption. A queue row or
 pre-upgrade fence that no longer decodes is removed with a `malformed`
-disposition; the rest of the queue still applies.
+disposition; the rest of the queue still applies. Only one pass runs at a time:
+a scoped pass leaves a row that depends on an unfinished earlier row for the
+next drain, and with Serato closed that drain waits for the next sync, so a rename
+made during another pass on the same file waits for that pass instead.
 
 The pass groups eligible rows into segments in queue order. Every V2 metadata
 edit joins one rewrite unless a rename, add, or V2 removal queued since that
 rewrite opened touches the same file or path; then it starts a new rewrite after
-that row. Consecutive renames share one path batch, and every other write is its
-own segment. Edits to the same record are merged in queue order before the batch
+that row. Consecutive renames share one path batch, which applies them in order:
+a rename of an earlier rename's destination (old → middle → new) lands the record
+at the final path. Every other write is its own segment. Edits to the same record are merged in queue order before the batch
 writer, which keeps only one update per path. A strict observation also treats a
 saved value equal to a later queued edit of the same file as our own coalesced
 write, so it is neither reapplied nor reported. Both landed-write rules apply only
-to rows whose I/O was attempted: a saved value matching an unsent edit is the
-user's own Serato edit and wins. A failed segment fails all of its rows together
+to rows whose last attempt recorded no error: a saved value matching an unsent
+edit, or one whose write threw, is the user's own Serato edit and wins. A failed segment fails all of its rows together
 and blocks their dependents; a row whose target becomes conflicted at the write
 boundary is blocked alone with its dependents, and the rest of the segment applies.
 

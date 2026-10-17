@@ -201,3 +201,15 @@ OperationEngine.swift, SeratoWriteEligibility.swift, SyncCheckpointStore.swift, 
   (commit to Serato, MusicBrainz match) for the written fields.
 - The write boundary names every conflicted row (`ExternalWriteInterruption.conflicted`);
   phase-one classification already blocks rows conflicted when the pass starts.
+
+## Implementation notes (#117 completion)
+
+- One pass over queued rows runs at a time; a pass started inside another (a
+  cleanup step a drain advances) joins it. Overlapping passes stranded a rename
+  behind another pass's unfinished row until the next sync.
+- A rename batch applies its renames in order, so old → middle → new lands at the
+  final path instead of stopping at the middle one.
+- A row counts as possibly landed only when its last attempt recorded no error.
+- Undo refuses to remove an indexed row once its membership changed, so only
+  `removeFile` (duplicate cleanup) removes a row with queued work; the file ID is
+  `AUTOINCREMENT`, so a re-indexed row never matches the removed row's tokens.
