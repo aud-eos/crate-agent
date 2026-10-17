@@ -52,15 +52,20 @@ still operate on the clicked file.
 The play button at the start of each Library row, beside each file in
 **Cleanup → Duplicates**, and beside each **Auto-Tag** review plays the track from
 about 30% in, past DJ intros, and keeps playing to the end. Press it again to pause
-and resume; in Library, Space does the same for the focused row. The now-playing
-bar at the bottom of the window shows the title and artist, elapsed and total time,
-a scrub bar, play/pause, ±10 s skip and stop. One track plays at a time, app-wide,
-across screens. Playback only reads the file.
+and resume; in Library, Space does the same for the focused row, and Shift-Space
+selects or deselects it. The now-playing bar at the bottom of the window shows the
+title and artist, elapsed and total time, a scrub bar, play/pause, ±10 s skip and
+stop. One track plays at a time, app-wide, across screens. Playback only reads the
+file, and stops with a visible error if the file stops delivering audio, for
+example when its drive is ejected.
 
 Right-click a track in Library, Duplicates or Auto-Tag for **Open in** its default
-app (Command-O on the focused Library row), an **Open With** list of other apps
-that can open it, and **Reveal in Finder**. A failed open is shown at the bottom
-of the window.
+app, an **Open With** list of other apps that can open it plus **Other…** to pick
+any app, and **Reveal in Finder**. Command-O opens the focused Library row, the
+last-clicked Duplicates file, or the Auto-Tag review in focus (or last clicked in
+List mode). Playing, opening and revealing first check that the file at the row's
+path is still that row's recording; a missing or replaced file is refused with a
+dismissible message at the bottom of the window.
 
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;

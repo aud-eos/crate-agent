@@ -24,6 +24,8 @@ struct DuplicatesPanel: View {
     /// (DuplicateKeeperPicker.chooseDefaultKeeper). Per-group radio
     /// taps write into this dictionary.
     @State private var keeperOverrides: [String: Int64] = [:]
+    /// The last file clicked; Command-O opens it.
+    @State private var focusedFileID: Int64?
     @State private var isScanning: Bool = false
     @State private var isResolving: Bool = false
     @State private var actionError: String?
@@ -83,6 +85,7 @@ struct DuplicatesPanel: View {
                 batchActionBar
             }
         }
+        .fileOpenShortcut(services.fileOpener, fileID: focusedFileID)
         .task { await rescan() }
         .task { await rescanAsLibraryChanges() }
         .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
@@ -339,7 +342,9 @@ struct DuplicatesPanel: View {
             }
             Spacer()
             Button {
-                services.fileOpener.reveal(file.path)
+                if let identifier = file.id {
+                    Task { await services.fileOpener.reveal(fileID: identifier) }
+                }
             } label: {
                 Label("Reveal", systemImage: "magnifyingglass")
                     .labelStyle(.iconOnly)
@@ -348,7 +353,14 @@ struct DuplicatesPanel: View {
             .help("Show this file in Finder so you can review or delete it manually.")
         }
         .padding(.vertical, density.rowPadding)
-        .contextMenu { FileOpenMenuItems(opener: services.fileOpener, path: file.path) }
+        .background(file.id == focusedFileID ? Color.accentColor.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { focusedFileID = file.id })
+        .contextMenu {
+            if let identifier = file.id {
+                FileOpenMenuItems(opener: services.fileOpener, fileID: identifier, path: file.path)
+            }
+        }
     }
 
     @ViewBuilder

@@ -4,8 +4,7 @@ import SwiftUI
 enum LibraryBrowserAction: Equatable {
     case rename
     case history
-    /// Opens the file in the given application, or its default one when nil.
-    case open(OpenApplication?)
+    case open(OpenTarget)
     case reveal
 }
 
@@ -93,8 +92,8 @@ struct LibraryPagedContent: View {
                        query.sort = .init(column: column, ascending: ascending)
                        model.setQuery(query)
                    }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, contentRevision: readiness?.scopeRevision ?? 0, onFocus: { identifier, index in model.focus(id: identifier, index: index) },
-                   onSpace: player.map { player in { row in player.toggle(PlayerTrack(row)) } },
-                   onOpen: opener.map { _ in { row in onAction(row.id, .open(nil)) } })
+                   onSpace: player.map { player in { row in Task { await player.toggle(PlayerTrack(row)) } } },
+                   onOpen: opener.map { _ in { row in onAction(row.id, .open(.defaultApplication)) } })
     }
 
     private func menu(for identifier: Int64) -> NSMenu? {
@@ -111,19 +110,17 @@ struct LibraryPagedContent: View {
             menu.addItem(.separator())
             let defaultApplication = opener.defaultApplication(for: path)
             let open = LibraryActionMenuItem(title: FileOpenerMessages.open(in: defaultApplication?.name ?? FileOpenerMessages.defaultApplication)) {
-                onAction(identifier, .open(nil))
+                onAction(identifier, .open(.defaultApplication))
             }
             open.keyEquivalent = "o"
             open.keyEquivalentModifierMask = .command
             open.isEnabled = defaultApplication != nil
             menu.addItem(open)
-            let others = opener.otherApplications(for: path)
-            if !others.isEmpty {
-                menu.addItem(.sectionHeader(title: FileOpenerMessages.openWith))
-                for application in others {
-                    menu.addItem(LibraryActionMenuItem(title: application.name) { onAction(identifier, .open(application)) })
-                }
+            menu.addItem(.sectionHeader(title: FileOpenerMessages.openWith))
+            for application in opener.otherApplications(for: path) {
+                menu.addItem(LibraryActionMenuItem(title: application.name) { onAction(identifier, .open(.application(application))) })
             }
+            menu.addItem(LibraryActionMenuItem(title: FileOpenerMessages.otherApplication) { onAction(identifier, .open(.chooseApplication)) })
         }
         menu.addItem(.separator())
         menu.addItem(LibraryActionMenuItem(title: FileOpenerMessages.reveal) { onAction(identifier, .reveal) })

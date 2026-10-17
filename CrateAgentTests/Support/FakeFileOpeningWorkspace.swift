@@ -7,6 +7,8 @@ final class FakeFileOpeningWorkspace: FileOpeningWorkspace {
     var defaultApplication: URL?
     var applications: [URL] = []
     var openError: Error?
+    /// What the Other… chooser returns; nil models Cancel.
+    var chosenApplication: URL?
     private(set) var opened: [(file: URL, application: URL)] = []
     private(set) var revealed: [URL] = []
 
@@ -27,5 +29,9 @@ final class FakeFileOpeningWorkspace: FileOpeningWorkspace {
 
     func reveal(_ url: URL) {
         revealed.append(url)
+    }
+
+    func chooseApplication() async -> URL? {
+        chosenApplication
     }
 }

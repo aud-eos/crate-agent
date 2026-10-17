@@ -10,6 +10,8 @@ struct AutoTaggerView: View {
     @State private var showResetConfirmation = false
     @State private var reviewQuery = ""
     @State private var chooserFile: ChooserFile?
+    /// The last review clicked in List mode; Command-O opens it.
+    @State private var listFocusedFileID: Int64?
 
     private struct ChooserFile: Identifiable { let id: Int64 }
 
@@ -26,6 +28,7 @@ struct AutoTaggerView: View {
                 reviewStage
             }
         }
+        .fileOpenShortcut(opener, fileID: session.scannedFileIDs.isEmpty ? nil : session.reviewMode == .focus ? session.focusedFileID : listFocusedFileID)
         .navigationTitle("Auto-Tag")
         .frame(minWidth: 680, minHeight: 480)
         .appPresentation()
@@ -227,9 +230,12 @@ struct AutoTaggerView: View {
             reviewDetails(fileID, file: file, path: path, isFocused: isFocused)
         }
         .padding(.vertical, density.rowPadding)
+        .background(!isFocused && fileID == listFocusedFileID ? Color.accentColor.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { listFocusedFileID = fileID })
         .contextMenu {
             if let file {
-                FileOpenMenuItems(opener: opener, path: file.path)
+                FileOpenMenuItems(opener: opener, fileID: fileID, path: file.path)
             }
         }
     }

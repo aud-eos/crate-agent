@@ -9,9 +9,15 @@ enum TrackPlayerMessages {
     static let nowPlaying = "Now playing"
     static let unavailable = "The file is unavailable, so it can't be played."
     static let unknownFailure = "The audio could not be played."
+    static let stalled = "no audio data arrived for several seconds. Check that its drive is still connected."
+    static let dismiss = "Dismiss"
 
-    static func unreadable(_ filename: String) -> String {
-        "Can't play \(filename): the file is missing or unreadable."
+    static func cannotPlay(_ filename: String, detail: String) -> String {
+        "Can't play \(filename): \(detail)"
+    }
+
+    static func nowPlayingLabel(title: String, artist: String?) -> String {
+        "\(nowPlaying): \([title, artist].compactMap { part in part.flatMap { $0.isEmpty ? nil : $0 } }.joined(separator: ", "))"
     }
 
     static func failed(_ filename: String, reason: String) -> String {

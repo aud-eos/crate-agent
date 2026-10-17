@@ -226,10 +226,10 @@ struct LibraryBrowserView: View {
                                            album: record.album, bpm: record.bpm, musicalKey: record.musicalKey,
                                            libraryMembership: record.libraryMembership, fileAvailability: record.fileAvailability,
                                            membershipRevision: record.membershipRevision)
-            case let .open(application):
-                await services.fileOpener.open(record.path, with: application)
+            case let .open(target):
+                await services.fileOpener.open(fileID: identifier, with: target)
             case .reveal:
-                services.fileOpener.reveal(record.path)
+                await services.fileOpener.reveal(fileID: identifier)
             }
         } catch { model.error = error.localizedDescription }
     }
