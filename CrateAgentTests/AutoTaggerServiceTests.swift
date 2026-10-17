@@ -1091,17 +1091,19 @@ final class AutoTaggerServiceTests: XCTestCase {
 
     private func makeMatchPayload(
         fileID: Int64,
-        expectedFileSize: Int64,
-        expectedMtime: Int64
+        expectedFileSize: Int64 = 1000,
+        expectedMtime: Int64 = 0,
+        recordingMBID: String = "rec",
+        fingerprintHash: Data = Data([0x01])
     ) -> ApplyMusicBrainzMatchPayload {
         ApplyMusicBrainzMatchPayload(
             fileID: fileID,
             acoustID: "aid",
-            recordingMBID: "rec",
+            recordingMBID: recordingMBID,
             releaseMBID: "rel",
             artistMBID: "art",
             isrc: "isrc",
-            fingerprintHash: Data([0x01]),
+            fingerprintHash: fingerprintHash,
             expectedFileSize: expectedFileSize,
             expectedMtime: expectedMtime,
             artist: "A", title: "T", album: "Al", year: 1994
@@ -1156,6 +1158,39 @@ final class AutoTaggerServiceTests: XCTestCase {
         }
         XCTAssertEqual(candidate.expectedFileSize, 7777, "expected size must be the on-disk value, not the DB 1000")
         XCTAssertEqual(candidate.expectedMtime, 8888, "expected mtime must be the on-disk value, not the DB 0")
+    }
+
+    /// Collisions are found per row, in apply order, including two rows of one batch that share a
+    /// fingerprint; a file re-identifying the row only it references is not a collision.
+    func testFingerprintConflictsAreFoundPerRowIncludingWithinTheBatch() async throws {
+        let database = try makeDatabase()
+        let clean = try insertFile(in: database, path: "/music/clean.mp3")
+        let collidingWithLibrary = try insertFile(in: database, path: "/music/library-collision.mp3")
+        let firstShared = try insertFile(in: database, path: "/music/shared-first.mp3")
+        let secondShared = try insertFile(in: database, path: "/music/shared-second.mp3")
+        let ownRowCorrection = try insertFile(in: database, path: "/music/own-row.mp3")
+        let libraryOwned = Data([0xA1]), ownRow = Data([0xB2]), shared = Data([0xC3])
+        try await database.writer.write { db in
+            var linkedElsewhere = TrackRecord(fingerprintHash: libraryOwned, musicbrainzRecordingId: "already-linked")
+            try linkedElsewhere.insert(db)
+            var dependent = FileRecord(path: "/music/dependent.mp3", volumeUuid: "VOL", inode: 9999, fileSize: 1, mtime: 0)
+            dependent.trackId = linkedElsewhere.id
+            try dependent.insert(db)
+            var onlyItsOwn = TrackRecord(fingerprintHash: ownRow, musicbrainzRecordingId: "earlier-guess")
+            try onlyItsOwn.insert(db)
+            try db.execute(sql: "UPDATE files SET track_id = ? WHERE id = ?", arguments: [onlyItsOwn.id, ownRowCorrection])
+        }
+        let service = makeService(database: database) { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 0) }
+        let payloads = [
+            makeMatchPayload(fileID: clean, recordingMBID: "clean", fingerprintHash: Data([0xD4])),
+            makeMatchPayload(fileID: collidingWithLibrary, recordingMBID: "different", fingerprintHash: libraryOwned),
+            makeMatchPayload(fileID: firstShared, recordingMBID: "first", fingerprintHash: shared),
+            makeMatchPayload(fileID: secondShared, recordingMBID: "second", fingerprintHash: shared),
+            makeMatchPayload(fileID: ownRowCorrection, recordingMBID: "corrected", fingerprintHash: ownRow),
+        ]
+
+        let conflicts = try await service.fingerprintConflictFileIDs(for: payloads)
+        XCTAssertEqual(conflicts, [collidingWithLibrary, secondShared])
     }
 
     /// A file whose on-disk size/mtime changed between lookup and Apply is
