@@ -232,8 +232,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
                 lastRequest = request
                 pendingRequest = .incremental
                 try Task.checkCancellation()
-                try await operationEngine.recoverLegacyEffectFences()
-                try await operationEngine.refreshQueueDepth()
+                try await operationEngine.recoverInterruptedEffects()
                 watchdog.refresh()
                 guard !watchdog.isSeratoRunning else { pendingRequest = request; state = .waitingForSerato; return }
                 state = .reconciling

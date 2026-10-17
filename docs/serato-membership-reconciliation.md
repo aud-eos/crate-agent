@@ -273,7 +273,11 @@ Pending, completed, failed, and superseded counts remain visible in sync status.
 The sequence is durable in `duplicate_cleanup_intents`: each step's mutation,
 queued effects, and intent update commit together, the confirmed V2 removal is
 recorded in the removal transaction, and the Trash transaction also deletes the
-row and the intent. A restart resumes the cleanup at its recorded step.
+row and the intent. A restart resumes the cleanup at its recorded step. If the
+process exited after Trash moved the target but before that transaction committed,
+the next sync finishes the cleanup from the attempted trash row instead of retiring
+the target. Cancellations found during reconciliation are reported in the ready
+summary.
 
 Physical move rollback and retained-source cleanup use `OwnedAudioIdentity`:
 precise device/inode/size/mtime/ctime plus a streaming SHA-256 digest of every byte.
@@ -315,7 +319,12 @@ A blocked entry is not superseded. A failed entry records its error and blocks o
 its dependents; the pass continues and then reports the failure. Rows are deleted in
 the transaction that commits their I/O, so a replay after a crash finds nothing to
 redo, and an attempted audio-tag write or Trash whose target then changed is
-reported as interrupted instead of being repeated.
+reported as interrupted instead of being repeated. Completing a queued V2 edit
+rebases later queued edits of the same file onto the values it wrote, and a strict
+observation treats a saved value equal to an earlier queued edit as that edit
+landing, so the newest edit still applies after an interruption. A queue row or
+pre-upgrade fence that no longer decodes is removed with a `malformed`
+disposition; the rest of the queue still applies.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.

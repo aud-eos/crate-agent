@@ -175,3 +175,9 @@ OperationEngine.swift, SeratoWriteEligibility.swift, SyncCheckpointStore.swift, 
   falls back to checkpoint evidence without the V2-source-equality check.
 - A scoped pass treats an out-of-scope row as a dependency only while its
   membership revision still permits it; a superseded row blocks nothing.
+- Review fixes: completing a V2 edit rebases later same-file edits; the
+  observation reducer is FIFO-aware; an interrupted cleanup Trash finishes on
+  the next sync; pass claims are owned and taken atomically; malformed rows and
+  fences are quarantined with a `malformed` disposition.
+- Known ordering gap left for step 7: a scoped pass applies its metadata group
+  before renames in the same scope.

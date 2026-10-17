@@ -56,6 +56,17 @@ extension SeratoPendingWrite: Codable {
     }
 }
 
+extension SeratoMetadata {
+    /// The fields this update sets, over `original` for the rest.
+    func overlaid(on original: SeratoMetadata) -> SeratoMetadata {
+        SeratoMetadata(artist: artist ?? original.artist, title: title ?? original.title,
+                       album: album ?? original.album, genre: genre ?? original.genre,
+                       bpm: bpm ?? original.bpm, musicalKey: musicalKey ?? original.musicalKey,
+                       comment: comment ?? original.comment, length: length ?? original.length,
+                       label: label ?? original.label)
+    }
+}
+
 struct SeratoQueuedWritePayload: Codable, Equatable, Sendable {
     let write: SeratoPendingWrite
     let originalIdentity: FileMetadata
@@ -115,6 +126,41 @@ enum SeratoWriteQueue {
 
     static func fetch(fileID: Int64, in database: Database) throws -> [GuardedSeratoWrite] {
         try Row.fetchAll(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE file_id = ? ORDER BY queue_id", arguments: [fileID]).map(decode)
+    }
+
+    static func fetch(queueID: Int64, in database: Database) throws -> GuardedSeratoWrite? {
+        try Row.fetchOne(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE queue_id = ?", arguments: [queueID]).map(decode)
+    }
+
+    /// Later queued V2 edits for the same file revision captured their
+    /// baseline before `completed` was written. Its written fields are now
+    /// the saved values those edits replace.
+    static func rebaseMetadata(after completed: GuardedSeratoWrite, in database: Database) throws {
+        guard case let .metadataUpdate(update) = completed.write, let queueID = completed.queueID else { return }
+        let later = try Row.fetchAll(database, sql: """
+        SELECT \(columns) FROM serato_write_queue
+        WHERE file_id = ? AND membership_revision = ? AND kind = ? AND queue_id > ? ORDER BY queue_id
+        """, arguments: [completed.token.fileId, completed.token.revision, SeratoWriteKind.metadataUpdate.rawValue, queueID]).map(decode)
+        for var write in later {
+            guard let baseline = write.externalBaseline else { continue }
+            write.externalBaseline = update.metadata.overlaid(on: baseline)
+            _ = try replace(write, in: database)
+        }
+    }
+
+    /// Moves rows whose stored payload no longer decodes out of the queue,
+    /// recording each one, so one damaged row cannot stop every other write.
+    static func quarantineMalformed(in database: Database) throws {
+        let rows = try Row.fetchAll(database, sql: "SELECT \(columns) FROM serato_write_queue ORDER BY queue_id")
+        for row in rows {
+            do { _ = try decode(row) }
+            catch let SeratoWriteQueueError.malformedRow(queueID) {
+                try database.execute(sql: "DELETE FROM serato_write_queue WHERE queue_id = ?", arguments: [queueID])
+                try SeratoWriteDispositions.record(eventID: row["event_id"], kind: SeratoWriteKind(rawValue: row["kind"]), disposition: .malformed,
+                                                   detail: "Queued change \(queueID) (\(row["kind"] as String)) was unreadable and was not applied.",
+                                                   reported: false, in: database)
+            }
+        }
     }
 
     static func fetch(cleanupTargetFileID: Int64, in database: Database) throws -> [GuardedSeratoWrite] {
@@ -234,6 +280,7 @@ enum SeratoWriteDisposition: String, Sendable {
     case uncertain
     case interrupted
     case legacyUnrecoverable
+    case malformed
 }
 
 struct SeratoWriteDispositionCounts: Sendable, Equatable {

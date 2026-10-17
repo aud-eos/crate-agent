@@ -68,7 +68,7 @@ public actor OperationEngine {
     /// process-local guards around it. A claimed row is being processed by a
     /// pass and must not be processed again, or overtaken by a dependent row,
     /// until that pass releases it.
-    private var claimedQueueIDs = Set<Int64>()
+    private var claimedQueueIDs: [Int64: UUID] = [:]
     private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
     private var isDraining = false
 
@@ -326,8 +326,8 @@ public actor OperationEngine {
 
     /// Cancels the cleanup and every queued effect it still owns in one
     /// transaction, recording each dropped effect.
-    private func cancelDuplicateCleanup(_ fileID: Int64, result: DuplicateCleanupResult) async throws {
-        let reported = LibrarySyncReadiness.drainAuthorization == nil
+    private func cancelDuplicateCleanup(_ fileID: Int64, result: DuplicateCleanupResult, reported explicitReported: Bool? = nil) async throws {
+        let reported = explicitReported ?? (LibrarySyncReadiness.drainAuthorization == nil)
         try await database.writer.write { database in
             for write in try SeratoWriteQueue.fetch(cleanupTargetFileID: fileID, in: database) {
                 try Self.dropQueuedWrite(write, disposition: .superseded, reported: reported, in: database)
@@ -353,13 +353,13 @@ public actor OperationEngine {
             }
             return true
         } catch is FileProcessingEligibilityError {
-            try await cancelDuplicateCleanup(fileID, result: .superseded("Duplicate cleanup was superseded by a changed keeper or target."))
+            try await cancelDuplicateCleanup(fileID, result: .superseded("Duplicate cleanup was superseded by a changed keeper or target."), reported: false)
             return false
         }
     }
 
     func supersedeReappearedCleanup(fileID: Int64) async throws {
-        try await cancelDuplicateCleanup(fileID, result: .superseded("Duplicate cleanup was superseded because Serato re-added the file after removal."))
+        try await cancelDuplicateCleanup(fileID, result: .superseded("Duplicate cleanup was superseded because Serato re-added the file after removal."), reported: false)
     }
 
     var duplicateCleanupMessage: String? {
@@ -690,6 +690,7 @@ public actor OperationEngine {
         }
         var reduction = QueuedMetadataReduction(overlay: overlay, journaledBaseline: baseline)
         var ownWrittenFields = Set<String>()
+        var earlierIntended: [String: Set<String?>] = [:]
         for guarded in queued {
             guard case let .metadataUpdate(update) = guarded.write else { continue }
             let rowBaseline = guarded.externalBaseline.map(metadataFieldMap)
@@ -702,15 +703,23 @@ public actor OperationEngine {
                 if saved == intended {
                     permitted.insert(field)
                     ownWrittenFields.insert(field)
+                } else if earlierIntended[field]?.contains(saved) == true {
+                    // An earlier queued edit of ours landed but its row was not
+                    // cleared; its value is what this later edit replaces.
+                    permitted.insert(field)
+                    ownWrittenFields.insert(field)
                 } else if rowBaseline != nil, saved == prior {
                     permitted.insert(field)
                 }
+            }
+            for field in desired.keys {
+                earlierIntended[field, default: []].insert(desired[field].flatMap { value in value.isEmpty ? nil : value })
             }
             if rowBaseline == nil {
                 reduction.uncertainFields.formUnion(Set(desired.keys).subtracting(permitted))
             }
             let kept = reducedMetadata(update.metadata, keeping: permitted)
-            reduction.overlay = overlayMetadata(kept, on: reduction.overlay)
+            reduction.overlay = kept.overlaid(on: reduction.overlay)
             var replacement = guarded
             replacement.write = .metadataUpdate(.init(absolutePath: update.absolutePath, metadata: kept))
             replacement.externalBaseline = observed
@@ -721,14 +730,6 @@ public actor OperationEngine {
             reduction.journaledBaseline = merging(ownWrittenFields, from: observed, into: baseline)
         }
         return reduction
-    }
-
-    private static func overlayMetadata(_ update: SeratoMetadata, on original: SeratoMetadata) -> SeratoMetadata {
-        SeratoMetadata(artist: update.artist ?? original.artist, title: update.title ?? original.title,
-                       album: update.album ?? original.album, genre: update.genre ?? original.genre,
-                       bpm: update.bpm ?? original.bpm, musicalKey: update.musicalKey ?? original.musicalKey,
-                       comment: update.comment ?? original.comment, length: update.length ?? original.length,
-                       label: update.label ?? original.label)
     }
 
     /// `base` with the named fields copied from `source`, including absent values.
@@ -843,37 +844,105 @@ public actor OperationEngine {
     /// Replayable events are rebuilt from the journal against current file
     /// state; destructive effects cannot be verified after the fact, so they
     /// are recorded as unrecoverable rather than resumed.
-    func recoverLegacyEffectFences() async throws {
+    /// Repairs durable state an earlier process left mid-effect, before any
+    /// pass reads the queue. Each damaged row or fence is isolated with a
+    /// visible disposition so the rest of the queue still applies.
+    func recoverInterruptedEffects() async throws {
+        try await database.writer.write { database in try SeratoWriteQueue.quarantineMalformed(in: database) }
+        try await recoverLegacyEffectFences()
+        try await recoverInterruptedCleanupTrash()
+        try await refreshQueueDepth()
+    }
+
+    private func recoverLegacyEffectFences() async throws {
         let prefix = SyncCheckpointStore.legacyEventFencePrefix
         let fences = try await database.writer.read { database in
             try String.fetchAll(database, sql: "SELECT batch_id FROM sync_effect_fences WHERE substr(batch_id, 1, ?) = ? ORDER BY batch_id",
                                 arguments: [prefix.count, prefix])
         }
-        guard !fences.isEmpty else { return }
         let context = mutationContext
         for fence in fences {
-            guard let eventID = Int64(fence.dropFirst(prefix.count)) else { throw SyncCheckpointError.malformed }
-            let event = try await database.writer.read { database in try EventRecord.fetchOne(database, key: eventID) }
-            var writes: [GuardedSeratoWrite] = []
-            if let event, event.eventType.hasReplayableSeratoProjection {
-                writes = try await reconstructResyncWrites(from: [event]).writes
-            } else if let event, event.eventType == .trackAddedToSerato {
-                writes = try await legacyImportWrite(event)
+            let eventID = Int64(fence.dropFirst(prefix.count))
+            let recovery: (writes: [GuardedSeratoWrite], event: EventRecord?)
+            do {
+                guard let eventID else { throw SyncCheckpointError.malformed }
+                let event = try await database.writer.read { database in try EventRecord.fetchOne(database, key: eventID) }
+                if let event, event.eventType.hasReplayableSeratoProjection {
+                    recovery = try await (reconstructResyncWrites(from: [event]).writes, event)
+                } else if let event, event.eventType == .trackAddedToSerato {
+                    recovery = try await (legacyImportWrite(event), event)
+                } else {
+                    recovery = ([], event)
+                }
+            } catch let error where Self.isUnreadableRecord(error) {
+                try await database.writer.write { database in
+                    try SeratoWriteDispositions.record(eventID: eventID ?? 0, kind: nil, disposition: .malformed,
+                                                       detail: "Pre-upgrade change \(fence) was unreadable and was not applied: \(error.localizedDescription)",
+                                                       reported: false, in: database)
+                    try SyncCheckpointStore.finishEffect(batchID: fence, in: database)
+                }
+                continue
             }
-            let unrecoverable = event.map { recorded in !recorded.eventType.hasReplayableSeratoProjection && recorded.eventType != .trackAddedToSerato } ?? true
+            let unrecoverable = recovery.event.map { recorded in !recorded.eventType.hasReplayableSeratoProjection && recorded.eventType != .trackAddedToSerato } ?? true
             try await database.writer.write { database in
-                for write in writes {
+                for write in recovery.writes {
                     try SeratoWriteQueue.insert(write, locator: context.locator, ignoringExisting: true, in: database)
                 }
-                if writes.isEmpty {
-                    try SeratoWriteDispositions.record(eventID: eventID, kind: event.flatMap { recorded in Self.legacyWriteKind(recorded.eventType) },
+                if recovery.writes.isEmpty, let eventID {
+                    try SeratoWriteDispositions.record(eventID: eventID, kind: recovery.event.flatMap { recorded in Self.legacyWriteKind(recorded.eventType) },
                                                        disposition: unrecoverable ? .legacyUnrecoverable : .superseded,
                                                        detail: "Recovered from an interrupted pre-upgrade session.", reported: false, in: database)
                 }
                 try SyncCheckpointStore.finishEffect(batchID: fence, in: database)
             }
         }
-        try await refreshQueueDepth()
+    }
+
+    /// A process that exited after Trash moved a cleanup target but before
+    /// that transaction committed leaves the attempted trash row and its
+    /// intent. The target is gone from its verified path, so the cleanup
+    /// finishes as its trash transaction would have instead of retiring the
+    /// row and reporting the cleanup superseded.
+    private func recoverInterruptedCleanupTrash() async throws {
+        let context = mutationContext
+        let finished = try await database.writer.write { database -> [Int64] in
+            var finished: [Int64] = []
+            for intent in try DuplicateCleanupStore.fetchAll(in: database) {
+                guard intent.step < intent.mutations.count, case .trashFile = intent.mutations[intent.step] else { continue }
+                let targetID = intent.target.token.fileId
+                let attempted = try SeratoWriteQueue.fetch(cleanupTargetFileID: targetID, in: database).first { write in
+                    if case .trashFile = write.write {
+                        write.attempts > 0
+                    } else {
+                        false
+                    }
+                }
+                guard let attempted, case let .trashFile(trash) = attempted.write,
+                      !FileManager.default.fileExists(atPath: trash.absolutePath) else { continue }
+                do {
+                    try intent.target.validate(in: database, audioWasTrashed: true)
+                    try intent.keeper.validate(in: database)
+                } catch is FileProcessingEligibilityError { continue }
+                let removal = TrackMutation.removeFile(.init(fileId: targetID))
+                try Self.requireCurrentToken(intent.target.token, mutation: removal, in: database)
+                _ = try Self.executeAndLog(context: context, mutation: removal, batchId: intent.batchID, in: database)
+                try SeratoWriteQueue.delete(attempted, in: database)
+                try DuplicateCleanupStore.delete(targetFileID: targetID, in: database)
+                finished.append(targetID)
+            }
+            return finished
+        }
+        for targetID in finished {
+            duplicateCleanupResults[targetID] = .completed
+            await note("Duplicate cleanup for file \(targetID) finished after an interrupted move to Trash.")
+        }
+    }
+
+    private static func isUnreadableRecord(_ error: Error) -> Bool {
+        if case OperationEngineError.eventPayloadDecodingFailed = error {
+            return true
+        }
+        return error is DecodingError || error is SyncCheckpointError
     }
 
     private func legacyImportWrite(_ event: EventRecord) async throws -> [GuardedSeratoWrite] {
@@ -1667,6 +1736,7 @@ public actor OperationEngine {
     @discardableResult
     public func drainPendingSeratoUpdates(retryingFailedCleanup: Bool = false) async throws -> ResyncOutcome {
         guard readiness?.permitsExternalWrites != false else { throw LibrarySyncReadinessError.synchronizationRequired }
+        try await recoverInterruptedEffects()
         if retryingFailedCleanup {
             try await database.writer.write { database in try DuplicateCleanupStore.clearFailures(in: database) }
         } else if let message = try await failedDuplicateCleanupMessage {
@@ -1690,24 +1760,28 @@ public actor OperationEngine {
         var blockedEvents = Set<Int64>()
         var blockedQueueIDs = Set<Int64>()
         var failures: [Error] = []
+        let owner = UUID()
         let pass = try await loadQueue()
-        for queued in pass {
-            guard let queueID = queued.queueID else { continue }
+        for loaded in pass {
+            guard let queueID = loaded.queueID else { continue }
             let predecessor = blocked
-            let claimed = claimedQueueIDs.contains(queueID)
             let readiness = readiness
-            let classification = try await database.writer.read { database -> (SeratoConflictQueueDisposition, SeratoQueueDependency)? in
-                guard try SeratoWriteQueue.state(of: queued, in: database) == .current else { return nil }
-                return try SeratoConflictQueue.classify(queued, blocked: predecessor, readiness: readiness, in: database)
+            // An earlier row's completion can rebase this row's baseline, so
+            // the pass works from the row as stored now, not as first loaded.
+            let classification = try await database.writer.read { database -> (GuardedSeratoWrite, SeratoConflictQueueDisposition, SeratoQueueDependency)? in
+                guard var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
+                current.requiredKeeper = loaded.requiredKeeper
+                let (disposition, dependency) = try SeratoConflictQueue.classify(current, blocked: predecessor, readiness: readiness, in: database)
+                return (current, disposition, dependency)
             }
-            guard let (disposition, dependency) = classification else { continue }
+            guard let (queued, disposition, dependency) = classification else { continue }
             if disposition == .blocked {
                 blocked.formUnion(dependency)
                 blockedEvents.insert(queued.eventId)
                 blockedQueueIDs.insert(queueID)
                 continue
             }
-            if claimed || dependency.intersects(waiting) {
+            if claimedQueueIDs[queueID] != nil || dependency.intersects(waiting) {
                 waiting.formUnion(dependency)
                 continue
             }
@@ -1717,7 +1791,11 @@ public actor OperationEngine {
                 superseded.insert(queued.eventId)
                 continue
             }
-            claimedQueueIDs.insert(queueID)
+            guard claim([queueID], owner: owner) == [queueID] else {
+                waiting.formUnion(dependency)
+                continue
+            }
+            defer { release([queueID], owner: owner) }
             do {
                 try await requireExternalWriteEligibility([next])
                 try await recordAttempt([next])
@@ -1732,8 +1810,8 @@ public actor OperationEngine {
                 try await supersede(next, reported: reported)
                 superseded.insert(next.eventId)
             } catch ExternalWriteInterruption.stale {
+                waiting.formUnion(dependency)
             } catch ExternalWriteInterruption.deferred {
-                claimedQueueIDs.remove(queueID)
                 if try await isEligible(next) {
                     break
                 }
@@ -1744,8 +1822,8 @@ public actor OperationEngine {
                 waiting.formUnion(dependency)
                 failures.append(error)
             }
-            claimedQueueIDs.remove(queueID)
             if let target = next.cleanupTargetFileID, applied.contains(next.eventId) {
+                release([queueID], owner: owner)
                 await advanceDuplicateCleanup(target)
             }
         }
@@ -1760,6 +1838,23 @@ public actor OperationEngine {
             throw OperationEngineError.externalSyncIncomplete(batchId: "queued-changes", underlying: "\(details). Fix the causes, then choose Retry Sync.")
         }
         return outcome
+    }
+
+    /// Claims the rows no other pass holds, in one actor step with no
+    /// suspension between the check and the claim.
+    private func claim(_ queueIDs: Set<Int64>, owner: UUID) -> Set<Int64> {
+        let available = queueIDs.filter { queueID in claimedQueueIDs[queueID] == nil }
+        for queueID in available {
+            claimedQueueIDs[queueID] = owner
+        }
+        return available
+    }
+
+    /// Releases only the claims this pass owns.
+    private func release(_ queueIDs: Set<Int64>, owner: UUID) {
+        for queueID in queueIDs where claimedQueueIDs[queueID] == owner {
+            claimedQueueIDs[queueID] = nil
+        }
     }
 
     private func loadQueue() async throws -> [GuardedSeratoWrite] {
@@ -1783,7 +1878,7 @@ public actor OperationEngine {
     /// newer revision already superseded can never apply and blocks nothing.
     private func partitionScopedRows(_ queueIDs: Set<Int64>) async throws -> (eligible: [GuardedSeratoWrite], blocked: [GuardedSeratoWrite], superseded: [GuardedSeratoWrite]) {
         let rows = try await loadQueue()
-        let claimed = claimedQueueIDs
+        let claimed = Set(claimedQueueIDs.keys)
         let readiness = readiness
         return try await database.writer.read { database in
             var dependencies = SeratoQueueDependency()
@@ -1867,8 +1962,9 @@ public actor OperationEngine {
             if case let .metadataUpdate(update) = write.write,
                let previous = try SeratoExternalBaselines.load(token: write.token, identity: write.originalIdentity, locator: locator, in: database)
             {
-                try SeratoExternalBaselines.save(overlayMetadata(update.metadata, on: previous), token: write.token, in: database)
+                try SeratoExternalBaselines.save(update.metadata.overlaid(on: previous), token: write.token, in: database)
             }
+            try SeratoWriteQueue.rebaseMetadata(after: write, in: database)
             try DuplicateCleanupStore.completeEffect(of: write, in: database)
         }
     }
@@ -1966,17 +2062,34 @@ public actor OperationEngine {
     /// `database V2` pass and consecutive renames in one batch. Rows outside
     /// the scope are left for the drain.
     private func processScopedRows(_ queueIDs: Set<Int64>) async throws -> ResyncOutcome {
-        let partition = try await partitionScopedRows(queueIDs)
-        let blockedEvents = Set(partition.blocked.map(\.eventId))
+        let owner = UUID()
         var superseded = Set<Int64>()
-        for write in partition.superseded {
-            try await supersede(write, reported: true)
-            superseded.insert(write.eventId)
+        var partition: (eligible: [GuardedSeratoWrite], blocked: [GuardedSeratoWrite], superseded: [GuardedSeratoWrite])
+        var claimed: Set<Int64>
+        // Another pass can claim a row while this one is suspended; partition
+        // again so rows that depend on it wait instead of overtaking it.
+        repeat {
+            partition = try await partitionScopedRows(queueIDs)
+            for write in partition.superseded {
+                try await supersede(write, reported: true)
+                superseded.insert(write.eventId)
+            }
+            let wanted = Set(partition.eligible.compactMap(\.queueID))
+            claimed = claim(wanted, owner: owner)
+            if claimed != wanted {
+                release(claimed, owner: owner)
+                claimed = []
+                partition.eligible = []
+                await Task.yield()
+                continue
+            }
+            break
+        } while true
+        defer {
+            release(claimed, owner: owner)
         }
+        let blockedEvents = Set(partition.blocked.map(\.eventId))
         let writes = partition.eligible
-        let claimed = Set(writes.compactMap(\.queueID))
-        claimedQueueIDs.formUnion(claimed)
-        defer { claimedQueueIDs.subtract(claimed) }
         var metadata: [GuardedSeratoWrite] = []
         var remaining: [GuardedSeratoWrite] = []
         for write in writes {

@@ -152,6 +152,90 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertFalse(intents)
     }
 
+    func testNewestQueuedEditWinsWhenAnEarlierEditLandedBeforeItsRowCleared() async throws {
+        for interruption in ["crash before commit", "Serato relaunched"] {
+            let fixture = try SeratoRemovalFixture()
+            defer { fixture.cleanup() }
+            let file = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav())
+            try save(fixture, paths: [file.path])
+            try setV2(fixture, path: file.path, title: "Original A")
+            try await makeSession(fixture, engine: fixture.engine).synchronize()
+            let fileID = try XCTUnwrap(file.id)
+            setRunning(fixture, true)
+            for title in ["Queued B", "Newest C"] {
+                try await fixture.engine.apply(.setMetadata(.init(fileId: fileID, metadata: .init(title: title), isSeratoAuthoritative: false)))
+                try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: fileID, metadata: .init(title: title))))
+            }
+            setRunning(fixture, false)
+            if interruption == "crash before commit" {
+                try await fixture.database.writer.write { database in
+                    try database.execute(sql: """
+                    CREATE TEMP TRIGGER crash_after_io BEFORE DELETE ON serato_write_queue
+                    BEGIN SELECT RAISE(ABORT, 'process exited after external I/O'); END
+                    """)
+                }
+                do { _ = try await fixture.engine.drainPendingSeratoUpdates(); XCTFail("The simulated crash did not interrupt the drain") }
+                catch {}
+                try await fixture.database.writer.write { database in try database.execute(sql: "DROP TRIGGER crash_after_io") }
+            } else {
+                let relaunched = LockedTestFlag()
+                let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                             seratoMetadataBatchWriter: { databasePath, updates in
+                                                 let result = try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+                                                 if relaunched.setOnce() {
+                                                     DispatchQueue.main.sync { self.setRunning(fixture, true) }
+                                                 }
+                                                 return result
+                                             })
+                do { try await makeSession(fixture, engine: engine).synchronize(); XCTFail("Serato relaunch did not stop the drain") }
+                catch SeratoMembershipSnapshotError.seratoRunning {}
+                setRunning(fixture, false)
+            }
+            XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first?.title, "Queued B", interruption)
+
+            let restarted = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator)
+            let session = makeSession(fixture, engine: restarted)
+            try await session.synchronize()
+
+            XCTAssertEqual(try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first?.title, "Newest C", interruption)
+            guard case let .ready(summary) = session.state else { return XCTFail("\(interruption): sync did not reach ready") }
+            XCTAssertEqual(summary.supersededWrites, 0, interruption)
+        }
+    }
+
+    func testCleanupInterruptedAfterTrashFinishesOnRestart() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let keeper = try await fixture.add("keeper.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let target = try await fixture.add("target.wav", bytes: FinalRemovalIntegrationTests.wav())
+        try save(fixture, paths: [keeper.path, target.path])
+        let recorder = BoundaryRecorder()
+        let first = recordingEngine(fixture, recorder: recorder)
+        try await makeSession(fixture, engine: first).synchronize()
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: """
+            CREATE TEMP TRIGGER crash_after_trash BEFORE DELETE ON serato_write_queue WHEN OLD.kind = 'trashFile'
+            BEGIN SELECT RAISE(ABORT, 'process exited after moving audio to Trash'); END
+            """)
+        }
+        let group = DuplicateFinder.DuplicateGroup(groupKey: "interrupted", mode: .byteLevel, files: [keeper, target])
+        _ = try await DuplicateResolver(operationEngine: first).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "interrupted-trash")
+        try await fixture.database.writer.write { database in try database.execute(sql: "DROP TRIGGER crash_after_trash") }
+        XCTAssertEqual(recorder.trashed, [target.path])
+
+        let restarted = recordingEngine(fixture, recorder: recorder)
+        let session = makeSession(fixture, engine: restarted)
+        try await session.synchronize()
+
+        let targetRow = try await fixture.database.writer.read { database in try FileRecord.fetchOne(database, key: target.id) }
+        XCTAssertNil(targetRow, "The cleanup must finish, not retire the target")
+        XCTAssertEqual(recorder.trashed, [target.path])
+        let remaining = try await restarted.pendingSeratoWriteCount
+        XCTAssertEqual(remaining, 0)
+        guard case let .ready(summary) = session.state else { return XCTFail("Sync did not reach ready") }
+        XCTAssertEqual(summary.supersededWrites + summary.interruptedWrites, 0)
+    }
+
     func testSeratoSessionEditsWinAcrossRestartAndFastStartup() async throws {
         for savedDuringSession in ["Original A", "Serato C", ""] {
             let fixture = try SeratoRemovalFixture()
@@ -350,6 +434,19 @@ final class DurableSeratoQueueTests: XCTestCase {
         return try [fixture.locator.subcratesDirectoryUrl.appendingPathComponent("queued.crate"), fixture.locator.smartCratesDirectoryUrl.appendingPathComponent("queued.scrate")].map { url in
             try bytes.write(to: url)
             return (url, bytes)
+        }
+    }
+}
+
+private final class LockedTestFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = false
+
+    func setOnce() -> Bool {
+        lock.withLock {
+            guard !stored else { return false }
+            stored = true
+            return true
         }
     }
 }
