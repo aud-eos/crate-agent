@@ -2423,6 +2423,12 @@ public actor OperationEngine {
     }
 
     private func applyFileTagWrite(_ write: SeratoPendingFileTagWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
+        let year = try write.year.map { requested in
+            guard let year = UInt32(exactly: requested) else {
+                throw OperationEngineError.fileTagWriteFailed(path: write.absolutePath, underlying: "year \(requested) is outside the writable range")
+            }
+            return year
+        }
         let update = AudioTagUpdate(
             artist: write.metadata.artist,
             title: write.metadata.title,
@@ -2436,7 +2442,7 @@ public actor OperationEngine {
             // Serato's database V2 has no year field, so the MusicBrainz
             // match routes year to the file tags only. `writeFileTags`
             // leaves it nil.
-            year: write.year.flatMap { $0 >= 0 ? UInt32($0) : nil },
+            year: year,
             clearYear: write.clearYear
         )
         let tagWriter = fileTagWriter
@@ -3591,27 +3597,17 @@ public actor OperationEngine {
             .filter(Column("fingerprint_hash") == payload.fingerprintHash)
             .fetchOne(db)
         {
-            // D-C: a 120s-capped fingerprint can collide across two DIFFERENT
-            // recordings. When the row already carries a recording MBID that
-            // differs from the incoming one AND another file depends on that
-            // row, overwriting would mis-link every one of those files
-            // (invariant #4). Reject instead. A single file re-identifying
-            // its OWN row (no other references) is a legitimate correction
-            // and proceeds — the reference check is what distinguishes a
-            // collision from a re-match.
-            if let existingRecordingMBID = existingTrack.musicbrainzRecordingId,
-               existingRecordingMBID != payload.recordingMBID
-            {
-                let otherFilesReferenceRow = try FileRecord.hasOtherFilesReferencingTrack(
-                    existingTrack.id, excluding: payload.fileID, in: db
+            // `AutoTaggerService.fingerprintConflictFileIDs` excludes these rows before the batch;
+            // this rejection remains the guard against changes made since that preflight.
+            let existingTrackID = existingTrack.id
+            if let existingMBID = try existingTrack.conflictingRecording(replacingWith: payload.recordingMBID, otherFilesReference: {
+                try FileRecord.hasOtherFilesReferencingTrack(existingTrackID, excluding: payload.fileID, in: db)
+            }) {
+                throw OperationEngineError.fingerprintRecordingConflict(
+                    fileId: payload.fileID,
+                    existingMBID: existingMBID,
+                    incomingMBID: payload.recordingMBID
                 )
-                if otherFilesReferenceRow {
-                    throw OperationEngineError.fingerprintRecordingConflict(
-                        fileId: payload.fileID,
-                        existingMBID: existingRecordingMBID,
-                        incomingMBID: payload.recordingMBID
-                    )
-                }
             }
             previousTrackIdentifiers = TrackIdentifiers(
                 acoustID: existingTrack.acoustidId,

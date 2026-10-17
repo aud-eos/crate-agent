@@ -73,6 +73,7 @@ struct DuplicatesPanel: View {
                 .padding(density.pagePadding)
             SeratoRunningBanner(message: SeratoGateMessages.quitBefore("resolving duplicates"))
             modeBar.disabled(isScanning || isResolving)
+            AudioPreviewFailureMessage(player: services.audioPreview).padding(.horizontal, density.pagePadding)
             Divider()
             ResultListHeader(results: $results, enabled: !isScanning && !isResolving)
             groupListSection.disabled(isScanning || isResolving)
@@ -85,6 +86,7 @@ struct DuplicatesPanel: View {
         }
         .task { await rescan() }
         .task { await rescanAsLibraryChanges() }
+        .onDisappear { services.audioPreview.stop() }
         .onChange(of: services.syncState) { _, _ in refreshConflictSelection() }
         // Cache invalidation: when the group set changes (after a
         // rescan, or after a resolve removed files) or the user
@@ -308,6 +310,9 @@ struct DuplicatesPanel: View {
             .accessibilityLabel("Keep \((file.path as NSString).lastPathComponent)")
             .accessibilityValue(isKeeper ? "Selected keeper" : "Not selected")
             .help("Set as the keeper for this group.")
+            if let identifier = file.id {
+                AudioPreviewButton(player: services.audioPreview, fileID: identifier, path: file.path)
+            }
             VStack(alignment: .leading, spacing: density.detailSpacing) {
                 TrackHeading(artist: file.artist, title: file.title, filename: (file.path as NSString).lastPathComponent)
                 Text(file.path)
@@ -502,6 +507,7 @@ struct DuplicatesPanel: View {
             return
         }
         isResolving = true
+        services.audioPreview.stop()
         defer { isResolving = false }
         actionError = nil
         lastResolution = nil
@@ -539,6 +545,7 @@ struct DuplicatesPanel: View {
         }
 
         isResolving = true
+        services.audioPreview.stop()
         defer {
             isResolving = false
             batchProgress = .idle
