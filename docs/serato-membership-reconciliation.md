@@ -275,7 +275,8 @@ the drop's queued adds in one scoped pass. Consecutive adds share one `database 
 rewrite per 200 files, and each file's result comes from its own queue rows and
 dispositions (#187). A file that changes before its add runs is reported as not
 added and stays pending; dropping it again observes the changed file and starts a
-new import. A file listed twice in one drop, such as a folder and a file inside it,
+new import. Only a pending import adopts a changed file this way: a retired or
+removed row still refuses a replacement at its path. A file listed twice in one drop, such as a folder and a file inside it,
 is imported once. The Library drop flow publishes
 the failure through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or

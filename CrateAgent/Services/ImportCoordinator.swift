@@ -143,8 +143,10 @@ public actor ImportCoordinator {
             if let existing {
                 guard existing.libraryMembership != .active, let existingID = existing.id else { return .skipped }
                 if !FileImportIdentity.matches(existing, identity: fileMetadata) {
-                    // The file at this path changed since it was indexed, as when
-                    // an earlier drop's add was superseded; observe it first.
+                    // Only an import still pending, such as one whose add was
+                    // superseded because the file changed, takes the file now at
+                    // its path; a retired row never adopts a replacement.
+                    guard existing.libraryMembership == .pendingImport else { return .skipped }
                     _ = try await operationEngine.apply(
                         .observeFileIdentity(ObserveFileIdentityPayload(
                             fileId: existingID, expectedRevision: existing.membershipRevision,
