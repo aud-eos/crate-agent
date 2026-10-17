@@ -87,7 +87,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         host.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
         func findSidebar(_ view: NSView) -> NSTableView? {
-            if let table = view as? NSTableView, !(table is PagedNSTableView), table.numberOfRows == 5 {
+            if let table = view as? NSTableView, !(table is PagedNSTableView), table.numberOfRows == MainWindowView.Section.allCases.count - 1 {
                 return table
             }
             for child in view.subviews {

@@ -20,4 +20,6 @@ public struct SetFileLibraryStatePayload: Codable, Sendable {
     public let expectedRevision: Int64
     public let state: FileLibraryState
     public var observedReadditionAfterOwnedRemoval: Bool? = nil
+    /// The verified native Trash item for a `.trashed` state; nil keeps the recorded one.
+    public var trashLocation: FileMetadata? = nil
 }

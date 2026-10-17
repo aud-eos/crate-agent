@@ -348,6 +348,34 @@ fn otrk_has_path_in(
     found
 }
 
+/// The path an `otrk` is keyed by: its first `path_tag` field that decodes.
+fn first_decodable_path(nested: &[TlvRecord], path_tag: &[u8; 4]) -> Option<String> {
+    nested
+        .iter()
+        .filter(|field| &field.tag == path_tag)
+        .find_map(|field| decode_utf16be(&field.payload))
+}
+
+/// Which of `paths` some `otrk` is keyed by, under the metadata writer's
+/// rule (`first_decodable_path` of a well-formed record). Only records
+/// holding a requested path are parsed.
+fn held_paths_in_otrks<'path>(
+    records: &[TlvRecord],
+    path_tag: &[u8; 4],
+    paths: impl IntoIterator<Item = &'path str>,
+) -> HashSet<String> {
+    let encoded_paths: HashSet<Vec<u8>> = paths.into_iter().map(encode_utf16be).collect();
+    records
+        .iter()
+        .filter(|record| {
+            &record.tag == TAG_OTRK && otrk_has_path_in(&record.payload, path_tag, &encoded_paths)
+        })
+        .filter_map(|record| TlvRecord::parse_all(&record.payload).ok())
+        .filter_map(|nested| first_decodable_path(&nested, path_tag))
+        .filter(|path| encoded_paths.contains(&encode_utf16be(path)))
+        .collect()
+}
+
 /// Visits each well-formed nested field in order and returns whether the
 /// whole payload parsed cleanly — the same acceptance as
 /// `TlvRecord::parse_all`.
@@ -426,6 +454,11 @@ fn rewrite_path_in_otrks(
 /// Multi-rename variant: rewrite every otrk whose path field matches
 /// any key in `renames`, replacing it with the mapped value. One pass
 /// over the records; only otrks holding a rename source are parsed.
+///
+/// Every matching path field is rewritten, while `held_paths_in_otrks`
+/// reads only the first decodable one. They differ only for an otrk with
+/// several path fields, which Serato does not write; rewriting all of them
+/// keeps such a record from pointing at the old path anywhere.
 fn rewrite_paths_in_otrks(
     records: &mut [TlvRecord],
     path_tag: &[u8; 4],
@@ -515,6 +548,14 @@ impl CrateFile {
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
         rewrite_path_in_otrks(&mut self.records, TAG_PTRK, old_path, new_path)
+    }
+
+    /// Which of `paths` this crate holds a track at.
+    pub fn held_paths<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path str>,
+    ) -> HashSet<String> {
+        held_paths_in_otrks(&self.records, TAG_PTRK, paths)
     }
 
     /// Multi-rename variant: rewrite every matching `ptrk` in one pass.
@@ -680,6 +721,14 @@ impl DatabaseV2 {
         remove_otrks_referencing_path(&mut self.records, TAG_PFIL, target_path)
     }
 
+    /// Which of `paths` this database holds a track at.
+    pub fn held_paths<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path str>,
+    ) -> HashSet<String> {
+        held_paths_in_otrks(&self.records, TAG_PFIL, paths)
+    }
+
     /// Number of `otrk` track entries in the database. Useful for
     /// progress reporting on full library scans.
     pub fn track_count(&self) -> usize {
@@ -827,14 +876,7 @@ impl DatabaseV2 {
             let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
                 continue;
             };
-            let track_path = nested.iter().find_map(|field| {
-                if &field.tag == TAG_PFIL {
-                    decode_utf16be(&field.payload)
-                } else {
-                    None
-                }
-            });
-            let Some(track_path) = track_path else {
+            let Some(track_path) = first_decodable_path(&nested, TAG_PFIL) else {
                 continue;
             };
             let Some(update) = updates.get(&track_path) else {

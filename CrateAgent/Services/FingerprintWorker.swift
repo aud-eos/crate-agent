@@ -299,14 +299,15 @@ public actor FingerprintWorker {
                 for (assignment, result) in representativeResults {
                     let fingerprint: Data?
                     let status: FingerprintStatus
+                    var failureReason: String?
                     switch result.outcome {
                     case let .success(bytes): fingerprint = bytes; status = .done
-                    case .failure: fingerprint = nil; status = .failed
+                    case let .failure(reason): fingerprint = nil; status = .failed; failureReason = reason
                     case .notDecoded: continue
                     }
                     for fileID in [result.fileId] + assignment.siblingIds where permittedIDs.contains(fileID) {
                         if try FingerprintPersistence.write(
-                            fileID: fileID, fingerprint: fingerprint, status: status,
+                            fileID: fileID, fingerprint: fingerprint, status: status, failureReason: failureReason,
                             requirePendingStatus: true, expectedMembershipToken: plan.membershipTokens[fileID]!, in: database
                         ) {
                             if status == .done {
@@ -440,7 +441,7 @@ public actor FingerprintWorker {
         SELECT file_size, lightweight_hash, chromaprint_fingerprint
         FROM files
         WHERE fingerprint_status = 'done'
-          AND chromaprint_fingerprint IS NOT NULL
+          AND NOT (\(WorkerCoverageQuery.invalidDoneSQL))
           AND (file_size, lightweight_hash) IN (VALUES \(placeholders))
         \(excludeClause)
         """
@@ -487,7 +488,7 @@ public actor FingerprintWorker {
         try Task.checkCancellation()
         try authorization?.check()
         guard let fileId = file.id else {
-            return ProcessResult(fileId: 0, path: file.path, outcome: .failure)
+            return ProcessResult(fileId: 0, path: file.path, outcome: .failure("The file has no library identifier."))
         }
         do {
             try await database.writer.read { database in
@@ -501,13 +502,16 @@ public actor FingerprintWorker {
         }
         do {
             let hashes = try function(file.path)
+            guard !hashes.isEmpty else {
+                return ProcessResult(fileId: fileId, path: file.path, outcome: .failure(WorkerMessages.noFingerprintProduced))
+            }
             return ProcessResult(
                 fileId: fileId,
                 path: file.path,
                 outcome: .success(FingerprintEncoder.serialize(hashes))
             )
         } catch {
-            return ProcessResult(fileId: fileId, path: file.path, outcome: .failure)
+            return ProcessResult(fileId: fileId, path: file.path, outcome: .failure(WorkerCoverageQuery.failureReason(for: error)))
         }
     }
 
@@ -564,7 +568,7 @@ private struct ProcessResult: Sendable {
 
     enum Outcome: Sendable {
         case success(Data)
-        case failure
+        case failure(String)
         case notDecoded
     }
 }

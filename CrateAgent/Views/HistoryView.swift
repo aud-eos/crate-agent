@@ -163,7 +163,7 @@ struct HistoryView: View {
             // it on the inline banner too — the activity strip
             // message scrolls past quickly, but History's banner
             // stays visible until the user dismisses or undoes.
-            if outcome.queuedCount > 0, outcome.appliedCount == 0 {
+            if outcome.missingTargetCount > 0 || (outcome.queuedCount > 0 && outcome.appliedCount == 0) {
                 actionError = outcome.summaryMessage
             }
         } catch {

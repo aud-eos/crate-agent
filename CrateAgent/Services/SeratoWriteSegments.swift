@@ -1,8 +1,9 @@
 import Foundation
 
-/// One external pass over queued rows: every `database V2` metadata update in
-/// one rewrite, consecutive renames in one path batch, consecutive adds of
-/// distinct files in one registration, or a single other write.
+/// One external pass over queued rows: `database V2` metadata updates in one
+/// rewrite, consecutive renames in one path batch, consecutive adds of
+/// distinct files in one registration, or a single other write. Batched
+/// segments hold at most `SeratoWriteSegmenter.maximumEntriesPerSegment` rows.
 struct SeratoWriteSegment: Sendable {
     enum Kind: Sendable {
         case metadata
@@ -21,6 +22,13 @@ struct SeratoWriteSegment: Sendable {
 }
 
 enum SeratoWriteSegmenter {
+    /// Each segment's I/O and its rows' verification and confirmation run in
+    /// one writer transaction, so this bounds how long a drain blocks other
+    /// writes. At about 1 ms per row plus a ~50 ms rewrite of a production-size
+    /// `database V2`, 200 rows keeps that under the 500 ms interaction budget
+    /// (#189); a larger backlog pays one more library rewrite per 200 rows.
+    static let maximumEntriesPerSegment = 200
+
     /// Groups eligible rows, given in queue order, into the fewest passes that
     /// keep every file's and path's effects in order. A metadata update joins
     /// the open V2 group unless a rename, add, or V2 removal emitted since that
@@ -35,7 +43,9 @@ enum SeratoWriteSegmenter {
         for entry in entries {
             switch entry.write.write {
             case .metadataUpdate:
-                if let index = openMetadata, !entry.dependency.intersects(pathEffectsSinceOpen) {
+                if let index = openMetadata, segments[index].entries.count < maximumEntriesPerSegment,
+                   !entry.dependency.intersects(pathEffectsSinceOpen)
+                {
                     segments[index].entries.append(entry)
                 } else {
                     openMetadata = segments.count
@@ -43,7 +53,7 @@ enum SeratoWriteSegmenter {
                     segments.append(SeratoWriteSegment(kind: .metadata, entries: [entry]))
                 }
             case .rename:
-                if let last = segments.indices.last, segments[last].kind == .renames {
+                if let last = segments.indices.last, segments[last].kind == .renames, segments[last].entries.count < maximumEntriesPerSegment {
                     segments[last].entries.append(entry)
                 } else {
                     segments.append(SeratoWriteSegment(kind: .renames, entries: [entry]))
@@ -52,7 +62,9 @@ enum SeratoWriteSegmenter {
             case .addTrack:
                 // A second add of the same file must see the first one's
                 // confirmation, so it starts a new registration.
-                if let last = segments.indices.last, segments[last].kind == .adds, !entry.dependency.intersects(openAddTargets) {
+                if let last = segments.indices.last, segments[last].kind == .adds, segments[last].entries.count < maximumEntriesPerSegment,
+                   !entry.dependency.intersects(openAddTargets)
+                {
                     segments[last].entries.append(entry)
                 } else {
                     segments.append(SeratoWriteSegment(kind: .adds, entries: [entry]))

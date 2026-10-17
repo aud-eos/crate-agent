@@ -33,10 +33,15 @@ public enum LightweightHashCalculator {
     /// nil for files that can't be opened — the caller treats this as
     /// "no hash available, fall back to inode-only behavior."
     public static func compute(forFileAt path: String) -> Data? {
-        LibrarySyncMetrics.current?.record(.hash)
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
+        return compute(reading: handle)
+    }
 
+    /// Hash through a handle the caller already opened, so the content read is the
+    /// file the caller verified rather than whatever the path names now.
+    public static func compute(reading handle: FileHandle) -> Data? {
+        LibrarySyncMetrics.current?.record(.hash)
         let fileSize: UInt64
         do {
             fileSize = try handle.seekToEnd()

@@ -44,6 +44,23 @@ isolated fixtures. A green suite alone is not evidence that new test code respec
 that contract.
 
 
+## Owned APFS volume fixture
+
+Native Trash, cross-volume and case-alias tests skip unless a disposable APFS
+volume is mounted at `/private/tmp/crate-agent-task6-volume` with a
+`.task6-test-volume` marker. It must be case-insensitive (plain `APFS`):
+
+```sh
+hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE /path/to/task6.sparseimage
+mkdir -p /private/tmp/crate-agent-task6-volume
+hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume -nobrowse
+touch /private/tmp/crate-agent-task6-volume/.task6-test-volume
+```
+
+Tests trash files only into that volume's own `.Trashes`, never the user's Trash.
+The mount is machine-wide, so it un-skips these tests for every concurrent suite;
+detach it (`hdiutil detach /private/tmp/crate-agent-task6-volume`) when done.
+
 ## Paged Library fixture
 
 `LibraryPagingTests` creates one temporary WAL database with 30,000 synthetic
@@ -197,8 +214,8 @@ These are warm-fixture measurements, not a promise for every disk or library.
 
 Owner-app smoke check: launch against an already indexed library, navigate/search
 while validation runs, then relaunch unchanged; change one Serato title and close
-Serato; verify that title updates and unrelated rows remain available. Exercise
-**Re-scan File Info**, **Stop Sync**, and **Retry Sync**. Inspect any file-info errors
+Serato; verify that title updates and unrelated rows remain available. In Workers,
+exercise **Re-scan File Info**, **Stop Sync**, and **Retry Sync**. Inspect any file-info errors
 and path conflicts before attempting processing on affected files.
 
 ## Planning large-library work
@@ -209,6 +226,29 @@ usable during validation. Define a production-scale fixture and an actual-screen
 smoke checklist before implementation. Small correctness fixtures alone do not
 prove responsiveness; compare baseline and final measurements with the same data
 and build settings. See issues 120 and 129 for the failures this requirement prevents.
+
+## Queued drain writer hold
+
+A drain applies each segment's I/O, physical-target checks and confirmations in
+one writer transaction. Writes elsewhere wait for it, though WAL reads do not.
+The budget is 500 ms per transaction. `SeratoWriteSegmenter.maximumEntriesPerSegment`
+bounds a segment at 200 rows (#189).
+
+Reference measurements on 2026-10-17, Test build, measured on the 30,000-file
+`LibraryStartupPerformanceFixture`:
+- **Scenario:** 1,000 rows of each batched kind are queued while Serato runs, then drained after it quits.
+- **Measured:** the longest wait of a probe that issues an empty write every 5 ms.
+- **Method:** a scratch test, not committed, run with identical data and settings before and after.
+
+| Kind | Before | After |
+| --- | ---: | ---: |
+| V2 metadata | 510 ms | 125 ms |
+| Rename | 413 ms | 88 ms |
+| Add | 1,105 ms | 232 ms |
+
+Total drain time is unchanged, at 1.4 to 2.1 s per 1,000 rows. A 26.7 MB `database V2`
+rewrite costs 40 to 60 ms, whatever the row count. The cap therefore costs about one
+extra library rewrite per 200 rows.
 
 ## Fingerprint backlog responsiveness
 
