@@ -17,7 +17,7 @@ struct SeratoSourceIdentity: Codable, Hashable, Sendable {
     static func read(_ url: URL) throws -> Self {
         var metadata = stat()
         guard lstat(url.path, &metadata) == 0 else {
-            throw SeratoMembershipSnapshotError.sourceUnavailable
+            throw errno == ENOENT ? SeratoMembershipSnapshotError.sourceMissing : SeratoMembershipSnapshotError.sourceUnavailable
         }
         guard metadata.st_mode & S_IFMT == S_IFREG else {
             throw SeratoMembershipSnapshotError.unsupportedSource
@@ -49,6 +49,8 @@ struct SeratoSnapshotAuthorization: Sendable {
 
 enum SeratoMembershipSnapshotError: LocalizedError, Equatable {
     case sourceUnavailable
+    /// No database V2 at all, as on a Mac where Serato has never run.
+    case sourceMissing
     case malformedSource
     case sourceChanged
     case seratoRunning
@@ -57,6 +59,7 @@ enum SeratoMembershipSnapshotError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .sourceUnavailable: "Cannot read Serato's saved database V2. Check that the library is available, then retry sync."
+        case .sourceMissing: "Serato's database V2 doesn't exist yet. crate-agent never creates it: open Serato once (or reconnect the drive that holds its library), close it, then retry sync. Changes queued for Serato wait until then."
         case .malformedSource: "Serato's saved database V2 is incomplete or corrupt. Save the library in Serato, close Serato, then retry sync."
         case .sourceChanged: "Serato's saved library changed during synchronization. Close Serato and retry sync."
         case .seratoRunning: "Waiting for Serato to close before synchronizing its saved library."
