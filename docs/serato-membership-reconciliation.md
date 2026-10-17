@@ -164,7 +164,9 @@ only the fields that were captured, so a permission failure never reads as an
 emptied Trash. Verification lives in `FileTrashLocation`: stat identity (volume,
 inode, size, mtime) is compared first, so a replaced or emptied item is `missing`
 without being read. Content is compared only when a hash was recorded and the item
-can be opened. Only `EACCES`/`EPERM` fall back to stat identity; any other read
+can be opened, and it is hashed through that open descriptor after confirming the
+descriptor is the stat-checked item, so a replacement between stat and read is
+never hashed in its place; an item that vanishes mid-check is `missing`. Only `EACCES`/`EPERM` fall back to stat identity; any other read
 failure is an error. An item whose identity cannot be read reports `inaccessible`,
 never `missing`. Stat-only identity relies on APFS/HFS+ file IDs, which are not
 reused. The mutation clears the item when the row becomes available or missing
@@ -173,12 +175,16 @@ inaccessible, which say nothing about whether the item still exists, and accepts
 location with those states so every logged inverse can be applied. A write that
 repeats the row's state and supplies no new location is a no-op and verifies
 nothing. A change to `.trashed` rechecks existence and stat identity inside the
-transaction, because Trash can be emptied while the caller awaits the commit; a
-row whose own indexed path is in Trash is rechecked the same way. Callers pass the
+transaction, because Trash can be emptied while the caller awaits the commit. A
+row whose own indexed path is in Trash counts as trashed only while that path holds
+the row's volume and inode, both when reconciling and under the lock; otherwise the
+recorded item, if any, decides. Callers pass the
 item they verified, so the event records which item justified it. A failed recheck
 is row-level staleness (`FileTrashLocationError.itemChanged`): the filesystem
-coordinator requests reconciliation and the reconciler leaves that row for the
-Trash event or next pass; neither fails its batch. A known path that now holds a
+coordinator requests reconciliation, and the reconciler counts the row in the sync
+summary ("changed in Trash, checked next sync") and leaves it out of the published
+checkpoint evidence, so the next sync re-checks it instead of taking the fast path;
+neither fails its batch. A known path that now holds a
 different file requests reconciliation; a missing or trashed row keeps its state
 until then, and an available row becomes `unknown`. A removal
 event at that Trash path, or any reconciliation that finds the indexed path

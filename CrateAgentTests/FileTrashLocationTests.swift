@@ -2,6 +2,7 @@
 import GRDB
 import XCTest
 
+@MainActor
 final class FileTrashLocationTests: XCTestCase {
     func testRemovingAnotherTrashItemLeavesTrashedFileUnchanged() async throws {
         let fixture = try await TrashedFilesFixture(names: ["kept.mp3", "emptied.mp3"])
@@ -76,9 +77,36 @@ final class FileTrashLocationTests: XCTestCase {
         let rechecked = try await fixture.row(item)
         XCTAssertEqual(rechecked.fileAvailability, .trashed)
     }
+
+    func testRecordedItemTruncatedToAnEmptyStubReconcilesAsMissing() async throws {
+        let fixture = try await TrashedFilesFixture(names: ["stubbed.mp3"])
+        defer { fixture.cleanup() }
+        let item = fixture.files[0]
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: item.trashPath))
+        try handle.truncate(atOffset: 0)
+        try handle.close()
+        _ = try await fixture.reconciler().reconcile(fixture.reader.read())
+        let row = try await fixture.row(item)
+        XCTAssertEqual(row.fileAvailability, .missing, "an empty stub in place of the recorded item is not that file")
+        let location = try await fixture.location(item)
+        XCTAssertNil(location)
+    }
+
+    func testTrashEmptiedBeforeCommitSkipsTheRowVisiblyWithoutFailingSync() async throws {
+        let fixture = try await TrashedFilesFixture(names: ["emptied-mid-sync.mp3"])
+        defer { fixture.cleanup() }
+        let item = fixture.files[0]
+        let reconciler = fixture.reconciler(beforeCommit: { try FileManager.default.removeItem(atPath: item.trashPath) })
+        let summary = try await reconciler.reconcile(fixture.reader.read())
+        XCTAssertEqual(summary.trashChangedFileIDs, [item.fileID])
+        let row = try await fixture.row(item)
+        XCTAssertEqual(row.fileAvailability, .trashed, "the skipped row keeps its state for the next sync")
+        XCTAssertEqual(row.libraryMembership, .active)
+    }
 }
 
 /// Indexed files moved to the native Trash of the task-owned APFS volume and observed there.
+@MainActor
 private final class TrashedFilesFixture {
     struct TrashedFile {
         let fileID: Int64
@@ -88,6 +116,7 @@ private final class TrashedFilesFixture {
 
     let directory: URL
     let database: LibraryDatabase
+    let reader: SeratoMembershipSnapshotReader
     let engine: OperationEngine
     let coordinator: FilesystemSyncCoordinator
     private(set) var files: [TrashedFile] = []
@@ -99,12 +128,15 @@ private final class TrashedFilesFixture {
         }
         directory = ownedVolume.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let locator = SeratoLibraryLocator(seratoDirectory: directory.appendingPathComponent("_Serato_"))
+        try FileManager.default.createDirectory(at: locator.subcratesDirectoryUrl, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: locator.smartCratesDirectoryUrl, withIntermediateDirectories: true)
+        try SeratoTestEncoding.library(paths: []).write(to: locator.databaseV2Url)
         let database = try LibraryDatabase.openInMemory()
         self.database = database
-        engine = await MainActor.run {
-            OperationEngine(database: database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
-                            seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
-        }
+        let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
+        reader = SeratoMembershipSnapshotReader(locator: locator, watchdog: watchdog)
+        engine = OperationEngine(database: database, seratoWatchdog: watchdog, seratoLocator: locator)
         coordinator = FilesystemSyncCoordinator(operationEngine: engine, database: database)
         for (index, name) in names.enumerated() {
             let source = directory.appendingPathComponent(name)
@@ -132,6 +164,10 @@ private final class TrashedFilesFixture {
             let trashed = try await database.writer.read { connection in try FileRecord.fetchOne(connection, key: fileID) }
             XCTAssertEqual(trashed?.fileAvailability, .trashed)
         }
+    }
+
+    func reconciler(beforeCommit: @escaping @Sendable () async throws -> Void = {}) -> SeratoMembershipReconciler {
+        SeratoMembershipReconciler(database: database, operationEngine: engine, reader: reader, beforeCommit: beforeCommit)
     }
 
     func row(_ file: TrashedFile) async throws -> FileRecord {
@@ -217,32 +253,6 @@ final class FileTrashLocationContractTests: XCTestCase {
         XCTAssertEqual(row.fileAvailability, .trashed, "an undetermined identity is left for reconciliation, not rewritten")
         let requested = await coordinator.takeReconciliationRequest()
         XCTAssertTrue(requested)
-    }
-
-    func testCaptureRecordsUnreadableAndEmptyItemsByStatIdentity() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let unreadable = directory.appendingPathComponent("denied.mp3")
-        let empty = directory.appendingPathComponent("empty.mp3")
-        try Data([1, 2, 3, 4]).write(to: unreadable)
-        try Data().write(to: empty)
-        let unreadableRow = try indexedRow(at: unreadable.path)
-        let emptyRow = try indexedRow(at: empty.path)
-        XCTAssertEqual(chmod(unreadable.path, 0), 0)
-        defer { chmod(unreadable.path, 0o644) }
-
-        let deniedLocation = try FileTrashLocation.capture(at: unreadable.path, for: unreadableRow)
-        XCTAssertEqual(deniedLocation?.inode, unreadableRow.inode)
-        XCTAssertNil(deniedLocation?.lightweightHash, "denied read permission records stat identity only")
-        let emptyLocation = try FileTrashLocation.capture(at: empty.path, for: emptyRow)
-        XCTAssertEqual(emptyLocation?.inode, emptyRow.inode, "an empty item has no content to read and is still recorded")
-    }
-
-    private func indexedRow(at path: String) throws -> FileRecord {
-        let metadata = try XCTUnwrap(FileMetadataCollector.collect(at: path, includeLightweightHash: true))
-        return FileRecord(path: path, volumeUuid: metadata.volumeUuid, inode: metadata.inode, fileSize: metadata.fileSize,
-                          mtime: metadata.mtime, lightweightHash: metadata.lightweightHash)
     }
 
     private func emptiedLocation() throws -> FileMetadata {

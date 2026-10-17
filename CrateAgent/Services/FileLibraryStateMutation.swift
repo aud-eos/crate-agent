@@ -60,20 +60,23 @@ enum FileLibraryStateMutation {
     /// about whether that item still exists, so they keep it for the next check. A change to
     /// trashed is re-checked here, under the write lock, because Trash can be emptied while
     /// the caller awaits the commit; the caller's own pre-check already compared content.
+    /// Without a supplied location the caller relied on the row's own path or its recorded
+    /// item, so both are checked against the row's identity, the own path first.
     private static func nextTrashLocation(_ payload: SetFileLibraryStatePayload, file: FileRecord, previous: FileMetadata?) throws -> FileMetadata? {
         switch payload.state.availability {
         case .trashed:
             let resolver = FileAvailabilityResolver()
-            if let location = payload.trashLocation ?? previous {
-                guard try FileTrashLocation.availability(of: location, resolver: resolver, comparingContent: false) == .trashed else {
-                    throw FileTrashLocationError.itemChanged(fileId: payload.fileId)
-                }
-                return location
+            if payload.trashLocation == nil,
+               try FileTrashLocation.ownPathAvailability(path: file.path, volumeUuid: file.volumeUuid, inode: file.inode, resolver: resolver) == .trashed
+            {
+                return nil
             }
-            guard try resolver.inspect(path: file.path, volumeID: file.volumeUuid) == .trashed else {
+            guard let location = payload.trashLocation ?? previous,
+                  try FileTrashLocation.availability(of: location, resolver: resolver, comparingContent: false) == .trashed
+            else {
                 throw FileTrashLocationError.itemChanged(fileId: payload.fileId)
             }
-            return nil
+            return location
         case .offline, .inaccessible:
             return payload.trashLocation ?? previous
         case .available, .missing, .unknown:

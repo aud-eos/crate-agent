@@ -10,6 +10,9 @@ struct ReconciliationSummary: Sendable, Equatable {
     var pathConflictCount: Int = 0
     var conflictBlockedWriteCount: Int = 0
     var duplicateCleanupMessage: String?
+    /// Rows whose Trash item changed before their state was saved. They keep their old
+    /// state and are left out of the checkpoint, so the next sync checks them again.
+    var trashChangedFileIDs: Set<Int64> = []
 }
 
 enum SeratoReconciliationError: LocalizedError {
@@ -111,6 +114,10 @@ actor SeratoMembershipReconciler {
             if observed == .offline {
                 summary.skippedUnsupported += 1
             }
+            if observed == .trashed {
+                observed = try FileTrashLocation.ownPathAvailability(path: path, volumeUuid: observedIdentity?.volumeUuid ?? file.volumeUuid,
+                                                                     inode: observedIdentity?.inode ?? file.inode, resolver: availability)
+            }
             var verifiedTrashLocation: FileMetadata?
             if observed == .missing {
                 let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
@@ -158,7 +165,7 @@ actor SeratoMembershipReconciler {
             do {
                 _ = try await operationEngine.applyObservedBatch(mutations, authorization: authorization, expectedFiles: [expected], batchId: batchID)
             } catch FileTrashLocationError.itemChanged {
-                // Trash changed after this row's check; the Trash event or next pass re-checks it.
+                summary.trashChangedFileIDs.insert(fileID)
                 continue
             }
             if readdedAfterOwnedRemoval {

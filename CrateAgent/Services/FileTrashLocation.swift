@@ -38,8 +38,14 @@ enum FileTrashLocation {
         guard case let .identity(statIdentity) = try observe(at: path) else {
             throw FileTrashLocationError.unverifiable(path: path)
         }
-        let location = try FileMetadata(path: statIdentity.path, volumeUuid: statIdentity.volumeUuid, inode: statIdentity.inode,
-                                        fileSize: statIdentity.fileSize, mtime: statIdentity.mtime, lightweightHash: contentHash(of: statIdentity))
+        let recordedHash: Data?
+        switch try content(of: statIdentity) {
+        case .gone: return nil
+        case .unreadable: recordedHash = nil
+        case let .hash(hash): recordedHash = hash
+        }
+        let location = FileMetadata(path: statIdentity.path, volumeUuid: statIdentity.volumeUuid, inode: statIdentity.inode,
+                                    fileSize: statIdentity.fileSize, mtime: statIdentity.mtime, lightweightHash: recordedHash)
         try readIdentity.requireUnchanged(at: path)
         let matches = location.lightweightHash == nil
             ? Self.sameStatIdentity(location, file.identity)
@@ -61,11 +67,28 @@ enum FileTrashLocation {
             case let .identity(current):
                 guard sameStatIdentity(location, current) else { return .missing }
                 guard comparingContent, let recordedHash = location.lightweightHash else { return .trashed }
-                return try contentHash(of: current).map { currentHash in currentHash == recordedHash ? .trashed : .missing } ?? .trashed
+                switch try content(of: current) {
+                case .gone: return .missing
+                case .unreadable: return .trashed
+                case let .hash(currentHash): return currentHash == recordedHash ? .trashed : .missing
+                }
             }
         case .offline: return .offline
         case .inaccessible: return .inaccessible
         case .available, .missing, .unknown: return .missing
+        }
+    }
+
+    /// Availability of a row's own path when it lies in Trash: trashed only while it still holds
+    /// the file with this volume and inode, since a path is only a label. An item that cannot
+    /// be checked is inaccessible, never taken as gone.
+    static func ownPathAvailability(path: String, volumeUuid: String, inode: Int64, resolver: FileAvailabilityResolver) throws -> FileAvailability {
+        let resolved = try resolver.inspect(path: path, volumeID: volumeUuid)
+        guard resolved == .trashed else { return resolved }
+        switch try observe(at: path) {
+        case .gone: return .missing
+        case .inaccessible: return .inaccessible
+        case let .identity(current): return current.volumeUuid == volumeUuid && current.inode == inode ? .trashed : .missing
         }
     }
 
@@ -75,8 +98,26 @@ enum FileTrashLocation {
         case inaccessible
     }
 
+    private enum Content {
+        case hash(Data)
+        /// Empty, or read permission denied: the stat identity decides.
+        case unreadable
+        case gone
+    }
+
     /// The item's stat identity, without reading its content.
     private static func observe(at path: String) throws -> Observation {
+        if let absence = try absence(at: path) {
+            return absence
+        }
+        guard let metadata = FileMetadataCollector.collect(at: path) else {
+            return try absence(at: path) ?? .inaccessible
+        }
+        return .identity(metadata)
+    }
+
+    /// Nil while a regular file is present at `path`.
+    private static func absence(at path: String) throws -> Observation? {
         var status = stat()
         guard stat(path, &status) == 0 else {
             switch errno {
@@ -85,27 +126,32 @@ enum FileTrashLocation {
             default: throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
         }
-        guard status.st_mode & S_IFMT == S_IFREG else { return .gone }
-        guard let metadata = FileMetadataCollector.collect(at: path) else { return .inaccessible }
-        return .identity(metadata)
+        return status.st_mode & S_IFMT == S_IFREG ? nil : .gone
     }
 
-    /// Nil when there is no content to compare: an empty item, or one whose read permission is
-    /// denied, where the stat identity decides. Any other read failure is an error, not a guess.
-    private static func contentHash(of item: FileMetadata) throws -> Data? {
-        guard item.fileSize > 0 else { return nil }
+    /// Hashes through the descriptor it opens, after confirming that descriptor is the
+    /// observed item, so a replacement between stat and read is never hashed in its place.
+    /// Any failure other than absence or denied permission is an error, not a guess.
+    private static func content(of item: FileMetadata) throws -> Content {
+        guard item.fileSize > 0 else { return .unreadable }
         let descriptor = open(item.path, O_RDONLY)
         guard descriptor >= 0 else {
-            if errno == EACCES || errno == EPERM {
-                return nil
+            switch errno {
+            case ENOENT, ENOTDIR: return .gone
+            case EACCES, EPERM: return .unreadable
+            default: throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        close(descriptor)
-        guard let hash = LightweightHashCalculator.compute(forFileAt: item.path) else {
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard Int64(status.st_ino) == item.inode, Int64(status.st_size) == item.fileSize,
+              Int64(status.st_mtimespec.tv_sec) == item.mtime else { return .gone }
+        guard let hash = LightweightHashCalculator.compute(reading: handle) else {
             throw FileTrashLocationError.unverifiable(path: item.path)
         }
-        return hash
+        return .hash(hash)
     }
 
     private static func sameStatIdentity(_ location: FileMetadata, _ current: FileMetadata) -> Bool {
