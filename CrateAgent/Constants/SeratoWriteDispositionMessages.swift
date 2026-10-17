@@ -9,6 +9,7 @@ enum SeratoWriteDispositionMessages {
         case .interrupted: "\(changes(count, "interrupted audio")) not retried"
         case .malformed: "\(changes(count, "unreadable queued")) skipped"
         case .legacyUnrecoverable: "\(changes(count, "pre-upgrade")) could not be resumed"
+        case .noSeratoRecord: "\(changes(count, nil)) not applied because Serato has no record of the track"
         }
     }
 
