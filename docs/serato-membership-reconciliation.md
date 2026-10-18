@@ -406,7 +406,11 @@ path by its NFC form, so a decomposed spelling Finder stored matches a composed
 request, and the reverse. Matching never rewrites a path field's bytes; only a
 rename replaces the matched field, with the requested destination. Two records whose
 spellings are equivalent form a conflict, which the scope above
-keeps away from those writers.
+keeps away from those writers. When both spellings reach a writer anyway, a record
+stored in the requested spelling wins: a metadata update writes that record, and
+equivalent rename sources bound for different destinations match only exactly. A
+metadata batch that sends equivalent paths different updates is refused, and a crate
+renamed from both spellings keeps one entry.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared
