@@ -178,6 +178,11 @@ final class SeratoPlayCountTests: XCTestCase {
         }
     }
 
+    private func observeTableWrites(in database: LibraryDatabase, counter: TableWriteCounter) -> AnyDatabaseCancellable {
+        DatabaseRegionObservation(tracking: Table(SeratoPlayCounts.table))
+            .start(in: database.writer, onError: { error in XCTFail("Play-count observation failed: \(error)") }) { _ in counter.record() }
+    }
+
     func testHistoryIsReadAgainOnlyWhenItOrTheLibraryPathsChangedAndUnchangedCountsAreNotRewritten() async throws {
         let file = try await database.writer.write { connection in
             _ = try self.insertFile("/Music/H/other.mp3", in: connection)
@@ -190,9 +195,7 @@ final class SeratoPlayCountTests: XCTestCase {
             return try readSeratoHistory(historyDirectory: directory)
         }
         let tableWrites = TableWriteCounter()
-        let observation = try DatabaseRegionObservation(tracking: Table(SeratoPlayCounts.table))
-            .start(in: database.writer, onError: { error in XCTFail("Play-count observation failed: \(error)") },
-                   onChange: { _ in tableWrites.record() })
+        let observation = observeTableWrites(in: database, counter: tableWrites)
         defer { observation.cancel() }
 
         await service.refresh()

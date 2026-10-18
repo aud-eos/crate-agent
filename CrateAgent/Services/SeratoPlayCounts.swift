@@ -89,9 +89,12 @@ enum SeratoPlayCounts {
         let occupancies = try occupanciesByPath(in: database)
         var counts: [Int64: Int] = [:]
         var unattributed = 0
+        var normalizedPaths: [String: String] = [:]
         for play in scan.plays {
             let startedAt = Int64(play.startedAt) * 1000
-            let claimants = Set((occupancies[SeratoPath.normalized(play.path)] ?? [])
+            let normalized = normalizedPaths[play.path] ?? SeratoPath.normalized(play.path)
+            normalizedPaths[play.path] = normalized
+            let claimants = Set((occupancies[normalized] ?? [])
                 .filter { occupancy in occupancy.start <= startedAt && startedAt < occupancy.end }
                 .map(\.fileID))
             guard claimants.count == 1, let fileID = claimants.first else {
@@ -136,15 +139,18 @@ enum SeratoPlayCounts {
         var changesByFile: [Int64: [(timestamp: Int64, oldPath: String, newPath: String)]] = [:]
         // Journal order, not timestamps: a file's changes chain old path to
         // new path in the order they were applied, even if the clock moved.
-        let events = try EventRecord
-            .filter(pathChangeEvents.map(\.rawValue).contains(Column("event_type")) && Column("file_id") != nil)
-            .order(Column("event_id"))
-            .fetchCursor(database)
+        let types = pathChangeEvents.map(\.rawValue)
+        let events = try Row.fetchCursor(database, sql: """
+        SELECT file_id, timestamp, event_type, payload_json,
+               CASE WHEN event_type = ? THEN inverse_payload_json END AS inverse_payload_json
+        FROM events WHERE event_type IN (\(types.map { _ in "?" }.joined(separator: ", "))) AND file_id IS NOT NULL ORDER BY event_id
+        """, arguments: StatementArguments([EventType.fileLocationObserved.rawValue] + types))
+        let decoder = JSONDecoder()
         while let event = try events.next() {
-            guard let fileID = event.fileId else { continue }
-            let (oldPath, newPath) = try paths(changedBy: event)
+            let fileID: Int64 = event["file_id"]
+            let (oldPath, newPath) = try paths(changedBy: event, decoder: decoder)
             if oldPath != newPath {
-                changesByFile[fileID, default: []].append((event.timestamp, oldPath, newPath))
+                changesByFile[fileID, default: []].append((event["timestamp"], oldPath, newPath))
             }
         }
         var occupancies: [String: [Occupancy]] = [:]
@@ -161,21 +167,37 @@ enum SeratoPlayCounts {
         return occupancies
     }
 
-    private static func paths(changedBy event: EventRecord) throws -> (old: String, new: String) {
-        let decoder = JSONDecoder()
-        let forward = Data(event.payloadJson.utf8)
-        switch event.eventType {
+    /// Only the paths of each payload are decoded: a large library journals
+    /// tens of thousands of identity observations, one per owned tag write.
+    private struct PathOnly: Decodable {
+        let path: String
+    }
+
+    private struct RenamePaths: Decodable {
+        let previousPath: String
+        let newPath: String
+    }
+
+    private struct IdentityPaths: Decodable {
+        let previousIdentity: PathOnly
+        let identity: PathOnly
+    }
+
+    private static func paths(changedBy event: Row, decoder: JSONDecoder) throws -> (old: String, new: String) {
+        let type: String = event["event_type"]
+        let forward = Data((event["payload_json"] as String).utf8)
+        switch EventType(rawValue: type) {
         case .fileRenamed:
-            let payload = try decoder.decode(RenameFilePayload.self, from: forward)
+            let payload = try decoder.decode(RenamePaths.self, from: forward)
             return (payload.previousPath, payload.newPath)
         case .fileLocationObserved:
-            let inverse = try decoder.decode(ObserveFileLocationPayload.self, from: Data(event.inversePayloadJson.utf8))
-            return try (inverse.path, decoder.decode(ObserveFileLocationPayload.self, from: forward).path)
+            let inverse = try decoder.decode(PathOnly.self, from: Data((event["inverse_payload_json"] as String).utf8))
+            return try (inverse.path, decoder.decode(PathOnly.self, from: forward).path)
         case .fileIdentityObserved:
-            let payload = try decoder.decode(ObserveFileIdentityPayload.self, from: forward)
+            let payload = try decoder.decode(IdentityPaths.self, from: forward)
             return (payload.previousIdentity.path, payload.identity.path)
         default:
-            throw SeratoPlayCountError.unexpectedEvent(event.eventType.rawValue)
+            throw SeratoPlayCountError.unexpectedEvent(type)
         }
     }
 }
