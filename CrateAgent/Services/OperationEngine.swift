@@ -578,6 +578,7 @@ public actor OperationEngine {
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
     {
         let executionResults = try await journalBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
+                                                      authorizingMembershipTokens: authorizingMembershipTokens,
                                                       expectedMetadata: expectedMetadata, filesystemObservation: filesystemObservation,
                                                       moveExpectation: moveExpectation)
         try await routeSeratoWrites(executionResults.flatMap(\.seratoWrites), batchId: batchId)
@@ -586,6 +587,7 @@ public actor OperationEngine {
 
     private func journalBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              authorizingMembershipTokens: [FileMembershipToken] = [],
                               expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [GuardedExecutionResult]
