@@ -26,6 +26,7 @@ public final class AppServices: ObservableObject {
     public let seratoWatchdog: SeratoWatchdog
     public let seratoLocator: SeratoLibraryLocator
     public let operationEngine: OperationEngine
+    let songFamilies: SongFamilyService
     public let filesystemSyncCoordinator: FilesystemSyncCoordinator
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
@@ -159,6 +160,7 @@ public final class AppServices: ObservableObject {
             readiness: readiness
         )
         operationEngine = engine
+        songFamilies = SongFamilyService(engine: engine, database: database)
 
         let filesystemCoordinator = FilesystemSyncCoordinator(
             operationEngine: engine,

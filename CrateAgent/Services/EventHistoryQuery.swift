@@ -286,6 +286,28 @@ public enum EventHistoryQuery {
             return "Applied MusicBrainz match to \(count) track\(pluralS)"
         case .musicBrainzMatchReverted:
             return "Reverted MusicBrainz match on \(count) track\(pluralS)"
+        case .songFamilyCreated:
+            return "Created \(songFamilies(count))"
+        case .songFamilyMembersAttached:
+            return "Added versions to \(songFamilies(count))"
+        case .songFamilyMembersDetached:
+            return "Removed versions from \(songFamilies(count))"
+        case .songFamiliesMerged:
+            return "Merged song families into \(songFamilies(count))"
+        case .songFamilySplit:
+            return "Split \(songFamilies(count))"
+        case .songFamilyRepresentativeChanged:
+            return "Changed the main version of \(songFamilies(count))"
+        case .songFamilyRestored:
+            return "Restored \(songFamilies(count))"
+        case .songFamilyRecordingLinked:
+            return "Linked \(count) file\(pluralS) to \(count == 1 ? "its recording" : "their recordings") for grouping"
+        case .songFamilyRecordingUnlinked:
+            return "Unlinked \(count) file\(pluralS) from \(count == 1 ? "its grouping recording" : "their grouping recordings")"
         }
+    }
+
+    private static func songFamilies(_ count: Int) -> String {
+        count == 1 ? "1 song family" : "\(count) song families"
     }
 }

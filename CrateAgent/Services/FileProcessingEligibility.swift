@@ -41,7 +41,7 @@ public extension QueryInterfaceRequest where RowDecoder == FileRecord {
 extension TrackMutation {
     var processingFileID: Int64? {
         switch self {
-        case .indexNewFile, .observeFileLocation, .observeFileIdentity, .observeFileMetadata, .recordSubsecondModificationTime, .setFileLibraryState, .beginFileImport, .removeFile: nil
+        case .indexNewFile, .observeFileLocation, .observeFileIdentity, .observeFileMetadata, .recordSubsecondModificationTime, .setFileLibraryState, .beginFileImport, .removeFile, .songFamily: nil
         case let .setMetadata(payload): payload.isSeratoAuthoritative == true ? nil : payload.fileId
         case let .renameFile(payload): payload.fileId
         case let .commitMetadataToSerato(payload): payload.fileId

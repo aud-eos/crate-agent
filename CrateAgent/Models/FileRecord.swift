@@ -165,6 +165,24 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
             .filter(Column("track_id") == trackId && Column("id") != excludingFileId)
             .fetchCount(db) > 0
     }
+
+    /// How the user knows the file: its title, else its file name.
+    var displayName: String {
+        title.flatMap { title in title.isEmpty ? nil : title } ?? (path as NSString).lastPathComponent
+    }
+
+    /// The lowest-id file still in the library, other than `excludingFileId`,
+    /// that links to `trackId`. A retired file keeps its link but no longer
+    /// claims the recording for grouping.
+    static func otherActiveFileReferencingTrack(
+        _ trackId: Int64?,
+        excluding excludingFileId: Int64,
+        in db: GRDB.Database
+    ) throws -> FileRecord? {
+        try FileRecord.filter(Column("track_id") == trackId && Column("id") != excludingFileId)
+            .filter(sql: FileProcessingEligibility.activeSQL)
+            .order(Column("id")).fetchOne(db)
+    }
 }
 
 /// State of the background fingerprinting pipeline for a given file.

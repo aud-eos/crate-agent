@@ -1,3 +1,4 @@
+import AppKit
 @testable import CrateAgent
 import SwiftUI
 
@@ -24,5 +25,19 @@ struct LibraryNavigationFixture: View {
             }
         }
         .onChange(of: section) { _, current in selection.section = current }
+    }
+
+    /// The first split-view window in a process pays one-time, library-independent AppKit and
+    /// SwiftUI setup (toolbar, split view, sidebar). Content-render budgets measure a window
+    /// opened after it, so they don't depend on which test runs first (#224).
+    static func prepareWindowChrome() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1400, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.orderFront(nil)
+        let host = NSHostingView(rootView: MainWindowNavigation(selection: .constant(.library), hasConflicts: false) { EmptyView() })
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        window.close()
     }
 }
