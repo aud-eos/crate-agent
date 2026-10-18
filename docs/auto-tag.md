@@ -90,22 +90,36 @@ the search, selected tracks, progress, proposals, edits, approvals and focus.
 running app; it is not restored after quitting and relaunching.
 
 **Apply approved tracks (N)** applies the approved proposals through the normal
-operation engine. It checks whether files changed since review. Serato library
+operation engine. It checks whether files changed since review: size, inode and
+modification time to the nanosecond must all still match what the review read, so a
+same-length edit within one second or an atomic replacement sends the track back for
+review. A stored fingerprint is reused only under the same rule, and redoing an undone
+match is refused when the file changed after the undo. The first library sync after
+upgrading records the subsecond time of unchanged files from their stat evidence,
+without reading the audio; History shows it as one "Recorded precise modification
+time" entry. A fingerprint basis recorded before subsecond time was tracked is adopted
+when its size and second still match the file, so the fingerprint is reused rather
+than decoded again; one that disagrees is decoded once more when Auto-Tag reaches it.
+Until a row's subsecond time is recorded, it matches any time within its recorded
+second, so redo of an undone match made before the upgrade still proceeds when size,
+second and inode match. Content is not compared, so an edit that restores the original
+size, timestamp and inode goes undetected. Serato library
 and tag writes queue while Serato is running; the queue is stored in the library
 database, so quitting crate-agent before Serato does not lose them. If an external write fails after
 the library transaction committed, the UI retains the recovery information;
 reapplying the same batch is not a substitute for recovery.
 
-An applied field whose value the file already holds on disk, as read during
-review, is left out of the audio-tag write. Confirming a match that changes
-nothing in the file's tags therefore does not rewrite the file, change its
-modification time, or drop secondary tags. The match still records the field in
-the recording and in Serato's database, still owns it for **Re-sync Serato**,
-and undo does not rewrite it. When a tag write for the file is still queued, or
-the file's recorded size or modification time changed since review, the review's
-reading is out of date, so every applied field is written. Redo checks every
-applied field against the file, so it refuses to overwrite a later edit even to
-a field the original match left alone.
+A match always queues its full audio-tag intent. When the tag write actually
+runs, immediately or after Serato quits, it reads the file's tags at that moment
+and leaves out any artist, title, album, or year the file already holds. If
+nothing is left, the file is not rewritten, so confirming a match that changes
+nothing does not change its modification time or drop secondary tags. Deciding
+at write time matters because a reading taken at review can go stale: Serato
+can rewrite a file's tags from its cached copy while it runs, and a write that
+was left out could not be refused or retried (#207). Undo does not restore a
+field whose matched value equals its pre-match value, so a later edit to it
+survives; redo checks every applied field against the file and refuses to
+overwrite a later edit.
 
 Removing a track from Serato retires its indexed entry, preserving its recording
 link and History. Serato can remove membership alone or also move audio to Trash.

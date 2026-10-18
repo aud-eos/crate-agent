@@ -4,8 +4,11 @@ import os.log
 
 /// Orchestrates the drag-drop import flow. The user drops files or
 /// folders onto crate-agent's window; this actor walks them, reads
-/// audio tags via the existing FFI, and fires two-mutation batches
-/// (`indexNewFile` + `addTrackToSerato`) through the OperationEngine.
+/// audio tags via the existing FFI, and journals each file in its own batch
+/// (`indexNewFile`, then `beginFileImport` + `addTrackToSerato`) through the
+/// OperationEngine. The drop's Serato adds are then applied in one pass, so
+/// a drop rewrites `database V2` once per 200 files rather than once per
+/// file (#187).
 ///
 /// `indexNewFile` registers the file in crate-agent's DB; the path
 /// uniqueness constraint makes re-drops a safe no-op. `addTrackToSerato`
@@ -24,12 +27,21 @@ public actor ImportCoordinator {
         public let filesSkipped: Int
         public let syncFailures: [String]
         public let blockedFiles: [String]
+        /// Files whose Serato add was dropped because the file changed first,
+        /// each with what to do; Retry Sync has nothing to finish for them.
+        public let filesNotAdded: [String]
+        /// Files an earlier drop is still importing.
+        public let filesAlreadyImporting: [String]
 
-        public init(filesImported: Int, filesSkipped: Int, syncFailures: [String], blockedFiles: [String] = []) {
+        public init(filesImported: Int, filesSkipped: Int, syncFailures: [String], blockedFiles: [String] = [],
+                    filesNotAdded: [String] = [], filesAlreadyImporting: [String] = [])
+        {
             self.filesImported = filesImported
             self.filesSkipped = filesSkipped
             self.syncFailures = syncFailures
             self.blockedFiles = blockedFiles
+            self.filesNotAdded = filesNotAdded
+            self.filesAlreadyImporting = filesAlreadyImporting
         }
 
         public var filesPendingSync: Int {
@@ -38,11 +50,13 @@ public actor ImportCoordinator {
     }
 
     private enum FileImportOutcome {
-        case imported
+        case awaitingSerato(DeferredSeratoBatch)
         case skipped
-        case pendingSync(String)
         case blocked(String)
     }
+
+    public static let alreadyImportingMessage = "already being imported"
+    public static let changedBeforeAddMessage = "Not added to Serato: the file changed before it could be registered. Drop it again to import it."
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -52,6 +66,9 @@ public actor ImportCoordinator {
     private let operationEngine: OperationEngine
     private let database: LibraryDatabase
     private let audioExtensions: Set<String>
+    /// Normalized paths an unfinished drop is importing. The actor is
+    /// reentrant, so a drop claims its paths with no suspension in between.
+    private var inFlightPaths = Set<String>()
 
     public init(
         operationEngine: OperationEngine,
@@ -72,23 +89,52 @@ public actor ImportCoordinator {
         var filesSkipped = 0
         var syncFailures: [String] = []
         var blockedFiles: [String] = []
+        var filesNotAdded: [String] = []
+        var filesAlreadyImporting: [String] = []
+        var awaitingSerato: [(batch: DeferredSeratoBatch, fileName: String)] = []
 
+        var claimed: [(url: URL, path: String)] = []
+        var seenPaths = Set<String>()
         for rootUrl in urls {
-            let audioFileUrls = enumerateAudioFiles(at: rootUrl)
-            for fileUrl in audioFileUrls {
-                switch await importSingleFile(at: fileUrl) {
-                case .imported:
-                    filesImported += 1
-                case .skipped:
-                    filesSkipped += 1
-                case let .pendingSync(message):
-                    syncFailures.append(message)
-                case let .blocked(message):
-                    blockedFiles.append(message)
+            for fileUrl in enumerateAudioFiles(at: rootUrl) {
+                let path = SeratoPath.normalized(fileUrl.path)
+                guard seenPaths.insert(path).inserted else { continue }
+                if inFlightPaths.insert(path).inserted {
+                    claimed.append((fileUrl, path))
+                } else {
+                    filesAlreadyImporting.append("\(fileUrl.lastPathComponent): \(Self.alreadyImportingMessage)")
                 }
             }
         }
-        return ImportResult(filesImported: filesImported, filesSkipped: filesSkipped, syncFailures: syncFailures, blockedFiles: blockedFiles)
+        defer { inFlightPaths.subtract(claimed.map(\.path)) }
+        for file in claimed {
+            switch await importSingleFile(at: file.url) {
+            case let .awaitingSerato(batch):
+                awaitingSerato.append((batch, file.url.lastPathComponent))
+            case .skipped:
+                filesSkipped += 1
+            case let .blocked(message):
+                blockedFiles.append(message)
+            }
+        }
+        let shortfalls: [String: DeferredSeratoShortfall]
+        do { shortfalls = try await operationEngine.routeDeferredSeratoWrites(awaitingSerato.map(\.batch)) }
+        catch {
+            // Only the status read after the pass throws here, so which adds
+            // landed is unknown; Retry Sync replays any still queued.
+            Self.logger.error("confirming dropped files with Serato failed: \(error.localizedDescription, privacy: .public)")
+            let shortfall = DeferredSeratoShortfall.failed("Could not confirm the Serato registration: \(error.localizedDescription)")
+            shortfalls = Dictionary(awaitingSerato.map { entry in (entry.batch.batchId, shortfall) }, uniquingKeysWith: { first, _ in first })
+        }
+        for entry in awaitingSerato {
+            switch shortfalls[entry.batch.batchId] {
+            case let .failed(failure): syncFailures.append("\(entry.fileName): \(failure)")
+            case .superseded: filesNotAdded.append("\(entry.fileName): \(Self.changedBeforeAddMessage)")
+            case nil: filesImported += 1
+            }
+        }
+        return ImportResult(filesImported: filesImported, filesSkipped: filesSkipped, syncFailures: syncFailures, blockedFiles: blockedFiles,
+                            filesNotAdded: filesNotAdded, filesAlreadyImporting: filesAlreadyImporting)
     }
 
     private func importSingleFile(at fileUrl: URL) async -> FileImportOutcome {
@@ -124,9 +170,21 @@ public actor ImportCoordinator {
                 return candidates.first
             }
             if let existing {
-                guard existing.libraryMembership != .active,
-                      FileImportIdentity.matches(existing, identity: fileMetadata),
-                      let existingID = existing.id else { return .skipped }
+                guard existing.libraryMembership != .active, let existingID = existing.id else { return .skipped }
+                if !FileImportIdentity.matches(existing, identity: fileMetadata) {
+                    // Only an import that never finished, such as one whose add
+                    // was superseded because the file changed, takes the file now
+                    // at its path; a retired row never adopts a replacement.
+                    guard [.pendingImport, .legacyUnverified].contains(existing.libraryMembership) else { return .skipped }
+                    _ = try await operationEngine.apply(
+                        .observeFileIdentity(ObserveFileIdentityPayload(
+                            fileId: existingID, expectedRevision: existing.membershipRevision,
+                            previousIdentity: existing.identity, identity: fileMetadata,
+                            metadata: seratoMetadata, bitrateKbps: bitrateKbps, expectedState: existing.libraryState
+                        )),
+                        batchId: batchId
+                    )
+                }
                 fileId = existingID
             } else {
                 _ = try await operationEngine.apply(
@@ -136,6 +194,7 @@ public actor ImportCoordinator {
                         inode: fileMetadata.inode,
                         fileSize: fileMetadata.fileSize,
                         mtime: fileMetadata.mtime,
+                        mtimeNanoseconds: fileMetadata.mtimeNanoseconds,
                         lightweightHash: fileMetadata.lightweightHash,
                         bitrateKbps: bitrateKbps,
                         metadata: seratoMetadata
@@ -159,6 +218,8 @@ public actor ImportCoordinator {
             }
         } catch let conflict as SeratoPathConflictError {
             return .blocked(conflict.localizedDescription)
+        } catch let readiness as LibrarySyncReadinessError {
+            return .blocked("\(fileUrl.lastPathComponent): \(readiness.localizedDescription)")
         } catch {
             // Most likely cause: path already in the DB (path is UNIQUE).
             // That's a no-op for the user — they re-dropped a file
@@ -174,27 +235,22 @@ public actor ImportCoordinator {
                 try FileRecord.fetchOne(database, key: fileId)
             }
             guard let file else { throw OperationEngineError.fileNotFound(fileId: fileId) }
-            _ = try await operationEngine.applyBatch([
-                .beginFileImport(BeginFileImportPayload(fileId: fileId, expectedRevision: file.membershipRevision, identity: fileMetadata)),
-                .addTrackToSerato(AddTrackToSeratoPayload(
-                    fileId: fileId,
-                    metadata: seratoMetadata
-                )),
-            ],
-            batchId: batchId)
+            return try await .awaitingSerato(operationEngine.applyBatchDeferringSerato([
+                    .beginFileImport(BeginFileImportPayload(fileId: fileId, expectedRevision: file.membershipRevision, identity: fileMetadata)),
+                    .addTrackToSerato(AddTrackToSeratoPayload(
+                        fileId: fileId,
+                        metadata: seratoMetadata
+                    )),
+                ],
+                batchId: batchId))
         } catch let conflict as SeratoPathConflictError {
             return .blocked(conflict.localizedDescription)
         } catch {
             Self.logger.error(
                 "addTrackToSerato for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
             )
-            if case let OperationEngineError.externalSyncIncomplete(_, underlying) = error {
-                return .pendingSync("\(fileUrl.lastPathComponent): \(underlying)")
-            }
             return .skipped
         }
-
-        return .imported
     }
 
     private func readMetadataAndBitrate(from path: String) -> (SeratoMetadata, Int?) {

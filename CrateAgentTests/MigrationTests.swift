@@ -8,9 +8,9 @@ final class MigrationTests: XCTestCase {
         let migrator = LibraryDatabase.makeMigrator()
         try migrator.migrate(queue, upTo: "010_add_file_library_state")
         try queue.write { connection in
-            var file = FileRecord(path: "/existing.wav", volumeUuid: "fixture", inode: 1, fileSize: 64, mtime: 1)
-            try file.insert(connection)
-            var event = EventRecord(batchId: "existing", timestamp: 1, fileId: file.id, eventType: .fileIdentityObserved,
+            // The current record type has columns this older schema lacks.
+            try connection.execute(sql: "INSERT INTO files (path, volume_uuid, inode, file_size, mtime) VALUES ('/existing.wav', 'fixture', 1, 64, 1)")
+            var event = EventRecord(batchId: "existing", timestamp: 1, fileId: connection.lastInsertedRowID, eventType: .fileIdentityObserved,
                                     payloadJson: "{\"forward\":true}", inversePayloadJson: "{\"inverse\":true}")
             try event.insert(connection)
         }

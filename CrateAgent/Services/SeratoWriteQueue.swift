@@ -95,6 +95,21 @@ enum SeratoWriteQueueError: LocalizedError {
     }
 }
 
+/// Whether one Serato file held a queued rename's record when it took the rename.
+struct SeratoRenameOutcome: Sendable {
+    let queueID: Int64
+    let matched: Bool
+}
+
+/// A queued write left pointing at a record that never moved, because a
+/// rename it depends on was dropped (#199).
+struct SeratoStrandedWrite: Sendable {
+    let write: GuardedSeratoWrite
+    let detail: String?
+    /// Whether Serato may still hold a record at this rename's new path.
+    let newPathHeld: Bool
+}
+
 /// The durable queue of Serato-side effects. A row is inserted in the same
 /// transaction as the mutation that produced it and deleted in the writer
 /// transaction that performs (or supersedes) its I/O.
@@ -117,10 +132,10 @@ enum SeratoWriteQueue {
         let payload = try encode(stored)
         let verb = ignoringExisting ? "INSERT OR IGNORE" : "INSERT"
         try database.execute(sql: """
-        \(verb) INTO serato_write_queue (event_id, kind, file_id, membership_revision, payload, cleanup_target_file_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        \(verb) INTO serato_write_queue (event_id, kind, file_id, membership_revision, payload, cleanup_target_file_id, created_at, rename_new_path_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, arguments: [write.eventId, write.write.kind.rawValue, write.token.fileId, write.token.revision, payload,
-                         cleanupTargetFileID, Self.now()])
+                         cleanupTargetFileID, Self.now(), renameNewPathKey(write.write)])
         if database.changesCount > 0 {
             stored.queueID = database.lastInsertedRowID
             stored.queuedPayload = payload
@@ -167,7 +182,69 @@ enum SeratoWriteQueue {
     }
 
     static func fetch(queueID: Int64, in database: Database) throws -> GuardedSeratoWrite? {
-        try Row.fetchOne(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE queue_id = ?", arguments: [queueID]).map(decode)
+        try Row.fetchOne(database.cachedStatement(sql: "SELECT \(columns) FROM serato_write_queue WHERE queue_id = ?"), arguments: [queueID]).map(decode)
+    }
+
+    /// Indexes queued renames by destination, compared as Serato compares paths.
+    private static func renameNewPathKey(_ write: SeratoPendingWrite) -> String? {
+        guard case let .rename(rename) = write else { return nil }
+        return SeratoPath.normalized(rename.newAbsolutePath)
+    }
+
+    /// Later queued writes that a dropped rename leaves pointing at a record
+    /// that never moved: renames into its old path, where its record still
+    /// sits, and the same file's writes that reference its new path, where
+    /// that record never arrived.
+    static func writesStranded(by dropped: GuardedSeratoWrite, in database: Database) throws -> [SeratoStrandedWrite] {
+        guard case let .rename(rename) = dropped.write, let queueID = dropped.queueID else { return [] }
+        let oldPath = SeratoPath.normalized(rename.oldAbsolutePath)
+        let newPath = SeratoPath.normalized(rename.newAbsolutePath)
+        var stranded: [SeratoStrandedWrite] = []
+        if try !renameNeverArrived(fileID: dropped.token.fileId, at: oldPath, before: dropped.eventId, in: database) {
+            // Rows queued before the key column carry none and are matched by decoding.
+            let arrivals = try Row.fetchAll(database.cachedStatement(sql: """
+            SELECT \(columns) FROM serato_write_queue
+            WHERE (rename_new_path_key = ? OR rename_new_path_key IS NULL) AND queue_id > ? AND kind = ?
+            ORDER BY queue_id
+            """), arguments: [oldPath, queueID, SeratoWriteKind.rename.rawValue]).map(decode)
+            for arrival in arrivals {
+                guard case let .rename(arriving) = arrival.write, SeratoPath.normalized(arriving.newAbsolutePath) == oldPath else { continue }
+                stranded.append(SeratoStrandedWrite(write: arrival, detail: SeratoWriteDispositionMessages.unmovedOccupant(at: rename.oldAbsolutePath),
+                                                    newPathHeld: true))
+            }
+        }
+        let later = try Row.fetchAll(database.cachedStatement(sql: "SELECT \(columns) FROM serato_write_queue WHERE file_id = ? AND queue_id > ? ORDER BY queue_id"),
+                                     arguments: [dropped.token.fileId, queueID]).map(decode)
+        for write in later where stranded.allSatisfy({ entry in entry.write.queueID != write.queueID }) {
+            let referencePath: String? = switch write.write {
+            case let .rename(later): later.oldAbsolutePath
+            case let .metadataUpdate(update): update.absolutePath
+            case let .removeFromDatabase(removal), let .removeFromCrates(removal): removal.absolutePath
+            case .addTrack, .fileTagWrite, .trashFile: nil
+            }
+            guard let referencePath, SeratoPath.normalized(referencePath) == newPath else { continue }
+            stranded.append(SeratoStrandedWrite(write: write, detail: SeratoWriteDispositionMessages.unarrivedRename(at: rename.newAbsolutePath),
+                                                newPathHeld: false))
+        }
+        return stranded
+    }
+
+    /// Whether the file's latest rename into `path` before `eventID` was
+    /// dropped with nothing left at that path, so no record waits there.
+    private static func renameNeverArrived(fileID: Int64, at path: String, before eventID: Int64, in database: Database) throws -> Bool {
+        let renames = try Row.fetchAll(database.cachedStatement(sql: """
+        SELECT event_id, payload_json FROM events WHERE file_id = ? AND event_type = ? AND event_id < ? ORDER BY event_id DESC
+        """), arguments: [fileID, EventType.fileRenamed.rawValue, eventID])
+        let decoder = JSONDecoder()
+        for row in renames {
+            let payloadJSON: String = row["payload_json"]
+            let rename = try decoder.decode(RenameFilePayload.self, from: Data(payloadJSON.utf8))
+            guard SeratoPath.normalized(rename.newPath) == path else { continue }
+            let held = try Bool.fetchOne(database.cachedStatement(sql: "SELECT new_path_held FROM serato_write_dispositions WHERE event_id = ? AND kind = ?"),
+                                         arguments: [row["event_id"], SeratoWriteKind.rename.rawValue])
+            return held == false
+        }
+        return false
     }
 
     /// Later queued V2 edits for the same file revision captured their
@@ -236,15 +313,40 @@ enum SeratoWriteQueue {
         guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
         var stored = write
         let payload = try encode(write)
-        try database.execute(sql: "UPDATE serato_write_queue SET payload = ? WHERE queue_id = ?", arguments: [payload, queueID])
+        try database.execute(sql: "UPDATE serato_write_queue SET payload = ?, rename_new_path_key = ? WHERE queue_id = ?",
+                             arguments: [payload, renameNewPathKey(write.write), queueID])
         stored.queuedPayload = payload
         return stored
+    }
+
+    /// For each queued rename, the Serato files it already rewrote, keyed by
+    /// path, and whether that file held its record.
+    /// Progress exists only for renames still queued, so the table is read whole.
+    static func renameProgress(of queueIDs: [Int64], in database: Database) throws -> [Int64: [String: Bool]] {
+        let wanted = Set(queueIDs)
+        return try Row.fetchAll(database, sql: "SELECT queue_id, store, matched FROM serato_rename_progress").reduce(into: [:]) { progress, row in
+            let queueID: Int64 = row["queue_id"]
+            if wanted.contains(queueID) {
+                progress[queueID, default: [:]][row["store"]] = row["matched"]
+            }
+        }
+    }
+
+    static func hasRenameProgress(queueID: Int64, in database: Database) throws -> Bool {
+        try Bool.fetchOne(database.cachedStatement(sql: "SELECT EXISTS (SELECT 1 FROM serato_rename_progress WHERE queue_id = ?)"), arguments: [queueID]) == true
+    }
+
+    static func recordRenameProgress(_ outcomes: [SeratoRenameOutcome], store: String, in database: Database) throws {
+        for outcome in outcomes {
+            try database.execute(sql: "INSERT INTO serato_rename_progress (queue_id, store, matched) VALUES (?, ?, ?) ON CONFLICT (queue_id, store) DO NOTHING",
+                                 arguments: [outcome.queueID, store, outcome.matched])
+        }
     }
 
     @discardableResult
     static func delete(_ write: GuardedSeratoWrite, in database: Database) throws -> Bool {
         guard let queueID = write.queueID else { return false }
-        try database.execute(sql: "DELETE FROM serato_write_queue WHERE queue_id = ?", arguments: [queueID])
+        try database.cachedStatement(sql: "DELETE FROM serato_write_queue WHERE queue_id = ?").execute(arguments: [queueID])
         return database.changesCount > 0
     }
 
@@ -370,13 +472,15 @@ struct SeratoWriteDispositionCounts: Sendable, Equatable {
 /// Durable record of queued work that will not be applied, so a restart cannot
 /// hide a dropped write behind an in-memory count.
 enum SeratoWriteDispositions {
+    /// `newPathHeld`: for a dropped rename, Serato may still hold a record at
+    /// its new path, because the rename partly landed or another record sits there.
     static func record(eventID: Int64, kind: SeratoWriteKind?, disposition: SeratoWriteDisposition, detail: String?,
-                       reported: Bool, in database: Database) throws
+                       reported: Bool, newPathHeld: Bool = false, in database: Database) throws
     {
-        try database.execute(sql: """
-        INSERT INTO serato_write_dispositions (event_id, batch_id, kind, disposition, detail, created_at, reported)
-        VALUES (?, COALESCE((SELECT batch_id FROM events WHERE event_id = ?), ''), ?, ?, ?, ?, ?)
-        """, arguments: [eventID, eventID, kind?.rawValue ?? "unknown", disposition.rawValue, detail, SeratoWriteQueue.now(), reported])
+        try database.cachedStatement(sql: """
+        INSERT INTO serato_write_dispositions (event_id, batch_id, kind, disposition, detail, created_at, reported, new_path_held)
+        VALUES (?, COALESCE((SELECT batch_id FROM events WHERE event_id = ?), ''), ?, ?, ?, ?, ?, ?)
+        """).execute(arguments: [eventID, eventID, kind?.rawValue ?? "unknown", disposition.rawValue, detail, SeratoWriteQueue.now(), reported, newPathHeld])
     }
 
     static func hasUnreported(in database: Database) throws -> Bool {
@@ -396,11 +500,77 @@ enum SeratoWriteDispositions {
         return result
     }
 
-    /// Not-applied event counts per History batch.
-    static func notAppliedCounts(in database: Database) throws -> [String: Int] {
-        try Row.fetchAll(database, sql: "SELECT batch_id, COUNT(DISTINCT event_id) AS count FROM serato_write_dispositions GROUP BY batch_id")
-            .reduce(into: [String: Int]()) { counts, row in counts[row["batch_id"]] = row["count"] }
+    /// Per History batch: not-applied changes by disposition, each event
+    /// counted once per disposition, the distinct events overall, and the
+    /// files they touch.
+    static func notAppliedByBatch(_ batchIDs: [String], in database: Database) throws -> [String: NotAppliedBatchCounts] {
+        guard !batchIDs.isEmpty else { return [:] }
+        let placeholders = batchIDs.map { _ in "?" }.joined(separator: ",")
+        var result: [String: NotAppliedBatchCounts] = [:]
+        for row in try Row.fetchAll(database, sql: """
+        SELECT d.batch_id, COUNT(DISTINCT d.event_id) AS changes, COUNT(DISTINCT COALESCE(e.file_id, -d.event_id)) AS files
+        FROM serato_write_dispositions d LEFT JOIN events e ON e.event_id = d.event_id
+        WHERE d.batch_id IN (\(placeholders)) GROUP BY d.batch_id
+        """, arguments: StatementArguments(batchIDs)) {
+            result[row["batch_id"]] = NotAppliedBatchCounts(changes: row["changes"], files: row["files"])
+        }
+        for row in try Row.fetchAll(database, sql: """
+        SELECT batch_id, disposition, COUNT(DISTINCT event_id) AS count FROM serato_write_dispositions
+        WHERE batch_id IN (\(placeholders)) GROUP BY batch_id, disposition
+        """, arguments: StatementArguments(batchIDs)) {
+            let batchID: String = row["batch_id"]
+            if let disposition = SeratoWriteDisposition(rawValue: row["disposition"]) {
+                result[batchID]?.byDisposition.counts[disposition] = row["count"]
+            } else {
+                result[batchID]?.byDisposition.unrecognized += row["count"] as Int
+            }
+        }
+        return result
     }
+
+    /// One page of a batch's not-applied changes grouped by file, ordered by
+    /// path; changes whose event has no file each form their own entry.
+    static func notAppliedFiles(batchID: String, limit: Int, offset: Int, in database: Database) throws -> [NotAppliedFileRecord] {
+        try Row.fetchAll(database, sql: """
+        SELECT e.file_id, MIN(d.event_id) AS first_event_id, f.path,
+               GROUP_CONCAT(DISTINCT d.event_id || ':' || d.disposition) AS dispositions, GROUP_CONCAT(DISTINCT e.event_type) AS event_types
+        FROM serato_write_dispositions d
+        LEFT JOIN events e ON e.event_id = d.event_id
+        LEFT JOIN files f ON f.id = e.file_id
+        WHERE d.batch_id = ?
+        GROUP BY COALESCE(e.file_id, -d.event_id)
+        ORDER BY f.path IS NULL, f.path, first_event_id
+        LIMIT ? OFFSET ?
+        """, arguments: [batchID, limit, offset]).map { row in
+            var byDisposition = SeratoWriteDispositionCounts()
+            for pair in (row["dispositions"] as String?)?.split(separator: ",") ?? [] {
+                let raw = pair.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+                if let disposition = SeratoWriteDisposition(rawValue: raw) {
+                    byDisposition.counts[disposition, default: 0] += 1
+                } else {
+                    byDisposition.unrecognized += 1
+                }
+            }
+            let eventTypes = (row["event_types"] as String?)?.split(separator: ",").map(String.init) ?? []
+            return NotAppliedFileRecord(fileID: row["file_id"], firstEventID: row["first_event_id"], path: row["path"],
+                                        byDisposition: byDisposition, eventTypes: eventTypes)
+        }
+    }
+}
+
+struct NotAppliedBatchCounts: Sendable, Equatable {
+    var changes: Int
+    var files: Int
+    var byDisposition = SeratoWriteDispositionCounts()
+}
+
+struct NotAppliedFileRecord: Sendable, Equatable {
+    let fileID: Int64?
+    let firstEventID: Int64
+    let path: String?
+    /// This file's not-applied changes, each event counted once per disposition.
+    let byDisposition: SeratoWriteDispositionCounts
+    let eventTypes: [String]
 }
 
 /// Duplicate cleanup is a durable state machine: the intent row is created in
@@ -411,6 +581,7 @@ enum DuplicateCleanupStore {
         let target: FileActionAuthority
         let keeper: FileActionAuthority
         let batchID: String
+        let evidenceRequirement: DuplicateEvidenceRequirement?
     }
 
     static func fetch(targetFileID: Int64, in database: Database) throws -> PendingDuplicateCleanup? {
@@ -426,7 +597,8 @@ enum DuplicateCleanupStore {
     }
 
     static func save(_ intent: PendingDuplicateCleanup, in database: Database) throws {
-        let authority = try JSONEncoder().encode(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID))
+        let authority = try JSONEncoder().encode(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID,
+                                                           evidenceRequirement: intent.evidenceRequirement))
         try database.execute(sql: """
         INSERT OR REPLACE INTO duplicate_cleanup_intents (target_file_id, payload, step, waiting_event_id, removed_v2, failure)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -464,7 +636,8 @@ enum DuplicateCleanupStore {
     private static func decode(_ row: Row) throws -> PendingDuplicateCleanup {
         let bytes: Data = row["payload"]
         let authority = try SyncCheckpointStore.decodeCanonical(Authority.self, from: bytes)
-        var intent = PendingDuplicateCleanup(target: authority.target, keeper: authority.keeper, batchID: authority.batchID)
+        var intent = PendingDuplicateCleanup(target: authority.target, keeper: authority.keeper, batchID: authority.batchID,
+                                             evidenceRequirement: authority.evidenceRequirement)
         intent.step = row["step"]
         intent.waitingEventID = row["waiting_event_id"]
         intent.removedV2 = row["removed_v2"]

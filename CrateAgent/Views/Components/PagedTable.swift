@@ -27,6 +27,9 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
     var enabled = true
     var contentRevision: UInt64 = 0
     var onFocus: (Snapshot.Row.ID?, Int) -> Void = { _, _ in }
+    /// Right Arrow expands and Left Arrow collapses the focused row, when it has a disclosure.
+    var onDisclose: (Snapshot.Row.ID, Bool) -> Bool = { _, _ in false }
+    var onSpace: ((Snapshot.Row) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -93,6 +96,17 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
                 guard let self, let row = configuration.controller.row(at: index) else { return nil }
                 pendingSelection = nil
                 return configuration.contextMenu(row.id)
+            }
+            table.disclosureIntent = { [weak self] index, expanded in
+                guard let self, let row = configuration.controller.row(at: index) else { return false }
+                return configuration.onDisclose(row.id, expanded)
+            }
+            table.spaceAction = { [weak self] index in
+                guard let self, let onSpace = configuration.onSpace else { return false }
+                if let row = configuration.controller.row(at: index) {
+                    onSpace(row)
+                }
+                return true
             }
             table.focusChanged = { [weak self] index in
                 guard let self else { return }

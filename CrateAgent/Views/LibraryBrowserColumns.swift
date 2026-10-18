@@ -1,22 +1,46 @@
 import AppKit
 
+/// Song-family row controls, supplied by the Library model.
+struct LibraryFamilyControls {
+    let state: (Int64) -> LibraryFamilyState?
+    let setExpanded: (Bool, Int64) -> Void
+    let setAlternatesSelected: (Bool, Int64) -> Void
+    let setHiddenSelected: (Bool, Int64) -> Void
+}
+
 enum LibraryBrowserColumns {
     private static let statusIdentifier = "status"
     private static let previewIdentifier = "preview"
+    private static let versionsIdentifier = "versions"
+    private static let alternatesIdentifier = "alternates"
     static func make(showsFilenames: Bool, density: AppDensity, readiness: LibrarySyncReadiness? = nil,
-                     preview: AudioPreviewPlayer? = nil) -> [PagedTableColumn<BrowserRow>]
+                     player: TrackPlayer? = nil, families: LibraryFamilyControls? = nil) -> [PagedTableColumn<BrowserRow>]
     {
         let definitions: [(LibraryBrowseSort.Column?, String, CGFloat)] = [
             (.artist, "Artist", 220), (.title, "Title", 280), (.bpm, "BPM", 70),
             (.musicalKey, "Key", 50), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
         ]
-        let previewColumns = preview.map { player in
-            [PagedTableColumn<BrowserRow>(identifier: previewIdentifier, title: "", width: 28, makeCell: { AudioPreviewCell() }, updateCell: { view, row in
-                guard let cell = view as? AudioPreviewCell else { preconditionFailure("Unexpected preview cell") }
+        let previewColumns = player.map { player in
+            [PagedTableColumn<BrowserRow>(identifier: previewIdentifier, title: "", width: 28, makeCell: { TrackPlayCell() }, updateCell: { view, row in
+                guard let cell = view as? TrackPlayCell else { preconditionFailure("Unexpected preview cell") }
                 cell.update(row: row, player: player)
             }, sortable: false)]
         } ?? []
-        return previewColumns + definitions.map { column, title, width in
+        let familyColumns = families.map { controls in
+            [
+                PagedTableColumn<BrowserRow>(identifier: versionsIdentifier, title: LibraryFamilyMessages.versionsColumn, width: 230,
+                                             makeCell: { LibraryFamilyDisclosureCell() }, updateCell: { view, row in
+                                                 guard let cell = view as? LibraryFamilyDisclosureCell else { preconditionFailure("Unexpected versions cell") }
+                                                 cell.update(row: row, controls: controls, density: density)
+                                             }, sortable: false),
+                PagedTableColumn<BrowserRow>(identifier: alternatesIdentifier, title: LibraryFamilyMessages.includeAlternates, width: 260,
+                                             makeCell: { LibraryFamilyInclusionCell() }, updateCell: { view, row in
+                                                 guard let cell = view as? LibraryFamilyInclusionCell else { preconditionFailure("Unexpected alternates cell") }
+                                                 cell.update(row: row, controls: controls, density: density)
+                                             }, sortable: false),
+            ]
+        } ?? []
+        return previewColumns + familyColumns + definitions.map { column, title, width in
             let identifier = column?.rawValue ?? statusIdentifier
             return PagedTableColumn(identifier: identifier, title: title, width: width, makeCell: { LibraryBrowserCell() }, updateCell: { view, row in
                 guard let cell = view as? LibraryBrowserCell else { preconditionFailure("Unexpected Library cell") }
@@ -29,6 +53,7 @@ enum LibraryBrowserColumns {
 private final class LibraryBrowserCell: NSTableCellView {
     private let primary = NSTextField(labelWithString: "")
     private var secondary: NSTextField?
+    private var indent: CGFloat = 0
 
     init() {
         super.init(frame: .zero)
@@ -40,7 +65,9 @@ private final class LibraryBrowserCell: NSTableCellView {
 
     override func layout() {
         super.layout()
-        let content = bounds.insetBy(dx: 4, dy: 1)
+        var content = bounds.insetBy(dx: 4, dy: 1)
+        content.origin.x += indent
+        content.size.width = max(0, content.width - indent)
         if let secondary, !secondary.isHidden {
             let detailHeight: CGFloat = 13
             secondary.frame = NSRect(x: content.minX, y: content.minY, width: content.width, height: detailHeight)
@@ -60,6 +87,7 @@ private final class LibraryBrowserCell: NSTableCellView {
         primary.textColor = .labelColor
         secondary?.isHidden = true
         primary.maximumNumberOfLines = column == nil ? 2 : 1
+        indent = column == .title && row?.familyRole == .alternate ? 16 : 0
         guard let row else {
             primary.stringValue = column == .title ? PagingLabels.loading : ""
             primary.textColor = .tertiaryLabelColor
@@ -105,5 +133,161 @@ private final class LibraryBrowserCell: NSTableCellView {
         }
         toolTip = column == nil ? row.statusText : row.path
         setAccessibilityLabel("\(title): \(primary.stringValue)")
+    }
+}
+
+/// Version count, selection count, and a text-labelled Show/Hide control for a family's main row.
+private final class LibraryFamilyDisclosureCell: NSTableCellView {
+    private let summary = NSTextField(labelWithString: "")
+    private let toggle = NSButton(title: "", target: nil, action: nil)
+    private var familyID: Int64?
+    private var expanded = false
+    private var controls: LibraryFamilyControls?
+
+    init() {
+        super.init(frame: .zero)
+        summary.lineBreakMode = .byTruncatingTail
+        toggle.bezelStyle = .inline
+        toggle.target = self
+        toggle.action = #selector(disclose)
+        addSubview(summary)
+        addSubview(toggle)
+        textField = summary
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("Versions cells are created programmatically")
+    }
+
+    override func layout() {
+        super.layout()
+        let content = bounds.insetBy(dx: 4, dy: 1)
+        let buttonWidth = toggle.isHidden ? 0 : min(content.width / 2, toggle.intrinsicContentSize.width)
+        toggle.frame = NSRect(x: content.maxX - buttonWidth, y: content.midY - 9, width: buttonWidth, height: 18)
+        summary.frame = NSRect(x: content.minX, y: content.minY, width: max(0, content.width - buttonWidth - 4), height: content.height)
+    }
+
+    func update(row: BrowserRow?, controls: LibraryFamilyControls, density: AppDensity) {
+        self.controls = controls
+        needsLayout = true
+        summary.font = .systemFont(ofSize: density == .compact ? 11 : 13)
+        summary.textColor = .secondaryLabelColor
+        toggle.isHidden = true
+        summary.toolTip = nil
+        familyID = nil
+        guard let row, let familyID = row.familyId, let role = row.familyRole else {
+            summary.stringValue = ""
+            return
+        }
+        switch role {
+        case .standalone:
+            summary.stringValue = ""
+        case .alternate:
+            summary.stringValue = LibraryFamilyMessages.alternate
+        case .main:
+            let state = controls.state(familyID)
+            summary.stringValue = state?.summary(versions: row.familyVersions ?? 1)
+                ?? LibraryFamilyMessages.versions(row.familyVersions ?? 1, selected: 0, of: 0, hidden: 0, selectedHidden: 0)
+            summary.toolTip = LibraryFamilyMessages.versionsHelp
+            summary.textColor = .labelColor
+            guard let state, state.alternateCount > 0 || state.isRevealedBySearch else { return }
+            self.familyID = familyID
+            expanded = state.isExpanded
+            toggle.isHidden = false
+            toggle.isEnabled = !state.isRevealedBySearch
+            toggle.title = state.disclosureLabel
+            toggle.toolTip = state.isRevealedBySearch ? LibraryFamilyMessages.searchRevealHelp : LibraryFamilyMessages.versionsHelp
+            toggle.setAccessibilityLabel(LibraryFamilyMessages.disclosureAccessibility(state.disclosureLabel, title: row.title ?? row.filenameOnly))
+            toggle.setAccessibilityExpanded(state.isShowingAlternates)
+        }
+    }
+
+    @objc private func disclose() {
+        guard let familyID else { return }
+        controls?.setExpanded(!expanded, familyID)
+    }
+}
+
+/// The per-family Include alternates checkbox, mixed when some eligible
+/// alternates are selected, and the text button that extends a selection to
+/// the members a search hides.
+private final class LibraryFamilyInclusionCell: NSTableCellView {
+    private let checkbox = NSButton(checkboxWithTitle: LibraryFamilyMessages.includeAlternates, target: nil, action: nil)
+    private let hiddenButton = NSButton(title: "", target: nil, action: nil)
+    private var familyID: Int64?
+    private var coverage = BatchSelection.Coverage.none
+    private var selectsHidden = true
+    private var controls: LibraryFamilyControls?
+
+    init() {
+        super.init(frame: .zero)
+        checkbox.allowsMixedState = true
+        checkbox.target = self
+        checkbox.action = #selector(toggleAlternates)
+        checkbox.toolTip = LibraryFamilyMessages.familyIncludeAlternatesHelp
+        hiddenButton.bezelStyle = .inline
+        hiddenButton.target = self
+        hiddenButton.action = #selector(toggleHidden)
+        hiddenButton.toolTip = LibraryFamilyMessages.hiddenSelectionHelp
+        addSubview(checkbox)
+        addSubview(hiddenButton)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("Alternates cells are created programmatically")
+    }
+
+    override func layout() {
+        super.layout()
+        let content = bounds.insetBy(dx: 4, dy: 1)
+        let buttonWidth = hiddenButton.isHidden ? 0 : min(content.width / 2, hiddenButton.intrinsicContentSize.width)
+        hiddenButton.frame = NSRect(x: content.maxX - buttonWidth, y: content.midY - 9, width: buttonWidth, height: 18)
+        checkbox.frame = NSRect(x: content.minX, y: content.minY, width: max(0, content.width - buttonWidth - 4), height: content.height)
+    }
+
+    func update(row: BrowserRow?, controls: LibraryFamilyControls, density: AppDensity) {
+        self.controls = controls
+        needsLayout = true
+        checkbox.font = .systemFont(ofSize: density == .compact ? 11 : 13)
+        hiddenButton.font = checkbox.font
+        guard let row, row.familyRole == .main, let familyID = row.familyId, let state = controls.state(familyID),
+              state.alternateCount > 0 || state.hiddenSelection != nil
+        else {
+            checkbox.isHidden = true
+            hiddenButton.isHidden = true
+            familyID = nil
+            return
+        }
+        self.familyID = familyID
+        let title = row.title ?? row.filenameOnly
+        if let hidden = state.hiddenSelection {
+            hiddenButton.isHidden = false
+            hiddenButton.title = hidden.label
+            hiddenButton.setAccessibilityLabel(LibraryFamilyMessages.hiddenSelectionAccessibility(hidden.label, title: title))
+            selectsHidden = hidden.selects
+        } else {
+            hiddenButton.isHidden = true
+        }
+        coverage = state.alternatesCoverage
+        checkbox.isHidden = state.alternateCount == 0
+        checkbox.isEnabled = !state.eligibleAlternates.isEmpty
+        checkbox.state = switch coverage {
+        case .none: .off
+        case .partial: .mixed
+        case .all: .on
+        }
+        checkbox.setAccessibilityLabel("\(LibraryFamilyMessages.includeAlternates) for \(title)")
+    }
+
+    @objc private func toggleAlternates() {
+        guard let familyID else { return }
+        controls?.setAlternatesSelected(coverage != .all, familyID)
+    }
+
+    @objc private func toggleHidden() {
+        guard let familyID else { return }
+        controls?.setHiddenSelected(selectsHidden, familyID)
     }
 }

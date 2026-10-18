@@ -32,6 +32,10 @@ final class LibrarySyncMetrics: Sendable {
         }
     }
 
+    func currentPhase() -> String? {
+        timing.withLock { timing in timing.name }
+    }
+
     func phaseDurations() -> [String: Duration] {
         timing.withLock { timing in
             var result = timing.durations

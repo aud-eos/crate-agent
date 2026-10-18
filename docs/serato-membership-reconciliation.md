@@ -277,8 +277,20 @@ Successful explicit adds and snapshots use the same volume UUID plus canonical
 directory ownership identifier. Add confirmation remains the engine's existing
 `import-confirmed:<eventID>` transaction. Failed adds retain pending membership.
 An immediate add failure also retains the original guarded add as a durable
-`serato_write_queue` row and reports a pending-sync import result. The Library drop flow publishes
-the failure through the shared sync status and Retry Sync action. Retry performs
+`serato_write_queue` row and reports a pending-sync import result. A drop journals
+each file in its own batch, so each stays separately undoable, then applies all of
+the drop's queued adds in one scoped pass. Consecutive adds share one `database V2`
+rewrite per 200 files, and each file's result comes from its own queue rows and
+dispositions (#187). A file that changes before its add runs is reported as not
+added and stays pending, with no Retry Sync, since nothing is left to retry;
+dropping it again observes the changed file and starts a new import. Only an
+import that never finished (pending or legacy-unverified) adopts a changed file
+this way: a retired or removed row still refuses a replacement at its path. When
+readiness is closed, that observation is refused and the file is reported with
+the readiness reason. A file listed twice in one drop, such as a folder and a
+file inside it, is imported once, and a file a still-running drop is importing
+is reported as already being imported by an overlapping drop. The Library drop
+flow publishes a failed add through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or
 changing the original event payloads/inverses. Failed or unattempted adds are
 retained once per event; already completed adds are not queued again. The normal
@@ -295,7 +307,21 @@ shared final writer boundary resolves a verified move to the current audio targe
 checks the actual target and original content intent, and rechecks after journal
 lookups under writer serialization. Ordered reference renames retain their explicit
 path transition; an unrelated occupant of an old path cannot authorize rewriting
-or removing that occupant's V2/crate references. Expected supersession removes only
+or removing that occupant's V2/crate references. The one exception is a chain or
+swap within one drain pass: when a later rename moves a different file into an
+earlier rename's old path, the earlier rename skips the old-path occupancy check,
+even when the two land in different bounded segments. It keeps every other
+identity check. A rename that some store already took also skips that check, so
+it finishes in the rest. When a rename is dropped, the same transaction drops every
+later queued rename into its old path, because the record there never moved
+(#199), and the same file's later queued writes that reference the dropped
+rename's new path, because another file's record may still sit there. Each
+drop is transitive, compared by `SeratoPath.normalized`, and records its own
+disposition; an indexed `rename_new_path_key` keeps the cascade linear in the
+queue. The exception is an old path that the same file's latest earlier rename
+never reached, because that rename was dropped while another record still held
+its new path (`new_path_held`): no record waits there. A rename that V2 took counts as
+arrived. Expected supersession removes only
 the obsolete queued work and records a `serato_write_dispositions` row so the drop
 stays visible after a restart; unexpected I/O failure stays visible and retryable.
 
@@ -305,6 +331,13 @@ ordered survivors and rechecks them at the serialized writer boundary. Valid
 survivors stay coalesced; a Serato restart queues them for guarded completion.
 Rejecting one target never discards or reports supersession for its valid siblings,
 and retrying the external subset does not repeat the local mutation journal.
+`serato_rename_progress` records, in each store's writer transaction, which
+queued renames V2 and each crate already took. A retry after supersession,
+failure or restart rewrites only the stores a rename has not reached. Applying a
+landed chain or swap a second time would move its records again. A store rewrite
+that lands just before a crash, ahead of its transaction's commit, is applied
+again on restart. With WAL and `synchronous=NORMAL`, a power loss can also drop
+a committed progress row while the rewritten store survives.
 
 Duplicate cleanup retains the original keeper and target authority for every step.
 V2 removal, both crate forms, and Trash must actually complete before it reports
@@ -315,6 +348,39 @@ An immediate external failure retains the already-journaled guarded write in the
 existing queue and publishes the existing Sync failure/Retry Sync surface. Normal
 sync leaves it failed; explicit Retry Sync resumes after fresh strict authorization,
 without re-journaling the mutation or renewing the original plan.
+
+Duplicate cleanup needs full evidence, not the scan's candidate key. A byte-level
+group (same size, same first and last megabyte) is confirmed only by
+`OwnedAudioIdentity`'s SHA-256 of every byte, cached in `file_content_digests`.
+Files sharing a 120 s fingerprint can be different versions (Clean and Dirty
+edits), so perceptual groups need decoded audio: `decoded_audio_digest` caches, in
+`file_audio_digests`, a SHA-256 of the native PCM sample bytes (integers widened
+losslessly to 32 bits, floats kept at their width, each tagged with its sample
+format, plus the sample rate and channel count, and a marker with the packet
+timestamp for every packet the decoder skipped), its container/codec, its decoded
+duration and a hash of its full-length fingerprint.
+
+`DuplicateEvidenceVerifier` computes digests lazily off the main actor. A second
+caller joins the running pass instead of starting another, the pass is cancelled
+only when every caller has gone, and finished digests are saved before
+cancellation is honoured. A row counts only while the file's size, mtime and
+inode still match and, on the cleanup recheck, its nanosecond mtime and ctime
+match exactly. Deterministic decode failures are cached and shown; transient
+failures (I/O, permission, unmounted volume) are dropped and retried on the next
+rescan.
+
+Identical contents or PCM is the only basis for pre-selecting a group. Files whose
+PCM differs (another format, or another encoding of one format such as MP3 320
+and MP3 128) but that share a full-length fingerprint and decode within 0.5 s of
+each other are grouped but never pre-selected, because Clean and Dirty edits can
+pass that test; the user checks each file by hand after listening. Files that
+differ in full contents, or in full-length fingerprint or duration, are kept and
+cannot be checked. Files that fail to decode, and groups still being checked,
+offer nothing. The cleanup's first step rechecks the cached evidence against the
+live file inside its writer transaction, for the exact identities it was
+authorized with: identical contents or PCM, or a fingerprint match only for a file
+the user selected. If that transaction rolls back on a conflict, the recheck runs
+again when the step resumes.
 
 Only a registered sequence with a confirmed own V2 removal may retain an absent
 member during reconciliation. An unstarted queued removal has no exemption.
@@ -361,7 +427,11 @@ path by its NFC form, so a decomposed spelling Finder stored matches a composed
 request, and the reverse. Matching never rewrites a path field's bytes; only a
 rename replaces the matched field, with the requested destination. Two records whose
 spellings are equivalent form a conflict, which the scope above
-keeps away from those writers.
+keeps away from those writers. When both spellings reach a writer anyway, a record
+stored in the requested spelling wins: a metadata update writes that record, and
+equivalent rename sources bound for different destinations match only exactly. A
+metadata batch that sends equivalent paths different updates is refused, and a crate
+renamed from both spellings keeps one entry.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared
@@ -471,7 +541,10 @@ The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
 warning. An outcome this version does not recognize, such as one recorded by a
 newer build, is counted as not applied rather than blocking readiness. History marks a batch with the number of its changes that were not
-applied.
+applied and one reason line per disposition. Its Show files button pages the
+affected files through `EventHistoryQuery.loadNotAppliedFiles`, each with its
+own reasons; a file whose events project onto Serato or audio-tag writes can be
+re-synced alone through `OperationEngine.resyncSeratoForBatch(_:fileID:)`.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.

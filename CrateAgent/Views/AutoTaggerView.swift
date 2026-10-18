@@ -2,6 +2,7 @@ import SwiftUI
 
 struct AutoTaggerView: View {
     @ObservedObject var session: AutoTagSession
+    let player: TrackPlayer
     var readiness: LibrarySyncReadiness?
     var conflictRevision: UInt64 = 0
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
@@ -218,6 +219,15 @@ struct AutoTaggerView: View {
     @ViewBuilder private func reviewEntry(_ fileID: Int64, isFocused: Bool) -> some View {
         let file = session.filesByID[fileID]
         let path = file?.path ?? "File \(fileID) — no longer in the library"
+        HStack(alignment: .firstTextBaseline, spacing: density.spacing) {
+            if let file {
+                TrackPlayButton(player: player, track: PlayerTrack(file), isAvailable: file.fileAvailability == .available)
+            }
+            reviewDetails(fileID, file: file, path: path, isFocused: isFocused)
+        }.padding(.vertical, density.rowPadding)
+    }
+
+    private func reviewDetails(_ fileID: Int64, file: BrowserRow?, path: String, isFocused: Bool) -> some View {
         VStack(alignment: .leading, spacing: density.spacing) {
             if session.appliedFileIDs.contains(fileID) {
                 StatusBadge(title: "Applied — read-only", systemImage: "checkmark.circle.fill", tint: .green)
@@ -246,7 +256,7 @@ struct AutoTaggerView: View {
             if let error = session.selectionErrorByFileID[fileID] {
                 ActionErrorMessage(message: error)
             }
-        }.padding(.vertical, density.rowPadding)
+        }
     }
 
     @ViewBuilder private func lookupStatus(_ fileID: Int64) -> some View {

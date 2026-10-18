@@ -7,10 +7,13 @@ enum LibrarySyncRequest: Equatable, Sendable {
 
 struct LibraryRefreshPlan: Sendable {
     let indexedFiles: [FileRecord]
-    let metadataPaths: Set<Data>
-    let refreshPaths: Set<Data>
+    let metadataPaths: Set<PathBytes>
+    let refreshPaths: Set<PathBytes>
     let reconcileFileIDs: Set<Int64>
     let evidence: [Int64: SyncFileEvidence]
+    /// Unchanged rows indexed before subsecond times were kept, with the subsecond part
+    /// their verified stat evidence already holds, so it is recorded without re-reading.
+    var subsecondTimes: [Int64: Int64] = [:]
 }
 
 struct FileRefreshObservation: Sendable {
@@ -39,18 +42,19 @@ struct LibraryRefreshPlanner: Sendable {
     }
 
     func makePlan(request: LibrarySyncRequest, snapshot: SeratoMembershipSnapshot, indexedFiles: [FileRecord],
-                  previousRecords: [SeratoTrackRecord], dirtyFileIDs: Set<Int64>, dirtyPaths: Set<Data>,
+                  previousRecords: [SeratoTrackRecord], dirtyFileIDs: Set<Int64>, dirtyPaths: Set<PathBytes>,
                   analysis: SeratoConflictAnalysis) async throws -> LibraryRefreshPlan
     {
         try analysis.validate(snapshot)
         let savedPaths = Set(snapshot.records.map { record in SeratoPath.normalized(record.path) })
-        let previous = Dictionary(grouping: previousRecords) { record in Data(record.path.utf8) }
+        let previous = Dictionary(grouping: previousRecords) { record in PathBytes(record.path) }
         let indexed = Dictionary(grouping: indexedFiles) { file in SeratoPath.normalized(file.path) }
-        let normalizedDirtyPaths = Set(dirtyPaths.compactMap { bytes in String(data: bytes, encoding: .utf8).map(SeratoPath.normalized) })
-        var refresh: Set<Data> = []
-        var metadata: Set<Data> = []
+        let normalizedDirtyPaths = Set(dirtyPaths.compactMap { path in String(data: path.bytes, encoding: .utf8).map(SeratoPath.normalized) })
+        var refresh: Set<PathBytes> = []
+        var metadata: Set<PathBytes> = []
         var reconcile: Set<Int64> = []
         var sound: Set<Int64> = []
+        var subsecondTimes: [Int64: Int64] = [:]
         for file in indexedFiles {
             try Task.checkCancellation()
             guard let identifier = file.id, analysis.scope.conflictingPath(for: .file(file)) == nil else { continue }
@@ -71,6 +75,9 @@ struct LibraryRefreshPlanner: Sendable {
             }
             if reusable {
                 sound.insert(identifier)
+                if file.mtimeNanoseconds == nil, let stamp = evidence[identifier]?.readIdentity {
+                    subsecondTimes[identifier] = Int64(stamp.target.modifiedNanoseconds)
+                }
             } else {
                 reconcile.insert(identifier)
             }
@@ -79,7 +86,7 @@ struct LibraryRefreshPlanner: Sendable {
             try Task.checkCancellation()
             let path = SeratoPath.normalized(record.path)
             guard analysis.scope.conflictingPath(for: SeratoConflictTarget(paths: [path])) == nil else { continue }
-            let bytes = Data(record.path.utf8)
+            let bytes = PathBytes(record.path)
             guard let candidates = indexed[path], candidates.count == 1, let file = candidates.first,
                   let identifier = file.id, sound.contains(identifier),
                   let baseline = previous[bytes], baseline.count == 1, let old = baseline.first
@@ -94,6 +101,7 @@ struct LibraryRefreshPlanner: Sendable {
                 metadata.insert(bytes)
             }
         }
-        return LibraryRefreshPlan(indexedFiles: indexedFiles, metadataPaths: metadata, refreshPaths: refresh, reconcileFileIDs: reconcile, evidence: evidence)
+        return LibraryRefreshPlan(indexedFiles: indexedFiles, metadataPaths: metadata, refreshPaths: refresh, reconcileFileIDs: reconcile, evidence: evidence,
+                                  subsecondTimes: subsecondTimes.filter { entry in sound.contains(entry.key) })
     }
 }

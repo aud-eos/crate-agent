@@ -12,10 +12,10 @@ final class AutoTagSessionTests: XCTestCase {
         let freshness = SessionFreshnessSuspension(started: started)
         let fixture = try SessionFixture(fileCount: 1, fileFreshnessReader: { freshness.read($0) })
         let recorded = SessionTokenRecorder()
-        let engine = OperationEngine(database: fixture.database,
-                                     seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
-                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
-                                     fileTagWriter: { _, _ in })
+        let engine = try OperationEngine(database: fixture.database,
+                                         seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                         seratoLocator: makeEmptySeratoLibrary(),
+                                         fileTagWriter: { _, _ in })
         let session = AutoTagSession(database: fixture.database, lookupService: fixture.service, applyBatch: { mutations, batchID, tokens in
             await recorded.record(tokens)
             _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens)
@@ -40,6 +40,30 @@ final class AutoTagSessionTests: XCTestCase {
         XCTAssertNil(file.artist)
         let matchCount = try await fixture.database.writer.read { try EventRecord.filter(Column("event_type") == EventType.musicBrainzMatchApplied.rawValue).fetchCount($0) }
         XCTAssertEqual(matchCount, 0)
+    }
+
+    func testApplyAppliesTheFreshFileAndSkipsOneWhoseMembershipChangedSinceScanning() async throws {
+        let fixture = try SessionFixture(fileCount: 2)
+        let engine = try OperationEngine(database: fixture.database,
+                                         seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                         seratoLocator: makeEmptySeratoLibrary(),
+                                         fileTagWriter: { _, _ in })
+        let session = AutoTagSession(database: fixture.database, lookupService: fixture.service, applyBatch: { mutations, batchID, tokens in
+            _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens)
+        }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: nil)
+        session.selectVisibleFileIDs(fixture.fileIDs)
+        await session.startScan()
+        session.approveAllSuggested()
+        // Changed synchronously, so apply starts before the session's membership observation sees it.
+        let bumpRevision = { () throws in
+            try fixture.database.writer.write { database in
+                try database.execute(sql: "UPDATE files SET membership_revision = membership_revision + 1 WHERE id = ?", arguments: [fixture.fileIDs[0]])
+            }
+        }
+        try bumpRevision()
+        await session.applyConfirmed()
+        XCTAssertEqual(session.appliedFileIDs, [fixture.fileIDs[1]], session.actionError ?? "no error")
+        XCTAssertTrue(session.lastResult?.contains("Skipped 1 file(s) that changed since scanning") == true, session.lastResult ?? "no result")
     }
 
     func testRetiredChoicesStayInspectableButCannotBeApprovedAfterReactivation() async throws {
@@ -112,7 +136,7 @@ final class AutoTagSessionTests: XCTestCase {
         await fixture.session.startScan()
         await fixture.session.loadBrowsePage(1)
         let mounted = expectation(description: "Review mounted")
-        let hosting = NSHostingView(rootView: AutoTaggerView(session: fixture.session)
+        let hosting = NSHostingView(rootView: AutoTaggerView(session: fixture.session, player: TrackPlayer(output: FakeTrackPlayerOutput()))
             .environmentObject(SeratoWatchdog(runningBundleIdentifiersProvider: { [] }))
             .onAppear { mounted.fulfill() })
         hosting.frame = NSRect(x: 0, y: 0, width: 1000, height: 760)
@@ -230,7 +254,7 @@ final class AutoTagSessionTests: XCTestCase {
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
         let appeared = expectation(description: "Auto-Tag mounted")
         let disappeared = expectation(description: "Auto-Tag removed")
-        let hosting = NSHostingView(rootView: AnyView(AutoTaggerView(session: fixture.session)
+        let hosting = NSHostingView(rootView: AnyView(AutoTaggerView(session: fixture.session, player: TrackPlayer(output: FakeTrackPlayerOutput()))
                 .environmentObject(watchdog).onAppear { appeared.fulfill() }.onDisappear { disappeared.fulfill() }))
         hosting.frame = NSRect(x: 0, y: 0, width: 1000, height: 760)
         hosting.layoutSubtreeIfNeeded()
@@ -249,7 +273,7 @@ final class AutoTagSessionTests: XCTestCase {
         await release.open()
         await scan.value
         let remounted = expectation(description: "Auto-Tag recreated")
-        hosting.rootView = AnyView(AutoTaggerView(session: fixture.session).environmentObject(watchdog).onAppear { remounted.fulfill() })
+        hosting.rootView = AnyView(AutoTaggerView(session: fixture.session, player: TrackPlayer(output: FakeTrackPlayerOutput())).environmentObject(watchdog).onAppear { remounted.fulfill() })
         hosting.layoutSubtreeIfNeeded()
         await fulfillment(of: [remounted], timeout: 3)
         XCTAssertEqual(fixture.session.rowModels.count, 2)
@@ -581,6 +605,19 @@ final class AutoTagSessionTests: XCTestCase {
 
 @MainActor
 private struct SessionFixture {
+    private nonisolated static let trackPathPrefix = "/fixture/track-"
+    private nonisolated static let trackPathSuffix = ".mp3"
+
+    nonisolated static func path(ofTrack index: Int) -> String {
+        trackPathPrefix + String(index) + trackPathSuffix
+    }
+
+    /// A fixture track's live stat while unchanged: indexed size, time and inode (its index).
+    nonisolated static func unchangedStat(of path: String) -> FileFreshnessSnapshot {
+        let index = Int64(path.dropFirst(trackPathPrefix.count).dropLast(trackPathSuffix.count))
+        return FileFreshnessSnapshot(fileSize: 1000, inode: index, mtime: 10, mtimeNanoseconds: 0)
+    }
+
     let database: LibraryDatabase
     let fileIDs: [Int64]
     let loader: SessionLookupLoader
@@ -590,7 +627,7 @@ private struct SessionFixture {
     init(fileCount: Int, alternatives: Bool = false, firstLookupHasNoMatch: Bool = false, lowScoreAlternative: Bool = false, onlyMetadataMatches: Bool = false,
          blockedRecordingID: String? = nil,
          started: SessionGate = SessionGate(), release: SessionGate = SessionGate(),
-         fileFreshnessReader: @escaping FileFreshnessReading = { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 10) },
+         fileFreshnessReader: @escaping FileFreshnessReading = { path in SessionFixture.unchangedStat(of: path) },
          apply: @escaping @Sendable ([TrackMutation], String) async throws -> Void = { _, _ in },
          resync: @escaping @Sendable (String) async throws -> ResyncOutcome = { _ in ResyncOutcome(appliedCount: 1, queuedCount: 0) }) throws
     {
@@ -598,8 +635,8 @@ private struct SessionFixture {
         var inserted: [Int64] = []
         try database.writer.write { database in
             for index in 1 ... fileCount {
-                var file = FileRecord(path: "/fixture/track-\(index).mp3", volumeUuid: "TEST", inode: Int64(index), fileSize: 1000, mtime: 10,
-                                      chromaprintFingerprint: FingerprintEncoder.serialize([UInt32(index)]), fingerprintStatus: .done)
+                var file = FileRecord(path: Self.path(ofTrack: index), volumeUuid: "TEST", inode: Int64(index), fileSize: 1000, mtime: 10,
+                                      mtimeNanoseconds: 0, chromaprintFingerprint: FingerprintEncoder.serialize([UInt32(index)]), fingerprintStatus: .done)
                 file.libraryMembership = .active
                 file.fileAvailability = .available
                 try file.insert(database)
@@ -645,7 +682,7 @@ private final class SessionFreshnessSuspension: @unchecked Sendable {
         semaphore.signal()
     }
 
-    func read(_: String) -> FileFreshnessSnapshot {
+    func read(_ path: String) -> FileFreshnessSnapshot {
         let shouldWait = lock.withLock {
             let shouldWait = armed
             armed = false
@@ -655,7 +692,7 @@ private final class SessionFreshnessSuspension: @unchecked Sendable {
             started.fulfill()
             semaphore.wait()
         }
-        return FileFreshnessSnapshot(fileSize: 1000, mtime: 10)
+        return SessionFixture.unchangedStat(of: path)
     }
 }
 
