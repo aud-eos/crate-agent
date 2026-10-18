@@ -1746,11 +1746,13 @@ public actor OperationEngine {
         guard plan.preview.laterChanges.isEmpty else {
             throw OperationEngineError.queuedChangeHasLaterChanges(path: path, later: plan.preview.laterChanges.map(\.path))
         }
-        let reverts = try plan.events.compactMap { event in
+        let kept = try await removalUndoEventsKept(plan)
+        let revertedEvents = plan.events.filter { event in event.eventId.map(kept.contains) != true }
+        let reverts = try revertedEvents.compactMap { event in
             try Self.decodeInverseMutation(event: event).map { inverse in (event: event, inverse: inverse) }
         }
-        let rewritesTags = plan.events.filter { event in event.eventId.flatMap { eventID in plan.unwritten[eventID] }?.contains(.fileTagWrite) != true }
-        let guards = try await inverseGuards(for: plan.events, tagEvents: rewritesTags)
+        let rewritesTags = revertedEvents.filter { event in event.eventId.flatMap { eventID in plan.unwritten[eventID] }?.contains(.fileTagWrite) != true }
+        let guards = try await inverseGuards(for: revertedEvents, tagEvents: rewritesTags)
         let authorization = try readiness?.capture()
         let discardBatchID = "\(Self.discardBatchPrefix)\(batchID):\(UUID().uuidString)"
         let context = mutationContext
@@ -1770,6 +1772,30 @@ public actor OperationEngine {
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: discardBatchID)
         try await refreshQueueDepth()
         return discardBatchID
+    }
+
+    /// The events of a removal's undo that discarding its stuck Serato
+    /// restores leaves in place: the restored file and row stay, and the
+    /// restores are only dropped. Redoing a removal is not supported (#270), so
+    /// a restore whose write may have landed, or already completed, refuses.
+    private func removalUndoEventsKept(_ plan: DiscardPlan) async throws -> Set<Int64> {
+        let undoTypes: Set<EventType> = [.trackImported, .fileRestoredFromTrash, .seratoRecordsRestored]
+        let undoEvents = plan.events.filter { event in undoTypes.contains(event.eventType) }
+        guard undoEvents.contains(where: { event in event.eventType != .trackImported }) else { return [] }
+        for event in undoEvents where event.eventType == .seratoRecordsRestored {
+            guard let eventID = event.eventId else { throw OperationEngineError.insertDidNotReturnRowId }
+            if plan.unwritten[eventID]?.contains(.restoreRecords) == true {
+                continue
+            }
+            let payload = try Self.decodeEventPayload(RestoreSeratoRecordsPayload.self, event: event, decoder: JSONDecoder())
+            let queuedRestore = try await database.writer.read { database in
+                try SeratoRemovalCaptureStore.captures(eventID: payload.removalEventID, in: database).contains { capture in capture.outcome != .nothingRemoved }
+            }
+            if queuedRestore {
+                throw OperationEngineError.removalRedoNotSupported(eventType: event.eventType)
+            }
+        }
+        return Set(undoEvents.compactMap(\.eventId))
     }
 
     private struct DiscardPlan: Sendable {
@@ -2893,16 +2919,13 @@ public actor OperationEngine {
         let databaseV2Path = try requireSeratoDatabase(waitingCount: guardedWrites.count)
         let cleanupTarget = guardedWrites.first?.cleanupTargetFileID
         let eventID = try Self.singleRowEventID(guardedWrites)
-        let mayHaveLanded = guardedWrites.contains(where: \.mayHaveLanded)
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
         do {
-            try await performExternalWrite(guardedWrites, completing: true) { database, io in
-                let removed = try removeTrackFromDatabaseCapturing(databasePath: databaseV2Path, trackPath: seratoRelativePath)
-                io.recordReturned()
-                try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: databaseV2Path, trackPath: seratoRelativePath, records: removed,
-                                                   earlierAttemptMayHaveLanded: mayHaveLanded, in: database)
+            try await removeCapturing(eventID: eventID, storePath: databaseV2Path, trackPath: seratoRelativePath, guardedWrites: guardedWrites, completing: true) {
+                try removeTrackFromDatabaseCapturing(databasePath: databaseV2Path, trackPath: seratoRelativePath)
+            } afterward: { database in
                 if let cleanupTarget {
                     guard try !readDatabaseRecordsStrict(databasePath: databaseV2Path).contains(where: { record in SeratoPath.normalized(record.path) == SeratoPath.normalized(removal.absolutePath) }) else {
                         throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: "Duplicate reference removal did not complete.")
@@ -2920,12 +2943,53 @@ public actor OperationEngine {
         }
     }
 
+    /// Runs one store's removal I/O after a write-ahead in-progress mark that
+    /// its own transaction replaces with what it removed. The mark is
+    /// withdrawn when the I/O cannot have landed, so a retry reads a store left
+    /// in progress as one whose capture may have been lost.
+    private func removeCapturing(eventID: Int64, storePath: String, trackPath: String, guardedWrites: [GuardedSeratoWrite], completing: Bool,
+                                 remove: @escaping @Sendable () throws -> [SeratoRemovedRecord],
+                                 afterward: @escaping @Sendable (GRDB.Database) throws -> Void = { _ in }) async throws
+    {
+        let earlier = try await database.writer.write { database in
+            try SeratoRemovalCaptureStore.beginRemoval(eventID: eventID, storePath: storePath, trackPath: trackPath, in: database)
+        }
+        do {
+            try await performExternalWrite(guardedWrites, completing: completing) { database, io in
+                let removed = try remove()
+                io.recordReturned()
+                try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: storePath, trackPath: trackPath, records: removed,
+                                                   earlierOutcome: earlier, in: database)
+                try afterward(database)
+            }
+        } catch {
+            if Self.ioCannotHaveLanded(error) {
+                try await database.writer.write { database in
+                    try SeratoRemovalCaptureStore.abandonRemoval(eventID: eventID, storePath: storePath, earlierOutcome: earlier, in: database)
+                }
+            }
+            throw error
+        }
+    }
+
+    /// An interruption stops before any I/O, and the core reports a write
+    /// that replaced its file but could not flush it as `LandedNotDurable`.
+    private static func ioCannotHaveLanded(_ error: Error) -> Bool {
+        if error is ExternalWriteInterruption {
+            return true
+        }
+        guard let coreError = error as? CoreError else { return false }
+        if case .LandedNotDurable = coreError {
+            return false
+        }
+        return true
+    }
+
     /// Without a database V2 no crate is rewritten either, so a removal
     /// lands in all three file sets together.
     private func applySeratoCrateSweepRemoval(_ removal: SeratoPendingRemoval, guardedWrites: [GuardedSeratoWrite]) async throws {
         _ = try requireSeratoDatabase(waitingCount: guardedWrites.count)
         let eventID = try Self.singleRowEventID(guardedWrites)
-        let mayHaveLanded = guardedWrites.contains(where: \.mayHaveLanded)
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
@@ -2947,11 +3011,8 @@ public actor OperationEngine {
         for crateFile in crateFiles {
             try await requireExternalWriteEligibility(guardedWrites)
             do {
-                try await performExternalWrite(guardedWrites) { database, io in
-                    let removed = try removePathFromCrateCapturing(cratePath: crateFile.path, trackPath: seratoRelativePath)
-                    io.recordReturned()
-                    try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: crateFile.path, trackPath: seratoRelativePath, records: removed,
-                                                       earlierAttemptMayHaveLanded: mayHaveLanded, in: database)
+                try await removeCapturing(eventID: eventID, storePath: crateFile.path, trackPath: seratoRelativePath, guardedWrites: guardedWrites, completing: false) {
+                    try removePathFromCrateCapturing(cratePath: crateFile.path, trackPath: seratoRelativePath)
                 }
             } catch let error as ExternalWriteInterruption {
                 throw error
@@ -2981,12 +3042,18 @@ public actor OperationEngine {
             try SeratoRemovalCaptureStore.captures(eventID: restore.removalEventID, in: database)
         }
         var missingStores: [String] = []
+        var missingUnrecordedStores: [String] = []
         for storePath in restore.storePaths {
+            let capture = captures.first { capture in capture.storePath == storePath }
             guard FileManager.default.fileExists(atPath: storePath) else {
-                missingStores.append(storePath)
+                if capture?.isUnrecorded == true {
+                    missingUnrecordedStores.append(storePath)
+                } else {
+                    missingStores.append(storePath)
+                }
                 continue
             }
-            guard let capture = captures.first(where: { capture in capture.storePath == storePath }), !capture.isUnrecorded else {
+            guard let capture, !capture.isUnrecorded else {
                 throw OperationEngineError.restoreBlocked(path: restore.absolutePath, reason: .recordsNotRecorded(store: storePath))
             }
             try await requireExternalWriteEligibility(guardedWrites)
@@ -3000,9 +3067,10 @@ public actor OperationEngine {
                 throw OperationEngineError.seratoRewriteFailed(path: storePath, underlying: UserFacingErrorMessage.message(for: error))
             }
         }
-        guard !missingStores.isEmpty else { return [] }
+        guard !missingStores.isEmpty || !missingUnrecordedStores.isEmpty else { return [] }
         let missing = Set(guardedWrites.compactMap(\.queueID))
-        let details = missing.reduce(into: [Int64: String]()) { details, queueID in details[queueID] = RemovalUndoMessages.storesMissing(missingStores) }
+        let detail = RemovalUndoMessages.storesMissing(missingStores, unrecorded: missingUnrecordedStores)
+        let details = missing.reduce(into: [Int64: String]()) { details, queueID in details[queueID] = detail }
         let locator = seratoLocator
         try await database.writer.write { database in
             try Self.completeQueuedWrites(guardedWrites, missingTarget: missing, missingDetails: details, reported: reported, locator: locator, in: database)

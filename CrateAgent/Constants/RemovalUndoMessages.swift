@@ -18,9 +18,20 @@ enum RemovalUndoMessages {
 
     static let redoNotSupported = "A removal that was undone can't be redone from History yet. Remove the file again instead."
 
-    static func storesMissing(_ storePaths: [String]) -> String {
-        let names = storePaths.map { storePath in (storePath as NSString).lastPathComponent }.joined(separator: ", ")
-        return "Not restored into \(names): \(storePaths.count == 1 ? "it no longer exists" : "they no longer exist")."
+    /// `unrecorded` stores no longer exist either, and may never have had records removed.
+    static func storesMissing(_ storePaths: [String], unrecorded: [String]) -> String {
+        var sentences: [String] = []
+        if !storePaths.isEmpty {
+            sentences.append("Not restored into \(names(storePaths)): \(storePaths.count == 1 ? "it no longer exists" : "they no longer exist").")
+        }
+        if !unrecorded.isEmpty {
+            sentences.append("\(names(unrecorded)) no longer \(unrecorded.count == 1 ? "exists" : "exist"), and whether the removal took records from \(unrecorded.count == 1 ? "it" : "them") was not recorded.")
+        }
+        return sentences.joined(separator: " ")
+    }
+
+    private static func names(_ storePaths: [String]) -> String {
+        storePaths.map { storePath in (storePath as NSString).lastPathComponent }.joined(separator: ", ")
     }
 
     static func storeMissingSummary(count: Int) -> String {

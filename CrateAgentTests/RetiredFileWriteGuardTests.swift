@@ -254,7 +254,7 @@ final class RetiredFileWriteGuardTests: XCTestCase {
                 let eventID = try OperationEngine.insertEvent(batchId: "removal", timestamp: 0, fileId: fileID, eventType: .fileRemovedFromCrates,
                                                               forwardPayload: RemoveFileFromCratesPayload(fileId: fileID), inversePayload: [String: String](), in: database)
                 try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: crate.path, trackPath: trackPath, records: removed,
-                                                   earlierAttemptMayHaveLanded: false, in: database)
+                                                   earlierOutcome: nil, in: database)
                 return eventID
             }
         }
