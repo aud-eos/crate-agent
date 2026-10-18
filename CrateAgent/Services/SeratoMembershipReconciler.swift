@@ -38,7 +38,9 @@ enum SeratoReconciliationError: LocalizedError {
 enum SeratoPath {
     static func normalized(_ path: String) -> String {
         let absolute = path.hasPrefix("/") ? path : "/" + path
-        return URL(fileURLWithPath: absolute).standardizedFileURL.path.precomposedStringWithCanonicalMapping
+        // Without `isDirectory`, Foundation stats the path to decide; the
+        // result is the same either way, since `path` drops a trailing slash.
+        return URL(fileURLWithPath: absolute, isDirectory: false).standardizedFileURL.path.precomposedStringWithCanonicalMapping
     }
 
     static func isVerifiedCaseAlias(_ file: FileRecord, identity: FileMetadata) throws -> Bool {

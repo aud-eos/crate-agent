@@ -1986,24 +1986,23 @@ public actor OperationEngine {
         var run = SegmentRun()
         var ready: [SeratoWriteSegment.Entry] = []
         var cascaded: Set<Int64> = []
-        let pass = try await loadQueue()
-        for loaded in pass {
-            guard let queueID = loaded.queueID else { continue }
+        for (loaded, requiredKeeper) in try await loadQueueOrder() {
+            let queueID = loaded.queueID
             guard !cascaded.contains(queueID) else {
-                run.superseded.insert(loaded.eventId)
+                run.superseded.insert(loaded.eventID)
                 continue
             }
             let predecessor = run.blocked
             let readiness = readiness
             let classification = try await database.writer.read { database -> (GuardedSeratoWrite, SeratoConflictQueueDisposition, SeratoQueueDependency)? in
                 guard var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
-                current.requiredKeeper = loaded.requiredKeeper
+                current.requiredKeeper = requiredKeeper
                 let (disposition, dependency) = try SeratoConflictQueue.classify(current, blocked: predecessor, readiness: readiness, in: database)
                 return (current, disposition, dependency)
             }
             guard let (queued, disposition, dependency) = classification else {
                 // Dropped since the pass loaded it, as by a rename cascade (#199).
-                run.superseded.insert(loaded.eventId)
+                run.superseded.insert(loaded.eventID)
                 continue
             }
             if disposition == .blocked {
@@ -2284,16 +2283,30 @@ public actor OperationEngine {
 
     private func loadQueue() async throws -> [GuardedSeratoWrite] {
         try await database.writer.read { database in
-            let keepers = try DuplicateCleanupStore.fetchAll(in: database).reduce(into: [Int64: FileActionAuthority]()) { keepers, intent in
-                keepers[intent.target.token.fileId] = intent.keeper
-            }
+            let keepers = try Self.cleanupKeepers(in: database)
             return try SeratoWriteQueue.fetchOrdered(in: database).map { row in
                 var write = row
-                if let target = row.cleanupTargetFileID {
-                    write.requiredKeeper = keepers[target]
-                }
+                write.requiredKeeper = row.cleanupTargetFileID.flatMap { target in keepers[target] }
                 return write
             }
+        }
+    }
+
+    /// The drain rereads each row before classifying it, so its pass order
+    /// needs no payloads: decoding them all up front cost as much as a
+    /// cascade that drops the whole queue (#249).
+    private func loadQueueOrder() async throws -> [(row: SeratoQueuedRowReference, requiredKeeper: FileActionAuthority?)] {
+        try await database.writer.read { database in
+            let keepers = try Self.cleanupKeepers(in: database)
+            return try SeratoWriteQueue.fetchOrderedReferences(in: database).map { row in
+                (row, row.cleanupTargetFileID.flatMap { target in keepers[target] })
+            }
+        }
+    }
+
+    private static func cleanupKeepers(in database: GRDB.Database) throws -> [Int64: FileActionAuthority] {
+        try DuplicateCleanupStore.fetchAll(in: database).reduce(into: [Int64: FileActionAuthority]()) { keepers, intent in
+            keepers[intent.target.token.fileId] = intent.keeper
         }
     }
 
