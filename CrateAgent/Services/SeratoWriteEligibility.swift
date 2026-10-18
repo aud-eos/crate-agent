@@ -131,7 +131,7 @@ enum SeratoWriteEligibility {
     }
 
     private static func sameContent(_ original: FileMetadata, _ current: FileMetadata) -> Bool {
-        original.fileSize == current.fileSize && original.mtime == current.mtime
+        original.fileSize == current.fileSize && original.hasSameModificationTime(as: current)
             && (original.lightweightHash == nil || original.lightweightHash == current.lightweightHash)
     }
 

@@ -1016,6 +1016,55 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// A redo has no review-time snapshot, so it compares the live file with the row identity our
+    /// own tag writes keep current: an external same-length edit within one second refuses it (#118).
+    /// A row indexed before subsecond times were kept still redoes when its file is unchanged:
+    /// size, whole seconds and inode match, and the missing nanoseconds prove nothing either way.
+    func testRedoProceedsForAnUnchangedLegacyRow() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(fileID: file1, fingerprintHash: sha256(sampleFingerprintBytes))),
+            batchId: "match"
+        )
+        let undoBatchId = try await engine.undoBatch("match")
+        try await database.writer.write { db in
+            try db.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL WHERE id = ?", arguments: [file1])
+        }
+
+        try await engine.undoBatch(undoBatchId)
+
+        let trackID = try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db, key: file1)).trackId }
+        XCTAssertNotNil(trackID)
+    }
+
+    func testRedoIsRefusedAfterAnExternalSameSecondEdit() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(fileID: file1, fingerprintHash: sha256(sampleFingerprintBytes))),
+            batchId: "match"
+        )
+        let undoBatchId = try await engine.undoBatch("match")
+        let path = try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db, key: file1)).path }
+        let before = try XCTUnwrap(FileMetadataCollector.collect(at: path))
+        try overwriteInPlace(path, with: Data(repeating: 99, count: Int(before.fileSize)))
+        try setModificationTime(of: path, seconds: Int(before.mtime), nanoseconds: 500_000_000)
+
+        do {
+            try await engine.undoBatch(undoBatchId)
+            XCTFail("a redo must not label audio that changed after the undo")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .redoFileChanged(fileId: file1))
+        }
+        let trackID = try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db, key: file1)).trackId }
+        XCTAssertNil(trackID)
+    }
+
     /// Undoing a match on a shared pre-existing row must restore the row's
     /// captured previous identity even when an OLDER file still references it —
     /// that older file's state is exactly what `previousTrackIdentifiers`

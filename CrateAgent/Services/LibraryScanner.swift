@@ -172,6 +172,7 @@ public actor LibraryScanner {
                     inode: metadata.inode,
                     fileSize: metadata.fileSize,
                     mtime: metadata.mtime,
+                    mtimeNanoseconds: metadata.mtimeNanoseconds,
                     lightweightHash: metadata.lightweightHash,
                     bitrateKbps: bitrate,
                     metadata: makeSeratoMetadata(fromRecord: record)
@@ -379,7 +380,8 @@ public actor LibraryScanner {
                 }
             } else {
                 _ = try await operationEngine.applyObservedBatch([.indexNewFile(.init(path: identity.path, volumeUuid: identity.volumeUuid, inode: identity.inode,
-                                                                                      fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash,
+                                                                                      fileSize: identity.fileSize, mtime: identity.mtime, mtimeNanoseconds: identity.mtimeNanoseconds,
+                                                                                      lightweightHash: identity.lightweightHash,
                                                                                       bitrateKbps: bitrate, metadata: metadata))], authorization: authorization)
                 guard let file = try await database.writer.read({ connection in
                     try FileRecord.filter(Column("path") == path).fetchOne(connection)

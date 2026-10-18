@@ -605,6 +605,19 @@ final class AutoTagSessionTests: XCTestCase {
 
 @MainActor
 private struct SessionFixture {
+    private nonisolated static let trackPathPrefix = "/fixture/track-"
+    private nonisolated static let trackPathSuffix = ".mp3"
+
+    nonisolated static func path(ofTrack index: Int) -> String {
+        trackPathPrefix + String(index) + trackPathSuffix
+    }
+
+    /// A fixture track's live stat while unchanged: indexed size, time and inode (its index).
+    nonisolated static func unchangedStat(of path: String) -> FileFreshnessSnapshot {
+        let index = Int64(path.dropFirst(trackPathPrefix.count).dropLast(trackPathSuffix.count))
+        return FileFreshnessSnapshot(fileSize: 1000, inode: index, mtime: 10, mtimeNanoseconds: 0)
+    }
+
     let database: LibraryDatabase
     let fileIDs: [Int64]
     let loader: SessionLookupLoader
@@ -614,7 +627,7 @@ private struct SessionFixture {
     init(fileCount: Int, alternatives: Bool = false, firstLookupHasNoMatch: Bool = false, lowScoreAlternative: Bool = false, onlyMetadataMatches: Bool = false,
          blockedRecordingID: String? = nil,
          started: SessionGate = SessionGate(), release: SessionGate = SessionGate(),
-         fileFreshnessReader: @escaping FileFreshnessReading = { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 10) },
+         fileFreshnessReader: @escaping FileFreshnessReading = { path in SessionFixture.unchangedStat(of: path) },
          apply: @escaping @Sendable ([TrackMutation], String) async throws -> Void = { _, _ in },
          resync: @escaping @Sendable (String) async throws -> ResyncOutcome = { _ in ResyncOutcome(appliedCount: 1, queuedCount: 0) }) throws
     {
@@ -622,8 +635,8 @@ private struct SessionFixture {
         var inserted: [Int64] = []
         try database.writer.write { database in
             for index in 1 ... fileCount {
-                var file = FileRecord(path: "/fixture/track-\(index).mp3", volumeUuid: "TEST", inode: Int64(index), fileSize: 1000, mtime: 10,
-                                      chromaprintFingerprint: FingerprintEncoder.serialize([UInt32(index)]), fingerprintStatus: .done)
+                var file = FileRecord(path: Self.path(ofTrack: index), volumeUuid: "TEST", inode: Int64(index), fileSize: 1000, mtime: 10,
+                                      mtimeNanoseconds: 0, chromaprintFingerprint: FingerprintEncoder.serialize([UInt32(index)]), fingerprintStatus: .done)
                 file.libraryMembership = .active
                 file.fileAvailability = .available
                 try file.insert(database)
@@ -669,7 +682,7 @@ private final class SessionFreshnessSuspension: @unchecked Sendable {
         semaphore.signal()
     }
 
-    func read(_: String) -> FileFreshnessSnapshot {
+    func read(_ path: String) -> FileFreshnessSnapshot {
         let shouldWait = lock.withLock {
             let shouldWait = armed
             armed = false
@@ -679,7 +692,7 @@ private final class SessionFreshnessSuspension: @unchecked Sendable {
             started.fulfill()
             semaphore.wait()
         }
-        return FileFreshnessSnapshot(fileSize: 1000, mtime: 10)
+        return SessionFixture.unchangedStat(of: path)
     }
 }
 
