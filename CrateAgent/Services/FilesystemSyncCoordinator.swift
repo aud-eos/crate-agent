@@ -84,12 +84,7 @@ public actor FilesystemSyncCoordinator {
             try FileRecord.filter(Column("path") == observation.path).fetchOne(connection)
         }
         if let knownPath {
-            try await operationEngine.requireUnconflicted(.file(knownPath))
-            if try await resolvePendingMove(for: knownPath, batchID: batchID) {
-                return
-            }
-            guard let current = try await currentAvailability(of: knownPath) else { return }
-            try await observe(file: knownPath, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
+            try await observeIndexedPath(of: knownPath, batchID: batchID)
             return
         }
         try await revalidateTrashLocation(at: observation.path, batchID: batchID)
@@ -105,6 +100,10 @@ public actor FilesystemSyncCoordinator {
         }
         if inodeMatches.count > 1 {
             requiresReconciliation = true; return
+        }
+        if let indexed = inodeMatches.first, Self.namesSameEntry(observation.path, indexed.path) {
+            try await observeIndexedPath(of: indexed, batchID: batchID)
+            return
         }
         var existing = inodeMatches.first
         if existing == nil {
@@ -153,6 +152,30 @@ public actor FilesystemSyncCoordinator {
             trashLocation = location
         }
         try await observe(file: existing, availability: availability, metadata: metadata, trashLocation: trashLocation, batchID: batchID)
+    }
+
+    private func observeIndexedPath(of file: FileRecord, batchID: String) async throws {
+        try await operationEngine.requireUnconflicted(.file(file))
+        if try await resolvePendingMove(for: file, batchID: batchID) {
+            return
+        }
+        guard let current = try await currentAvailability(of: file) else { return }
+        try await observe(file: file, availability: current.availability, metadata: nil, trashLocation: current.trashLocation, batchID: batchID)
+    }
+
+    /// FSEvents names an item by its real path, which an indexed path can spell differently
+    /// (`/tmp` for `/private/tmp`, a symlinked folder, or case on a case-insensitive volume).
+    /// Taking the row's own entry for a move destination would record a bogus move that
+    /// later drops its real Trash destination (#225).
+    private static func namesSameEntry(_ path: String, _ other: String) -> Bool {
+        guard let resolved = realPath(path), let otherResolved = realPath(other) else { return false }
+        return resolved == otherResolved
+    }
+
+    private static func realPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// A trashed row keeps its indexed path, so only its recorded Trash item proves the audio still exists.
