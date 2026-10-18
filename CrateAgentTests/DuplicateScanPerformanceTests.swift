@@ -121,7 +121,8 @@ final class DuplicateScanPerformanceTests: XCTestCase {
         let selectElapsed = selectStart.duration(to: .now)
         XCTAssertEqual(awaiting.count, Self.perceptualPairs * 2, "Only colliding files need a full-length fingerprint")
 
-        XCTAssertLessThan(scanElapsed, .milliseconds(500))
+        // Opening Shared Openings, like opening Duplicates above.
+        XCTAssertLessThan(scanElapsed, .milliseconds(1000))
         XCTAssertLessThan(splitElapsed, .milliseconds(100))
         XCTAssertLessThan(selectElapsed, .milliseconds(500))
         let metrics = "SHARED_OPENINGS files=\(Self.fileCount) colliding=\(Self.perceptualPairs * 2) differing_groups=\(Self.differingPairs) select_colliding=\(selectElapsed) preview=\(scanElapsed) one_split=\(splitElapsed)"

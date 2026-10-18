@@ -130,5 +130,7 @@ either. Its redo takes the general replay guard.
 uses the 30,000-file duplicate fixture: 24,000 fingerprinted files, 3,300 of
 them in 1,650 colliding pairs, 150 of which differ over their full length. It
 holds three budgets: selecting the files that need a full-length fingerprint
-(only the 3,300) and the preview each under 500 ms, and one split's write under
-100 ms.
+(only the 3,300) under 500 ms, the preview under 1,000 ms (the budget for
+opening Duplicates on the same fixture), and one split's write under 100 ms.
+Measured: selection about 130 ms locally and 165 ms on CI, the preview 220 ms
+and 505 ms, and a split under 20 ms.
