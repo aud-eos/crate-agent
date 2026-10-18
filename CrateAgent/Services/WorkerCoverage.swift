@@ -29,9 +29,16 @@ struct FileInfoCoverage: Equatable, Sendable {
     var removedFromSerato = 0
 }
 
+/// Matched recordings a library file links to, and how many have a MusicBrainz work.
+struct MusicBrainzWorkCoverage: Equatable, Sendable {
+    var matched = 0
+    var withWork = 0
+}
+
 struct WorkerCoverage: Equatable, Sendable {
     var fingerprint = FingerprintCoverage()
     var fileInfo = FileInfoCoverage()
+    var musicBrainzWork = MusicBrainzWorkCoverage()
 }
 
 enum WorkerFileCategory: String, CaseIterable, Identifiable, Sendable {
@@ -101,7 +108,12 @@ enum WorkerCoverageQuery {
           COALESCE(SUM(NOT (\(active))), 0) AS removed
         FROM files
         """
-        guard let row = try Row.fetchOne(database, sql: sql) else { return WorkerCoverage() }
+        guard let row = try Row.fetchOne(database, sql: sql),
+              let works = try Row.fetchOne(database, sql: """
+              SELECT COUNT(*) AS matched, COALESCE(SUM(musicbrainz_work_id IS NOT NULL), 0) AS with_work
+              FROM tracks WHERE \(MusicBrainzWorkBackfill.matchedRecordingSQL)
+              """)
+        else { return WorkerCoverage() }
         let removed: Int = row["removed"]
         let available: Int = row["available"]
         let indexed: Int = row["indexed"]
@@ -111,7 +123,8 @@ enum WorkerCoverageQuery {
                                              awaitingMembership: available - row["eligible"], removedFromSerato: removed),
             fileInfo: FileInfoCoverage(indexed: indexed, available: available, missing: row["missing"], trashed: row["trashed"],
                                        offline: row["offline"], inaccessible: row["inaccessible"], unknown: row["unknown"],
-                                       removedFromSerato: removed)
+                                       removedFromSerato: removed),
+            musicBrainzWork: MusicBrainzWorkCoverage(matched: works["matched"], withWork: works["with_work"])
         )
     }
 
