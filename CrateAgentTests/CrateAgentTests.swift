@@ -2437,6 +2437,36 @@ final class FingerprintWorkerTests: XCTestCase {
         XCTAssertNotEqual(id1, id2) // sanity on the fixture
     }
 
+    /// A pre-subsecond basis that still matches its row is adopted, not re-decoded; one
+    /// that disagrees stays unconfirmable.
+    func testLegacyBasesMatchingTheirRowsAreAdoptedWithoutDecoding() async throws {
+        let database = try await LibraryDatabase.openInMemory()
+        let matching = try await insertPendingFile(path: "/Music/A/matching.mp3", in: database, inode: 1)
+        let stale = try await insertPendingFile(path: "/Music/A/stale.mp3", in: database, inode: 2)
+        let fingerprint = FingerprintEncoder.serialize([7, 8])
+        try await database.writer.write { db in
+            try db.execute(sql: """
+            UPDATE files SET fingerprint_status = 'done', chromaprint_fingerprint = ?, fingerprinted_size = 1024,
+                fingerprinted_mtime = CASE WHEN id = ? THEN 1700000000 ELSE 1699999999 END
+            """, arguments: [fingerprint, matching])
+        }
+        let worker = FingerprintWorker(database: database, concurrency: 1, fingerprintFunction: { path in
+            XCTFail("Decoded \(path)")
+            return []
+        })
+
+        _ = try await worker.processAllPendingOnce()
+
+        let rows = try await database.writer.read { db in
+            try (XCTUnwrap(FileRecord.fetchOne(db, key: matching)), XCTUnwrap(FileRecord.fetchOne(db, key: stale)))
+        }
+        XCTAssertEqual(rows.0.fingerprintStatus, .done)
+        XCTAssertEqual(rows.0.chromaprintFingerprint, fingerprint)
+        XCTAssertNil(rows.0.fingerprintedSize)
+        XCTAssertEqual(rows.0.fingerprintBasis, rows.0.freshness)
+        XCTAssertEqual(rows.1.fingerprintedMtime, 1_699_999_999)
+    }
+
     func testFailingFingerprintMarksRowFailedWithoutBlockingOtherFiles() async throws {
         let database = try await LibraryDatabase.openInMemory()
         try await insertPendingFile(path: "/Music/A/good.mp3", in: database, inode: 1)

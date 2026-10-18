@@ -14,10 +14,7 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
     }
 
     private func nativeTrashCapture(replaying: Bool) async throws {
-        let mount = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume").standardizedFileURL
-        guard FileManager.default.fileExists(atPath: mount.appendingPathComponent(".task6-test-volume").path) else {
-            throw XCTSkip("Requires task-owned APFS volume")
-        }
+        let mount = try ownedVolume()
         let music = mount.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: music, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: music) }
@@ -28,17 +25,7 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         let source = music.appendingPathComponent("native-trash.wav")
         try FileManager.default.moveItem(atPath: local.path, toPath: source.path)
         let identity = try FileMetadataCollector.collectVerified(at: source.path)
-        let file = try await fixture.database.writer.write { connection in
-            var moved = local
-            moved.path = identity.path
-            moved.volumeUuid = identity.volumeUuid
-            moved.inode = identity.inode
-            moved.fileSize = identity.fileSize
-            moved.mtime = identity.mtime
-            moved.lightweightHash = identity.lightweightHash
-            try moved.update(connection)
-            return moved
-        }
+        let file = try await relocate(local, to: identity, in: fixture)
         try fixture.save(paths: [file.path])
         let trash = try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: music, create: true).standardizedFileURL
         guard trash.path.hasPrefix(mount.path + "/") else { return XCTFail("Native Trash must belong to the owned volume") }
@@ -131,11 +118,45 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         XCTAssertEqual(try savedPaths(fixture), [file.path])
     }
 
+    /// FSEvents spells the owned volume `/private/tmp`, while the indexed path is standardized to
+    /// `/tmp`. An event on the still-present source must not become a move destination, or the
+    /// later Trash destination is dropped and reconciliation records the file missing (#225).
+    func testDifferentlySpelledSourceEventKeepsNativeTrashCapture() async throws {
+        let mount = try ownedVolume()
+        let music = mount.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: music, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: music) }
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let local = try await fixture.add("spelled.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let source = music.appendingPathComponent("spelled.wav")
+        try FileManager.default.moveItem(atPath: local.path, toPath: source.path)
+        let file = try await relocate(local, to: FileMetadataCollector.collectVerified(at: source.path), in: fixture)
+        let eventSourcePath = "/private" + file.path
+        XCTAssertTrue(file.path.hasPrefix("/tmp/"))
+        let coordinator = FilesystemSyncCoordinator(operationEngine: fixture.engine, database: fixture.database)
+        try await coordinator.handleObservations([FSEventsObservation(path: eventSourcePath, isFile: true, wasCreated: true, wasModified: true, eventID: 1)])
+
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: source, resultingItemURL: &resultingURL)
+        let destination = try XCTUnwrap(resultingURL as URL?).standardizedFileURL
+        defer { try? FileManager.default.removeItem(at: destination) }
+        try await coordinator.handleObservations([
+            FSEventsObservation(path: eventSourcePath, isFile: true, wasRenamed: true, eventID: 2),
+            FSEventsObservation(path: "/private" + destination.path, isFile: true, wasRenamed: true, eventID: 3),
+        ])
+
+        let after = try await fixture.row(file)
+        XCTAssertEqual(after.fileAvailability, .trashed)
+        XCTAssertEqual(after.path, file.path)
+        let location = try await trashLocation(of: file, fixture: fixture)
+        XCTAssertEqual(location.map { SeratoPath.normalized($0.path) }, SeratoPath.normalized(destination.path))
+        let reconciliationRequested = await coordinator.takeReconciliationRequest()
+        XCTAssertFalse(reconciliationRequested)
+    }
+
     func testWatchConfigurationCreatesOwnedTrashAndScopesCombinedCursor() throws {
-        let mount = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume").standardizedFileURL
-        guard FileManager.default.fileExists(atPath: mount.appendingPathComponent(".task6-test-volume").path) else {
-            throw XCTSkip("Requires task-owned APFS volume")
-        }
+        let mount = try ownedVolume()
         let music = mount.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: music, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: music) }
@@ -152,6 +173,28 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         XCTAssertEqual(configuration.resumeEventID { $0 == music.path ? 7 : nil }, 7)
         XCTAssertEqual(configuration.resumeEventID { $0 == configuration.checkpointKey ? 12 : 7 }, 12)
         XCTAssertThrowsError(try FilesystemWatchConfiguration(musicFolder: music, trashDirectory: { _ in throw CocoaError(.fileWriteNoPermission) }))
+    }
+
+    private func ownedVolume() throws -> URL {
+        let mount = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume").standardizedFileURL
+        guard FileManager.default.fileExists(atPath: mount.appendingPathComponent(".task6-test-volume").path) else {
+            throw XCTSkip("Requires task-owned APFS volume")
+        }
+        return mount
+    }
+
+    private func relocate(_ local: FileRecord, to identity: FileMetadata, in fixture: SeratoRemovalFixture) async throws -> FileRecord {
+        try await fixture.database.writer.write { connection in
+            var moved = local
+            moved.path = identity.path
+            moved.volumeUuid = identity.volumeUuid
+            moved.inode = identity.inode
+            moved.fileSize = identity.fileSize
+            moved.mtime = identity.mtime
+            moved.lightweightHash = identity.lightweightHash
+            try moved.update(connection)
+            return moved
+        }
     }
 
     func testEmptyWatchConfigurationFailsVisibly() {

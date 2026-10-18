@@ -5,7 +5,7 @@ import Foundation
 /// Every non-success HTTP status — and every transport-level failure —
 /// maps to exactly one of these; none of them is silently swallowed into
 /// an empty result.
-public enum LookupError: Error, Equatable {
+public enum LookupError: LocalizedError, Equatable {
     /// 401 — the API key/credentials were rejected.
     case unauthorized
     /// 429 — rate limited, and retries were exhausted.
@@ -23,4 +23,19 @@ public enum LookupError: Error, Equatable {
     /// unparsable response body, a non-HTTP response, or an unexpected status
     /// code. Carries the underlying description for operator-useful context.
     case transport(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unauthorized:
+            "the AcoustID API key was rejected (401 Unauthorized)"
+        case .rateLimited:
+            "the lookup was rate-limited and retries were exhausted"
+        case .server:
+            "the lookup server returned repeated errors"
+        case let .offline(message):
+            "the network is unavailable (\(message))"
+        case let .transport(message):
+            message
+        }
+    }
 }

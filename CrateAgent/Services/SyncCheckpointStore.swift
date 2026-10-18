@@ -19,7 +19,22 @@ actor SyncCheckpointStore {
     func dirtyFiles() async throws -> SyncDirtyFiles {
         try await database.writer.read { connection in
             let rows = try Row.fetchAll(connection, sql: "SELECT file_id, path FROM sync_dirty_files")
-            return SyncDirtyFiles(fileIDs: Set(rows.map { row in row["file_id"] }), paths: Set(rows.map { row in row["path"] }))
+            return SyncDirtyFiles(fileIDs: Set(rows.map { row in row["file_id"] }), paths: Set(rows.map { row in PathBytes(bytes: row["path"]) }))
+        }
+    }
+
+    /// Whether an active, available row was indexed before subsecond times were kept. Only a
+    /// planned sync records that time, so such a row keeps sync off the unchanged fast path.
+    /// Whether a row the reconciler can record for `libraryID` still lacks its subsecond
+    /// time. Rows of another Serato library are never reconciled here, so they must not
+    /// keep the fast path closed.
+    func hasRowsAwaitingSubsecondTime(libraryID: String) async throws -> Bool {
+        try await database.writer.read { connection in
+            try Bool.fetchOne(connection, sql: """
+            SELECT EXISTS(SELECT 1 FROM files WHERE mtime_nanoseconds IS NULL
+                          AND library_membership = 'active' AND file_availability = 'available'
+                          AND (serato_library_id IS NULL OR serato_library_id = ?))
+            """, arguments: [libraryID]) ?? false
         }
     }
 

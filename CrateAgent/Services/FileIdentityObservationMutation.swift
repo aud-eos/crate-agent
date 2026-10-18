@@ -54,7 +54,7 @@ extension FileRecord {
     }
 
     static func loadIdentityProjections(database: LibraryDatabase) async throws -> [FileRecord] {
-        let columns = "id, track_id, path, volume_uuid, inode, file_size, mtime, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision, artist, title, album, genre, bpm, musical_key, comment, length, label, serato_year, bitrate_kbps"
+        let columns = "id, track_id, path, volume_uuid, inode, file_size, mtime, mtime_nanoseconds, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision, artist, title, album, genre, bpm, musical_key, comment, length, label, serato_year, bitrate_kbps"
         var result: [FileRecord] = []
         var cursor: Int64 = 0
         while true {
@@ -70,7 +70,8 @@ extension FileRecord {
     }
 
     public var identity: FileMetadata {
-        FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, lightweightHash: lightweightHash)
+        FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, mtimeNanoseconds: mtimeNanoseconds,
+                     lightweightHash: lightweightHash)
     }
 }
 
@@ -78,9 +79,13 @@ enum FileIdentityObservationMutation {
     static func recordOwnedTagWrite(previous: FileRecord, identity: FileMetadata, eventID: Int64, in database: GRDB.Database) throws {
         guard let fileID = previous.id else { throw OperationEngineError.insertDidNotReturnRowId }
         var current = previous
-        if current.fingerprintedSize == previous.fileSize, current.fingerprintedMtime == previous.mtime {
+        // Tags are not audio: a fingerprint still valid for the pre-write file stays valid,
+        // so its explicit basis follows our own write instead of forcing a re-decode.
+        if current.fingerprintedSize != nil, current.fingerprintBasis.isConfirmed(by: previous.freshness) {
             current.fingerprintedSize = identity.fileSize
             current.fingerprintedMtime = identity.mtime
+            current.fingerprintedMtimeNanoseconds = identity.mtimeNanoseconds
+            current.fingerprintedInode = identity.inode
         }
         applyIdentity(identity, to: &current)
         guard current != previous else { return }
@@ -138,6 +143,8 @@ enum FileIdentityObservationMutation {
             file.fingerprintStatus = .pending
             file.fingerprintedSize = nil
             file.fingerprintedMtime = nil
+            file.fingerprintedMtimeNanoseconds = nil
+            file.fingerprintedInode = nil
             file.bitrateKbps = nil
             applyMetadata(SeratoMetadata(), to: &file)
         }
@@ -170,7 +177,7 @@ enum FileIdentityObservationMutation {
             return false
         }
         return file.volumeUuid != identity.volumeUuid || file.inode != identity.inode
-            || file.fileSize != identity.fileSize || file.mtime != identity.mtime
+            || file.fileSize != identity.fileSize || !file.hasSameModificationTime(as: identity)
             || (file.lightweightHash != nil && file.lightweightHash != identity.lightweightHash)
     }
 
@@ -180,6 +187,7 @@ enum FileIdentityObservationMutation {
         file.inode = identity.inode
         file.fileSize = identity.fileSize
         file.mtime = identity.mtime
+        file.mtimeNanoseconds = identity.mtimeNanoseconds
         file.lightweightHash = identity.lightweightHash
     }
 
@@ -188,7 +196,7 @@ enum FileIdentityObservationMutation {
         if let hash = file.lightweightHash {
             return hash == identity.lightweightHash
         }
-        return file.inode == identity.inode && file.volumeUuid == identity.volumeUuid && file.mtime == identity.mtime
+        return file.inode == identity.inode && file.volumeUuid == identity.volumeUuid && file.hasSameModificationTime(as: identity)
     }
 
     private static func applyMetadata(_ metadata: SeratoMetadata, to file: inout FileRecord) {

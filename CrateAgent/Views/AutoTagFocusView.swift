@@ -19,9 +19,9 @@ struct AutoTagFocusView<Content: View>: View {
                 Text("Track \(position) of \(total)")
                     .font(.body.monospacedDigit())
             } actions: {
-                Button("Previous", systemImage: "chevron.left", action: previous)
+                Button("Previous", action: previous)
                     .disabled(position <= 1 || !navigationEnabled)
-                Button("Next", systemImage: "chevron.right", action: next)
+                Button("Next", action: next)
                     .disabled(position >= total || !navigationEnabled)
                 Button(isApproved ? "Approved — Next Ready" : "Approve & Next", action: approveAndAdvance)
                     .disabled(!canApprove)

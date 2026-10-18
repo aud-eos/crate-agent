@@ -132,7 +132,7 @@ public struct AcoustIDClient: Sendable {
     /// `internal`, not below it).
     static func cacheKey(forFingerprint fingerprintBase64: String, durationSeconds: Int) -> String {
         let digest = SHA256.hash(data: Data("\(fingerprintBase64)|\(durationSeconds)".utf8))
-        let hexDigest = digest.map { String(format: "%02x", $0) }.joined()
+        let hexDigest = digest.lowercaseHex
         return "acoustid:\(hexDigest)"
     }
 }

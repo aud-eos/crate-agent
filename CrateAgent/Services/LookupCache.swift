@@ -108,7 +108,7 @@ private final class DiskLookupCacheBackend: LookupCacheBackend, @unchecked Senda
     /// digest of the key rather than the key itself.
     private func fileURL(forKey key: String) -> URL {
         let digest = SHA256.hash(data: Data(key.utf8))
-        let hexDigest = digest.map { String(format: "%02x", $0) }.joined()
+        let hexDigest = digest.lowercaseHex
         return directory.appendingPathComponent(hexDigest)
     }
 }

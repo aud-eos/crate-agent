@@ -36,11 +36,15 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var volumeUuid: String
     public var inode: Int64
     public var fileSize: Int64
+    /// Whole seconds since the epoch.
     public var mtime: Int64
+    /// The subsecond part of `mtime` in nanoseconds; nil for rows indexed before migration 018.
+    public var mtimeNanoseconds: Int64?
     public var lightweightHash: Data?
     public var chromaprintFingerprint: Data?
     public var fingerprintStatus: FingerprintStatus
-    /// The file's on-disk size + mtime at the moment its current
+    /// The file's on-disk size and modification time (with the inode and
+    /// subsecond part since migration 018) at the moment its current
     /// `chromaprintFingerprint` was computed — the freshness basis the
     /// auto-tagger compares the live file against before trusting a stored
     /// fingerprint for a lookup. Written whenever the fingerprint is
@@ -52,6 +56,10 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     /// for those rows IS the fingerprint's basis) when these are nil.
     public var fingerprintedSize: Int64?
     public var fingerprintedMtime: Int64?
+    /// The rest of the fingerprint basis; nil for bases recorded before migration 018, which
+    /// therefore cannot confirm a fingerprint (see `FileFreshnessSnapshot.isConfirmed(by:)`).
+    public var fingerprintedMtimeNanoseconds: Int64?
+    public var fingerprintedInode: Int64?
     public var trackId: Int64?
     /// Audio bitrate in kbps from lofty's audio_bitrate, populated
     /// during indexing. Nil for rows pre-dating the bitrate column
@@ -80,11 +88,14 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         inode: Int64,
         fileSize: Int64,
         mtime: Int64,
+        mtimeNanoseconds: Int64? = nil,
         lightweightHash: Data? = nil,
         chromaprintFingerprint: Data? = nil,
         fingerprintStatus: FingerprintStatus = .pending,
         fingerprintedSize: Int64? = nil,
         fingerprintedMtime: Int64? = nil,
+        fingerprintedMtimeNanoseconds: Int64? = nil,
+        fingerprintedInode: Int64? = nil,
         trackId: Int64? = nil,
         bitrateKbps: Int? = nil,
         artist: String? = nil,
@@ -104,11 +115,14 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         self.inode = inode
         self.fileSize = fileSize
         self.mtime = mtime
+        self.mtimeNanoseconds = mtimeNanoseconds
         self.lightweightHash = lightweightHash
         self.chromaprintFingerprint = chromaprintFingerprint
         self.fingerprintStatus = fingerprintStatus
         self.fingerprintedSize = fingerprintedSize
         self.fingerprintedMtime = fingerprintedMtime
+        self.fingerprintedMtimeNanoseconds = fingerprintedMtimeNanoseconds
+        self.fingerprintedInode = fingerprintedInode
         self.trackId = trackId
         self.bitrateKbps = bitrateKbps
         self.artist = artist
@@ -121,6 +135,19 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         self.length = length
         self.label = label
         self.seratoYear = seratoYear
+    }
+
+    /// The file's indexed freshness identity.
+    public var freshness: FileFreshnessSnapshot {
+        FileFreshnessSnapshot(fileSize: fileSize, inode: inode, mtime: mtime, mtimeNanoseconds: mtimeNanoseconds)
+    }
+
+    /// What the stored fingerprint was computed from: its own recorded basis, or for rows
+    /// fingerprinted without one (the background worker, byte twins) the indexed identity.
+    public var fingerprintBasis: FileFreshnessSnapshot {
+        guard let fingerprintedSize, let fingerprintedMtime else { return freshness }
+        return FileFreshnessSnapshot(fileSize: fingerprintedSize, inode: fingerprintedInode, mtime: fingerprintedMtime,
+                                     mtimeNanoseconds: fingerprintedMtimeNanoseconds)
     }
 
     public mutating func didInsert(_ inserted: InsertionSuccess) {
@@ -141,6 +168,24 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         try FileRecord
             .filter(Column("track_id") == trackId && Column("id") != excludingFileId)
             .fetchCount(db) > 0
+    }
+
+    /// How the user knows the file: its title, else its file name.
+    var displayName: String {
+        title.flatMap { title in title.isEmpty ? nil : title } ?? (path as NSString).lastPathComponent
+    }
+
+    /// The lowest-id file still in the library, other than `excludingFileId`,
+    /// that links to `trackId`. A retired file keeps its link but no longer
+    /// claims the recording for grouping.
+    static func otherActiveFileReferencingTrack(
+        _ trackId: Int64?,
+        excluding excludingFileId: Int64,
+        in db: GRDB.Database
+    ) throws -> FileRecord? {
+        try FileRecord.filter(Column("track_id") == trackId && Column("id") != excludingFileId)
+            .filter(sql: FileProcessingEligibility.activeSQL)
+            .order(Column("id")).fetchOne(db)
     }
 }
 
