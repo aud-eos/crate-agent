@@ -54,7 +54,7 @@ final class OperationEngineApplyBatchTests: XCTestCase {
             XCTFail("Batch containing a conflict committed")
         } catch is SeratoPathConflictError {}
         do {
-            _ = try await fixture.engine.resolveDuplicate(target: independent, keeper: protected, batchID: "blocked-keeper")
+            _ = try await fixture.engine.resolveDuplicate(target: independent, keeper: protected, batchID: "blocked-keeper", requirement: .identicalContent)
             XCTFail("Protected keeper authorized duplicate cleanup")
         } catch is SeratoPathConflictError {}
         let protectedAfter = try await fixture.row(protected)
