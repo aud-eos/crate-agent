@@ -84,6 +84,7 @@ no title.
 | `merge(_:into:)` | Moves every member of the given families into one, keeping its saved main version. |
 | `split(_:from:)` | Moves two or more members into a new family, with the saved main version if it moves. |
 | `setRepresentative(_:of:)` | Saves a main version, or clears it with nil. |
+| `apply(_:authority:)` | Runs several creates, attaches and merges as one batch; one refusal refuses them all. |
 | `family(id:)`, `family(containingTrack:)` | Reads a family's live members, with its displayed representative. |
 
 Members are passed as `SongFamilyMember.track(id)` or `.file(id)`. In the same
@@ -188,6 +189,53 @@ step is under that budget:
 
 Each interaction includes the new snapshot, its first page, its families'
 members, and the selection summary.
+
+## Find Versions
+
+**Find Versions…** in Library's header suggests families across the library.
+`SongFamilySuggester` is the API: `suggestions()` scans, and `apply(_:)` groups
+the confirmed suggestions through `SongFamilyService`, so every family follows
+the rules above and a collision is refused by name.
+
+- **Candidates.** Processable files with the same normalized artist and title
+  stem. The stem drops every annotation that names a version in the
+  `VersionLabel` vocabulary, labelled or not (`(Clean)`, `- Radio Edit`,
+  `(DJ Snake Remix)`, `(Club Mix)`), and every featured-artist annotation.
+  Both sides drop a trailing featured credit (`feat.`, `ft.`, `featuring`; for
+  the artist also `&`), punctuation, case and diacritics. Words in the base title
+  are kept, so "Dirty Diana" is not "Diana".
+- **Recordings.** Each candidate is placed on the recording grouping would link
+  it to. Linked files keep their recording; an unlinked file takes the
+  recording its current fingerprint names. Files without a current fingerprint
+  are left out and counted until fingerprinting finishes.
+- **Same audio.** Files that are duplicates, not versions, are left out and
+  listed with a pointer to **Duplicates**: recordings whose files share a
+  decoded-audio or byte digest in the duplicate digest cache (no new decode),
+  unlinked files that share a fingerprint or whose fingerprint another file
+  already claims (grouping would refuse them), and recordings whose own files
+  name different labels.
+- **Targets.** A suggestion with no member in a live family creates one. One
+  with members in one live family adds the others to it; one whose members are
+  all grouped already is not shown. One spanning several live families merges
+  them into the family holding most of its files, then adds the rest.
+- **Confidence.** A suggestion is **Strong** (pre-checked) when every version
+  names a different set of labels, and **Near** (unchecked) when versions repeat
+  a set or the suggestion merges families. Recordings that share a MusicBrainz
+  recording are one version, as everywhere else. A shared MusicBrainz work is
+  meant to be the strongest signal, but crate-agent does not record work IDs
+  yet (#262).
+- **Checklist.** One row per suggested family, showing each file's title,
+  version label and length. The family checkbox is mixed while only some
+  versions are checked; unchecking a version leaves it out. A new family needs
+  two checked versions. A rescan keeps the user's checks.
+- **Apply.** The checked families are one History batch, undone in one step.
+  One apply groups at most `SongFamilySuggester.maximumFamiliesPerApply` (100)
+  families, so the writer is held well under 500 ms; group again for the rest.
+
+`LibraryPagingTests` measures the 30,000-file fixture with 2,000 three-version
+suggestions. The scan reads the library on a database reader, off the main
+actor, so Library stays responsive while it runs. Budgets: scan under 2 s, main
+actor stalls under 100 ms, and an apply's longest writer wait under 500 ms.
 
 ## History and undo
 
