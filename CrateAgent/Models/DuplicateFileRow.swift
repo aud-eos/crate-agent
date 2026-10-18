@@ -14,9 +14,9 @@ public protocol DuplicateFileSource: SeratoConflictTargetFile, Hashable, Sendabl
     var bitrateKbps: Int? { get }
     var fingerprintStatus: FingerprintStatus { get }
     var identity: FileMetadata { get }
+    /// Plays Serato History attributes to this file; a keeper tiebreak.
+    var seratoPlayCount: Int { get }
 }
-
-extension FileRecord: DuplicateFileSource {}
 
 /// One member of a duplicate group, fetched by
 /// `DuplicateFinder.findDuplicates(in:mode:)`. Carries the reviewed
@@ -31,23 +31,27 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
     public let inode: Int64
     public let fileSize: Int64
     public let mtime: Int64
+    public let mtimeNanoseconds: Int64?
     public let lightweightHash: Data?
     public let bitrateKbps: Int?
     public let artist: String?
     public let title: String?
     public let album: String?
     public let fingerprintStatus: FingerprintStatus
+    public let seratoPlayCount: Int
 
     static let columnsSQL = """
-    files.id, files.membership_revision, files.path, files.volume_uuid, files.inode, files.file_size, files.mtime,
+    files.id, files.membership_revision, files.path, files.volume_uuid, files.inode, files.file_size, files.mtime, files.mtime_nanoseconds,
     files.lightweight_hash, files.bitrate_kbps, files.artist, files.title, files.album, files.fingerprint_status
     """
 
     public var identity: FileMetadata {
-        FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, lightweightHash: lightweightHash)
+        FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, mtimeNanoseconds: mtimeNanoseconds,
+                     lightweightHash: lightweightHash)
     }
 
-    init(row: Row) throws {
+    /// `playCounts` is `SeratoPlayCounts.all(in:)`; a file absent from it has no attributed plays.
+    init(row: Row, playCounts: [Int64: Int]) throws {
         id = row["id"]
         membershipRevision = row["membership_revision"]
         path = row["path"]
@@ -55,6 +59,7 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
         inode = row["inode"]
         fileSize = row["file_size"]
         mtime = row["mtime"]
+        mtimeNanoseconds = row["mtime_nanoseconds"]
         lightweightHash = row["lightweight_hash"]
         bitrateKbps = row["bitrate_kbps"]
         artist = row["artist"]
@@ -65,6 +70,7 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
             throw DuplicateScanError.unknownFingerprintStatus(status)
         }
         self.fingerprintStatus = fingerprintStatus
+        seratoPlayCount = id.flatMap { identifier in playCounts[identifier] } ?? 0
     }
 }
 

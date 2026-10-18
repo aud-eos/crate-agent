@@ -19,8 +19,20 @@ protocol PagedQuerySnapshot: Sendable {
 struct PagedSelectionSummary: Equatable, Sendable {
     let total: Int
     let inScope: Int
+    /// Rows a scope-wide Select all would select.
     let scopeCount: Int
     let removed: Int
+    /// Selected rows among those `scopeCount` rows; drives the Select all toggle's state.
+    var scopeSelected: Int
+
+    init(total: Int, inScope: Int, scopeCount: Int, removed: Int, scopeSelected: Int? = nil) {
+        self.total = total
+        self.inScope = inScope
+        self.scopeCount = scopeCount
+        self.removed = removed
+        self.scopeSelected = scopeSelected ?? inScope
+    }
+
     var hidden: Int {
         total - inScope
     }

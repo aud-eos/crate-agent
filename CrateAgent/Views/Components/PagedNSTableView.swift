@@ -18,6 +18,8 @@ final class PagedNSTableView: NSTableView {
     var selectMatchingRows: (() -> Void)?
     var menuAtRow: ((Int) -> NSMenu?)?
     var focusChanged: ((Int) -> Void)?
+    /// Returns whether the row handled the disclosure key.
+    var disclosureIntent: ((Int, Bool) -> Bool)?
     /// Handles Space for the focused row instead of toggling its selection;
     /// Shift-Space then toggles the selection.
     var spaceAction: ((Int) -> Bool)? {
@@ -60,6 +62,12 @@ final class PagedNSTableView: NSTableView {
             if modifiers == .shift || spaceAction?(selectedRow) != true {
                 selectionIntent?(selectedRow, [.command])
             }
+            return
+        case 123, 124:
+            if selectedRow >= 0, disclosureIntent?(selectedRow, event.keyCode == 124) == true {
+                return
+            }
+            super.keyDown(with: event)
             return
         default:
             super.keyDown(with: event)

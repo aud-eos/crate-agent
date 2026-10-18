@@ -69,6 +69,72 @@ final class LibraryPagingTests: XCTestCase {
         }
     }
 
+    /// Invariant 8 evidence: 30,000 files, then 6,000 of them grouped into 2,000 three-version families.
+    func testSongFamilyProjectionStaysWithinPagingBudgetsAtThirtyThousandFiles() async throws {
+        let fixture = try fixture
+        func measure(_ label: String) async throws -> String {
+            let start = ContinuousClock.now
+            let snapshot = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: .init(sort: .init(column: .artist)))
+            let opened = ContinuousClock.now
+            _ = try await snapshot.rows(in: 0 ..< 200)
+            let firstPage = ContinuousClock.now
+            let total = await snapshot.count()
+            _ = try await snapshot.rows(in: (total - 200) ..< total)
+            let distantPage = ContinuousClock.now
+            _ = try await snapshot.selectAllIdentities(after: nil, limit: 200)
+            let placements = ContinuousClock.now
+            for duration in [opened - start, firstPage - opened, distantPage - firstPage, placements - distantPage] {
+                XCTAssertLessThan(duration, .milliseconds(500))
+            }
+            return "\(label)_rows=\(total) \(label)_count_ms=\((opened - start).milliseconds) \(label)_first_page_ms=\((firstPage - opened).milliseconds) "
+                + "\(label)_distant_page_ms=\((distantPage - firstPage).milliseconds) \(label)_placements_ms=\((placements - distantPage).milliseconds)"
+        }
+        let ungrouped = try await measure("ungrouped")
+        try await fixture.pool.write { connection in
+            for family in 0 ..< 2000 {
+                var record = SongFamilyRecord()
+                try record.insert(connection)
+                for member in 0 ..< 3 {
+                    let fileID = Int64(family * 10 + member + 1)
+                    var track = TrackRecord(fingerprintHash: Data("family-\(fileID)".utf8), workId: record.id)
+                    try track.insert(connection)
+                    try connection.execute(sql: "UPDATE files SET track_id = ? WHERE id = ?", arguments: [track.id, fileID])
+                }
+            }
+        }
+        let grouped = try await measure("grouped")
+        let snapshot = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: fixture.query)
+        let visible = await snapshot.count()
+        XCTAssertEqual(visible, 26000)
+
+        // One interaction is what the screen waits for: the new snapshot, its first page,
+        // the members of the families on it, and the selection summary over every placement.
+        let store = try LibrarySelectionStore(database: fixture.database)
+        try await store.setScope(snapshot, selected: true)
+        func interaction(_ label: String, _ query: LibraryBrowseQuery) async throws -> String {
+            let start = ContinuousClock.now
+            let opened = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: query)
+            let page = try await opened.rows(in: 0 ..< 200)
+            _ = try await opened.familyMembers(Set(page.compactMap { row in row.familyRole == .main ? row.familyId : nil }))
+            _ = try await store.summary(in: opened)
+            let elapsed = ContinuousClock.now - start
+            XCTAssertLessThan(elapsed, .milliseconds(500), label)
+            return "\(label)_ms=\(elapsed.milliseconds)"
+        }
+        let firstPage = try await snapshot.rows(in: 0 ..< 200)
+        let firstFamily = try XCTUnwrap(firstPage.first { row in row.familyRole == .main }?.familyId)
+        let expanded = try await interaction("expand", LibraryBrowseQuery(sort: fixture.query.sort, expandedFamilies: [firstFamily]))
+        let collapsed = try await interaction("collapse", fixture.query)
+        let included = try await interaction("include_alternates", LibraryBrowseQuery(sort: fixture.query.sort, includeAlternates: true))
+        let searched = try await interaction("search", LibraryBrowseQuery(search: "Artist A", sort: fixture.query.sort))
+        await store.close()
+        let metrics = "\(ungrouped) \(grouped) \(expanded) \(collapsed) \(included) \(searched)"
+        print("SONG_FAMILY_PAGING_METRICS \(metrics)")
+        let attachment = XCTAttachment(string: metrics)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testCapturedSelectionExcludesNewMatchesAndReconcilesChangedIdentities() async throws {
         let fixture = try fixture
         let store = try LibrarySelectionStore(database: fixture.database)
@@ -107,7 +173,7 @@ final class LibraryPagingTests: XCTestCase {
 
     func testPartialCaptureFailureRollsBackWithoutChangingCommittedSelection() async throws {
         let fixture = try fixture
-        let store = try LibrarySelectionStore(database: fixture.database, readIdentities: { snapshot, after, limit in
+        let store = try LibrarySelectionStore(database: fixture.database, readIdentities: { snapshot, _, after, limit in
             if after != nil {
                 throw PagingFixtureError.unavailable
             }
@@ -248,5 +314,11 @@ final class LibraryPagingTests: XCTestCase {
             try connection.execute(sql: "UPDATE files SET file_availability = 'offline' WHERE id = 30000")
         }
         await fulfillment(of: [changes], timeout: 3)
+    }
+}
+
+private extension Duration {
+    var milliseconds: Double {
+        Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
     }
 }

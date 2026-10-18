@@ -26,9 +26,9 @@ enum FingerprintPersistence {
         return result
     }
 
-    /// - Parameter freshnessBasis: the file's on-disk size + mtime AT THE TIME
-    ///   this fingerprint was computed, persisted into
-    ///   `fingerprinted_size`/`fingerprinted_mtime` so a later scan can tell a
+    /// - Parameter freshnessBasis: the file's on-disk identity AT THE TIME
+    ///   this fingerprint was computed, persisted into the `fingerprinted_*`
+    ///   columns so a later scan can tell a
     ///   trustworthy stored fingerprint from a stale one WITHOUT re-decoding
     ///   (finding #3999114461). Pass it whenever the caller computed the
     ///   fingerprint from the live file (the on-demand path). Nil leaves the
@@ -68,10 +68,12 @@ enum FingerprintPersistence {
                     fingerprint_status = ?,
                     fingerprint_failure = ?,
                     fingerprinted_size = ?,
-                    fingerprinted_mtime = ?
+                    fingerprinted_mtime = ?,
+                    fingerprinted_mtime_nanoseconds = ?,
+                    fingerprinted_inode = ?
                 WHERE id = ?\(pendingGuard)
                 """,
-                arguments: [fingerprint, status.rawValue, failureReason, basis.fileSize, basis.mtime, fileID]
+                arguments: [fingerprint, status.rawValue, failureReason, basis.fileSize, basis.mtime, basis.mtimeNanoseconds, basis.inode, fileID]
             )
         } else {
             try db.execute(
@@ -86,6 +88,22 @@ enum FingerprintPersistence {
             )
         }
         return db.changesCount > 0
+    }
+
+    /// Clears an explicit fingerprint basis recorded before subsecond times were kept when its
+    /// size and whole seconds still match the row, so the basis falls back to the row's own
+    /// identity as a worker-written one does, and the fingerprint stays `done` without a
+    /// re-decode. A basis that disagrees with the row is left unconfirmable.
+    @discardableResult static func adoptLegacyBasesMatchingTheirRows(in db: Database) throws -> Int {
+        try db.execute(sql: """
+        UPDATE files
+        SET fingerprinted_size = NULL, fingerprinted_mtime = NULL,
+            fingerprinted_mtime_nanoseconds = NULL, fingerprinted_inode = NULL
+        WHERE fingerprint_status = 'done' AND fingerprinted_size IS NOT NULL
+          AND (fingerprinted_mtime_nanoseconds IS NULL OR fingerprinted_inode IS NULL)
+          AND fingerprinted_size = file_size AND fingerprinted_mtime = mtime
+        """)
+        return db.changesCount
     }
 
     /// Returns failed and invalid `done` rows to `pending` so the worker recomputes them;

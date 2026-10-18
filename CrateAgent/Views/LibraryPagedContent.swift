@@ -8,6 +8,7 @@ enum LibraryBrowserAction: Equatable {
     case reveal
 }
 
+/// Song-family changes offered from a Library row's context menu.
 struct LibraryPagedContent: View {
     @ObservedObject var model: LibraryBrowserModel
     let density: AppDensity
@@ -16,14 +17,15 @@ struct LibraryPagedContent: View {
     var player: TrackPlayer?
     var opener: FileOpener?
     let onAction: (Int64, LibraryBrowserAction) -> Void
+    var onFamilyAction: (BrowserRow, LibraryFamilyAction) -> Void = { _, _ in }
 
     private var enabled: Bool {
         !model.isRefreshing && !model.selection.isBusy && model.results.snapshot != nil
     }
 
     private var coverage: BatchSelection.Coverage {
-        guard let summary = model.selection.summary, summary.inScope > 0 else { return .none }
-        return summary.inScope == summary.scopeCount ? .all : .partial
+        guard let summary = model.selection.summary, summary.scopeSelected > 0 else { return .none }
+        return summary.scopeSelected == summary.scopeCount ? .all : .partial
     }
 
     var body: some View {
@@ -41,8 +43,14 @@ struct LibraryPagedContent: View {
                 let summary = model.selection.summary
                 ListResultSummary(results: model.results.totalCount, selected: summary?.total ?? 0, hidden: summary?.hidden ?? 0)
                 Spacer()
-                BatchSelectionToggle(title: "Select all \(model.results.totalCount.formatted()) matches", coverage: coverage,
-                                     enabled: enabled && model.results.totalCount > 0)
+                if model.showsFamilies {
+                    Toggle(LibraryFamilyMessages.includeAlternates, isOn: Binding(get: { model.query.includeAlternates },
+                                                                                  set: { include in model.setIncludeAlternates(include) }))
+                        .toggleStyle(.checkbox).help(LibraryFamilyMessages.includeAlternatesHelp).disabled(!enabled)
+                }
+                let scopeCount = model.selection.summary?.scopeCount ?? model.results.totalCount
+                BatchSelectionToggle(title: "Select all \(scopeCount.formatted()) matches", coverage: coverage,
+                                     enabled: enabled && scopeCount > 0)
                 { selected in
                     if let snapshot = model.results.snapshot {
                         model.selection.setScope(snapshot, selected: selected)
@@ -72,7 +80,8 @@ struct LibraryPagedContent: View {
     }
 
     private var table: some View {
-        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, player: player),
+        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, player: player,
+                                                                                  families: model.showsFamilies ? familyControls : nil),
                    accessibilityLabel: "Library files", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
                    isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
                    onSelect: { rows, selected in
@@ -91,9 +100,19 @@ struct LibraryPagedContent: View {
                        var query = model.query
                        query.sort = .init(column: column, ascending: ascending)
                        model.setQuery(query)
-                   }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, contentRevision: readiness?.scopeRevision ?? 0, onFocus: { identifier, index in model.focus(id: identifier, index: index) },
+                   }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled,
+                   contentRevision: (readiness?.scopeRevision ?? 0) &+ model.familyRevision,
+                   onFocus: { identifier, index in model.focus(id: identifier, index: index) },
+                   onDisclose: { identifier, expanded in model.disclose(expanded, row: identifier) },
                    onSpace: player.map { player in { row in Task { await player.toggle(PlayerTrack(row)) } } },
                    onOpen: opener.map { _ in { row in onAction(row.id, .open(.defaultApplication)) } })
+    }
+
+    private var familyControls: LibraryFamilyControls {
+        LibraryFamilyControls(state: { familyID in model.familyStates[familyID] },
+                              setExpanded: { expanded, familyID in model.setExpanded(expanded, family: familyID) },
+                              setAlternatesSelected: { selected, familyID in model.setAlternatesSelected(selected, family: familyID) },
+                              setHiddenSelected: { selected, familyID in model.setHiddenMembersSelected(selected, family: familyID) })
     }
 
     private func menu(for identifier: Int64) -> NSMenu? {
@@ -124,6 +143,35 @@ struct LibraryPagedContent: View {
         }
         menu.addItem(.separator())
         menu.addItem(LibraryActionMenuItem(title: FileOpenerMessages.reveal) { onAction(identifier, .reveal) })
+        guard let row else { return menu }
+        let targetCount = model.familyTargetCount(for: row)
+        let familyActions = LibraryFamilyAction.allCases.filter { action in action.applies(to: row, targetCount: targetCount) }
+        if !familyActions.isEmpty {
+            menu.addItem(.separator())
+        }
+        for action in familyActions {
+            let item = LibraryActionMenuItem(title: action.title) { onFamilyAction(row, action) }
+            item.isEnabled = !model.selection.isBusy
+            menu.addItem(item)
+        }
+        if row.familyRole == .main, let familyID = row.familyId, let state = model.familyStates[familyID] {
+            if state.alternateCount > 0, !state.isRevealedBySearch {
+                menu.addItem(LibraryActionMenuItem(title: state.disclosureLabel) { model.setExpanded(!state.isExpanded, family: familyID) })
+            }
+            if !state.eligibleAlternates.isEmpty {
+                let selectsAll = state.alternatesCoverage != .all
+                let item = LibraryActionMenuItem(title: selectsAll ? LibraryFamilyMessages.selectAlternates : LibraryFamilyMessages.deselectAlternates) {
+                    model.setAlternatesSelected(selectsAll, family: familyID)
+                }
+                item.isEnabled = !model.selection.isBusy
+                menu.addItem(item)
+            }
+            if let hidden = state.hiddenSelection {
+                let item = LibraryActionMenuItem(title: hidden.label) { model.setHiddenMembersSelected(hidden.selects, family: familyID) }
+                item.isEnabled = !model.selection.isBusy
+                menu.addItem(item)
+            }
+        }
         return menu
     }
 

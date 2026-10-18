@@ -5,6 +5,7 @@
 
 mod ffi;
 mod serato;
+mod serato_history;
 mod tags;
 
 pub use ffi::*;

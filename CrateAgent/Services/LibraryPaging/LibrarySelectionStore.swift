@@ -4,14 +4,15 @@ import GRDB
 actor LibrarySelectionStore: PagedSelectionProvider {
     typealias Snapshot = LibraryPagedSnapshot
     typealias Identity = PagedIdentity<Int64>
-    typealias IdentityReader = @Sendable (Snapshot, Int64?, Int) async throws -> [Identity]
+    /// Reads the scope Select all sets (`selected` true) or clears (false) in id-ordered batches.
+    typealias IdentityReader = @Sendable (Snapshot, _ selected: Bool, Int64?, Int) async throws -> [Identity]
     private let pool: DatabasePool
     private var storage: DatabaseQueue?
     private let readIdentities: IdentityReader
     private var epoch: UInt64 = 0
 
     init(database: LibraryDatabase,
-         readIdentities: @escaping IdentityReader = { snapshot, after, limit in try await snapshot.identities(after: after, limit: limit) }) throws
+         readIdentities: @escaping IdentityReader = LibrarySelectionStore.scopeIdentities) throws
     {
         guard let pool = database.writer as? DatabasePool else { throw PagingError.unavailableDatabase }
         self.pool = pool
@@ -48,10 +49,17 @@ actor LibrarySelectionStore: PagedSelectionProvider {
         }
     }
 
+    /// Select all takes main and standalone rows (plus eligible alternates when
+    /// included); clearing it takes every in-scope file, so it also removes
+    /// alternates that Include alternates or a family checkbox added.
+    static let scopeIdentities: IdentityReader = { snapshot, selected, after, limit in
+        selected ? try await snapshot.selectAllIdentities(after: after, limit: limit) : try await snapshot.identities(after: after, limit: limit)
+    }
+
     func setScope(_ snapshot: Snapshot, selected: Bool) async throws {
         var lastID: Int64?
         try await capture(selected: selected) { [readIdentities] in
-            let batch = try await readIdentities(snapshot, lastID, 200)
+            let batch = try await readIdentities(snapshot, selected, lastID, 200)
             lastID = batch.last?.id
             return batch
         }
@@ -85,28 +93,83 @@ actor LibrarySelectionStore: PagedSelectionProvider {
         }
     }
 
+    /// Selected files the snapshot still shows, collapsed alternates included,
+    /// at the revision they were selected at. Throws when more than `limit`,
+    /// or when a selected file changed after it was selected, naming it, so a
+    /// command never acts on part of what the user chose.
+    func selectedIdentities(in snapshot: Snapshot, limit: Int) async throws -> [Identity] {
+        var selected: [Identity] = []
+        var changed: [Int64] = []
+        var lastID: Int64?
+        while true {
+            try Task.checkCancellation()
+            let batch = try await snapshot.identities(after: lastID, limit: 200)
+            guard let last = batch.last else { break }
+            let revisions = try selectedRevisions(of: batch)
+            for identity in batch {
+                guard let revision = revisions[identity.id] else { continue }
+                if revision == identity.revision {
+                    selected.append(identity)
+                } else {
+                    changed.append(identity.id)
+                }
+            }
+            guard selected.count + changed.count <= limit else { throw LibrarySelectionError.tooManySelected(limit: limit) }
+            lastID = last.id
+        }
+        guard changed.isEmpty else {
+            let names = try await pool.read { database in try FileRecord.filter(keys: changed).order(Column("id")).fetchAll(database).map(\.displayName) }
+            throw LibrarySelectionError.changedSinceSelected(files: names)
+        }
+        return selected
+    }
+
+    private func selectedRevisions(of identities: [Identity]) throws -> [Int64: Int64] {
+        let placeholders = Array(repeating: "?", count: identities.count).joined(separator: ",")
+        return try requireStorage().read { database in
+            try Row.fetchAll(database, sql: "SELECT id, revision FROM selected_identity WHERE included = 1 AND id IN (\(placeholders))",
+                             arguments: StatementArguments(identities.map(\.id)))
+                .reduce(into: [Int64: Int64]()) { revisions, row in revisions[row["id"]] = row["revision"] }
+        }
+    }
+
     func summary(in snapshot: Snapshot) async throws -> PagedSelectionSummary {
         let requestedEpoch = epoch
-        let total = try await requireStorage().read { database in
-            guard let count = try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM selected_identity WHERE included = 1") else { throw PagingError.incompletePage }
-            return count
+        let selected = try selectedIdentities()
+        let scopeCount = await snapshot.selectAllCount()
+        guard !selected.isEmpty else { return .init(total: 0, inScope: 0, scopeCount: scopeCount, removed: 0, scopeSelected: 0) }
+        let inScope = try await countSelected(selected) { after in try await snapshot.identities(after: after, limit: Self.summaryBatch) }
+        let scopeSelected = try await countSelected(selected) { after in try await snapshot.selectAllIdentities(after: after, limit: Self.summaryBatch) }
+        guard requestedEpoch == epoch else { throw CancellationError() }
+        return .init(total: selected.count, inScope: inScope, scopeCount: scopeCount, removed: 0, scopeSelected: scopeSelected)
+    }
+
+    private func selectedIdentities() throws -> Set<Identity> {
+        try requireStorage().read { database in
+            try Set(Row.fetchAll(database, sql: "SELECT id, revision FROM selected_identity WHERE included = 1").map { row in
+                Identity(id: row["id"], revision: row["revision"])
+            })
         }
-        let count = await snapshot.count()
-        var inScope = 0
-        if total > 0 {
-            var lastID: Int64?
-            while true {
-                try Task.checkCancellation()
-                let batch = try await snapshot.identities(after: lastID, limit: 200)
-                guard requestedEpoch == epoch else { throw CancellationError() }
-                if batch.isEmpty {
-                    break
-                }
-                inScope += try selectedIDs(in: batch).count
-                lastID = batch.last?.id
-            }
+    }
+
+    /// The summary reads the selection once and counts each scope in memory,
+    /// so a 30,000-file selection costs one storage read, not one per batch.
+    private static let summaryBatch = 5000
+
+    /// Selected identities across a scope read in id-ordered batches.
+    private func countSelected(_ selected: Set<Identity>, batch nextBatch: (Int64?) async throws -> [Identity]) async throws -> Int {
+        let requestedEpoch = epoch
+        var count = 0
+        var lastID: Int64?
+        while true {
+            try Task.checkCancellation()
+            let batch = try await nextBatch(lastID)
+            guard requestedEpoch == epoch else { throw CancellationError() }
+            guard let last = batch.last else { break }
+            count += batch.filter(selected.contains).count
+            lastID = last.id
         }
-        return .init(total: total, inScope: inScope, scopeCount: count, removed: 0)
+        return count
     }
 
     func reconcile() throws -> Int {
@@ -199,6 +262,19 @@ actor LibrarySelectionStore: PagedSelectionProvider {
                 try database.execute(sql: "DELETE FROM staged_identity WHERE operation = ?", arguments: [operation])
             }
             throw error
+        }
+    }
+}
+
+enum LibrarySelectionError: LocalizedError, Equatable {
+    case tooManySelected(limit: Int)
+    case changedSinceSelected(files: [String])
+
+    var errorDescription: String? {
+        switch self {
+        case let .tooManySelected(limit): "Select at most \(limit) files for this action."
+        case let .changedSinceSelected(files):
+            "\(files.map { file in "“\(file)”" }.formatted(.list(type: .and))) changed after you selected \(files.count == 1 ? "it" : "them"). Select \(files.count == 1 ? "it" : "them") again, then retry."
         }
     }
 }
