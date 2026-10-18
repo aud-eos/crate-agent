@@ -1828,7 +1828,7 @@ mod tests {
             },
         )]);
 
-        assert_eq!(database.batch_update_track_metadata(&updates), 1);
+        assert_eq!(database.batch_update_track_metadata(&updates).unwrap(), 1);
 
         let reread = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
         let records = reread.strict_track_records().unwrap();
