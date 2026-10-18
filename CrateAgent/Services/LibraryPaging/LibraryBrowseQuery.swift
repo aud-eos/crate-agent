@@ -71,11 +71,12 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         return ["search": trimmedSearch, "expanded": "[\(expanded)]"]
     }
 
+    /// A search runs its text match once per file, in `matched_files`, however often the passes below test it.
     /// Family files are ranked in small CTEs; the outer pass over `files` only joins their results,
     /// so a library without families pays only primary-key joins per file. The CROSS JOINs pin
     /// `family_files` to the `tracks_work_id` index; without statistics SQLite otherwise scans `files`.
     private var placedSQL: String {
-        let matches = isSearching ? ListSearch.predicate(prefix: "files.", parameter: ":search") : "1"
+        let matches = isSearching ? "files.id IN (SELECT id FROM matched_files)" : "1"
         let sortKey = sort.column.sql("files")
         let order = SongFamilyRepresentative.orderSQL(available: "available", saved: "saved_main", title: "title",
                                                       musicBrainzID: "recording_mbid", recording: "recording_id", file: "id")
@@ -85,8 +86,11 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         (\(matches)) AS matches
         """
         let live = SongFamilyMutation.liveTrackSQL
+        let matchedFiles = isSearching
+            ? "matched_files AS MATERIALIZED (SELECT id FROM files WHERE \(ListSearch.predicate(prefix: "files.", parameter: ":search"))),\n"
+            : ""
         return """
-        WITH live_families AS MATERIALIZED (\(SongFamilyMutation.liveFamiliesSQL)),
+        WITH \(matchedFiles)live_families AS MATERIALIZED (\(SongFamilyMutation.liveFamiliesSQL)),
         family_files AS MATERIALIZED (
             SELECT files.id, files.membership_revision, files.title, tracks.work_id AS family_id, files.track_id AS recording_id,
                    tracks.musicbrainz_recording_id AS recording_mbid, \(sortKey) AS sort_key, \(familyColumns)

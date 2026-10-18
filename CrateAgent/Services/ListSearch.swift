@@ -9,10 +9,15 @@ enum ListSearch {
         predicate()
     }
 
-    static func predicate(prefix: String = "", parameter: String = "?") -> String {
-        "(" + ["artist", "title", "album", "path"].map { field in
-            "\(functionName)(\(prefix)\(field), \(parameter))"
-        }.joined(separator: " OR ") + ")"
+    /// ASCII text, most of a library, is matched by SQLite itself; the Swift
+    /// fold runs only for a field or search with other characters, whose byte
+    /// length differs from its character length. Calling into Swift for every
+    /// row is what took a searched 30,000-file Library view over its budget.
+    static func predicate(prefix: String = "", parameter: String = ":query") -> String {
+        let text = "(" + ["artist", "title", "album", "path"].map { field in "COALESCE(\(prefix)\(field), '')" }
+            .joined(separator: " || char(10) || ") + ")"
+        let folds = "length(CAST(\(text) AS BLOB)) != length(\(text)) OR length(CAST(\(parameter) AS BLOB)) != length(\(parameter))"
+        return "(instr(lower(\(text)), lower(\(parameter))) > 0 OR ((\(folds)) AND \(functionName)(\(text), \(parameter))))"
     }
 
     static func normalized(_ text: String) -> String {

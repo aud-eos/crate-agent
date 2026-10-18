@@ -44,10 +44,10 @@ final class AutoTagSessionTests: XCTestCase {
 
     func testApplyAppliesTheFreshFileAndSkipsOneWhoseMembershipChangedSinceScanning() async throws {
         let fixture = try SessionFixture(fileCount: 2)
-        let engine = OperationEngine(database: fixture.database,
-                                     seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
-                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
-                                     fileTagWriter: { _, _ in })
+        let engine = try OperationEngine(database: fixture.database,
+                                         seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                         seratoLocator: makeEmptySeratoLibrary(),
+                                         fileTagWriter: { _, _ in })
         let session = AutoTagSession(database: fixture.database, lookupService: fixture.service, applyBatch: { mutations, batchID, tokens in
             _ = try await engine.applyBatch(mutations, batchId: batchID, expectedMembershipTokens: tokens)
         }, resyncBatch: { _ in ResyncOutcome(appliedCount: 0, queuedCount: 0) }, preferences: nil)
