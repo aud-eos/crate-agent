@@ -46,7 +46,7 @@ public enum DuplicateLabelReview {
         \(DuplicateDigestStore.freshJoinSQL(payload.mode.digestKind))
         WHERE files.id IN (\(databaseQuestionMarks(count: payload.fileIds.count))) AND \(FileProcessingEligibility.processableSQL)
         """, arguments: StatementArguments(payload.fileIds))
-        let files = try rows.map(DuplicateFileRow.init(row:))
+        let files = try rows.map { row in try DuplicateFileRow(row: row, playCounts: [:]) }
         let members = try zip(files, rows).map { file, row in
             guard let fileID = file.id else { throw DuplicateLabelReviewError.superseded }
             return try (fileID: fileID, evidence: DuplicateDigestStore.evidence(from: row, kind: payload.mode.digestKind))

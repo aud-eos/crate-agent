@@ -23,6 +23,7 @@ struct WorkersView: View {
                     fileInfoJob
                     fingerprintJob
                     deferredWrites
+                    PlayCountCard(service: services.playCountService)
                     coverage
                     drillDown
                 }
@@ -210,6 +211,32 @@ private struct WorkerCard<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(density.pagePadding)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct PlayCountCard: View {
+    @ObservedObject var service: SeratoPlayCountService
+
+    var body: some View {
+        WorkerCard(title: SeratoPlayCountMessages.title) {
+            switch service.status {
+            case .notRefreshed:
+                Text(SeratoPlayCountMessages.notRefreshed).font(.callout)
+            case .refreshing:
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(SeratoPlayCountMessages.refreshing).font(.callout)
+                }
+            case let .refreshed(summary):
+                Text(SeratoPlayCountMessages.refreshed(summary)).font(.callout.monospacedDigit())
+                Text(SeratoPlayCountMessages.skipped(summary)).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+            case .skippedWhileSeratoRunning:
+                Text(SeratoPlayCountMessages.skippedWhileSeratoRunning).font(.callout)
+            case let .failed(reason):
+                Text(SeratoPlayCountMessages.failed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            Text(SeratoPlayCountMessages.explanation).font(.caption).foregroundStyle(.secondary)
+        }
     }
 }
 

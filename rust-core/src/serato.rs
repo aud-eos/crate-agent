@@ -204,7 +204,7 @@ impl TlvRecord {
     }
 }
 
-fn decode_utf16be(bytes: &[u8]) -> Option<String> {
+pub(crate) fn decode_utf16be(bytes: &[u8]) -> Option<String> {
     let (code_unit_pairs, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
         return None;
