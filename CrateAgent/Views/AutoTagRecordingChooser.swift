@@ -127,7 +127,7 @@ struct AutoTagRecordingChooser: View {
                 Button("Retry details") { retry(alternative) }
                     .disabled(isLoading || session.isApplying)
             }
-            DisclosureGroup("Lookup identifiers") {
+            TextDisclosure(show: "Show lookup identifiers", hide: "Hide lookup identifiers") {
                 VStack(alignment: .leading, spacing: density.detailSpacing) {
                     Text("Returned recording: \(alternative.recordingID)")
                     if let detail = details[alternative.recordingID] {

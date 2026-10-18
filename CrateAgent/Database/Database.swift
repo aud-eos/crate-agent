@@ -71,6 +71,7 @@ public final class LibraryDatabase {
         var configuration = Configuration()
         configuration.prepareDatabase { database in
             ListSearch.register(in: database)
+            SongFamilyRepresentative.register(in: database)
             // NORMAL is the WAL-mode recommended setting: durable
             // across power loss (committed transactions survive),
             // but only fsyncs once per commit instead of twice.
@@ -124,7 +125,10 @@ public final class LibraryDatabase {
         AddSeratoWriteLandedMarkerMigration.register(in: &migrator)
         AddFileTrashLocationsMigration.register(in: &migrator)
         AddFingerprintFailureReasonMigration.register(in: &migrator)
+        AddSubsecondFileIdentityMigration.register(in: &migrator)
+        AddSeratoRenameProgressMigration.register(in: &migrator)
         AddFileDigestsMigration.register(in: &migrator)
+        AddSongFamiliesMigration.register(in: &migrator)
         AddSeratoWriteResolutionsMigration.register(in: &migrator)
         return migrator
     }

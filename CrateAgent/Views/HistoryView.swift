@@ -214,14 +214,13 @@ private struct NotAppliedFilesList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.detailSpacing) {
-            Button(isExpanded ? SeratoWriteDispositionMessages.hideFiles : SeratoWriteDispositionMessages.showFiles(count: batch.notApplied.listedFileCount)) {
-                isExpanded.toggle()
-                if isExpanded, files.isEmpty {
-                    Task { await loadPage() }
+            DisclosureButton(showTitle: SeratoWriteDispositionMessages.showFiles(count: batch.notApplied.listedFileCount),
+                             hideTitle: SeratoWriteDispositionMessages.hideFiles, isExpanded: $isExpanded)
+                .onChange(of: isExpanded) { _, expanded in
+                    if expanded, files.isEmpty {
+                        Task { await loadPage() }
+                    }
                 }
-            }
-            .buttonStyle(.link)
-            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
             if isExpanded {
                 ForEach(files) { file in
                     fileRow(file)
