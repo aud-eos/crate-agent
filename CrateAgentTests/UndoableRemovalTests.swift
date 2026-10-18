@@ -8,12 +8,9 @@ final class UndoableRemovalTests: XCTestCase {
     func testCleanupRecordsEveryRemovedRecordAndTheTrashDestination() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
-        let trashPath = fixture.directory.appendingPathComponent("trashed-target.wav").path
-        let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator, fileTrasher: { path in
-            try FileManager.default.moveItem(atPath: path, toPath: trashPath)
-            return trashPath
-        })
+        let engine = try temporaryTrashEngine(fixture)
         let cleaned = try await cleanDuplicate(fixture, engine: engine)
+        let trashPath = Self.trashDirectory(fixture).appendingPathComponent("target.wav").path
         let originalBytes = cleaned.originalBytes.reduce(into: [String: Data]()) { bytes, entry in bytes[Self.resolved(entry.key)] = entry.value }
 
         let recorded = try await fixture.database.writer.read { database in
@@ -45,10 +42,11 @@ final class UndoableRemovalTests: XCTestCase {
     func testUndoRestoresTheFileAndExactSeratoBytes() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
-        let cleaned = try await cleanDuplicate(fixture, engine: fixture.engine)
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine)
         XCTAssertFalse(FileManager.default.fileExists(atPath: cleaned.target.path))
 
-        try await fixture.engine.undoBatch(cleaned.batchID)
+        try await engine.undoBatch(cleaned.batchID)
 
         try await assertFileRestored(cleaned, in: fixture)
         for (path, bytes) in cleaned.originalBytes {
@@ -59,14 +57,15 @@ final class UndoableRemovalTests: XCTestCase {
     func testUndoQueuesSeratoRestoresWhileSeratoRuns() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
-        let cleaned = try await cleanDuplicate(fixture, engine: fixture.engine)
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine)
         let removedBytes = try cleaned.originalBytes.keys.reduce(into: [String: Data]()) { bytes, path in
             bytes[path] = try Data(contentsOf: URL(fileURLWithPath: path))
         }
         fixture.lifecycle.running = true
         fixture.watchdog.refresh()
 
-        try await fixture.engine.undoBatch(cleaned.batchID)
+        try await engine.undoBatch(cleaned.batchID)
 
         try await assertFileRestored(cleaned, in: fixture)
         for (path, bytes) in removedBytes {
@@ -74,10 +73,36 @@ final class UndoableRemovalTests: XCTestCase {
         }
         fixture.lifecycle.running = false
         fixture.watchdog.refresh()
-        try await fixture.engine.drainPendingSeratoUpdates()
+        try await engine.drainPendingSeratoUpdates()
         for (path, bytes) in cleaned.originalBytes {
             XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
         }
+    }
+
+    func testUndoReportsADeletedCrateAndRestoresTheOtherStores() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine)
+        fixture.lifecycle.running = true
+        fixture.watchdog.refresh()
+        try await engine.undoBatch(cleaned.batchID)
+        let deletedCrate = fixture.locator.subcratesDirectoryUrl.appendingPathComponent("owned.crate").path
+        try FileManager.default.removeItem(atPath: deletedCrate)
+
+        fixture.lifecycle.running = false
+        fixture.watchdog.refresh()
+        try await engine.drainPendingSeratoUpdates()
+
+        for (path, bytes) in cleaned.originalBytes where path != deletedCrate {
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
+        }
+        let dispositions = try await fixture.database.writer.read { database in
+            try Row.fetchAll(database, sql: "SELECT disposition, detail FROM serato_write_dispositions").map { row in
+                [row["disposition"] as String, row["detail"] as String]
+            }
+        }
+        XCTAssertEqual(dispositions, [[SeratoWriteDisposition.storeMissing.rawValue, RemovalUndoMessages.storesMissing([deletedCrate])]])
     }
 
     private struct CleanedDuplicate {
@@ -100,6 +125,23 @@ final class UndoableRemovalTests: XCTestCase {
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.trashedCount, 1)
         return CleanedDuplicate(target: target, batchID: outcome.batchId, originalBytes: originalBytes)
+    }
+
+    private static func trashDirectory(_ fixture: SeratoRemovalFixture) -> URL {
+        fixture.directory.appendingPathComponent("Trash")
+    }
+
+    /// Trashes into the fixture's own Trash directory, never the user's.
+    private func temporaryTrashEngine(_ fixture: SeratoRemovalFixture) throws -> OperationEngine {
+        let trash = Self.trashDirectory(fixture)
+        try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+        return OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                               fileTrasher: { path in
+                                   let destination = trash.appendingPathComponent((path as NSString).lastPathComponent).path
+                                   try FileManager.default.moveItem(atPath: path, toPath: destination)
+                                   return destination
+                               },
+                               availabilityResolver: FileAvailabilityResolver(trashDirectory: { _ in trash }))
     }
 
     private func assertFileRestored(_ cleaned: CleanedDuplicate, in fixture: SeratoRemovalFixture) async throws {

@@ -28,6 +28,8 @@ struct SeratoPendingRestore: Codable, Sendable, Equatable {
 public enum RestoreBlockReason: Sendable, Equatable {
     case trashItemMissing
     case trashItemChanged
+    /// A file is at the recorded path, but it is no longer in a Trash.
+    case trashItemNotInTrash
     case originalPathOccupied
     case trashItemNotRecorded
     /// The store's records were removed, but their capture was lost.
@@ -36,27 +38,38 @@ public enum RestoreBlockReason: Sendable, Equatable {
 }
 
 enum RemovalRestoreMutation {
-    /// A records restore is redone by the removal it undid.
-    struct Redo: Codable {
+    /// A Trash move's inverse; undo supplies the removal event's own id.
+    struct TrashInverse: Codable {
+        let originalPath: String
+        let identity: FileMetadata
+
+        func payload(removalEventID: Int64) -> RestoreFromTrashPayload {
+            RestoreFromTrashPayload(originalPath: originalPath, identity: identity, removalEventID: removalEventID)
+        }
+    }
+
+    /// A Serato removal's inverse; undo supplies the removal event's own id.
+    struct RecordsInverse: Codable {
+        let trackPath: String
+
+        func payload(removalEventID: Int64) -> RestoreSeratoRecordsPayload {
+            RestoreSeratoRecordsPayload(removalEventID: removalEventID, trackPath: trackPath)
+        }
+    }
+
+    /// What redoing a records restore would remove again. Journaled for the
+    /// record; redo is refused until it runs through a cleanup intent.
+    private struct Redo: Codable {
         let fileId: Int64
         let removalEventType: EventType
-
-        var mutation: TrackMutation {
-            get throws {
-                switch removalEventType {
-                case .trackRemovedFromSerato: .removeTrackFromSerato(RemoveTrackFromSeratoPayload(fileId: fileId))
-                case .fileRemovedFromCrates: .removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fileId))
-                default: throw OperationEngineError.undoNotSupported(eventType: .seratoRecordsRestored)
-                }
-            }
-        }
     }
 
     /// Moves the file back from its recorded Trash item into the re-indexed row
     /// at its original path, refusing when the item is gone or changed, or the
     /// path holds another file.
     static func restoreFromTrash(_ payload: RestoreFromTrashPayload, batchId: String, timestamp: Int64,
-                                 physicalMoves: PhysicalFileMoveTransaction?, in database: GRDB.Database) throws -> Int64
+                                 physicalMoves: PhysicalFileMoveTransaction?, resolver: FileAvailabilityResolver,
+                                 in database: GRDB.Database) throws -> Int64
     {
         func blocked(_ reason: RestoreBlockReason) -> OperationEngineError {
             .restoreBlocked(path: payload.originalPath, reason: reason)
@@ -64,13 +77,17 @@ enum RemovalRestoreMutation {
         guard let trashItem = try SeratoRemovalCaptureStore.trashDestination(eventID: payload.removalEventID, in: database)?.identity else {
             throw blocked(.trashItemNotRecorded)
         }
-        switch try FileTrashLocation.availability(of: trashItem, resolver: FileAvailabilityResolver()) {
-        case .trashed: break
-        case .missing where FileManager.default.fileExists(atPath: trashItem.path): throw blocked(.trashItemChanged)
-        case .missing, .offline, .inaccessible, .available, .unknown: throw blocked(.trashItemMissing)
+        switch try resolver.inspect(path: trashItem.path, volumeID: trashItem.volumeUuid) {
+        case .trashed:
+            guard try FileTrashLocation.availability(of: trashItem, resolver: resolver) == .trashed else {
+                throw blocked(FileManager.default.fileExists(atPath: trashItem.path) ? .trashItemChanged : .trashItemMissing)
+            }
+        case .available: throw blocked(.trashItemNotInTrash)
+        case .missing, .offline, .inaccessible, .unknown: throw blocked(.trashItemMissing)
         }
         guard !FileManager.default.fileExists(atPath: payload.originalPath) else { throw blocked(.originalPathOccupied) }
-        guard let physicalMoves, var file = try FileRecord.filter(Column("path") == payload.originalPath).fetchOne(database),
+        guard let physicalMoves else { preconditionFailure("Restoring from Trash runs only inside a physical move transaction") }
+        guard var file = try FileRecord.filter(Column("path") == payload.originalPath).fetchOne(database),
               let fileID = file.id, file.identity == payload.identity
         else {
             throw blocked(.fileNotRestored)
@@ -101,7 +118,9 @@ enum RemovalRestoreMutation {
             throw OperationEngineError.restoreBlocked(path: payload.trackPath, reason: .fileNotRestored)
         }
         try FileProcessingEligibility.requireProcessable(file)
-        let captures = try SeratoRemovalCaptureStore.captures(eventID: payload.removalEventID, in: database)
+        let captures = try SeratoRemovalCaptureStore.captures(eventID: payload.removalEventID, in: database).filter { capture in
+            capture.outcome != .nothingRemoved
+        }
         // A store deleted since has nothing to restore into; the drain reports it as not applied.
         if let unrecorded = captures.first(where: { capture in capture.isUnrecorded && FileManager.default.fileExists(atPath: capture.storePath) }) {
             throw OperationEngineError.restoreBlocked(path: payload.trackPath, reason: .recordsNotRecorded(store: unrecorded.storePath))

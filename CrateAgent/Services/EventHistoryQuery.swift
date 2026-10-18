@@ -248,6 +248,8 @@ public enum EventHistoryQuery {
             EventType.fileTrashed.rawValue,
             EventType.trackRemovedFromSerato.rawValue,
             EventType.fileRemovedFromCrates.rawValue,
+            EventType.fileRestoredFromTrash.rawValue,
+            EventType.seratoRecordsRestored.rawValue,
         ]
         return !typeList.contains(where: unsupportedRaw.contains)
     }

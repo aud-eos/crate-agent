@@ -113,6 +113,8 @@ public actor OperationEngine {
     struct MutationContext: Sendable {
         let readiness: LibrarySyncReadiness?
         let locator: SeratoLibraryLocator
+        /// Decides whether a removed file's recorded item is still in the Trash.
+        let availabilityResolver: FileAvailabilityResolver
         var cleanupTargetFileID: Int64?
         /// Writes a discard's revert leaves out: Serato or the file still
         /// holds the value the inverse would write (#163).
@@ -162,7 +164,8 @@ public actor OperationEngine {
             return trashPath
         },
         activityLog: ActivityLog? = nil,
-        readiness: LibrarySyncReadiness? = nil
+        readiness: LibrarySyncReadiness? = nil,
+        availabilityResolver: FileAvailabilityResolver = FileAvailabilityResolver()
     ) {
         self.readiness = readiness
         self.database = database
@@ -174,7 +177,7 @@ public actor OperationEngine {
         self.seratoAddTrackBatchWriter = seratoAddTrackBatchWriter
         self.fileTrasher = fileTrasher
         self.activityLog = activityLog
-        mutationContext = MutationContext(readiness: readiness, locator: seratoLocator)
+        mutationContext = MutationContext(readiness: readiness, locator: seratoLocator, availabilityResolver: availabilityResolver)
     }
 
     private func note(_ message: String) async {
@@ -2025,14 +2028,16 @@ public actor OperationEngine {
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
         case .fileTrashed:
             try requireRemovalInverse(event, inverseJsonData)
-            return try .restoreFromTrash(decoder.decode(RestoreFromTrashPayload.self, from: inverseJsonData))
+            return try .restoreFromTrash(decoder.decode(RemovalRestoreMutation.TrashInverse.self, from: inverseJsonData)
+                .payload(removalEventID: removalEventID(of: event)))
         case .trackRemovedFromSerato, .fileRemovedFromCrates:
             try requireRemovalInverse(event, inverseJsonData)
-            return try .restoreSeratoRecords(decoder.decode(RestoreSeratoRecordsPayload.self, from: inverseJsonData))
-        case .fileRestoredFromTrash:
-            return try .trashFile(decoder.decode(TrashFilePayload.self, from: inverseJsonData))
-        case .seratoRecordsRestored:
-            return try decoder.decode(RemovalRestoreMutation.Redo.self, from: inverseJsonData).mutation
+            return try .restoreSeratoRecords(decoder.decode(RemovalRestoreMutation.RecordsInverse.self, from: inverseJsonData)
+                .payload(removalEventID: removalEventID(of: event)))
+        case .fileRestoredFromTrash, .seratoRecordsRestored:
+            // Redoing a removal must run through a cleanup intent, which
+            // sequences the row's deletion after its queued Trash move.
+            throw OperationEngineError.removalRedoNotSupported(eventType: event.eventType)
         case .fileTagsWritten:
             // Undoable when previousMetadata was captured at forward
             // time. Same gate as commitMetadataToSerato.
@@ -2567,14 +2572,15 @@ public actor OperationEngine {
 
     /// A row whose write found no entry at its path is recorded visibly and
     /// leaves the external baseline alone, since nothing was written.
-    private static func completeQueuedWrites(_ writes: [GuardedSeratoWrite], missingTarget: Set<Int64> = [], reported: Bool = false,
-                                             locator: SeratoLibraryLocator, in database: GRDB.Database) throws
+    private static func completeQueuedWrites(_ writes: [GuardedSeratoWrite], missingTarget: Set<Int64> = [], missingDetails: [Int64: String] = [:],
+                                             reported: Bool = false, locator: SeratoLibraryLocator, in database: GRDB.Database) throws
     {
         for write in writes {
             guard try SeratoWriteQueue.delete(write, in: database) else { continue }
             if write.queueID.map(missingTarget.contains) == true {
                 try SeratoWriteDispositions.record(eventID: write.eventId, kind: write.write.kind, disposition: missingTargetDisposition(write.write),
-                                                   detail: missingTargetDetail(write.write), reported: reported, in: database)
+                                                   detail: write.queueID.flatMap { queueID in missingDetails[queueID] } ?? missingTargetDetail(write.write),
+                                                   reported: reported, in: database)
             } else if case let .metadataUpdate(update) = write.write,
                       let previous = try SeratoExternalBaselines.load(token: write.token, identity: write.originalIdentity, locator: locator, in: database)
             {
@@ -2596,14 +2602,11 @@ public actor OperationEngine {
     }
 
     private static func missingTargetDetail(_ write: SeratoPendingWrite) -> String {
-        if case let .restoreRecords(restore) = write {
-            return RemovalUndoMessages.storesMissing(restore.storePaths.filter { storePath in !FileManager.default.fileExists(atPath: storePath) })
-        }
         let path = switch write {
         case let .rename(rename): rename.oldAbsolutePath
         case let .metadataUpdate(update): update.absolutePath
         case .addTrack, .fileTagWrite, .removeFromDatabase, .removeFromCrates, .trashFile, .restoreRecords:
-            preconditionFailure("Only renames, metadata updates and restores report a missing target")
+            preconditionFailure("Only renames and metadata updates report a path with no Serato entry; restores name their stores")
         }
         return "Serato's database has no entry at this path: \((path as NSString).lastPathComponent)."
     }
@@ -2969,21 +2972,21 @@ public actor OperationEngine {
     }
 
     /// Reinserts a removal's captured records into each store it took them
-    /// from, every store in its own write like a crate sweep. Returns the row
-    /// when a store was deleted since, so it is reported as not applied while
-    /// the others are still restored.
-    private func applySeratoRecordRestore(_ restore: SeratoPendingRestore, guardedWrites: [GuardedSeratoWrite]) async throws -> Set<Int64> {
+    /// from, every store in its own write like a crate sweep. A store deleted
+    /// since completes the row as not applied, naming that store, while the
+    /// others are still restored; the row is then returned as a missing target.
+    private func applySeratoRecordRestore(_ restore: SeratoPendingRestore, guardedWrites: [GuardedSeratoWrite], reported: Bool) async throws -> Set<Int64> {
         _ = try requireSeratoDatabase(waitingCount: guardedWrites.count)
         let captures = try await database.writer.read { database in
             try SeratoRemovalCaptureStore.captures(eventID: restore.removalEventID, in: database)
         }
-        var storeMissing = false
+        var missingStores: [String] = []
         for storePath in restore.storePaths {
             guard FileManager.default.fileExists(atPath: storePath) else {
-                storeMissing = true
+                missingStores.append(storePath)
                 continue
             }
-            guard let capture = captures.first(where: { capture in capture.storePath == storePath }) else {
+            guard let capture = captures.first(where: { capture in capture.storePath == storePath }), !capture.isUnrecorded else {
                 throw OperationEngineError.restoreBlocked(path: restore.absolutePath, reason: .recordsNotRecorded(store: storePath))
             }
             try await requireExternalWriteEligibility(guardedWrites)
@@ -2997,7 +3000,14 @@ public actor OperationEngine {
                 throw OperationEngineError.seratoRewriteFailed(path: storePath, underlying: UserFacingErrorMessage.message(for: error))
             }
         }
-        return storeMissing ? Set(guardedWrites.compactMap(\.queueID)) : []
+        guard !missingStores.isEmpty else { return [] }
+        let missing = Set(guardedWrites.compactMap(\.queueID))
+        let details = missing.reduce(into: [Int64: String]()) { details, queueID in details[queueID] = RemovalUndoMessages.storesMissing(missingStores) }
+        let locator = seratoLocator
+        try await database.writer.write { database in
+            try Self.completeQueuedWrites(guardedWrites, missingTarget: missing, missingDetails: details, reported: reported, locator: locator, in: database)
+        }
+        return missing
     }
 
     private func applyFileTagWrite(_ write: SeratoPendingFileTagWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
@@ -3332,7 +3342,7 @@ public actor OperationEngine {
                 }
                 try await applySeratoAddTracks(adds)
             case let .restoreRecords(restore):
-                try await missingTarget.formUnion(applySeratoRecordRestore(restore, guardedWrites: [remaining[index]]))
+                try await missingTarget.formUnion(applySeratoRecordRestore(restore, guardedWrites: [remaining[index]], reported: reported))
                 index += 1
             default:
                 try await applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites)
@@ -3427,7 +3437,7 @@ public actor OperationEngine {
         if let target {
             try readiness?.requireUnconflicted(target)
         }
-        let result = try executeAndLogUnchecked(mutation: mutation, batchId: batchId, in: database,
+        let result = try executeAndLogUnchecked(mutation: mutation, batchId: batchId, in: database, availabilityResolver: context.availabilityResolver,
                                                 physicalMoves: physicalMoves, expectedPhysicalSource: expectedPhysicalSource)
         if let target {
             try readiness?.requireUnconflicted(target)
@@ -3443,6 +3453,7 @@ public actor OperationEngine {
         mutation: TrackMutation,
         batchId: String,
         in database: GRDB.Database,
+        availabilityResolver: FileAvailabilityResolver,
         physicalMoves: PhysicalFileMoveTransaction? = nil,
         expectedPhysicalSource: SeratoSourceIdentity? = nil
     ) throws -> GuardedExecutionResult {
@@ -3468,7 +3479,8 @@ public actor OperationEngine {
                                                               previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true,
                                                               newMtimeNanoseconds: moved.mtimeNanoseconds))
         }
-        let result = try executeMutation(mutation: effectiveMutation, batchId: batchId, in: database, physicalMoves: physicalMoves)
+        let result = try executeMutation(mutation: effectiveMutation, batchId: batchId, in: database, physicalMoves: physicalMoves,
+                                         availabilityResolver: availabilityResolver)
         guard !result.seratoWrites.isEmpty else {
             return GuardedExecutionResult(eventId: result.eventId, seratoWrites: [])
         }
@@ -3494,7 +3506,8 @@ public actor OperationEngine {
         mutation: TrackMutation,
         batchId: String,
         in db: GRDB.Database,
-        physicalMoves: PhysicalFileMoveTransaction?
+        physicalMoves: PhysicalFileMoveTransaction?,
+        availabilityResolver: FileAvailabilityResolver
     ) throws -> ExecutionResult {
         let timestampMillis = Int64(Date().timeIntervalSince1970 * 1000)
         switch mutation {
@@ -3587,7 +3600,7 @@ public actor OperationEngine {
             )
         case let .restoreFromTrash(payload):
             let eventId = try RemovalRestoreMutation.restoreFromTrash(payload, batchId: batchId, timestamp: timestampMillis,
-                                                                      physicalMoves: physicalMoves, in: db)
+                                                                      physicalMoves: physicalMoves, resolver: availabilityResolver, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .restoreSeratoRecords(payload):
             let (eventId, restore) = try RemovalRestoreMutation.restoreSeratoRecords(payload, batchId: batchId, timestamp: timestampMillis, in: db)
@@ -3918,6 +3931,15 @@ public actor OperationEngine {
         let reason: String
     }
 
+    /// A removal's inverse names its captures by the removal event's own id.
+    private static func removalEventID(of event: EventRecord) throws -> Int64 {
+        guard let eventID = event.eventId else {
+            throw OperationEngineError.eventPayloadDecodingFailed(eventId: nil, batchId: event.batchId, eventType: event.eventType,
+                                                                  underlying: "The removal event has no id.")
+        }
+        return eventID
+    }
+
     private static func requireRemovalInverse(_ event: EventRecord, _ inverseJsonData: Data) throws {
         if let legacy = try? JSONDecoder().decode(NonUndoableInverse.self, from: inverseJsonData), legacy.reason == NonUndoableInverse.reasonValue {
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
@@ -3947,9 +3969,8 @@ public actor OperationEngine {
             path: fileRecord.path
         )
         let eventId = try insertEvent(batchId: batchId, timestamp: timestamp, fileId: payload.fileId, eventType: .fileTrashed,
-                                      forwardPayload: forwardPayload, inverseNamingEvent: { eventID in
-                                          RestoreFromTrashPayload(originalPath: fileRecord.path, identity: fileRecord.identity, removalEventID: eventID)
-                                      }, in: db)
+                                      forwardPayload: forwardPayload,
+                                      inversePayload: RemovalRestoreMutation.TrashInverse(originalPath: fileRecord.path, identity: fileRecord.identity), in: db)
         return (eventId, SeratoPendingTrash(absolutePath: fileRecord.path))
     }
 
@@ -3971,9 +3992,8 @@ public actor OperationEngine {
             path: fileRecord.path
         )
         let eventId = try insertEvent(batchId: batchId, timestamp: timestamp, fileId: payload.fileId, eventType: .trackRemovedFromSerato,
-                                      forwardPayload: forwardPayload, inverseNamingEvent: { eventID in
-                                          RestoreSeratoRecordsPayload(removalEventID: eventID, trackPath: fileRecord.path)
-                                      }, in: db)
+                                      forwardPayload: forwardPayload,
+                                      inversePayload: RemovalRestoreMutation.RecordsInverse(trackPath: fileRecord.path), in: db)
         let pending = SeratoPendingRemoval(absolutePath: fileRecord.path)
         return (eventId, pending)
     }
@@ -3996,9 +4016,8 @@ public actor OperationEngine {
             path: fileRecord.path
         )
         let eventId = try insertEvent(batchId: batchId, timestamp: timestamp, fileId: payload.fileId, eventType: .fileRemovedFromCrates,
-                                      forwardPayload: forwardPayload, inverseNamingEvent: { eventID in
-                                          RestoreSeratoRecordsPayload(removalEventID: eventID, trackPath: fileRecord.path)
-                                      }, in: db)
+                                      forwardPayload: forwardPayload,
+                                      inversePayload: RemovalRestoreMutation.RecordsInverse(trackPath: fileRecord.path), in: db)
         let pending = SeratoPendingRemoval(absolutePath: fileRecord.path)
         return (eventId, pending)
     }
@@ -4408,23 +4427,6 @@ public actor OperationEngine {
         guard let eventId = event.eventId else {
             throw OperationEngineError.insertDidNotReturnRowId
         }
-        return eventId
-    }
-
-    /// For an event whose inverse names the event itself, as a removal's
-    /// names the records captured under its id when its I/O lands.
-    static func insertEvent(
-        batchId: String, timestamp: Int64, fileId: Int64?, eventType: EventType, forwardPayload: some Encodable,
-        inverseNamingEvent: (Int64) -> some Encodable, in db: GRDB.Database
-    ) throws -> Int64 {
-        let eventId = try insertEvent(batchId: batchId, timestamp: timestamp, fileId: fileId, eventType: eventType,
-                                      forwardPayload: forwardPayload, inversePayload: [String: String](), in: db)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        guard let inverseJson = try String(data: encoder.encode(inverseNamingEvent(eventId)), encoding: .utf8) else {
-            throw OperationEngineError.payloadEncodingFailed
-        }
-        try db.execute(sql: "UPDATE events SET inverse_payload_json = ? WHERE event_id = ?", arguments: [inverseJson, eventId])
         return eventId
     }
 }
@@ -5192,6 +5194,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case queuedChangeHasLaterChanges(path: String, later: [String])
     /// Undoing a removal can't put the file or its Serato records back as they were.
     case restoreBlocked(path: String, reason: RestoreBlockReason)
+    case removalRedoNotSupported(eventType: EventType)
 
     public var errorDescription: String? {
         switch self {
@@ -5251,6 +5254,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Later queued changes depend on the change to \((path as NSString).lastPathComponent). Discard them first: \(later.map { laterPath in (laterPath as NSString).lastPathComponent }.joined(separator: ", "))."
         case let .restoreBlocked(path, reason):
             RemovalUndoMessages.restoreBlocked(path: path, reason: reason)
+        case .removalRedoNotSupported:
+            RemovalUndoMessages.redoNotSupported
         }
     }
 }

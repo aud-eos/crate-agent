@@ -7,14 +7,23 @@ extension SeratoRemovedRecord: @unchecked Sendable {}
 /// What each landed removal took out of a Serato store, and where a cleaned-up
 /// file's audio went in Trash: the inputs an undo needs to put both back.
 enum SeratoRemovalCaptureStore {
+    /// What one removal attempt found in a store.
+    enum Outcome: String, Sendable {
+        case removed
+        case nothingRemoved = "nothing_removed"
+        /// The store held nothing on a retry after an attempt whose I/O may
+        /// have landed and whose capture rolled back with its transaction.
+        case unrecorded
+    }
+
     struct SeratoRemovalCapture: Sendable {
         let storePath: String
         let trackPath: String
         let records: [SeratoRemovedRecord]
+        let outcome: Outcome
 
-        /// The store's records may have been removed by an attempt whose capture rolled back.
         var isUnrecorded: Bool {
-            records.isEmpty
+            outcome == .unrecorded
         }
     }
 
@@ -24,28 +33,33 @@ enum SeratoRemovalCaptureStore {
         let record: Data
     }
 
-    /// A retry that finds nothing left to remove after an earlier attempt's I/O may
-    /// have landed saves an unrecorded capture, unless that attempt's capture committed.
+    /// Every store a removal checks is recorded, so a retry can tell a store an
+    /// earlier attempt committed from one whose capture rolled back. A committed
+    /// outcome is kept unless this attempt found records it did not.
     static func save(eventID: Int64, storePath: String, trackPath: String, records: [SeratoRemovedRecord],
                      earlierAttemptMayHaveLanded: Bool, in database: Database) throws
     {
-        if records.isEmpty {
-            let captured = try Bool.fetchOne(database, sql: "SELECT EXISTS(SELECT 1 FROM serato_removal_captures WHERE event_id = ? AND store_path = ?)",
-                                             arguments: [eventID, storePath]) ?? false
-            guard earlierAttemptMayHaveLanded, !captured else { return }
-        }
+        let existing = try String.fetchOne(database, sql: "SELECT outcome FROM serato_removal_captures WHERE event_id = ? AND store_path = ?",
+                                           arguments: [eventID, storePath])
+        guard existing == nil || (!records.isEmpty && existing != Outcome.removed.rawValue) else { return }
+        let outcome: Outcome = !records.isEmpty ? .removed : earlierAttemptMayHaveLanded ? .unrecorded : .nothingRemoved
         let stored = records.map { removed in StoredRecord(index: removed.index, record: removed.record) }
         try database.execute(sql: """
-        INSERT INTO serato_removal_captures (event_id, store_path, track_path, records, captured_at) VALUES (?, ?, ?, ?, ?)
-        """, arguments: [eventID, storePath, trackPath, JSONEncoder().encode(stored), SeratoWriteQueue.now()])
+        INSERT OR REPLACE INTO serato_removal_captures (event_id, store_path, track_path, records, outcome, captured_at) VALUES (?, ?, ?, ?, ?, ?)
+        """, arguments: [eventID, storePath, trackPath, JSONEncoder().encode(stored), outcome.rawValue, SeratoWriteQueue.now()])
     }
 
     static func captures(eventID: Int64, in database: Database) throws -> [SeratoRemovalCapture] {
-        try Row.fetchAll(database, sql: "SELECT store_path, track_path, records FROM serato_removal_captures WHERE event_id = ? ORDER BY store_path",
+        try Row.fetchAll(database, sql: "SELECT store_path, track_path, records, outcome FROM serato_removal_captures WHERE event_id = ? ORDER BY store_path",
                          arguments: [eventID]).map { row in
             let stored = try JSONDecoder().decode([StoredRecord].self, from: row["records"])
+            let rawOutcome: String = row["outcome"]
+            guard let outcome = Outcome(rawValue: rawOutcome) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unknown removal capture outcome \(rawOutcome)."))
+            }
             return SeratoRemovalCapture(storePath: row["store_path"], trackPath: row["track_path"],
-                                        records: stored.map { record in SeratoRemovedRecord(index: record.index, record: record.record) })
+                                        records: stored.map { record in SeratoRemovedRecord(index: record.index, record: record.record) },
+                                        outcome: outcome)
         }
     }
 

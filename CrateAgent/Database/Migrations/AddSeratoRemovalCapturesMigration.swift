@@ -13,6 +13,7 @@ enum AddSeratoRemovalCapturesMigration {
                 store_path BLOB NOT NULL,
                 track_path BLOB NOT NULL,
                 records BLOB NOT NULL,
+                outcome TEXT NOT NULL,
                 captured_at INTEGER NOT NULL,
                 PRIMARY KEY (event_id, store_path)
             );
