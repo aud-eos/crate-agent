@@ -611,10 +611,9 @@ public actor OperationEngine {
                     throw OperationEngineError.metadataChanged(fileId: fileID)
                 }
             }
-            for token in authorizingMembershipTokens {
-                guard try FileRecord.fetchOne(db, key: token.fileId)?.membershipRevision == token.revision else {
-                    throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
-                }
+            let revisions = try FileRecord.membershipRevisions(of: authorizingMembershipTokens.map(\.fileId), in: db)
+            for token in authorizingMembershipTokens where revisions[token.fileId] != token.revision {
+                throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
             }
             let results = try mutations.map { mutation in
                 if let expectedMembershipTokens, let fileID = mutation.tokenFileID {
@@ -4350,11 +4349,11 @@ public actor OperationEngine {
         encoder.outputFormatting = [.sortedKeys]
 
         var forwardJsonData = try encoder.encode(forwardPayload)
-        if let fileId, let file = try FileRecord.fetchOne(db, key: fileId) {
+        if let fileId, let membershipRevision = try FileRecord.membershipRevisions(of: [fileId], in: db)[fileId] {
             guard var object = try JSONSerialization.jsonObject(with: forwardJsonData) as? [String: Any] else {
                 throw OperationEngineError.payloadEncodingFailed
             }
-            object["membershipRevision"] = file.membershipRevision
+            object["membershipRevision"] = membershipRevision
             forwardJsonData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         }
         let inverseJsonData = try encoder.encode(inversePayload)

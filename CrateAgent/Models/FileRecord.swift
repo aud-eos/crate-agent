@@ -170,6 +170,12 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
             .fetchCount(db) > 0
     }
 
+    /// Each file's membership revision, read without decoding its record.
+    static func membershipRevisions(of fileIds: [Int64], in db: GRDB.Database) throws -> [Int64: Int64] {
+        try Row.fetchAll(db, FileRecord.select(Column("id"), Column("membership_revision")).filter(keys: fileIds))
+            .reduce(into: [:]) { revisions, row in revisions[row[0]] = row[1] }
+    }
+
     /// How the user knows the file: its title, else its file name.
     var displayName: String {
         title.flatMap { title in title.isEmpty ? nil : title } ?? (path as NSString).lastPathComponent

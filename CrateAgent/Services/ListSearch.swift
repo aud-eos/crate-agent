@@ -27,8 +27,10 @@ enum ListSearch {
         "length(CAST(\(expression) AS BLOB)) = length(\(expression))"
     }
 
+    /// ASCII text, most of a library, folds to its lowercase, as `predicate` relies on.
     static func normalized(_ text: String) -> String {
-        text.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        guard !text.canBeConverted(to: .ascii) else { return text.lowercased() }
+        return text.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
     }
 
     static func text(artist: String?, title: String?, album: String?, path: String) -> String {
