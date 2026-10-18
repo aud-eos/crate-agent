@@ -15,6 +15,9 @@ enum LibraryFamilyMessages {
     static let setMain = "Set as Main Version"
     static let automaticMain = "Use Automatic Main Version"
     static let remove = "Remove from Song Family"
+    static let groupAsDifferentRecordings = "Group as Different Recordings"
+    static let addAsDifferentRecordings = "Add as Different Recordings"
+    static let differentRecordingsHelp = "Gives each file that shares a recording one of its own, so they count as separate versions. Undo it from History."
     static let selectAlternates = "Select Alternate Files"
     static let deselectAlternates = "Deselect Alternate Files"
     static let selectionLimit = 500

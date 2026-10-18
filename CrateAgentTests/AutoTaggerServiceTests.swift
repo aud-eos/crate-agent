@@ -1,4 +1,5 @@
 @testable import CrateAgent
+import CryptoKit
 import GRDB
 import XCTest
 
@@ -444,6 +445,28 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         XCTAssertEqual(service.rows[noMatchFileID], .noMatch)
         XCTAssertNil(service.haltReason)
+    }
+
+    func testLookupOfAFileWithARecordingOfItsOwnNamesThatRecording() async throws {
+        let database = try makeDatabase()
+        let hashes: [UInt32] = [1, 2, 3]
+        let fileID = try insertFile(in: database, path: "/music/dirty.mp3", fingerprintHashes: hashes)
+        let expected = try await database.writer.write { db in
+            let separation = RecordingDiscriminator(fingerprintHash: Data(SHA256.hash(data: FingerprintEncoder.serialize(hashes))),
+                                                    discriminator: Data("full-length".utf8), source: .fullFingerprint)
+            try RecordingIdentity.store(separation, ofFile: fileID, in: db)
+            return try RecordingIdentity.key(of: XCTUnwrap(FileRecord.fetchOne(db, key: fileID)), in: db)
+        }
+        let recording = makeRecording()
+        let service = AutoTaggerService(database: database,
+                                        acoustIDClient: StubAcoustIDClient { _ in [AcoustIDResult(id: "a-dirty", score: 0.98, recordingIDs: ["mb-dirty"])] },
+                                        musicBrainzClient: StubMusicBrainzClient { _ in recording }, keyStore: StubKeyProvider(),
+                                        audioTagsReader: stubAudioTagsReader())
+
+        await service.run(fileIDs: [fileID])
+
+        guard case let .strong(candidate) = service.rows[fileID] else { return XCTFail("expected .strong, got \(String(describing: service.rows[fileID]))") }
+        XCTAssertEqual(candidate.fingerprintHash, expected)
     }
 
     /// A 401 from the KEYLESS MusicBrainz request must not be reported as a

@@ -106,7 +106,8 @@ enum QueuedChangeDiscardMutation {
              .fileModificationTimeRecorded, .fileImportRequested, .songFamilyCreated, .songFamilyMembersAttached,
              .songFamilyMembersDetached, .songFamiliesMerged, .songFamilySplit, .songFamilyRepresentativeChanged,
              .songFamilyRestored, .songFamilyRecordingLinked, .songFamilyRecordingUnlinked, .duplicateLabelsKeptBoth,
-             .duplicateLabelsReopened, .queuedSeratoChangeDiscarded:
+             .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined:
             []
         }
     }
@@ -157,7 +158,8 @@ enum QueuedChangeDiscardMutation {
              .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged, .songFamilySplit,
              .songFamilyRepresentativeChanged, .songFamilyRestored, .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
-             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded:
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined:
             return []
         }
     }

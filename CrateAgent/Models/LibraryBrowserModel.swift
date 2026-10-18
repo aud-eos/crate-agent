@@ -9,6 +9,9 @@ final class LibraryBrowserModel: ObservableObject {
     @Published private(set) var query = LibraryBrowseQuery()
     @Published private(set) var isRefreshing = false
     @Published var error: String?
+    /// A group or add refused because its files share a recording, which the
+    /// user may retry as different recordings (#205).
+    @Published var differentRecordingsOffer: LibraryDifferentRecordingsOffer?
     /// Selection and eligibility of each visible family's members, including collapsed alternates.
     @Published private(set) var familyStates: [Int64: LibraryFamilyState] = [:]
     /// Changes whenever a family row's selection or disclosure display changes.
@@ -144,12 +147,23 @@ final class LibraryBrowserModel: ObservableObject {
         return LibraryFamilyActionTarget(clicked: row, files: files)
     }
 
-    func performFamilyAction(_ action: LibraryFamilyAction, on row: BrowserRow, using actions: LibraryFamilyActions) async {
+    func performFamilyAction(_ action: LibraryFamilyAction, on row: BrowserRow, using actions: LibraryFamilyActions,
+                             asDifferentRecordings: Bool = false) async
+    {
+        differentRecordingsOffer = nil
         do {
-            try await actions.perform(action, on: familyActionTarget(for: row))
+            try await actions.perform(action, on: familyActionTarget(for: row), asDifferentRecordings: asDifferentRecordings)
+        } catch let SongFamilyError.fingerprintCollision(file, otherFile) where !asDifferentRecordings && action.differentRecordingsTitle != nil {
+            let message = SongFamilyError.fingerprintCollision(file: file, otherFile: otherFile).localizedDescription
+            differentRecordingsOffer = LibraryDifferentRecordingsOffer(action: action, row: row, actions: actions, message: message)
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    func acceptDifferentRecordingsOffer() async {
+        guard let offer = differentRecordingsOffer else { return }
+        await performFamilyAction(offer.action, on: offer.row, using: offer.actions, asDifferentRecordings: true)
     }
 
     func setIncludeAlternates(_ include: Bool) {

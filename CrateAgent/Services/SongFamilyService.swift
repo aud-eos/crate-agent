@@ -85,6 +85,27 @@ public struct SongFamilyService: Sendable {
         try await apply(.attach(familyId: familyId, members: members), linking: members, familyId: familyId, authority: authority)
     }
 
+    /// `create` for files the user says are different recordings even though
+    /// they share one: each file whose recording another library file or a
+    /// file grouped with it shares is first given a grouping-owned recording
+    /// of its own, in the same batch (#205, docs/recording-identity.md).
+    public func createAsDifferentRecordings(_ fileIds: [Int64], authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
+        let members = fileIds.map(SongFamilyMember.file)
+        return try await apply(.create(members: members, representative: nil), linking: members,
+                               separating: groupingSeparations(of: fileIds), familyId: nil, authority: authority)
+    }
+
+    /// `attach` with the separations of `createAsDifferentRecordings`.
+    public func attachAsDifferentRecordings(_ fileIds: [Int64], to familyId: Int64, authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
+        let members = fileIds.map(SongFamilyMember.file)
+        return try await apply(.attach(familyId: familyId, members: members), linking: members,
+                               separating: groupingSeparations(of: fileIds), familyId: familyId, authority: authority)
+    }
+
+    private func groupingSeparations(of fileIds: [Int64]) async throws -> [TrackMutation] {
+        try await database.writer.read { database in try RecordingIdentity.groupingSeparations(of: fileIds, in: database) }
+    }
+
     /// Removing members that leaves fewer than two recordings dissolves the family.
     public func detach(_ trackIds: [Int64], from familyId: Int64, authority: [FileMembershipToken] = []) async throws -> SongFamilyResult {
         try await apply(.detach(familyId: familyId, trackIds: trackIds), familyId: familyId, authority: authority)
@@ -137,8 +158,8 @@ public struct SongFamilyService: Sendable {
     /// undo reverses both and a refused change leaves no link behind. Every
     /// `authority` token must still be current inside that transaction; a
     /// stale one is refused by the file's name.
-    private func apply(_ operation: SongFamilyOperation, linking members: [SongFamilyMember] = [], familyId: Int64?,
-                       authority: [FileMembershipToken]) async throws -> SongFamilyResult
+    private func apply(_ operation: SongFamilyOperation, linking members: [SongFamilyMember] = [], separating separations: [TrackMutation] = [],
+                       familyId: Int64?, authority: [FileMembershipToken]) async throws -> SongFamilyResult
     {
         let batchID = UUID().uuidString
         let links = members.compactMap { member -> TrackMutation? in
@@ -146,7 +167,7 @@ public struct SongFamilyService: Sendable {
             return .songFamily(.linkRecording(fileId: fileID))
         }
         do {
-            _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID, authorizingMembershipTokens: authority)
+            _ = try await engine.applyBatch(separations + links + [.songFamily(operation)], batchId: batchID, authorizingMembershipTokens: authority)
         } catch let FileProcessingEligibilityError.superseded(fileID) where authority.contains(where: { token in token.fileId == fileID }) {
             let name = try await database.writer.read { database in try FileRecord.fetchOne(database, key: fileID)?.displayName }
             guard let name else { throw FileProcessingEligibilityError.superseded(fileId: fileID) }

@@ -204,30 +204,44 @@ public enum DuplicateFinder {
     }
 
     private static func memberSQL(for mode: Mode, digestFilter: String = "") -> String {
+        """
+        SELECT \(DuplicateFileRow.columnsSQL), \(keyBlobColumn(mode)) AS group_blob, \(DuplicateDigestStore.columnsSQL(mode.digestKind))
+        FROM files
+        \(DuplicateDigestStore.freshJoinSQL(mode.digestKind))
+        WHERE \(clusterMemberSQL(mode)) \(digestFilter)
+        ORDER BY files.path
+        """
+    }
+
+    private static func keyBlobColumn(_ mode: Mode) -> String {
+        switch mode {
+        case .byteLevel: "files.lightweight_hash"
+        case .perceptual: "files.chromaprint_fingerprint"
+        }
+    }
+
+    /// Selects processable files whose candidate key another processable
+    /// file shares. For `.perceptual`, these are the files whose 120 s
+    /// fingerprint collides, the only files that need a full-length one.
+    static func clusterMemberSQL(_ mode: Mode) -> String {
+        let keyBlob = keyBlobColumn(mode)
         let keyColumns: String
-        let keyBlobColumn: String
         let keyCondition: String
         switch mode {
         case .byteLevel:
-            keyBlobColumn = "files.lightweight_hash"
-            keyColumns = "files.file_size, \(keyBlobColumn)"
-            keyCondition = "\(keyBlobColumn) IS NOT NULL"
+            keyColumns = "files.file_size, \(keyBlob)"
+            keyCondition = "\(keyBlob) IS NOT NULL"
         case .perceptual:
-            keyBlobColumn = "files.chromaprint_fingerprint"
-            keyColumns = keyBlobColumn
-            keyCondition = "files.fingerprint_status = '\(FingerprintStatus.done.rawValue)' AND \(keyBlobColumn) IS NOT NULL"
+            keyColumns = keyBlob
+            keyCondition = "files.fingerprint_status = '\(FingerprintStatus.done.rawValue)' AND \(keyBlob) IS NOT NULL"
         }
         let eligibleSQL = "\(FileProcessingEligibility.processableSQL) AND \(keyCondition)"
         return """
-        SELECT \(DuplicateFileRow.columnsSQL), \(keyBlobColumn) AS group_blob, \(DuplicateDigestStore.columnsSQL(mode.digestKind))
-        FROM files
-        \(DuplicateDigestStore.freshJoinSQL(mode.digestKind))
-        WHERE \(eligibleSQL) \(digestFilter)
+        \(eligibleSQL)
           AND (\(keyColumns)) IN (
             SELECT \(keyColumns) FROM files WHERE \(eligibleSQL)
             GROUP BY \(keyColumns) HAVING COUNT(*) > 1
           )
-        ORDER BY files.path
         """
     }
 

@@ -39,6 +39,14 @@ struct LibraryPagedContent: View {
             if let message = model.selection.error {
                 failure(message) { model.selection.retry() }
             }
+            if let offer = model.differentRecordingsOffer, let title = offer.action.differentRecordingsTitle {
+                HStack {
+                    ActionErrorMessage(message: offer.message)
+                    Button(title) { Task { await model.acceptDifferentRecordingsOffer() } }
+                        .help(LibraryFamilyMessages.differentRecordingsHelp)
+                    Button(CommonLabels.dismiss) { model.differentRecordingsOffer = nil }
+                }
+            }
             HStack(spacing: density.spacing) {
                 let summary = model.selection.summary
                 ListResultSummary(results: model.results.totalCount, selected: summary?.total ?? 0, hidden: summary?.hidden ?? 0)

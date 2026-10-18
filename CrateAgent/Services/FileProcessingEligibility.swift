@@ -55,6 +55,7 @@ extension TrackMutation {
         case let .applyMusicBrainzMatch(payload): payload.fileID
         case let .revertMusicBrainzMatch(payload): payload.applied.fileID
         case let .discardQueuedSeratoChange(payload): payload.fileId
+        case let .recordingIdentity(operation): operation.processingFileID
         }
     }
 

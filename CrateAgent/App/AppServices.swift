@@ -32,6 +32,7 @@ public final class AppServices: ObservableObject {
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
     public let duplicateEvidenceVerifier: DuplicateEvidenceVerifier
+    let recordingIdentity: RecordingIdentityService
     public let activityLog: ActivityLog
     let trackPlayer: TrackPlayer
     let fileOpener: FileOpener
@@ -168,6 +169,7 @@ public final class AppServices: ObservableObject {
             readiness: readiness
         )
         operationEngine = engine
+        recordingIdentity = RecordingIdentityService(engine: engine, database: database, verifier: audioEvidence)
         songFamilies = SongFamilyService(engine: engine, database: database)
 
         let filesystemCoordinator = FilesystemSyncCoordinator(

@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import GRDB
 
@@ -171,9 +170,9 @@ public enum SongFamilyError: LocalizedError, Equatable {
         case let .recordingHasNoFiles(recording):
             "“\(recording)” has no file in the library, so it can't be grouped."
         case let .fingerprintCollision(file, otherFile?):
-            "“\(file)” and “\(otherFile)” share an audio fingerprint, so crate-agent treats them as one recording and can't group them as separate versions."
+            "“\(file)” and “\(otherFile)” share an audio fingerprint, so crate-agent treats them as one recording. Group them as different recordings to keep them as separate versions."
         case let .fingerprintCollision(file, nil):
-            "“\(file)” has the same audio fingerprint as a recording crate-agent already identified, so it treats them as one recording and can't group them as separate versions."
+            "“\(file)” has the same audio fingerprint as a recording crate-agent already identified, so it treats them as one recording. Group them as different recordings to keep them as separate versions."
         case let .linkChanged(file):
             "“\(file)” was linked to a different recording since this was recorded."
         case let .changedSinceShown(file):
@@ -379,7 +378,7 @@ enum SongFamilyMutation {
     private static func link(_ fileID: Int64, in database: GRDB.Database) throws -> SongFamilyRecordingLink? {
         let file = try activeFile(fileID, in: database)
         guard file.trackId == nil else { return nil }
-        guard let hash = currentFingerprintHash(of: file) else { throw SongFamilyError.recordingUnidentified(file: file.displayName) }
+        guard let hash = try RecordingIdentity.key(of: file, in: database) else { throw SongFamilyError.recordingUnidentified(file: file.displayName) }
         let trackID: Int64
         if let existing = try TrackRecord.filter(Column("fingerprint_hash") == hash).fetchOne(database), let existingID = existing.id {
             try requireUnclaimed(existing, by: fileID, in: database)
@@ -399,22 +398,13 @@ enum SongFamilyMutation {
         guard try fileRecord(recorded.fileId, in: database).trackId != recorded.trackId else { return nil }
         let file = try activeFile(recorded.fileId, in: database)
         guard file.trackId == nil, let track = try TrackRecord.fetchOne(database, key: recorded.trackId),
-              currentFingerprintHash(of: file) == track.fingerprintHash
+              try RecordingIdentity.key(of: file, in: database) == track.fingerprintHash
         else {
             throw SongFamilyError.linkChanged(file: file.displayName)
         }
         try requireUnclaimed(track, by: recorded.fileId, in: database)
         return try setLink(SongFamilyRecordingLink(fileId: recorded.fileId, trackId: recorded.trackId, membershipRevision: file.membershipRevision),
                            in: database)
-    }
-
-    private static func currentFingerprintHash(of file: FileRecord) -> Data? {
-        guard file.fingerprintStatus == .done, let fingerprint = file.chromaprintFingerprint,
-              (file.fingerprintedSize ?? file.fileSize) == file.fileSize, (file.fingerprintedMtime ?? file.mtime) == file.mtime
-        else {
-            return nil
-        }
-        return Data(SHA256.hash(data: fingerprint))
     }
 
     /// A link a later identity change claimed stays; that change owns it now.

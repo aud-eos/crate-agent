@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import GRDB
 
@@ -60,6 +59,8 @@ enum SeratoConflictTargets {
                 include(discarded.queued.originalIdentity, in: &target)
                 target.paths += discarded.queued.originalReferencePaths + discarded.queued.write.referencePaths
             }
+        case let .recordingIdentity(operation):
+            fileID = try includeRecordingSeparation(operation, in: &target, database: database)
         case let .duplicateLabelReview(.keepBoth(payload)), let .duplicateLabelReview(.reopen(payload)):
             fileID = nil
             target.fileIDs.formUnion(payload.fileIds)
@@ -117,8 +118,8 @@ enum SeratoConflictTargets {
     {
         switch operation {
         case let .linkRecording(fileID):
-            if let file = try FileRecord.fetchOne(database, key: fileID), let fingerprint = file.chromaprintFingerprint {
-                try includeSharedTrack(Data(SHA256.hash(data: fingerprint)), in: &target, database: database)
+            if let file = try FileRecord.fetchOne(database, key: fileID), let key = try RecordingIdentity.key(of: file, in: database) {
+                try includeSharedTrack(key, in: &target, database: database)
             }
             return fileID
         case let .unlinkRecording(link), let .relinkRecording(link):
@@ -126,6 +127,31 @@ enum SeratoConflictTargets {
             return link.fileId
         case .create, .attach, .detach, .merge, .split, .setRepresentative, .restore:
             return nil
+        }
+    }
+
+    /// A separation moves a file's identity, and maybe its `track_id`, off
+    /// the shared recording onto its own, so it targets the file and both.
+    private static func includeRecordingSeparation(_ operation: RecordingIdentityOperation, in target: inout SeratoConflictTarget,
+                                                   database: GRDB.Database) throws -> Int64
+    {
+        switch operation {
+        case let .separate(request):
+            if let file = try FileRecord.fetchOne(database, key: request.fileId) {
+                if let trackID = file.trackId {
+                    target.sharedTrackIDs.insert(trackID)
+                }
+                if let key = try RecordingIdentity.key(of: file, in: database) {
+                    try includeSharedTrack(key, in: &target, database: database)
+                }
+                if let separated = RecordingIdentity.fingerprintHash(of: file).map(request.discriminator(fingerprintHash:)) {
+                    try includeSharedTrack(separated.key, in: &target, database: database)
+                }
+            }
+            return request.fileId
+        case let .rejoin(separation), let .reseparate(separation):
+            target.sharedTrackIDs.formUnion([separation.trackId, separation.previousTrackId].compactMap(\.self))
+            return separation.fileId
         }
     }
 

@@ -96,6 +96,9 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case duplicateLabelsKeptBoth = "duplicate_labels_kept_both"
     case duplicateLabelsReopened = "duplicate_labels_reopened"
     case queuedSeratoChangeDiscarded = "queued_serato_change_discarded"
+    case recordingSeparated = "recording_separated"
+    case recordingSeparatedForGrouping = "recording_separated_for_grouping"
+    case recordingRejoined = "recording_rejoined"
 
     /// Whether this event type projects onto Serato/audio-file writes that
     /// `OperationEngine.resyncSeratoForBatch` can idempotently replay from the
@@ -121,7 +124,8 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
-             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded:
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined:
             false
         }
     }
