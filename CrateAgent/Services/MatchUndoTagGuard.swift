@@ -10,8 +10,11 @@ extension ApplyMusicBrainzMatchPayload {
     /// Applied file-tag fields whose matched value equals the file's captured
     /// pre-match value. Undo has nothing to restore there, so it leaves them
     /// alone, and a later edit to one survives. Absent and empty text are the
-    /// same tag value.
+    /// same tag value. Events recorded before the file's own tags were
+    /// captured hold only the row snapshot, which says nothing about the
+    /// disk, so for them no field counts as unchanged.
     var fileTagFieldsUnchangedByMatch: Set<MatchFileTagField> {
+        guard previousFileTags != nil else { return [] }
         let restored = fileTagRestoreSnapshot
         let textFields: [(field: MatchFileTagField, applied: String?, restored: String?)] = [
             (.artist, artist, restored.artist), (.title, title, restored.title), (.album, album, restored.album),
