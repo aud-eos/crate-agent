@@ -4183,6 +4183,7 @@ final class DuplicateResolverTests: XCTestCase {
         let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe.mp3"])
         defer { fixture.cleanup() }
         let keeperID = try XCTUnwrap(files[0].id)
+        try await DuplicateEvidenceVerifier(database: fixture.database).verifyPendingFiles(mode: .byteLevel)
         let scanned = try await fixture.database.writer.read { connection in try DuplicateFinder.findDuplicates(in: connection, mode: .byteLevel) }
         let group = try XCTUnwrap(scanned.first)
         XCTAssertEqual(Set(group.files.map(\.id)), Set(files.map(\.id)))
@@ -4199,7 +4200,7 @@ final class DuplicateResolverTests: XCTestCase {
     func testResolveJournalsFourEventsPerNonKeeperUnderOneBatch() async throws {
         let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe1.mp3", "dupe2.mp3"])
         defer { fixture.cleanup() }
-        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: XCTUnwrap(files[0].id))
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: DuplicateFinder.DuplicateGroup.confirmedByteLevel("k", files: files, in: fixture.database), keeperId: XCTUnwrap(files[0].id))
         let events = try await fixture.database.writer.read { try EventRecord.filter(Column("batch_id") == outcome.batchId).order(Column("event_id")).fetchAll($0) }
         XCTAssertEqual(events.count, 8)
         XCTAssertEqual(events.map(\.eventType), [.trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileTrashed, .fileRemoved])
@@ -4218,7 +4219,7 @@ final class DuplicateResolverTests: XCTestCase {
     func testResolveBatchIsNotUndoable() async throws {
         let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe.mp3"])
         defer { fixture.cleanup() }
-        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: XCTUnwrap(files[0].id))
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: DuplicateFinder.DuplicateGroup.confirmedByteLevel("k", files: files, in: fixture.database), keeperId: XCTUnwrap(files[0].id))
         do {
             _ = try await engine.undoBatch(outcome.batchId)
             XCTFail("Cleanup is not undoable through the engine")
@@ -4230,7 +4231,7 @@ final class DuplicateResolverTests: XCTestCase {
     func testResolveContinuesAfterPerFileFailureAndReportsCounts() async throws {
         let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe-ok.mp3", "dupe-fail.mp3"], failingName: "dupe-fail.mp3")
         defer { fixture.cleanup() }
-        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: .init(groupKey: "k", mode: .byteLevel, files: files), keeperId: XCTUnwrap(files[0].id))
+        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: DuplicateFinder.DuplicateGroup.confirmedByteLevel("k", files: files, in: fixture.database), keeperId: XCTUnwrap(files[0].id))
         XCTAssertEqual(outcome.trashedCount, 1)
         XCTAssertEqual(outcome.failureCount, 1)
         XCTAssertEqual(outcome.errors.count, 1)

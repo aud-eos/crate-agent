@@ -29,11 +29,10 @@ struct LibraryBrowserView: View {
             if let loadError {
                 ActionErrorMessage(message: loadError).padding(density.pagePadding)
             }
-            AudioPreviewFailureMessage(player: services.audioPreview).padding(.horizontal, density.pagePadding)
             ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
             if let model {
                 LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness,
-                                    preview: services.audioPreview)
+                                    player: services.trackPlayer)
                 { identifier, action in
                     Task { await perform(action, for: identifier) }
                 } onFamilyAction: { row, action in
@@ -64,7 +63,7 @@ struct LibraryBrowserView: View {
         .onChange(of: services.librarySearchRequest) { _, _ in applySearchRequest() }
         .onChange(of: debouncedSearch) { _, _ in updateQuery() }
         .onChange(of: statusFilter) { _, _ in updateQuery() }
-        .onDisappear { model?.stop(); model = nil; services.audioPreview.stop() }
+        .onDisappear { model?.stop(); model = nil }
         .alert("Restart required", isPresented: $showRestartAlert) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -79,7 +78,8 @@ struct LibraryBrowserView: View {
             let coordinator = services.importCoordinator
             Task { @MainActor in
                 let result = await coordinator.importDroppedItems(droppedUrls)
-                loadError = result.blockedFiles.isEmpty ? nil : result.blockedFiles.joined(separator: "\n")
+                let notices = result.blockedFiles + result.filesNotAdded + result.filesAlreadyImporting
+                loadError = notices.isEmpty ? nil : notices.joined(separator: "\n")
                 if result.filesPendingSync > 0 {
                     lastImportSummary = "\(result.filesImported) imported; \(result.filesPendingSync) pending sync; \(result.filesSkipped) skipped"
                     services.syncSession.reportFailure(

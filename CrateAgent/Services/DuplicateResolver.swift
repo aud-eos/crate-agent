@@ -58,6 +58,7 @@ public actor DuplicateResolver {
     public enum ResolverError: LocalizedError, Equatable {
         case keeperNotInGroup
         case noFilesToTrash
+        case notConfirmed
 
         public var errorDescription: String? {
             switch self {
@@ -65,6 +66,8 @@ public actor DuplicateResolver {
                 "The chosen keeper isn't a member of this duplicate group."
             case .noFilesToTrash:
                 "Nothing to do — the group has only the keeper file."
+            case .notConfirmed:
+                "These files haven't been confirmed the same, so none of them were moved to Trash."
             }
         }
     }
@@ -93,16 +96,28 @@ public actor DuplicateResolver {
     /// may hold lightweight projections; the full rows are fetched by
     /// id here, and a row whose revision or physical identity no
     /// longer matches the reviewed one is reported as superseded.
+    /// A group needing listening trashes only `explicitlySelectedFileIDs`; every
+    /// other group trashes all non-keepers.
     @discardableResult
     public func resolve(
         group: DuplicateFinder.DuplicateGroup<some DuplicateFileSource>,
         keeperId: Int64,
-        batchId: String? = nil
+        batchId: String? = nil,
+        explicitlySelectedFileIDs: Set<Int64> = []
     ) async throws -> Outcome {
         guard let reviewedKeeper = group.files.first(where: { file in file.id == keeperId }) else { throw ResolverError.keeperNotInGroup }
+        let requirement: DuplicateEvidenceRequirement
+        switch group.check {
+        case .confirmed: requirement = .init(kind: group.mode.digestKind, allowsFingerprintMatch: false)
+        case .needsListening: requirement = .init(kind: group.mode.digestKind, allowsFingerprintMatch: true)
+        case .checking, .differs: throw ResolverError.notConfirmed
+        }
 
         let reviewedTargets = group.files.compactMap { file in
-            file.id.flatMap { identifier in identifier == keeperId ? nil : (fileID: identifier, file: file) }
+            file.id.flatMap { identifier in
+                identifier == keeperId || (group.check == .needsListening && !explicitlySelectedFileIDs.contains(identifier))
+                    ? nil : (fileID: identifier, file: file)
+            }
         }
         guard !reviewedTargets.isEmpty else { throw ResolverError.noFilesToTrash }
         let currentByID = try await database.writer.read { connection in
@@ -130,7 +145,8 @@ public actor DuplicateResolver {
         for (fileId, reviewed) in reviewedTargets {
             do {
                 let result = try await operationEngine.resolveDuplicate(
-                    target: current(fileId, reviewed: reviewed), keeper: current(keeperId, reviewed: reviewedKeeper), batchID: effectiveBatchId
+                    target: current(fileId, reviewed: reviewed), keeper: current(keeperId, reviewed: reviewedKeeper), batchID: effectiveBatchId,
+                    requirement: requirement
                 )
                 switch result {
                 case .completed: trashedCount += 1

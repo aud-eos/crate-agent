@@ -13,7 +13,7 @@ struct LibraryPagedContent: View {
     let density: AppDensity
     let showsFilenames: Bool
     var readiness: LibrarySyncReadiness?
-    var preview: AudioPreviewPlayer?
+    var player: TrackPlayer?
     let onAction: (Int64, LibraryBrowserAction) -> Void
     var onFamilyAction: (BrowserRow, LibraryFamilyAction) -> Void = { _, _ in }
 
@@ -78,7 +78,7 @@ struct LibraryPagedContent: View {
     }
 
     private var table: some View {
-        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, preview: preview,
+        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, player: player,
                                                                                   families: model.showsFamilies ? familyControls : nil),
                    accessibilityLabel: "Library files", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
                    isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
@@ -101,7 +101,8 @@ struct LibraryPagedContent: View {
                    }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled,
                    contentRevision: (readiness?.scopeRevision ?? 0) &+ model.familyRevision,
                    onFocus: { identifier, index in model.focus(id: identifier, index: index) },
-                   onDisclose: { identifier, expanded in model.disclose(expanded, row: identifier) })
+                   onDisclose: { identifier, expanded in model.disclose(expanded, row: identifier) },
+                   onSpace: player.map { player in { row in player.toggle(PlayerTrack(row)) } })
     }
 
     private var familyControls: LibraryFamilyControls {

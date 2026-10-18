@@ -53,10 +53,20 @@ search and filter changes, and the count shows selected files outside the filter
 New matches never join an earlier selection automatically. Right-click actions
 still operate on the clicked file.
 
-The play button at the start of each Library row, and beside each file in
-**Cleanup → Duplicates**, previews the audio. Only one file plays at a time;
-starting another, pressing stop, or leaving the screen ends it. Previewing only
-reads the file.
+The play button at the start of each Library row, beside each file in
+**Cleanup → Duplicates**, and beside each **Auto-Tag** review plays the track from
+about 30% in, past DJ intros, and keeps playing to the end. Press it again to pause
+and resume; in Library, Space does the same for the focused row. The now-playing
+bar at the bottom of the window shows the title and artist, elapsed and total time,
+a scrub bar, play/pause, ±10 s skip and stop. One track plays at a time, app-wide,
+across screens. Playback only reads the file.
+
+Duplicates are checked in full before cleanup is offered: byte-level matches by
+hashing every byte, perceptual matches by decoding. Only files with identical
+contents or decoded audio are offered together. Files that share a fingerprint but differ in audio,
+such as Clean and Dirty edits, are listed as kept. Copies in another format or
+encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
+listen and check each one yourself.
 
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;

@@ -20,6 +20,8 @@ final class PagedNSTableView: NSTableView {
     var focusChanged: ((Int) -> Void)?
     /// Returns whether the row handled the disclosure key.
     var disclosureIntent: ((Int, Bool) -> Bool)?
+    /// Handles Space for the focused row instead of toggling its selection.
+    var spaceAction: ((Int) -> Bool)?
 
     func focusRow(_ index: Int, modifiers: NSEvent.ModifierFlags, selecting: Bool) {
         guard index >= 0, index < numberOfRows else { return }
@@ -49,7 +51,9 @@ final class PagedNSTableView: NSTableView {
         case 121: next = min(numberOfRows - 1, selectedRow + step)
         case 116: next = max(0, selectedRow - step)
         case 49:
-            selectionIntent?(selectedRow, [.command])
+            if spaceAction?(selectedRow) != true {
+                selectionIntent?(selectedRow, [.command])
+            }
             return
         case 123, 124:
             if selectedRow >= 0, disclosureIntent?(selectedRow, event.keyCode == 124) == true {
