@@ -19,16 +19,16 @@ Today the owner searches by genre, BPM range, compatible key, sometimes clean ve
    - **In a playlist:** in at least one Serato crate (Subcrates). SmartCrate membership doesn't count, because it's rule-derived.
    - **Cue points:** the file has Serato cue points.
    - **Beatgrid checked:** the beatgrid is locked or confirmed in Serato.
-   - **Good metadata:** the required fields are present: artist, title, genre, BPM and key. This reuses Auto-Tag's existing "missing metadata" definition.
+   - **Good metadata:** artist, title, genre, BPM and key are all present, read from the indexed values crate-agent mirrors from Serato. This is wider than Auto-Tag's "missing metadata", which only checks artist, title and album. Each field gets its own fix: artist and title through Auto-Tag; genre through the tag editor; BPM and key through "Analyze in Serato", because MusicBrainz doesn't supply them.
    - **Good quality:** passes a bitrate and format threshold. Lossless, or lossy at 256 kbps or more, is the default; it's the builder's call and should be one shared constant.
    - **Not over-versioned:** the track's song family has no more than a threshold of versions, or the track is the family's main version.
-   - **Not a duplicate:** isn't in a confirmed duplicate group, other than as its keeper.
+   - **Not a duplicate:** isn't in a confirmed duplicate group from the most recent duplicate scan, using cached digests and no new library-wide scan. Every member of an unresolved confirmed group is flagged, except a file the owner marked as a keeper. Needs-listening groups aren't flagged.
 
    A track that passes every item, or that the owner marked as a keeper (see 5), is **Finished**.
 2. **Popularity signals** per track:
    - **All-time:** how well known it is overall.
    - **Hot:** how fast it's gaining now.
-   - **My plays:** the owner's own Serato History play count (#34).
+   - **My plays:** the owner's own Serato History play count. PR 236 (#34) adds the Serato History reader and play counts and is in the merge queue. This design depends on it landing, and "My plays", "Never played" and Prepare's ranking wait for it.
 
    The owner confirmed that both all-time and hot are useful in different ways.
 3. **Library integration ("A", approved):**
@@ -40,7 +40,10 @@ Today the owner searches by genre, BPM range, compatible key, sometimes clean ve
    - It uses the same filters as the Library and shows one track, or one song family, at a time.
    - Each card shows what's missing and offers the fixes: Add to crate, Fix tags (through Auto-Tag), Open in Serato to check the grid, Play (the existing player), Mark as keeper, Show other versions, and Move to Trash.
 5. **Keeper flag.** The owner can mark a track as a keeper, which protects it. It never appears as filler or a removal candidate, and it counts as Finished. This covers obscure gems. The flag is recording-level, so all encodings of one recording share it (Invariant 4), and setting or clearing it is an undoable mutation.
-6. **Removal is deletion.** When the owner decides a track is filler, they want it gone from the library entirely, not hidden. Deletion goes through the existing reviewed, undoable path used by Duplicates cleanup: move to Trash, remove from V2, Subcrates and SmartCrates, record it in History, and undo while the file is still in the Trash. Prepare and the Library can select several tracks for one reviewed removal, which shows how much space it frees.
+6. **Removal is deletion, and fully undoable (owner decision, 2026-10-18).** When the owner decides a track is filler, they want it gone from the library entirely, not hidden. Removing it moves the file to the Trash and removes it from V2, Subcrates and SmartCrates. **Undo from History must restore all of it** while the file is still in the Trash: the file to its path, its V2 record, and its position in every crate and SmartCrate cache.
+   - **Not available today.** The existing Duplicates path can't do this. `RemoveTrackFromSeratoPayload` and `RemoveFileFromCratesPayload` are documented as not undoable, the app keeps neither the `otrk` record nor the list of crates that held the file, and the Duplicates dialog says "This action can't be undone from History".
+   - **Needs a new removal mutation first.** A keeper-less removal intent, separate from `resolveDuplicate(target:keeper:)`, has to record each removed `otrk` record and its crate positions in its inverse payload. Its undo restores them, under Invariant 3. Deleting filler ships after this mutation, and Duplicates cleanup should move to it as well.
+   - **Batch removal.** Prepare and the Library can select several tracks for one reviewed removal, which shows how much space it frees.
 7. **Version attributes (#137).** Structured facets for content (Clean/Dirty/unknown) and arrangement (Main, Intro/Outro, Radio, Extended, Remix, Instrumental, Acapella, …). They're filterable, for example "clean instrumentals". Build on PR 244's `VersionLabel` vocabulary. Inference from titles is a *suggestion* that needs review, as #137 says.
 
 ## Non-goals (for this design)
@@ -91,6 +94,8 @@ The owner accepted these as the first-run list.
 - **Showing popularity:** each source keeps its own raw value. The UI shows one normalized all-time score, and its tooltip lists the sources.
 - **Date added (#43):** use Serato's `tadd` from V2 where present, and otherwise when crate-agent first indexed the file. Label it "Date added".
 - **The quality threshold and the "too many versions" threshold** are single named constants the builder picks and documents.
+- **The checklist applies per file.** Quality, duplicates, cues and grid are properties of each file. A keeper protects its recording from appearing as *filler*, but a low-bitrate copy of a kept recording still shows "Low quality", and can still be removed in favour of the better copy. A collapsed song-family row shows its main version's checklist, plus a count like "2 of 5 versions need work". "Too many versions" only applies to files in a song family. It says nothing about files without one.
+- **Version attributes (#137) wait for PR 244** (#204), which defines `VersionLabel` and is in the merge queue.
 - **Where keeper and popularity attach:** to the file's recording when `track_id` is set, so every encoding of that recording shares it. Otherwise they attach to the file itself. When a file later gains a `track_id`, its keeper flag moves to the recording through a mutation, never silently.
 - **Add to crate:** offers the owner's existing Serato crates only. Creating, renaming or reorganizing crates belongs to #141, which is still undecided.
 - **Popularity sources start switched off.** The first time the owner opens a popularity column or Prepare, one prompt explains what each source receives and lets them switch it on. Until then, Popularity shows "off", not "unknown".
