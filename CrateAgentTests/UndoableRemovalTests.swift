@@ -239,13 +239,35 @@ final class UndoableRemovalTests: XCTestCase {
         for path in removed.originalBytes.keys {
             XCTAssertNil(try Data(contentsOf: URL(fileURLWithPath: path)).range(of: seratoPath), "\(path) still holds the file")
         }
+        let history = try await EventHistoryQuery.loadRecentBatches(database: fixture.database)
+        XCTAssertEqual(history.first { batch in batch.batchId == removed.batchID }?.canUndo, true)
         try await engine.undoBatch(removed.batchID)
         try await assertFileRestored(removed, in: fixture)
         for (path, bytes) in removed.originalBytes {
             XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
         }
-        let history = try await EventHistoryQuery.loadRecentBatches(database: fixture.database)
-        XCTAssertEqual(history.first { batch in batch.batchId == removed.batchID }?.canUndo, true)
+    }
+
+    func testRemovingTheKeeperOfAPendingCleanupIsRefused() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine, whileSeratoRuns: true)
+        let keeperPath = fixture.directory.appendingPathComponent("keeper.wav").path
+        let keeper = try await fixture.database.writer.read { database in
+            try XCTUnwrap(FileRecord.filter(Column("path") == keeperPath).fetchOne(database))
+        }
+
+        do {
+            _ = try await engine.removeFile(target: keeper, batchID: UUID().uuidString)
+            XCTFail("Removing the copy a pending cleanup keeps must be refused")
+        } catch OperationEngineError.removalTargetIsKept(keeperPath) {}
+
+        fixture.lifecycle.running = false
+        fixture.watchdog.refresh()
+        try await engine.drainPendingSeratoUpdates()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: keeperPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cleaned.target.path))
     }
 
     private struct LibraryState: Equatable {

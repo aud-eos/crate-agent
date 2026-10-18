@@ -231,13 +231,10 @@ public enum EventHistoryQuery {
     }
 
     static func canUndoBatch(typeList: [String]) -> Bool {
-        // Mirror OperationEngine.decodeInverseMutation's whitelist.
-        // `metadataCommittedToSerato` was on this list before SP-1.5
-        // landed undo-aware commits — every production caller today
-        // (the hygiene runner) supplies `previousMetadata`, so the
-        // engine accepts the inverse. Only `trackAddedToSerato`
-        // remains unconditionally unsupported (it needs a Rust-side
-        // removeTrackFromSerato FFI we don't have yet).
+        // Mirror OperationEngine.decodeInverseMutation: these event types
+        // have no inverse it accepts. Observations and import requests
+        // record state rather than change it, `trackAddedToSerato` has no
+        // inverse yet, and the two removal-restore types refuse redo.
         let unsupportedRaw: Set<String> = [
             EventType.trackAddedToSerato.rawValue,
             EventType.fileLocationObserved.rawValue,
@@ -245,7 +242,7 @@ public enum EventHistoryQuery {
             EventType.fileModificationTimeRecorded.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
             EventType.fileImportRequested.rawValue,
-            // Undoing a removal's undo is not supported yet (#270).
+            // Redo of an undone removal is #270.
             EventType.fileRestoredFromTrash.rawValue,
             EventType.seratoRecordsRestored.rawValue,
         ]

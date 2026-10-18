@@ -695,6 +695,10 @@ enum DuplicateCleanupStore {
         try Bool.fetchOne(database, sql: "SELECT EXISTS(SELECT 1 FROM duplicate_cleanup_intents)") ?? false
     }
 
+    static func isKeeper(fileID: Int64, in database: Database) throws -> Bool {
+        try fetchAll(in: database).contains { intent in intent.authority.keeper?.token.fileId == fileID }
+    }
+
     static func save(_ intent: PendingFileRemoval, in database: Database) throws {
         let stored = switch intent.authority {
         case let .duplicateOf(keeper, requirement):
@@ -740,7 +744,13 @@ enum DuplicateCleanupStore {
     private static func decode(_ row: Row) throws -> PendingFileRemoval {
         let bytes: Data = row["payload"]
         let stored = try SyncCheckpointStore.decodeCanonical(Authority.self, from: bytes)
-        let authority: RemovalAuthority = stored.keeper.map { keeper in .duplicateOf(keeper, stored.evidenceRequirement) } ?? .ownerChoice
+        let authority: RemovalAuthority
+        if let keeper = stored.keeper {
+            authority = .duplicateOf(keeper, stored.evidenceRequirement)
+        } else {
+            guard stored.evidenceRequirement == nil else { throw SyncCheckpointError.malformed }
+            authority = .ownerChoice
+        }
         var intent = PendingFileRemoval(target: stored.target, authority: authority, batchID: stored.batchID)
         intent.step = row["step"]
         intent.waitingEventID = row["waiting_event_id"]

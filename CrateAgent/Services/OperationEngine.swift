@@ -263,12 +263,13 @@ public actor OperationEngine {
             return existing.failure.map(FileRemovalResult.failed) ?? duplicateCleanupResults[fileID] ?? .pending
         }
         try await database.writer.read { database in
+            try Self.requireNotKept(intent, in: database)
             try intent.target.validate(in: database)
             try intent.authority.validateKeeper(in: database)
         }
         duplicateCleanupResults[fileID] = .pending
         await advanceFileRemoval(fileID, starting: intent)
-        return duplicateCleanupResults[fileID] ?? .failed("Cleanup lost its completion state.")
+        return duplicateCleanupResults[fileID] ?? .failed(FileRemovalMessages.lostCompletionState)
     }
 
     /// Runs removal steps until one waits on queued external work, fails, or the
@@ -291,7 +292,7 @@ public actor OperationEngine {
                 }
             } catch {
                 duplicateCleanupResults[fileID] = .failed(error.localizedDescription)
-                await note("Duplicate cleanup state for file \(fileID) is unreadable: \(error.localizedDescription)")
+                await note(FileRemovalMessages.stateUnreadable(fileID: fileID, error: error.localizedDescription))
                 return
             }
             unsaved = nil
@@ -322,6 +323,10 @@ public actor OperationEngine {
                         guard stored?.step == intent.step, stored?.batchID == intent.batchID else {
                             throw DuplicateCleanupInterruption.withdrawn
                         }
+                    }
+                    try Self.requireNotKept(intent, in: database)
+                    if let keeper = intent.authority.keeper, try DuplicateCleanupStore.fetch(targetFileID: keeper.token.fileId, in: database) != nil {
+                        throw FileProcessingEligibilityError.superseded(fileId: fileID)
                     }
                     try intent.target.validate(in: database, audioWasTrashed: intent.step == 3)
                     try intent.authority.validateKeeper(in: database)
@@ -367,7 +372,7 @@ public actor OperationEngine {
                 }
                 if outcome.queuedCount > 0 {
                     duplicateCleanupResults[fileID] = .pending
-                    await note("Duplicate cleanup for \((intent.target.identity.path as NSString).lastPathComponent) is pending; its file row is retained until all external steps finish.")
+                    await note(FileRemovalMessages.pending(path: intent.target.identity.path))
                     return
                 }
             } catch is SeratoPathConflictError {
@@ -387,16 +392,23 @@ public actor OperationEngine {
                 let result: FileRemovalResult = error is FileProcessingEligibilityError ? .superseded(message) : .failed(message)
                 do { try await cancelDuplicateCleanup(fileID, result: result) }
                 catch { duplicateCleanupResults[fileID] = .failed(error.localizedDescription) }
-                await note("Duplicate cleanup stopped for file \(fileID): \(message)")
+                await note(FileRemovalMessages.stopped(fileID: fileID, message: message))
                 return
             }
+        }
+    }
+
+    /// Removing a file another removal keeps could lose every copy.
+    private static func requireNotKept(_ intent: PendingFileRemoval, in database: GRDB.Database) throws {
+        if try DuplicateCleanupStore.isKeeper(fileID: intent.target.token.fileId, in: database) {
+            throw OperationEngineError.removalTargetIsKept(path: intent.target.identity.path)
         }
     }
 
     private func finishDuplicateCleanupIfCompleted(_ fileID: Int64) async {
         guard duplicateCleanupResults[fileID] == .pending else { return }
         duplicateCleanupResults[fileID] = .completed
-        await note("Duplicate cleanup completed for file \(fileID).")
+        await note(FileRemovalMessages.completed(fileID: fileID))
     }
 
     /// Cancels the cleanup and every queued effect it still owns in one
@@ -421,7 +433,7 @@ public actor OperationEngine {
     }
 
     private static func duplicateCleanupFailureMessage(_ intent: PendingFileRemoval, error: Error) -> String {
-        "Cleanup stopped at step \(intent.step + 1) for \((intent.target.identity.path as NSString).lastPathComponent): \(UserFacingErrorMessage.message(for: error)). Fix the cause, then choose Retry Sync."
+        FileRemovalMessages.stoppedAtStep(intent.step + 1, path: intent.target.identity.path, error: UserFacingErrorMessage.message(for: error))
     }
 
     func pendingCleanupOwnsRemoval(of file: FileRecord) async throws -> Bool {
@@ -435,13 +447,13 @@ public actor OperationEngine {
             }
             return true
         } catch is FileProcessingEligibilityError {
-            try await cancelDuplicateCleanup(fileID, result: .superseded("Duplicate cleanup was superseded by a changed keeper or target."), reported: false)
+            try await cancelDuplicateCleanup(fileID, result: .superseded(FileRemovalMessages.supersededByChange), reported: false)
             return false
         }
     }
 
     func supersedeReappearedCleanup(fileID: Int64) async throws {
-        try await cancelDuplicateCleanup(fileID, result: .superseded("Duplicate cleanup was superseded because Serato re-added the file after removal."), reported: false)
+        try await cancelDuplicateCleanup(fileID, result: .superseded(FileRemovalMessages.supersededBySeratoReadd), reported: false)
     }
 
     var duplicateCleanupMessage: String? {
@@ -466,7 +478,7 @@ public actor OperationEngine {
                 }
             }.count
             let superseded = values.count - completed - pending - failed
-            return "Duplicate cleanup: \(completed) completed · \(pending) pending · \(failed) failed · \(superseded) superseded (see activity log)"
+            return FileRemovalMessages.summary(completed: completed, pending: pending, failed: failed, superseded: superseded)
         }
     }
 
@@ -1128,7 +1140,7 @@ public actor OperationEngine {
         }
         for targetID in finished {
             duplicateCleanupResults[targetID] = .completed
-            await note("Duplicate cleanup for file \(targetID) finished after an interrupted move to Trash.")
+            await note(FileRemovalMessages.finishedAfterInterruptedTrash(fileID: targetID))
         }
     }
 
@@ -2611,7 +2623,7 @@ public actor OperationEngine {
     @discardableResult
     private func supersede(_ write: GuardedSeratoWrite, reported: Bool) async throws -> Set<Int64> {
         if let target = write.cleanupTargetFileID, !write.isOrphanedCleanup {
-            try await cancelDuplicateCleanup(target, result: .superseded("Duplicate cleanup was superseded; its remaining steps were cancelled."))
+            try await cancelDuplicateCleanup(target, result: .superseded(FileRemovalMessages.supersededRemainingSteps))
             return []
         }
         return try await database.writer.write { database in
@@ -5346,6 +5358,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// Undoing a removal can't put the file or its Serato records back as they were.
     case restoreBlocked(path: String, reason: RestoreBlockReason)
     case removalRedoNotSupported(eventType: EventType)
+    /// A pending removal keeps this file as the copy that stays.
+    case removalTargetIsKept(path: String)
 
     public var errorDescription: String? {
         switch self {
@@ -5407,6 +5421,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             RemovalUndoMessages.restoreBlocked(path: path, reason: reason)
         case .removalRedoNotSupported:
             RemovalUndoMessages.redoNotSupported
+        case let .removalTargetIsKept(path):
+            FileRemovalMessages.targetIsKept(path: path)
         }
     }
 }
