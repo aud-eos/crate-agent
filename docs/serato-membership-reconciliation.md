@@ -332,6 +332,39 @@ existing queue and publishes the existing Sync failure/Retry Sync surface. Norma
 sync leaves it failed; explicit Retry Sync resumes after fresh strict authorization,
 without re-journaling the mutation or renewing the original plan.
 
+Duplicate cleanup needs full evidence, not the scan's candidate key. A byte-level
+group (same size, same first and last megabyte) is confirmed only by
+`OwnedAudioIdentity`'s SHA-256 of every byte, cached in `file_content_digests`.
+Files sharing a 120 s fingerprint can be different versions (Clean and Dirty
+edits), so perceptual groups need decoded audio: `decoded_audio_digest` caches, in
+`file_audio_digests`, a SHA-256 of the native PCM sample bytes (integers widened
+losslessly to 32 bits, floats kept at their width, each tagged with its sample
+format, plus the sample rate and channel count, and a marker with the packet
+timestamp for every packet the decoder skipped), its container/codec, its decoded
+duration and a hash of its full-length fingerprint.
+
+`DuplicateEvidenceVerifier` computes digests lazily off the main actor. A second
+caller joins the running pass instead of starting another, the pass is cancelled
+only when every caller has gone, and finished digests are saved before
+cancellation is honoured. A row counts only while the file's size, mtime and
+inode still match and, on the cleanup recheck, its nanosecond mtime and ctime
+match exactly. Deterministic decode failures are cached and shown; transient
+failures (I/O, permission, unmounted volume) are dropped and retried on the next
+rescan.
+
+Identical contents or PCM is the only basis for pre-selecting a group. Files whose
+PCM differs (another format, or another encoding of one format such as MP3 320
+and MP3 128) but that share a full-length fingerprint and decode within 0.5 s of
+each other are grouped but never pre-selected, because Clean and Dirty edits can
+pass that test; the user checks each file by hand after listening. Files that
+differ in full contents, or in full-length fingerprint or duration, are kept and
+cannot be checked. Files that fail to decode, and groups still being checked,
+offer nothing. The cleanup's first step rechecks the cached evidence against the
+live file inside its writer transaction, for the exact identities it was
+authorized with: identical contents or PCM, or a fingerprint match only for a file
+the user selected. If that transaction rolls back on a conflict, the recheck runs
+again when the step resumes.
+
 Only a registered sequence with a confirmed own V2 removal may retain an absent
 member during reconciliation. An unstarted queued removal has no exemption.
 Retirement, replacement, a changed keeper, or a saved re-add cancels old cleanup.
