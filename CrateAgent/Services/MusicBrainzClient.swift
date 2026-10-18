@@ -133,7 +133,7 @@ public struct MusicBrainzClient: Sendable {
     }
 
     private static func searchCacheKey(forQuery query: String) -> String {
-        "mb:search-v1:" + SHA256.hash(data: Data(query.utf8)).map { byte in String(format: "%02x", byte) }.joined()
+        "mb:search-v1:" + SHA256.hash(data: Data(query.utf8)).lowercaseHex
     }
 
     private struct ReleasePage: Decodable {

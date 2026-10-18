@@ -211,7 +211,7 @@ public enum DuplicateFinder {
         case .byteLevel:
             "\(fileSize):\(keyBytes.base64EncodedString())"
         case .perceptual:
-            SHA256.hash(data: keyBytes).map { byte in String(format: "%02x", byte) }.joined()
+            SHA256.hash(data: keyBytes).lowercaseHex
         }
     }
 }
