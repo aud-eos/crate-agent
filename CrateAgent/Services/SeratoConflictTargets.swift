@@ -48,8 +48,12 @@ enum SeratoConflictTargets {
         case let .revertMusicBrainzMatch(payload):
             fileID = payload.applied.fileID
             try includeSharedTrack(payload.applied.fingerprintHash, in: &target, database: database)
-        case .duplicateLabelReview:
+        case let .duplicateLabelReview(.keepBoth(payload)), let .duplicateLabelReview(.reopen(payload)):
             fileID = nil
+            target.fileIDs.formUnion(payload.fileIds)
+            for file in try FileRecord.fetchAll(database, keys: payload.fileIds) {
+                target.include(file)
+            }
         }
         if let fileID {
             target.fileIDs.insert(fileID)

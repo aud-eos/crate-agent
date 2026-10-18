@@ -2,7 +2,7 @@ import Foundation
 
 /// The actions on a same-audio group whose version labels disagree. Choosing
 /// the keeper needs no write; these two do, through `OperationEngine`.
-public struct DuplicateLabelReviewer: Sendable {
+public struct DuplicateLabelReviewer {
     private let operationEngine: OperationEngine
     private let database: LibraryDatabase
 
