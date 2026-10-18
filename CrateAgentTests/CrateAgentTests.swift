@@ -84,7 +84,7 @@ final class OperationEngineTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         return (engine, database, locator)
     }
@@ -1212,7 +1212,7 @@ final class LibraryScannerTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         let scanner = LibraryScanner(
             operationEngine: engine,
@@ -1514,7 +1514,7 @@ final class FilesystemSyncCoordinatorTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         let coordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
@@ -2252,7 +2252,7 @@ final class EventHistoryQueryTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3355,7 +3355,7 @@ final class LibraryHygieneFindReplaceRunnerTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3555,7 +3555,7 @@ final class LibraryHygieneCaseRunnerTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3724,7 +3724,7 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -3878,7 +3878,7 @@ final class LibraryHygieneRunnerTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* no-op: tests use synthetic paths */ },
-            fileTrasher: { _ in /* no-op: tests use synthetic paths */ }
+            fileTrasher: { path in path /* no-op: tests use synthetic paths */ }
         )
         return (engine, database)
     }
@@ -4221,7 +4221,9 @@ final class DuplicateResolverTests: XCTestCase {
             if (path as NSString).lastPathComponent == failingName {
                 throw NSError(domain: "TestTrasher", code: 13, userInfo: [NSLocalizedDescriptionKey: "synthetic trash failure"])
             }
-            try FileManager.default.moveItem(atPath: path, toPath: root.appendingPathComponent("trashed-" + (path as NSString).lastPathComponent).path)
+            let destination = root.appendingPathComponent("trashed-" + (path as NSString).lastPathComponent).path
+            try FileManager.default.moveItem(atPath: path, toPath: destination)
+            return destination
         })
         return (fixture, engine, files)
     }

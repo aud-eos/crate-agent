@@ -140,7 +140,7 @@ final class OperationEngineApplyBatchTests: XCTestCase {
             seratoWatchdog: watchdog,
             seratoLocator: locator,
             fileTagWriter: { _, _ in /* synthetic paths */ },
-            fileTrasher: { _ in /* synthetic paths */ }
+            fileTrasher: { path in path /* synthetic paths */ }
         )
         return (engine, database)
     }

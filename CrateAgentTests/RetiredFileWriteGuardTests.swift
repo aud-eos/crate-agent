@@ -225,7 +225,10 @@ final class RetiredFileWriteGuardTests: XCTestCase {
             let engine = OperationEngine(database: database, seratoWatchdog: watchdog,
                                          seratoLocator: SeratoLibraryLocator(seratoDirectory: library),
                                          fileTagWriter: tagWriter ?? { path, _ in try Data("changed audio".utf8).write(to: URL(fileURLWithPath: path)) },
-                                         fileTrasher: { path in try FileManager.default.moveItem(atPath: path, toPath: path + ".trashed") })
+                                         fileTrasher: { path in
+                                             try FileManager.default.moveItem(atPath: path, toPath: path + ".trashed")
+                                             return path + ".trashed"
+                                         })
             return Fixture(root: root, audio: audio, library: library, crate: crate, database: database,
                            state: state, watchdog: watchdog, engine: engine, fileID: fileID)
         }

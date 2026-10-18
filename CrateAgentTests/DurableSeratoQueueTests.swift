@@ -1255,8 +1255,10 @@ final class DurableSeratoQueueTests: XCTestCase {
                             return result
                         },
                         fileTrasher: { path in
-                            try FileManager.default.moveItem(atPath: path, toPath: fixture.directory.appendingPathComponent("trashed-" + (path as NSString).lastPathComponent).path)
+                            let destination = fixture.directory.appendingPathComponent("trashed-" + (path as NSString).lastPathComponent).path
+                            try FileManager.default.moveItem(atPath: path, toPath: destination)
                             recorder.recordTrash(path)
+                            return destination
                         })
     }
 

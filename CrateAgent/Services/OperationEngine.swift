@@ -59,11 +59,11 @@ public actor OperationEngine {
     public typealias SeratoAddTrackBatchWriter =
         @Sendable (_ databasePath: String, _ additions: [SeratoTrackAddition]) throws -> UInt32
 
-    /// Injectable file-to-Trash mover. Production uses
-    /// `FileManager.trashItem`; tests inject a no-op or recorder so
-    /// the resolution flow can be exercised without actually moving
-    /// files into the user's Trash.
-    public typealias FileTrasher = @Sendable (String) throws -> Void
+    /// Injectable file-to-Trash mover that returns the resulting Trash
+    /// path. Production uses `FileManager.trashItem`; tests inject a
+    /// recorder so the resolution flow can be exercised without actually
+    /// moving files into the user's Trash.
+    public typealias FileTrasher = @Sendable (String) throws -> String
 
     private let readiness: LibrarySyncReadiness?
     private let database: LibraryDatabase
@@ -154,8 +154,12 @@ public actor OperationEngine {
             try batchAddTracksToDatabase(databasePath: databasePath, additions: additions)
         },
         fileTrasher: @escaping FileTrasher = { path in
-            let url = URL(fileURLWithPath: path)
-            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            var resultingURL: NSURL?
+            try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &resultingURL)
+            guard let trashPath = resultingURL?.path else {
+                throw OperationEngineError.trashFailed(path: path, underlying: "Trash did not report where the file went.")
+            }
+            return trashPath
         },
         activityLog: ActivityLog? = nil,
         readiness: LibrarySyncReadiness? = nil
@@ -2827,12 +2831,20 @@ public actor OperationEngine {
         }
     }
 
+    /// Removals and trashes run as single-row segments, so their one row names the event.
+    private static func singleRowEventID(_ guardedWrites: [GuardedSeratoWrite]) throws -> Int64 {
+        guard guardedWrites.count == 1, let write = guardedWrites.first else { throw OperationEngineError.insertDidNotReturnRowId }
+        return write.eventId
+    }
+
     private func applyTrashFileOperation(_ trash: SeratoPendingTrash, guardedWrites: [GuardedSeratoWrite]) async throws {
         let trasher = fileTrasher
         let context = mutationContext
+        let eventID = try Self.singleRowEventID(guardedWrites)
         try await performExternalWrite(guardedWrites, completing: true) { database, io in
+            let trashPath: String
             do {
-                try trasher(trash.absolutePath)
+                trashPath = try trasher(trash.absolutePath)
             } catch {
                 throw OperationEngineError.trashFailed(path: trash.absolutePath, underlying: UserFacingErrorMessage.message(for: error))
             }
@@ -2843,6 +2855,12 @@ public actor OperationEngine {
             }
             try intent.target.validate(in: database, audioWasTrashed: true)
             try intent.keeper.validate(in: database)
+            guard let file = try FileRecord.fetchOne(database, key: targetFileID),
+                  let trashIdentity = try FileTrashLocation.capture(at: trashPath, for: file)
+            else {
+                throw OperationEngineError.trashFailed(path: trash.absolutePath, underlying: "The Trash item could not be verified as this file.")
+            }
+            try SeratoRemovalCaptureStore.saveTrashDestination(eventID: eventID, originalPath: trash.absolutePath, identity: trashIdentity, in: database)
             let removal = TrackMutation.removeFile(.init(fileId: targetFileID))
             try Self.requireCurrentToken(intent.target.token, mutation: removal, in: database)
             _ = try Self.executeAndLog(context: context, mutation: removal, batchId: intent.batchID, in: database)
@@ -2853,20 +2871,21 @@ public actor OperationEngine {
     private func applySeratoDatabaseRemoval(_ removal: SeratoPendingRemoval, guardedWrites: [GuardedSeratoWrite]) async throws {
         let databaseV2Path = try requireSeratoDatabase(waitingCount: guardedWrites.count)
         let cleanupTarget = guardedWrites.first?.cleanupTargetFileID
+        let eventID = try Self.singleRowEventID(guardedWrites)
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
         do {
-            _ = try await performExternalWrite(guardedWrites, completing: true) { database, io in
-                let removed = try removeTrackFromDatabase(databasePath: databaseV2Path, trackPath: seratoRelativePath)
+            try await performExternalWrite(guardedWrites, completing: true) { database, io in
+                let removed = try removeTrackFromDatabaseCapturing(databasePath: databaseV2Path, trackPath: seratoRelativePath)
                 io.recordReturned()
+                try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: databaseV2Path, trackPath: seratoRelativePath, records: removed, in: database)
                 if let cleanupTarget {
                     guard try !readDatabaseRecordsStrict(databasePath: databaseV2Path).contains(where: { record in SeratoPath.normalized(record.path) == SeratoPath.normalized(removal.absolutePath) }) else {
                         throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: "Duplicate reference removal did not complete.")
                     }
                     try DuplicateCleanupStore.confirmDatabaseRemoval(targetFileID: cleanupTarget, in: database)
                 }
-                return removed
             }
         } catch let error as ExternalWriteInterruption {
             throw error
@@ -2882,6 +2901,7 @@ public actor OperationEngine {
     /// lands in all three file sets together.
     private func applySeratoCrateSweepRemoval(_ removal: SeratoPendingRemoval, guardedWrites: [GuardedSeratoWrite]) async throws {
         _ = try requireSeratoDatabase(waitingCount: guardedWrites.count)
+        let eventID = try Self.singleRowEventID(guardedWrites)
         let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(
             fromAbsolute: removal.absolutePath
         )
@@ -2903,10 +2923,11 @@ public actor OperationEngine {
         for crateFile in crateFiles {
             try await requireExternalWriteEligibility(guardedWrites)
             do {
-                _ = try await performExternalWrite(guardedWrites) { _ in try removePathFromCrate(
-                    cratePath: crateFile.path,
-                    trackPath: seratoRelativePath
-                ) }
+                try await performExternalWrite(guardedWrites) { database, io in
+                    let removed = try removePathFromCrateCapturing(cratePath: crateFile.path, trackPath: seratoRelativePath)
+                    io.recordReturned()
+                    try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: crateFile.path, trackPath: seratoRelativePath, records: removed, in: database)
+                }
             } catch let error as ExternalWriteInterruption {
                 throw error
             } catch {

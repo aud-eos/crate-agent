@@ -73,7 +73,9 @@ final class DuplicateCheckTests: XCTestCase {
         let trash = fixture.directory.appendingPathComponent("trash", isDirectory: true)
         try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
         let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator, fileTrasher: { path in
-            try FileManager.default.moveItem(atPath: path, toPath: trash.appendingPathComponent((path as NSString).lastPathComponent).path)
+            let destination = trash.appendingPathComponent((path as NSString).lastPathComponent).path
+            try FileManager.default.moveItem(atPath: path, toPath: destination)
+            return destination
         })
         _ = try await DuplicateResolver(operationEngine: engine, database: fixture.database)
             .resolve(group: group, keeperId: XCTUnwrap(twentyFourBit.id), explicitlySelectedFileIDs: [XCTUnwrap(reencoded.id)])
