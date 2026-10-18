@@ -98,7 +98,7 @@ enum SeratoConflictTargets {
         if let file = try FileRecord.fetchOne(database, key: write.token.fileId) {
             target.include(file)
         }
-        if let keeper = write.requiredKeeper {
+        if let keeper = write.cleanupAuthority?.keeper {
             target.fileIDs.insert(keeper.token.fileId)
             include(keeper.identity, in: &target)
             if let file = try FileRecord.fetchOne(database, key: keeper.token.fileId) {

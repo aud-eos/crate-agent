@@ -245,9 +245,7 @@ public enum EventHistoryQuery {
             EventType.fileModificationTimeRecorded.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
             EventType.fileImportRequested.rawValue,
-            EventType.fileTrashed.rawValue,
-            EventType.trackRemovedFromSerato.rawValue,
-            EventType.fileRemovedFromCrates.rawValue,
+            // Undoing a removal's undo is not supported yet (#270).
             EventType.fileRestoredFromTrash.rawValue,
             EventType.seratoRecordsRestored.rawValue,
         ]

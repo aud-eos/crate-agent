@@ -145,7 +145,7 @@ struct DuplicatesPanel: View {
             Button("Cancel", role: .cancel) {}
         } message: { group in
             let count = trashCount(for: group)
-            Text("This moves \(count) file\(count == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. The file in Trash stays restorable from Finder until you empty Trash. This action can't be undone from History.")
+            Text("This moves \(count) file\(count == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. \(RemovalUndoMessages.undoableWhileInTrash)")
         }
         .alert(
             "Resolve selected duplicate groups?",
@@ -156,7 +156,7 @@ struct DuplicatesPanel: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This moves \(totalNonKeeperCount) file\(totalNonKeeperCount == 1 ? "" : "s") across \(results.selectedIDs.count) group\(groups.count == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. Files in Trash stay restorable from Finder until you empty Trash. This action can't be undone from History. The keeper for each group is the one currently selected — change keepers before resolving if needed.")
+            Text("This moves \(totalNonKeeperCount) file\(totalNonKeeperCount == 1 ? "" : "s") across \(results.selectedIDs.count) group\(groups.count == 1 ? "" : "s") to your Trash, removes their entries from Serato's database, and strips them from any Serato crate that referenced them. \(RemovalUndoMessages.undoableWhileInTrash) The keeper for each group is the one currently selected — change keepers before resolving if needed.")
         }
     }
 
@@ -189,7 +189,7 @@ struct DuplicatesPanel: View {
                     .labelStyle(.titleAndIcon)
             }
             .disabled(isScanning || isResolving || totalNonKeeperCount == 0)
-            .seratoWriteGated(help: "Trash every non-keeper across selected groups in one undoable-as-an-audit-log batch.",
+            .seratoWriteGated(help: "Trash every non-keeper across selected groups in one batch. \(RemovalUndoMessages.undoableWhileInTrash)",
                               runningHelp: SeratoGateMessages.duplicateResolveBlocked)
         }
         .background(Color.secondary.opacity(0.06))

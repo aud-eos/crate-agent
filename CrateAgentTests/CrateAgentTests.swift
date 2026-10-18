@@ -4265,18 +4265,6 @@ final class DuplicateResolverTests: XCTestCase {
         } catch let error as DuplicateResolver.ResolverError { XCTAssertEqual(error, .keeperNotInGroup) }
     }
 
-    func testResolveBatchIsNotUndoable() async throws {
-        let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe.mp3"])
-        defer { fixture.cleanup() }
-        let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: DuplicateFinder.DuplicateGroup.confirmedByteLevel("k", files: files, in: fixture.database), keeperId: XCTUnwrap(files[0].id))
-        do {
-            _ = try await engine.undoBatch(outcome.batchId)
-            XCTFail("Cleanup is not undoable through the engine")
-        } catch let error as OperationEngineError {
-            guard case .undoNotSupported = error else { return XCTFail("Expected undoNotSupported, got \(error)") }
-        }
-    }
-
     func testResolveContinuesAfterPerFileFailureAndReportsCounts() async throws {
         let (fixture, engine, files) = try await setup(["keeper.mp3", "dupe-ok.mp3", "dupe-fail.mp3"], failingName: "dupe-fail.mp3")
         defer { fixture.cleanup() }

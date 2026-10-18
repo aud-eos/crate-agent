@@ -418,6 +418,11 @@ that lands just before a crash, ahead of its transaction's commit, is applied
 again on restart. With WAL and `synchronous=NORMAL`, a power loss can also drop
 a committed progress row while the rewritten store survives.
 
+File removal runs one durable four-step sequence. `resolveDuplicate` starts it
+with a `.duplicateOf` keeper and evidence requirement, and
+`OperationEngine.removeFile(target:batchID:)` starts it with `.ownerChoice`, for a
+file the owner removes with no keeper. Each queued step write carries its intent's
+`RemovalAuthority`; a write whose intent is gone is orphaned, keeper or not.
 Duplicate cleanup retains the original keeper and target authority for every step.
 V2 removal, both crate forms, and Trash must actually complete before it reports
 completion. The row remains while external work is pending or failed; its final
@@ -494,6 +499,16 @@ process exited after Trash moved the target but before that transaction committe
 the next sync finishes the cleanup from the attempted trash row instead of retiring
 the target. Cancellations found during reconciliation are reported in the ready
 summary.
+
+A removal batch is undoable from History. The V2 and crate steps record in
+`serato_removal_captures` the exact records each checked store lost, and the Trash
+step records in `removal_trash_destinations` the item it landed at. Undo first
+checks that this item is still in the Trash and unchanged and that nothing now
+sits at the original path; otherwise it refuses and changes nothing. It then moves
+the item back, re-indexes the file, and queues the record restores behind the
+Serato-running guard. A crate deleted since the removal is reported as not
+restored, and the other stores are still restored. Undoing a removal that has not
+finished drops its queued steps. Undoing that undo is not supported yet (#270).
 
 Physical move rollback and retained-source cleanup use `OwnedAudioIdentity`:
 precise device/inode/size/mtime/ctime plus a streaming SHA-256 digest of every byte.

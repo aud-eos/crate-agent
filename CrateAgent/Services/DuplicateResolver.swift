@@ -13,9 +13,9 @@ import Foundation
 ///   4. `removeFile` — drop the FileRecord from crate-agent's DB
 ///
 /// All four under the same `batch_id`, surfaced in the History
-/// view. The events are journaled but undoNotSupported — recovery
-/// is via Finder Trash plus manual Serato re-add. The History
-/// entry is an audit log, not an undo handle, for this workflow.
+/// view. Undoing the batch restores the file from the Trash and puts
+/// back the exact Serato records each removal took, while the Trash
+/// item is still there and unchanged (`RemovalRestoreMutation`).
 /// Pending/failed external stages retain their owner row. Completion and
 /// final row deletion follow actual successful Trash I/O; Retry Sync resumes
 /// a retained failed stage only after fresh saved-library authorization.

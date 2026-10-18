@@ -84,7 +84,7 @@ public actor OperationEngine {
     private var claimedQueueIDs: [Int64: UUID] = [:]
     /// Per queue row, how far the current attempt's external writes got.
     private var attemptIO: [Int64: AttemptIOStage] = [:]
-    private var duplicateCleanupResults: [Int64: DuplicateCleanupResult] = [:]
+    private var duplicateCleanupResults: [Int64: FileRemovalResult] = [:]
     private var isDraining = false
     /// One pass over queued rows runs at a time. A scoped pass leaves a row
     /// that depends on another pass's unfinished row for a later drain, and
@@ -240,35 +240,44 @@ public actor OperationEngine {
     }
 
     func resolveDuplicate(target: FileRecord, keeper: FileRecord, batchID: String,
-                          requirement: DuplicateEvidenceRequirement) async throws -> DuplicateCleanupResult
+                          requirement: DuplicateEvidenceRequirement) async throws -> FileRemovalResult
     {
-        try readiness?.requireUnconflicted(.file(target))
         try readiness?.requireUnconflicted(.file(keeper))
-        let intent = try PendingDuplicateCleanup(target: FileActionAuthority(target), keeper: FileActionAuthority(keeper), batchID: batchID,
-                                                 evidenceRequirement: requirement)
+        return try await startFileRemoval(target: target, authority: .duplicateOf(FileActionAuthority(keeper), requirement), batchID: batchID)
+    }
+
+    /// Removes the file from Serato's library and crates, moves it to the
+    /// Trash, and retires its row, as one batch that History can undo.
+    public func removeFile(target: FileRecord, batchID: String) async throws -> FileRemovalResult {
+        try await startFileRemoval(target: target, authority: .ownerChoice, batchID: batchID)
+    }
+
+    private func startFileRemoval(target: FileRecord, authority: RemovalAuthority, batchID: String) async throws -> FileRemovalResult {
+        try readiness?.requireUnconflicted(.file(target))
+        let intent = try PendingFileRemoval(target: FileActionAuthority(target), authority: authority, batchID: batchID)
         let fileID = intent.target.token.fileId
         let existing = try await database.writer.read { database in
             try DuplicateCleanupStore.fetch(targetFileID: fileID, in: database)
         }
         if let existing {
-            return existing.failure.map(DuplicateCleanupResult.failed) ?? duplicateCleanupResults[fileID] ?? .pending
+            return existing.failure.map(FileRemovalResult.failed) ?? duplicateCleanupResults[fileID] ?? .pending
         }
         try await database.writer.read { database in
             try intent.target.validate(in: database)
-            try intent.keeper.validate(in: database)
+            try intent.authority.validateKeeper(in: database)
         }
         duplicateCleanupResults[fileID] = .pending
-        await advanceDuplicateCleanup(fileID, starting: intent)
+        await advanceFileRemoval(fileID, starting: intent)
         return duplicateCleanupResults[fileID] ?? .failed("Cleanup lost its completion state.")
     }
 
-    /// Runs cleanup steps until one waits on queued external work, fails, or the
+    /// Runs removal steps until one waits on queued external work, fails, or the
     /// final step's transaction removes the intent. Each step's mutation,
     /// queued effects, and intent update commit together.
-    private func advanceDuplicateCleanup(_ fileID: Int64, starting initial: PendingDuplicateCleanup? = nil) async {
+    private func advanceFileRemoval(_ fileID: Int64, starting initial: PendingFileRemoval? = nil) async {
         var unsaved = initial
         while true {
-            let intent: PendingDuplicateCleanup
+            let intent: PendingFileRemoval
             let isNew = unsaved != nil
             do {
                 if let unsaved {
@@ -308,20 +317,28 @@ public actor OperationEngine {
                     if isNew, try DuplicateCleanupStore.fetch(targetFileID: fileID, in: database) != nil {
                         throw DuplicateCleanupInterruption.alreadyPending
                     }
-                    if !isNew, try DuplicateCleanupStore.fetch(targetFileID: fileID, in: database)?.step != intent.step {
-                        throw DuplicateCleanupInterruption.withdrawn
+                    if !isNew {
+                        let stored = try DuplicateCleanupStore.fetch(targetFileID: fileID, in: database)
+                        guard stored?.step == intent.step, stored?.batchID == intent.batchID else {
+                            throw DuplicateCleanupInterruption.withdrawn
+                        }
                     }
                     try intent.target.validate(in: database, audioWasTrashed: intent.step == 3)
-                    try intent.keeper.validate(in: database)
-                    if intent.step == 0 {
-                        guard let requirement = intent.evidenceRequirement else {
+                    try intent.authority.validateKeeper(in: database)
+                    if intent.step == 0, case let .duplicateOf(keeper, requirement) = intent.authority {
+                        guard let requirement else {
                             throw DuplicateCheckError.notConfirmed(path: intent.target.identity.path)
                         }
-                        try DuplicateDigestStore.requireConfirmed(target: intent.target, keeper: intent.keeper, requirement: requirement, in: database)
+                        try DuplicateDigestStore.requireConfirmed(target: intent.target, keeper: keeper, requirement: requirement, in: database)
                     }
-                    try readiness?.requireUnconflicted(SeratoConflictTargets.identity(intent.keeper.identity))
+                    let keeperConflicts = intent.authority.keeper.map { keeper in SeratoConflictTargets.identity(keeper.identity) }
+                    if let keeperConflicts {
+                        try readiness?.requireUnconflicted(keeperConflicts)
+                    }
                     let result = try Self.executeAndLog(context: context, mutation: mutation, batchId: intent.batchID, in: database)
-                    try readiness?.requireUnconflicted(SeratoConflictTargets.identity(intent.keeper.identity))
+                    if let keeperConflicts {
+                        try readiness?.requireUnconflicted(keeperConflicts)
+                    }
                     try authorization?.check()
                     var advanced = intent
                     if let eventID = result.eventId, !result.seratoWrites.isEmpty {
@@ -367,7 +384,7 @@ public actor OperationEngine {
                 return
             } catch {
                 let message = error.localizedDescription
-                let result: DuplicateCleanupResult = error is FileProcessingEligibilityError ? .superseded(message) : .failed(message)
+                let result: FileRemovalResult = error is FileProcessingEligibilityError ? .superseded(message) : .failed(message)
                 do { try await cancelDuplicateCleanup(fileID, result: result) }
                 catch { duplicateCleanupResults[fileID] = .failed(error.localizedDescription) }
                 await note("Duplicate cleanup stopped for file \(fileID): \(message)")
@@ -384,7 +401,7 @@ public actor OperationEngine {
 
     /// Cancels the cleanup and every queued effect it still owns in one
     /// transaction, recording each dropped effect.
-    private func cancelDuplicateCleanup(_ fileID: Int64, result: DuplicateCleanupResult, reported explicitReported: Bool? = nil) async throws {
+    private func cancelDuplicateCleanup(_ fileID: Int64, result: FileRemovalResult, reported explicitReported: Bool? = nil) async throws {
         let reported = explicitReported ?? (LibrarySyncReadiness.drainAuthorization == nil)
         try await database.writer.write { database in
             try Self.dropCleanup(fileID, disposition: .superseded, reported: reported, in: database)
@@ -403,7 +420,7 @@ public actor OperationEngine {
         try DuplicateCleanupStore.delete(targetFileID: targetFileID, in: database)
     }
 
-    private static func duplicateCleanupFailureMessage(_ intent: PendingDuplicateCleanup, error: Error) -> String {
+    private static func duplicateCleanupFailureMessage(_ intent: PendingFileRemoval, error: Error) -> String {
         "Cleanup stopped at step \(intent.step + 1) for \((intent.target.identity.path as NSString).lastPathComponent): \(UserFacingErrorMessage.message(for: error)). Fix the cause, then choose Retry Sync."
     }
 
@@ -414,7 +431,7 @@ public actor OperationEngine {
         do {
             try await database.writer.read { database in
                 try intent.target.validate(in: database)
-                try intent.keeper.validate(in: database)
+                try intent.authority.validateKeeper(in: database)
             }
             return true
         } catch is FileProcessingEligibilityError {
@@ -435,7 +452,7 @@ public actor OperationEngine {
                 results[fileID] = .completed
             }
             for intent in intents {
-                results[intent.target.token.fileId] = intent.failure.map(DuplicateCleanupResult.failed) ?? .pending
+                results[intent.target.token.fileId] = intent.failure.map(FileRemovalResult.failed) ?? .pending
             }
             guard !results.isEmpty else { return nil }
             let values = Array(results.values)
@@ -1098,7 +1115,7 @@ public actor OperationEngine {
                       !FileManager.default.fileExists(atPath: trash.absolutePath) else { continue }
                 do {
                     try intent.target.validate(in: database, audioWasTrashed: true)
-                    try intent.keeper.validate(in: database)
+                    try intent.authority.validateKeeper(in: database)
                 } catch is FileProcessingEligibilityError { continue }
                 let removal = TrackMutation.removeFile(.init(fileId: targetID))
                 try Self.requireCurrentToken(intent.target.token, mutation: removal, in: database)
@@ -2217,12 +2234,12 @@ public actor OperationEngine {
         let reported = LibrarySyncReadiness.drainAuthorization == nil
         let intents = try await database.writer.read { database in try DuplicateCleanupStore.fetchAll(in: database) }
         for intent in intents where intent.waitingEventID == nil && intent.failure == nil {
-            await advanceDuplicateCleanup(intent.target.token.fileId)
+            await advanceFileRemoval(intent.target.token.fileId)
         }
         var run = SegmentRun()
         var ready: [SeratoWriteSegment.Entry] = []
         var cascaded: Set<Int64> = []
-        for (loaded, requiredKeeper) in try await loadQueueOrder() {
+        for (loaded, cleanupAuthority) in try await loadQueueOrder() {
             let queueID = loaded.queueID
             guard !cascaded.contains(queueID) else {
                 run.superseded.insert(loaded.eventID)
@@ -2232,7 +2249,7 @@ public actor OperationEngine {
             let readiness = readiness
             let classification = try await database.writer.read { database -> (GuardedSeratoWrite, SeratoConflictQueueDisposition, SeratoQueueDependency)? in
                 guard var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
-                current.requiredKeeper = requiredKeeper
+                current.cleanupAuthority = cleanupAuthority
                 let (disposition, dependency) = try SeratoConflictQueue.classify(current, blocked: predecessor, readiness: readiness, in: database)
                 return (current, disposition, dependency)
             }
@@ -2261,7 +2278,7 @@ public actor OperationEngine {
             guard !run.stopped else { break }
             let applied = try await runSegment(segment, owner: owner, reported: reported, run: &run)
             for target in Set(applied.compactMap(\.cleanupTargetFileID)) {
-                await advanceDuplicateCleanup(target)
+                await advanceFileRemoval(target)
             }
         }
         let remaining = try await database.writer.read { database in try SeratoWriteQueue.pendingEventCount(in: database) }
@@ -2349,7 +2366,7 @@ public actor OperationEngine {
         let stored = try await database.writer.read { database in
             try segment.entries.map { entry -> SeratoWriteSegment.Entry? in
                 guard let queueID = entry.write.queueID, var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
-                current.requiredKeeper = entry.write.requiredKeeper
+                current.cleanupAuthority = entry.write.cleanupAuthority
                 current.oldPathRefilled = entry.write.oldPathRefilled
                 return SeratoWriteSegment.Entry(write: current, dependency: entry.dependency)
             }
@@ -2523,10 +2540,10 @@ public actor OperationEngine {
 
     private func loadQueue() async throws -> [GuardedSeratoWrite] {
         try await database.writer.read { database in
-            let keepers = try Self.cleanupKeepers(in: database)
+            let authorities = try Self.cleanupAuthorities(in: database)
             return try SeratoWriteQueue.fetchOrdered(in: database).map { row in
                 var write = row
-                write.requiredKeeper = row.cleanupTargetFileID.flatMap { target in keepers[target] }
+                write.cleanupAuthority = row.cleanupTargetFileID.flatMap { target in authorities[target] }
                 return write
             }
         }
@@ -2535,18 +2552,18 @@ public actor OperationEngine {
     /// The drain rereads each row before classifying it, so its pass order
     /// needs no payloads: decoding them all up front cost as much as a
     /// cascade that drops the whole queue (#249).
-    private func loadQueueOrder() async throws -> [(row: SeratoQueuedRowReference, requiredKeeper: FileActionAuthority?)] {
+    private func loadQueueOrder() async throws -> [(row: SeratoQueuedRowReference, cleanupAuthority: RemovalAuthority?)] {
         try await database.writer.read { database in
-            let keepers = try Self.cleanupKeepers(in: database)
+            let authorities = try Self.cleanupAuthorities(in: database)
             return try SeratoWriteQueue.fetchOrderedReferences(in: database).map { row in
-                (row, row.cleanupTargetFileID.flatMap { target in keepers[target] })
+                (row, row.cleanupTargetFileID.flatMap { target in authorities[target] })
             }
         }
     }
 
-    private static func cleanupKeepers(in database: GRDB.Database) throws -> [Int64: FileActionAuthority] {
-        try DuplicateCleanupStore.fetchAll(in: database).reduce(into: [Int64: FileActionAuthority]()) { keepers, intent in
-            keepers[intent.target.token.fileId] = intent.keeper
+    private static func cleanupAuthorities(in database: GRDB.Database) throws -> [Int64: RemovalAuthority] {
+        try DuplicateCleanupStore.fetchAll(in: database).reduce(into: [Int64: RemovalAuthority]()) { authorities, intent in
+            authorities[intent.target.token.fileId] = intent.authority
         }
     }
 
@@ -2973,7 +2990,7 @@ public actor OperationEngine {
                 throw FileProcessingEligibilityError.superseded(fileId: targetFileID)
             }
             try intent.target.validate(in: database, audioWasTrashed: true)
-            try intent.keeper.validate(in: database)
+            try intent.authority.validateKeeper(in: database)
             guard let file = try FileRecord.fetchOne(database, key: targetFileID),
                   let trashIdentity = try FileTrashLocation.capture(at: trashPath, for: file)
             else {
@@ -4684,10 +4701,9 @@ public enum TrackMutation: Sendable {
 }
 
 /// Move the file at `fileId` to the user's Trash via
-/// FileManager.trashItem. Reversible only by the user via Finder
-/// ("Put Back"); journaled but undoNotSupported in the engine
-/// because we can't reliably re-create audio bytes if the user has
-/// emptied Trash by the time undo runs.
+/// FileManager.trashItem. The Trash item it landed at is recorded, and
+/// undo moves that item back while it is still in the Trash and
+/// unchanged; once Trash is emptied, undo refuses.
 public struct TrashFilePayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public init(fileId: Int64) {
@@ -4698,9 +4714,8 @@ public struct TrashFilePayload: Codable, Sendable, Equatable {
 /// Remove the `otrk` from Serato's database V2 whose `pfil`
 /// matches the file's path. Gated by `SeratoWatchdog` — Serato
 /// must be closed to avoid the in-memory cache overwriting the
-/// disk version on save. Not undoable: re-adding would require
-/// reconstructing the otrk's full metadata + analysis (cue points,
-/// beatgrid) which we don't carry across the boundary today.
+/// disk version on save. The removed records are captured byte for
+/// byte, cues and beatgrid included, and undo puts them back.
 public struct RemoveTrackFromSeratoPayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public init(fileId: Int64) {
@@ -4708,11 +4723,10 @@ public struct RemoveTrackFromSeratoPayload: Codable, Sendable, Equatable {
     }
 }
 
-/// Sweep every `.crate` file in Serato's Subcrates directory and
-/// remove the `otrk` whose `ptrk` matches the file's path. Gated
-/// by SeratoWatchdog. Not undoable: a follow-up "re-add to original
-/// crates" would need to track which crates contained the file
-/// before removal, which isn't journaled today.
+/// Sweep every `.crate` and `.scrate` file and remove the `otrk` whose
+/// `ptrk` matches the file's path. Gated by SeratoWatchdog. Each crate's
+/// removed records are captured, and undo puts them back into every crate
+/// that still exists.
 public struct RemoveFileFromCratesPayload: Codable, Sendable, Equatable {
     public let fileId: Int64
     public init(fileId: Int64) {

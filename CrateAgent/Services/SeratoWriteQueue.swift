@@ -674,18 +674,20 @@ struct NotAppliedFileRecord: Sendable, Equatable {
 /// the transaction of its first step and advanced in the transactions that
 /// complete each step's external effects.
 enum DuplicateCleanupStore {
+    /// A removal with no keeper is the owner's choice; rows saved before
+    /// owner-chosen removals existed always carry a keeper.
     private struct Authority: Codable {
         let target: FileActionAuthority
-        let keeper: FileActionAuthority
+        let keeper: FileActionAuthority?
         let batchID: String
         let evidenceRequirement: DuplicateEvidenceRequirement?
     }
 
-    static func fetch(targetFileID: Int64, in database: Database) throws -> PendingDuplicateCleanup? {
+    static func fetch(targetFileID: Int64, in database: Database) throws -> PendingFileRemoval? {
         try Row.fetchOne(database, sql: "SELECT * FROM duplicate_cleanup_intents WHERE target_file_id = ?", arguments: [targetFileID]).map(decode)
     }
 
-    static func fetchAll(in database: Database) throws -> [PendingDuplicateCleanup] {
+    static func fetchAll(in database: Database) throws -> [PendingFileRemoval] {
         try Row.fetchAll(database, sql: "SELECT * FROM duplicate_cleanup_intents ORDER BY target_file_id").map(decode)
     }
 
@@ -693,9 +695,14 @@ enum DuplicateCleanupStore {
         try Bool.fetchOne(database, sql: "SELECT EXISTS(SELECT 1 FROM duplicate_cleanup_intents)") ?? false
     }
 
-    static func save(_ intent: PendingDuplicateCleanup, in database: Database) throws {
-        let authority = try SyncCheckpointStore.encodeCanonical(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID,
-                                                                          evidenceRequirement: intent.evidenceRequirement))
+    static func save(_ intent: PendingFileRemoval, in database: Database) throws {
+        let stored = switch intent.authority {
+        case let .duplicateOf(keeper, requirement):
+            Authority(target: intent.target, keeper: keeper, batchID: intent.batchID, evidenceRequirement: requirement)
+        case .ownerChoice:
+            Authority(target: intent.target, keeper: nil, batchID: intent.batchID, evidenceRequirement: nil)
+        }
+        let authority = try SyncCheckpointStore.encodeCanonical(stored)
         try database.execute(sql: """
         INSERT OR REPLACE INTO duplicate_cleanup_intents (target_file_id, payload, step, waiting_event_id, removed_v2, failure)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -730,11 +737,11 @@ enum DuplicateCleanupStore {
         try save(intent, in: database)
     }
 
-    private static func decode(_ row: Row) throws -> PendingDuplicateCleanup {
+    private static func decode(_ row: Row) throws -> PendingFileRemoval {
         let bytes: Data = row["payload"]
-        let authority = try SyncCheckpointStore.decodeCanonical(Authority.self, from: bytes)
-        var intent = PendingDuplicateCleanup(target: authority.target, keeper: authority.keeper, batchID: authority.batchID,
-                                             evidenceRequirement: authority.evidenceRequirement)
+        let stored = try SyncCheckpointStore.decodeCanonical(Authority.self, from: bytes)
+        let authority: RemovalAuthority = stored.keeper.map { keeper in .duplicateOf(keeper, stored.evidenceRequirement) } ?? .ownerChoice
+        var intent = PendingFileRemoval(target: stored.target, authority: authority, batchID: stored.batchID)
         intent.step = row["step"]
         intent.waitingEventID = row["waiting_event_id"]
         intent.removedV2 = row["removed_v2"]

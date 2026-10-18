@@ -223,13 +223,38 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
+    func testRemovingAFileWithoutAKeeperIsUndoable() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let target = try await fixture.add("target.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let removed = try RemovedFile(target: target, batchID: UUID().uuidString, originalBytes: saveStores(fixture, paths: [target.path]))
+        let seratoPath = SeratoLibraryLocator.seratoRelativePath(fromAbsolute: target.path).data(using: .utf16BigEndian)!
+
+        let result = try await engine.removeFile(target: target, batchID: removed.batchID)
+
+        XCTAssertEqual(result, .completed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: Self.trashDirectory(fixture).appendingPathComponent("target.wav").path))
+        for path in removed.originalBytes.keys {
+            XCTAssertNil(try Data(contentsOf: URL(fileURLWithPath: path)).range(of: seratoPath), "\(path) still holds the file")
+        }
+        try await engine.undoBatch(removed.batchID)
+        try await assertFileRestored(removed, in: fixture)
+        for (path, bytes) in removed.originalBytes {
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
+        }
+        let history = try await EventHistoryQuery.loadRecentBatches(database: fixture.database)
+        XCTAssertEqual(history.first { batch in batch.batchId == removed.batchID }?.canUndo, true)
+    }
+
     private struct LibraryState: Equatable {
         let storeBytes: [String: Data]
         let eventCount: Int
         let hasRowAtOriginalPath: Bool
     }
 
-    private func libraryState(_ cleaned: CleanedDuplicate, in fixture: SeratoRemovalFixture) async throws -> LibraryState {
+    private func libraryState(_ cleaned: RemovedFile, in fixture: SeratoRemovalFixture) async throws -> LibraryState {
         let storeBytes = try cleaned.originalBytes.keys.reduce(into: [String: Data]()) { bytes, path in
             bytes[path] = try Data(contentsOf: URL(fileURLWithPath: path))
         }
@@ -239,7 +264,7 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
-    private func assertUndoBlocked(_ cleaned: CleanedDuplicate, engine: OperationEngine, reason expected: RestoreBlockReason) async {
+    private func assertUndoBlocked(_ cleaned: RemovedFile, engine: OperationEngine, reason expected: RestoreBlockReason) async {
         do {
             try await engine.undoBatch(cleaned.batchID)
             XCTFail("Undo must refuse with \(expected)")
@@ -251,7 +276,7 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
-    private struct CleanedDuplicate {
+    private struct RemovedFile {
         let target: FileRecord
         let batchID: String
         /// Database V2, `owned.crate` and `owned.scrate` before the cleanup.
@@ -262,20 +287,13 @@ final class UndoableRemovalTests: XCTestCase {
     /// `otherCrates`, by name, are saved as well, `extraDatabaseRecords` are appended to V2, and `completes: false` lets a cleanup step fail.
     /// `whileSeratoRuns` starts Serato before the cleanup, so its steps stay queued.
     private func cleanDuplicate(_ fixture: SeratoRemovalFixture, engine: OperationEngine, otherCrates: [String: Data] = [:],
-                                extraDatabaseRecords: Data = Data(), completes: Bool = true, whileSeratoRuns: Bool = false) async throws -> CleanedDuplicate
+                                extraDatabaseRecords: Data = Data(), completes: Bool = true, whileSeratoRuns: Bool = false) async throws -> RemovedFile
     {
         let keeper = try await fixture.add("keeper.wav", bytes: FinalRemovalIntegrationTests.wav())
         let target = try await fixture.add("target.wav", bytes: FinalRemovalIntegrationTests.wav())
-        try fixture.save(paths: [keeper.path, target.path].map(SeratoLibraryLocator.seratoRelativePath))
-        if !extraDatabaseRecords.isEmpty {
-            try (Data(contentsOf: fixture.locator.databaseV2Url) + extraDatabaseRecords).write(to: fixture.locator.databaseV2Url)
-        }
-        let crates = try saveCrates(fixture, paths: [keeper.path, target.path])
+        let originalBytes = try saveStores(fixture, paths: [keeper.path, target.path], extraDatabaseRecords: extraDatabaseRecords)
         for (name, bytes) in otherCrates {
             try bytes.write(to: fixture.locator.subcratesDirectoryUrl.appendingPathComponent(name))
-        }
-        let originalBytes = try ([fixture.locator.databaseV2Url.path] + crates.map(\.path)).reduce(into: [String: Data]()) { bytes, path in
-            bytes[path] = try Data(contentsOf: URL(fileURLWithPath: path))
         }
         let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("undoable", files: [keeper, target], in: fixture.database)
         if whileSeratoRuns {
@@ -284,7 +302,7 @@ final class UndoableRemovalTests: XCTestCase {
         }
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.trashedCount, completes && !whileSeratoRuns ? 1 : 0)
-        return CleanedDuplicate(target: target, batchID: outcome.batchId, originalBytes: originalBytes)
+        return RemovedFile(target: target, batchID: outcome.batchId, originalBytes: originalBytes)
     }
 
     private static func trashDirectory(_ fixture: SeratoRemovalFixture) -> URL {
@@ -304,7 +322,7 @@ final class UndoableRemovalTests: XCTestCase {
                                availabilityResolver: FileAvailabilityResolver(trashDirectory: { _ in trash }))
     }
 
-    private func assertFileRestored(_ cleaned: CleanedDuplicate, in fixture: SeratoRemovalFixture) async throws {
+    private func assertFileRestored(_ cleaned: RemovedFile, in fixture: SeratoRemovalFixture) async throws {
         XCTAssertEqual(FileMetadataCollector.collect(at: cleaned.target.path, includeLightweightHash: true), cleaned.target.identity)
         let row = try await fixture.database.writer.read { database in
             try FileRecord.filter(Column("path") == cleaned.target.path).fetchOne(database)
@@ -325,12 +343,20 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
-    private func saveCrates(_ fixture: SeratoRemovalFixture, paths: [String]) throws -> [URL] {
-        let bytes = Self.crateBytes(paths: paths)
-        return try [fixture.locator.subcratesDirectoryUrl.appendingPathComponent("owned.crate"),
-                    fixture.locator.smartCratesDirectoryUrl.appendingPathComponent("owned.scrate")].map { url in
-            try bytes.write(to: url)
-            return url
+    /// Saves `paths` into database V2, `owned.crate` and `owned.scrate`, and returns each store's bytes.
+    private func saveStores(_ fixture: SeratoRemovalFixture, paths: [String], extraDatabaseRecords: Data = Data()) throws -> [String: Data] {
+        try fixture.save(paths: paths.map(SeratoLibraryLocator.seratoRelativePath))
+        if !extraDatabaseRecords.isEmpty {
+            try (Data(contentsOf: fixture.locator.databaseV2Url) + extraDatabaseRecords).write(to: fixture.locator.databaseV2Url)
+        }
+        let crateBytes = Self.crateBytes(paths: paths)
+        let crates = [fixture.locator.subcratesDirectoryUrl.appendingPathComponent("owned.crate"),
+                      fixture.locator.smartCratesDirectoryUrl.appendingPathComponent("owned.scrate")]
+        for crate in crates {
+            try crateBytes.write(to: crate)
+        }
+        return try ([fixture.locator.databaseV2Url] + crates).reduce(into: [String: Data]()) { bytes, url in
+            bytes[url.path] = try Data(contentsOf: url)
         }
     }
 }

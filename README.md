@@ -97,6 +97,10 @@ Play counts come from Serato History, which is read only while Serato is closed 
 never written; each row shows its plays, and **Workers** shows how many plays were
 matched to library files, including plays at an earlier path of a renamed file.
 
+Cleanup moves the other copies to the Trash and removes them from Serato's database
+and crates. Undo it from History while a file is still in the Trash: the file
+comes back with its exact Serato records, cues and crate positions included.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing
