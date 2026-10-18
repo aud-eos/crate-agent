@@ -301,7 +301,7 @@ public actor LibraryScanner {
         for path in records.keys.sorted() {
             try Task.checkCancellation()
             guard let record = records[path] else { preconditionFailure("Snapshot path index lost a record") }
-            let rawPath = Data(record.path.utf8)
+            let rawPath = PathBytes(record.path)
             if let plan, !plan.refreshPaths.contains(rawPath), !plan.metadataPaths.contains(rawPath) {
                 continue
             }

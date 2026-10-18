@@ -33,12 +33,12 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         })
         let plan = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: files,
                                               previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
-        XCTAssertEqual(plan.metadataPaths, [Data(current[1].path.utf8)])
+        XCTAssertEqual(plan.metadataPaths, [PathBytes(current[1].path)])
         XCTAssertEqual(plan.refreshPaths, [])
         XCTAssertEqual(plan.reconcileFileIDs, [])
         let forced = try await planner.makePlan(request: .forceRefresh, snapshot: snapshot, indexedFiles: files,
                                                 previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
-        XCTAssertEqual(forced.refreshPaths, Set(current.map { record in Data(record.path.utf8) }))
+        XCTAssertEqual(forced.refreshPaths, Set(current.map { record in PathBytes(record.path) }))
     }
 
     func testUncoveredPreciseChangeAndLostCoverageRequireRefresh() async throws {
@@ -57,7 +57,7 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         let planner = LibraryRefreshPlanner(evidence: fixture.evidence, validatedFileIDs: [1, 3])
         let plan = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: fixture.files,
                                               previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
-        XCTAssertEqual(plan.refreshPaths, [Data(changedPath.utf8)])
+        XCTAssertEqual(plan.refreshPaths, [PathBytes(changedPath)])
         XCTAssertEqual(plan.reconcileFileIDs, [2])
         let lost = LibraryRefreshPlanner(evidence: fixture.evidence, validatedFileIDs: [], requiresReconciliation: true)
         let broad = try await lost.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: fixture.files,
@@ -92,7 +92,7 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         let planner = LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: [2, 3])
         let plan = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: files,
                                               previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
-        XCTAssertEqual(plan.refreshPaths, [Data(path.utf8)])
+        XCTAssertEqual(plan.refreshPaths, [PathBytes(path)])
         XCTAssertEqual(plan.reconcileFileIDs, [1])
     }
 
@@ -111,7 +111,7 @@ final class LibraryRefreshPlannerTests: XCTestCase {
         })
         let plan = try await planner.makePlan(request: .incremental, snapshot: snapshot, indexedFiles: fixture.files,
                                               previousRecords: fixture.records, dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
-        XCTAssertEqual(plan.refreshPaths, [Data(missing.utf8), Data(replaced.utf8)])
+        XCTAssertEqual(plan.refreshPaths, [PathBytes(missing), PathBytes(replaced)])
     }
 }
 
