@@ -98,6 +98,7 @@ actor SeratoMembershipReconciler {
         var summary = ReconciliationSummary()
         summary.pathConflictCount = analysis.conflicts.count
         let batchID = UUID().uuidString
+        var trashIndex = NativeTrashIndex()
         for file in eligibleFiles {
             if let plan, let identifier = file.id, !plan.reconcileFileIDs.contains(identifier) {
                 continue
@@ -123,6 +124,10 @@ actor SeratoMembershipReconciler {
                 let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
                 observed = try FileTrashLocation.availability(of: location, resolver: availability)
                 verifiedTrashLocation = observed == .trashed ? location : nil
+                if observed == .missing, observedIdentity == nil, let discovered = try trashIndex.locate(file) {
+                    observed = .trashed
+                    verifiedTrashLocation = discovered
+                }
             }
             let saved = savedPaths.contains(SeratoPath.normalized(path))
             let ownedRemoval = try await operationEngine.pendingCleanupOwnsRemoval(of: file)
