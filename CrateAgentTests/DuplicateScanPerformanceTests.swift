@@ -12,7 +12,13 @@ final class DuplicateScanPerformanceTests: XCTestCase {
     private static let bytePairs = 300
     private static let perceptualPairs = 1650
 
-    private func makeFixture() throws -> (directory: URL, database: LibraryDatabase) {
+    /// The owner's library had 120 colliding groups whose labels differ, 12
+    /// of which also differ over their full length (#205); this is 12x that.
+    private static let differingPairs = 150
+
+    /// `differingPairs` of the perceptual pairs share a 120 s fingerprint but
+    /// differ in decoded audio and full-length fingerprint.
+    private func makeFixture(differingPairs: Int = 0) throws -> (directory: URL, database: LibraryDatabase) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("DuplicateScan-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let database = try LibraryDatabase.openWAL(at: directory.appendingPathComponent("library.sqlite"))
@@ -37,10 +43,12 @@ final class DuplicateScanPerformanceTests: XCTestCase {
                                                   kind: .content, in: connection)
                 }
                 if identifier <= Self.perceptualPairs * 2 {
+                    let differs = fingerprintSeed <= differingPairs && identifier.isMultiple(of: 2)
+                    let audioSeed = differs ? fingerprintSeed + Self.fileCount : fingerprintSeed
                     try DuplicateDigestStore.save([DigestResult(
                         fileID: Int64(identifier), basis: basis,
-                        evidence: .decoded(.init(format: "mp3/mp3", pcmDigest: Self.bytes(seed: fingerprintSeed, count: 32),
-                                                 fullFingerprintDigest: Self.bytes(seed: fingerprintSeed, count: 32), durationSeconds: 240))
+                        evidence: .decoded(.init(format: "mp3/mp3", pcmDigest: Self.bytes(seed: audioSeed, count: 32),
+                                                 fullFingerprintDigest: Self.bytes(seed: audioSeed, count: 32), durationSeconds: 240))
                     )], kind: .audio, in: connection)
                 }
             }
@@ -79,6 +87,45 @@ final class DuplicateScanPerformanceTests: XCTestCase {
         XCTAssertLessThan(elapsed, .milliseconds(1000))
 
         let metrics = "DUPLICATE_SCAN files=\(Self.fileCount) fingerprinted=\(Self.fingerprintedCount) byte_groups=\(scan.byteLevel.count) perceptual_groups=\(scan.perceptual.count) both_modes_and_coverage=\(elapsed)"
+        print(metrics)
+        let attachment = XCTAttachment(string: metrics)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    /// The collision-only full-length fingerprint pass (#205): selecting the
+    /// files that need one, previewing the splits, and applying one split.
+    @MainActor
+    func testSharedOpeningPassSelectsOnlyCollidingFilesAndPreviewsAndSplitsWithinBudget() async throws {
+        let fixture = try makeFixture(differingPairs: Self.differingPairs)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let engine = OperationEngine(database: fixture.database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")))
+        let service = RecordingIdentityService(engine: engine, database: fixture.database, verifier: DuplicateEvidenceVerifier(database: fixture.database))
+
+        let scanStart = ContinuousClock.now
+        let scan = try await service.scan()
+        let scanElapsed = scanStart.duration(to: .now)
+        XCTAssertEqual(scan.candidates.count, Self.differingPairs)
+        XCTAssertEqual(scan.checkingCount, 0)
+
+        let splitStart = ContinuousClock.now
+        try await service.separate(XCTUnwrap(scan.candidates.first))
+        let splitElapsed = splitStart.duration(to: .now)
+
+        try await fixture.database.writer.write { connection in try connection.execute(sql: "DELETE FROM file_audio_digests") }
+        let selectStart = ContinuousClock.now
+        let awaiting = try await fixture.database.writer.read { connection in
+            try DuplicateFinder.filesAwaitingCheck(in: connection, mode: .perceptual)
+        }
+        let selectElapsed = selectStart.duration(to: .now)
+        XCTAssertEqual(awaiting.count, Self.perceptualPairs * 2, "Only colliding files need a full-length fingerprint")
+
+        // Opening Shared Openings, like opening Duplicates above.
+        XCTAssertLessThan(scanElapsed, .milliseconds(1000))
+        XCTAssertLessThan(splitElapsed, .milliseconds(100))
+        XCTAssertLessThan(selectElapsed, .milliseconds(500))
+        let metrics = "SHARED_OPENINGS files=\(Self.fileCount) colliding=\(Self.perceptualPairs * 2) differing_groups=\(Self.differingPairs) select_colliding=\(selectElapsed) preview=\(scanElapsed) one_split=\(splitElapsed)"
         print(metrics)
         let attachment = XCTAttachment(string: metrics)
         attachment.lifetime = .keepAlways

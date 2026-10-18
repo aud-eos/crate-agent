@@ -33,8 +33,11 @@ rules:
    `fingerprintCollision`, naming the other file when there is one. A 120-second
    fingerprint can match two different recordings (Clean and Dirty edits), and
    grouping must not merge them or hand one the other's MusicBrainz identity.
-   Such files share an audio fingerprint, so crate-agent treats them as one
-   recording, and they cannot yet be grouped as separate versions.
+   "The recording that fingerprint identifies" is the file's recording key
+   (`RecordingIdentity.key`), so a file split off by its full-length
+   fingerprint links to its own recording. Files that still share one can be
+   grouped with **Group as Different Recordings**, which gives each a
+   grouping-owned recording first ([recording identity](recording-identity.md)).
 2. **Each grouping link is its own per-file event**
    (`song_family_recording_linked`, with `file_id` set). It shows in the file's
    History, and records the file's membership revision. Its undo checks the
@@ -214,7 +217,8 @@ the rules above and a collision is refused by name.
   cover, is not joined.
 - **Recordings.** Each candidate is placed on the recording grouping would link
   it to. Linked files keep their recording; an unlinked file takes the
-  recording its current fingerprint names. Files without a current fingerprint
+  recording its current recording key names
+  ([recording identity](recording-identity.md)). Files without a current fingerprint
   are left out and counted until fingerprinting finishes.
 - **Same audio.** Files that are duplicates, not versions, are left out and
   listed with a pointer to **Duplicates**: recordings whose files share a

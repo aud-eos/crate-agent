@@ -16,6 +16,12 @@ In **Library**, alternate versions of a song (Instrumental, Acapella, Clean)
 can be grouped into a song family that shows one main row with a version count;
 expand it to see the alternates. **Find Versions…** suggests families across the
 library for you to confirm. See [song families](docs/song-families.md).
+Files whose first 120 seconds match, such as Clean and Dirty edits, share one
+recording until you separate them. **Cleanup → Shared Openings** lists those
+whose full-length audio differs and gives each version its own recording; when
+grouping files with identical audio is refused, Library offers **Group as
+Different Recordings**. Both are undoable. See
+[recording identity](docs/recording-identity.md).
 
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the

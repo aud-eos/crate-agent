@@ -96,6 +96,9 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case duplicateLabelsKeptBoth = "duplicate_labels_kept_both"
     case duplicateLabelsReopened = "duplicate_labels_reopened"
     case queuedSeratoChangeDiscarded = "queued_serato_change_discarded"
+    case recordingSeparated = "recording_separated"
+    case recordingSeparatedForGrouping = "recording_separated_for_grouping"
+    case recordingRejoined = "recording_rejoined"
     case musicBrainzWorkRecorded = "music_brainz_work_recorded"
     case musicBrainzWorkCleared = "music_brainz_work_cleared"
 
@@ -124,6 +127,7 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
              .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             false
         }

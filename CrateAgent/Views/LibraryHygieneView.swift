@@ -28,6 +28,9 @@ struct LibraryHygieneView: View {
 
             DuplicatesPanel()
                 .tabItem { Label("Duplicates", systemImage: "square.on.square") }
+
+            SharedOpeningsPanel()
+                .tabItem { Label("Shared Openings", systemImage: "waveform.path.ecg") }
         }
         .navigationTitle("Library Cleanup")
         .appPresentation()

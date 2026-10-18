@@ -14,6 +14,25 @@ enum TestAudio {
             let encoded = bitsPerSample == 24 ? (value << 8) | lowBits : value
             samples += little(encoded).prefix(bytesPerSample)
         }
+        return riff(samples: samples, sampleRate: sampleRate, bitsPerSample: bitsPerSample, title: title)
+    }
+
+    /// 16-bit mono at 11,025 Hz: one second of each tone in `frequencies`.
+    /// Files that list the same first 120 tones share a 120 s fingerprint.
+    static func tones(_ frequencies: [Double], title: String? = nil) -> Data {
+        let sampleRate = 11025
+        var samples = Data()
+        for (second, frequency) in frequencies.enumerated() {
+            for index in 0 ..< sampleRate {
+                let time = Double(second * sampleRate + index) / Double(sampleRate)
+                samples += little(Int16(sin(2 * Double.pi * frequency * time) * 12000))
+            }
+        }
+        return riff(samples: samples, sampleRate: sampleRate, bitsPerSample: 16, title: title)
+    }
+
+    private static func riff(samples: Data, sampleRate: Int, bitsPerSample: Int, title: String?) -> Data {
+        let bytesPerSample = bitsPerSample / 8
         var info = Data()
         if let title {
             var value = Data(title.utf8) + Data([0])

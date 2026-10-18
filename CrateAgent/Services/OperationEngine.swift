@@ -1128,6 +1128,7 @@ public actor OperationEngine {
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
              .musicBrainzWorkRecorded, .musicBrainzWorkCleared: nil
         }
     }
@@ -1518,6 +1519,7 @@ public actor OperationEngine {
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
              .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             false
         }
@@ -1619,6 +1621,7 @@ public actor OperationEngine {
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
              .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             return []
         }
@@ -1695,10 +1698,10 @@ public actor OperationEngine {
             try MatchUndoTagGuard.requireUnchanged(read)
         }
         try requireRedoneFilesUnchanged(guards.redoFreshness, in: database)
-        // Undoing a grouping link checks that grouping still owns the link
-        // and keeps it otherwise, so a retired file never blocks the undo
-        // (docs/song-families.md). Its redo takes the general guard.
-        for event in guards.events where event.eventType != .songFamilyRecordingLinked {
+        // Undoing a grouping link or grouping separation checks that grouping
+        // still owns it and keeps it otherwise, so a retired file never blocks
+        // the undo (docs/song-families.md). Its redo takes the general guard.
+        for event in guards.events where event.eventType != .songFamilyRecordingLinked && event.eventType != .recordingSeparatedForGrouping {
             guard let fileID = event.fileId else { continue }
             guard let file = try FileRecord.fetchOne(database, key: fileID),
                   file.libraryMembership != .retired,
@@ -1923,6 +1926,11 @@ public actor OperationEngine {
                 if liveMatches[fileId]?.last != eventId {
                     throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                 }
+                // A split since moved the file to a recording of its own
+                // (#205); undoing would unlink it from that recording.
+                if let file = currentFiles[fileId], file.trackId != event.trackId {
+                    throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
+                }
                 // Value comparison against the current row: a field the match
                 // applied that no longer holds the applied value has been
                 // changed since, so undoing would clobber that change.
@@ -2055,6 +2063,10 @@ public actor OperationEngine {
             return try .songFamily(.unlinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
         case .songFamilyRecordingUnlinked:
             return try .songFamily(.relinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
+        case .recordingSeparated, .recordingSeparatedForGrouping:
+            return try .recordingIdentity(.rejoin(decoder.decode(RecordingSeparation.self, from: inverseJsonData)))
+        case .recordingRejoined:
+            return try .recordingIdentity(.reseparate(decoder.decode(RecordingSeparation.self, from: inverseJsonData)))
         case .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             return try .recordMusicBrainzWork(decoder.decode(RecordMusicBrainzWorkPayload.self, from: inverseJsonData))
         }
@@ -3525,6 +3537,9 @@ public actor OperationEngine {
         case let .discardQueuedSeratoChange(payload):
             let eventId = try QueuedChangeDiscardMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .recordingIdentity(operation):
+            let eventId = try RecordingIdentityMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .recordMusicBrainzWork(payload):
             let eventId = try MusicBrainzWorkMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
@@ -4030,6 +4045,14 @@ public actor OperationEngine {
         let previousMetadata = SeratoMetadata(mirroredBy: fileRecord)
         let previousTrackID = fileRecord.trackId
 
+        // A lookup made before the file was given a recording of its own (or
+        // before that was undone) names the wrong recording row (#205).
+        if let separation = try RecordingIdentity.discriminator(ofFile: payload.fileID, in: db),
+           separation.fingerprintHash == RecordingIdentity.fingerprintHash(of: fileRecord), separation.key != payload.fingerprintHash
+        {
+            throw RecordingIdentityError.identityChangedSinceLookup(file: fileRecord.displayName)
+        }
+
         // Upsert the canonical track row keyed by fingerprint (invariant
         // #4): identity fields always applied, display fields cherry-
         // picked (nil leaves the prior value).
@@ -4467,6 +4490,8 @@ public enum TrackMutation: Sendable {
     /// Drops a queued change that cannot apply; produced only by
     /// `discardQueuedChange(batchID:fileID:)`, in the batch that reverts it.
     case discardQueuedSeratoChange(DiscardQueuedSeratoChangePayload)
+    /// Gives a file a recording identity of its own, or undoes that (#205).
+    case recordingIdentity(RecordingIdentityOperation)
     /// Records an already-matched recording's MusicBrainz work; produced by
     /// `MusicBrainzWorkBackfill` and by undoing it.
     case recordMusicBrainzWork(RecordMusicBrainzWorkPayload)
