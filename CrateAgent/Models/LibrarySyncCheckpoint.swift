@@ -52,7 +52,7 @@ struct LibrarySyncCheckpoint: Sendable {
 
 struct SyncDirtyFiles: Sendable {
     let fileIDs: Set<Int64>
-    let paths: Set<Data>
+    let paths: Set<PathBytes>
 }
 
 enum SyncCheckpointError: LocalizedError {

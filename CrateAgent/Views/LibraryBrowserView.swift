@@ -35,6 +35,8 @@ struct LibraryBrowserView: View {
                                     player: services.trackPlayer)
                 { identifier, action in
                     Task { await perform(action, for: identifier) }
+                } onFamilyAction: { row, action in
+                    Task { await perform(action, on: row) }
                 }
             } else if loadError == nil {
                 ProgressView("Loading library…").frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -231,6 +233,10 @@ struct LibraryBrowserView: View {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: record.path)])
             }
         } catch { model.error = error.localizedDescription }
+    }
+
+    private func perform(_ action: LibraryFamilyAction, on row: BrowserRow) async {
+        await model?.performFamilyAction(action, on: row, using: LibraryFamilyActions(families: services.songFamilies))
     }
 
     private var footer: some View {

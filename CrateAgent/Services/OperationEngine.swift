@@ -450,15 +450,20 @@ public actor OperationEngine {
     /// `expectedMetadata` rejects the batch with `metadataChanged` when a
     /// row's metadata no longer matches the snapshot the caller derived
     /// its values from.
+    ///
+    /// `authorizingMembershipTokens` names files no mutation acts on whose
+    /// selection still authorizes the batch (a family change acting on
+    /// selected rows); each must be current inside the transaction.
     @discardableResult
     public func applyBatch(
         _ mutations: [TrackMutation],
         batchId: String,
         expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+        authorizingMembershipTokens: [FileMembershipToken] = [],
         expectedMetadata: [Int64: SeratoMetadata] = [:]
     ) async throws -> [Int64] {
         try await executeBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
-                               expectedMetadata: expectedMetadata)
+                               authorizingMembershipTokens: authorizingMembershipTokens, expectedMetadata: expectedMetadata)
     }
 
     func applyFilesystemObservations(_ mutations: [TrackMutation], batchId: String,
@@ -567,11 +572,13 @@ public actor OperationEngine {
 
     private func executeBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              authorizingMembershipTokens: [FileMembershipToken] = [],
                               expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
     {
         let executionResults = try await journalBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
+                                                      authorizingMembershipTokens: authorizingMembershipTokens,
                                                       expectedMetadata: expectedMetadata, filesystemObservation: filesystemObservation,
                                                       moveExpectation: moveExpectation)
         try await routeSeratoWrites(executionResults.flatMap(\.seratoWrites), batchId: batchId)
@@ -580,6 +587,7 @@ public actor OperationEngine {
 
     private func journalBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              authorizingMembershipTokens: [FileMembershipToken] = [],
                               expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [GuardedExecutionResult]
@@ -595,6 +603,11 @@ public actor OperationEngine {
             for (fileID, metadata) in expectedMetadata {
                 guard try FileRecord.fetchOne(db, key: fileID)?.seratoMetadata == metadata else {
                     throw OperationEngineError.metadataChanged(fileId: fileID)
+                }
+            }
+            for token in authorizingMembershipTokens {
+                guard try FileRecord.fetchOne(db, key: token.fileId)?.membershipRevision == token.revision else {
+                    throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
                 }
             }
             let results = try mutations.map { mutation in
@@ -880,7 +893,8 @@ public actor OperationEngine {
     private static func validateObservedIdentity(_ mutation: TrackMutation, in database: GRDB.Database) throws {
         switch mutation {
         case let .indexNewFile(payload):
-            let expected = FileMetadata(path: payload.path, volumeUuid: payload.volumeUuid, inode: payload.inode, fileSize: payload.fileSize, mtime: payload.mtime, lightweightHash: payload.lightweightHash)
+            let expected = FileMetadata(path: payload.path, volumeUuid: payload.volumeUuid, inode: payload.inode, fileSize: payload.fileSize, mtime: payload.mtime,
+                                        mtimeNanoseconds: payload.mtimeNanoseconds, lightweightHash: payload.lightweightHash)
             guard try FileMetadataCollector.collectVerified(at: payload.path) == expected else { throw SeratoMembershipSnapshotError.sourceChanged }
         case let .setFileLibraryState(payload) where payload.state.availability == .available:
             guard let file = try FileRecord.fetchOne(database, key: payload.fileId),
@@ -893,7 +907,7 @@ public actor OperationEngine {
             guard let file = try FileRecord.fetchOne(database, key: payload.fileId),
                   identity.inode == payload.inode, identity.volumeUuid == payload.volumeUuid,
                   identity.fileSize == file.fileSize,
-                  file.lightweightHash.map({ hash in hash == identity.lightweightHash }) ?? (file.mtime == identity.mtime)
+                  file.lightweightHash.map({ hash in hash == identity.lightweightHash }) ?? file.hasSameModificationTime(as: identity)
             else {
                 throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
             }
@@ -1107,7 +1121,10 @@ public actor OperationEngine {
         case .trackRemovedFromSerato: .removeFromDatabase
         case .fileRemovedFromCrates: .removeFromCrates
         case .fileTrashed: .trashFile
-        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested: nil
+        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked: nil
         }
     }
 
@@ -1528,7 +1545,10 @@ public actor OperationEngine {
             true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             false
         }
     }
@@ -1623,7 +1643,10 @@ public actor OperationEngine {
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             return []
         }
     }
@@ -1653,6 +1676,7 @@ public actor OperationEngine {
         // the newer match's tags; both checks run again inside the transaction.
         try await database.writer.read { database in try Self.requireNoLaterMatchSupersedes(events: events, in: database) }
         let tagReads = try await readMatchFileTags(events)
+        let redoFreshness = try await liveFreshnessOfRedoneFiles(events)
         let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
         let context = mutationContext
         // One transaction for every inverse mutation in the batch.
@@ -1671,7 +1695,11 @@ public actor OperationEngine {
                 }
                 try MatchUndoTagGuard.requireUnchanged(read)
             }
-            for event in events {
+            try Self.requireRedoneFilesUnchanged(redoFreshness, in: database)
+            // Undoing a grouping link checks that grouping still owns the link
+            // and keeps it otherwise, so a retired file never blocks the undo
+            // (docs/song-families.md). Its redo takes the general guard.
+            for event in events where event.eventType != .songFamilyRecordingLinked {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
                       file.libraryMembership != .retired,
@@ -1718,6 +1746,34 @@ public actor OperationEngine {
             return MatchUndoTagGuard.Request(fileID: match.fileID, path: path, direction: match.direction, applied: match.applied)
         }
         return try await MatchUndoTagGuard.readAll(requests, reader: fileTagReader)
+    }
+
+    /// A redo (undoing a revert) re-applies a match without Apply's review-time check, so it
+    /// compares each file's live stat with its row identity, which our own tag writes keep
+    /// current: an external edit or replacement since the revert refuses the redo (#118).
+    /// Stat runs here, outside the write transaction; the transaction rechecks the row.
+    private func liveFreshnessOfRedoneFiles(_ events: [EventRecord]) async throws -> [Int64: FileFreshnessSnapshot] {
+        let fileIDs = events.filter { event in event.eventType == .musicBrainzMatchReverted }.compactMap(\.fileId)
+        guard !fileIDs.isEmpty else { return [:] }
+        let paths = try await database.writer.read { database in
+            try FileRecord.filter(keys: fileIDs).fetchAll(database).compactMap { file in file.id.map { fileID in (fileID, file.path) } }
+        }
+        return try await Task.detached(priority: .userInitiated) {
+            try paths.reduce(into: [Int64: FileFreshnessSnapshot]()) { result, entry in
+                guard let metadata = FileMetadataCollector.collect(at: entry.1) else {
+                    throw OperationEngineError.undoFileUnavailable(fileId: entry.0, path: entry.1, direction: .redo)
+                }
+                result[entry.0] = FileFreshnessSnapshot(metadata)
+            }
+        }.value
+    }
+
+    private static func requireRedoneFilesUnchanged(_ liveFreshness: [Int64: FileFreshnessSnapshot], in database: GRDB.Database) throws {
+        for (fileID, live) in liveFreshness {
+            guard let file = try FileRecord.fetchOne(database, key: fileID), file.freshness.describesSameFile(as: live) else {
+                throw OperationEngineError.redoFileChanged(fileId: fileID)
+            }
+        }
     }
 
     /// Throws `undoSupersededByLaterMatch` if any match-affecting event in the
@@ -1866,7 +1922,7 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
-        case .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+        case .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested:
             // Observation inverses preserve audit evidence, not permission to
             // reverse an external Serato decision or re-add its membership.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
@@ -1901,6 +1957,13 @@ public actor OperationEngine {
                 ApplyMusicBrainzMatchPayload.self, from: inverseJsonData
             )
             return .applyMusicBrainzMatch(payload)
+        case .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+            return try .songFamily(.restore(decoder.decode(RestoreSongFamiliesPayload.self, from: inverseJsonData)))
+        case .songFamilyRecordingLinked:
+            return try .songFamily(.unlinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
+        case .songFamilyRecordingUnlinked:
+            return try .songFamily(.relinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
         }
     }
 
@@ -1952,9 +2015,14 @@ public actor OperationEngine {
         }
         var run = SegmentRun()
         var ready: [SeratoWriteSegment.Entry] = []
+        var cascaded: Set<Int64> = []
         let pass = try await loadQueue()
         for loaded in pass {
             guard let queueID = loaded.queueID else { continue }
+            guard !cascaded.contains(queueID) else {
+                run.superseded.insert(loaded.eventId)
+                continue
+            }
             let predecessor = run.blocked
             let readiness = readiness
             let classification = try await database.writer.read { database -> (GuardedSeratoWrite, SeratoConflictQueueDisposition, SeratoQueueDependency)? in
@@ -1963,7 +2031,11 @@ public actor OperationEngine {
                 let (disposition, dependency) = try SeratoConflictQueue.classify(current, blocked: predecessor, readiness: readiness, in: database)
                 return (current, disposition, dependency)
             }
-            guard let (queued, disposition, dependency) = classification else { continue }
+            guard let (queued, disposition, dependency) = classification else {
+                // Dropped since the pass loaded it, as by a rename cascade (#199).
+                run.superseded.insert(loaded.eventId)
+                continue
+            }
             if disposition == .blocked {
                 run.block(queued, dependency: dependency)
                 continue
@@ -1973,7 +2045,7 @@ public actor OperationEngine {
                 continue
             }
             guard disposition == .eligible, !queued.isOrphanedCleanup, try await isEligible(queued) else {
-                try await supersede(queued, reported: reported)
+                try await cascaded.formUnion(supersede(queued, reported: reported))
                 run.superseded.insert(queued.eventId)
                 continue
             }
@@ -2073,8 +2145,13 @@ public actor OperationEngine {
             try segment.entries.map { entry -> SeratoWriteSegment.Entry? in
                 guard let queueID = entry.write.queueID, var current = try SeratoWriteQueue.fetch(queueID: queueID, in: database) else { return nil }
                 current.requiredKeeper = entry.write.requiredKeeper
+                current.oldPathRefilled = entry.write.oldPathRefilled
                 return SeratoWriteSegment.Entry(write: current, dependency: entry.dependency)
             }
+        }
+        // A row gone since the pass loaded it was dropped, as by a rename cascade (#199).
+        for (entry, current) in zip(segment.entries, stored) where current == nil {
+            run.superseded.insert(entry.write.eventId)
         }
         var dependencies: [Int64: SeratoQueueDependency] = [:]
         var candidates: [GuardedSeratoWrite] = []
@@ -2290,12 +2367,14 @@ public actor OperationEngine {
 
     /// Drops a queued write that can no longer apply, recording why. A
     /// cleanup step's write cancels the whole cleanup it belongs to.
-    private func supersede(_ write: GuardedSeratoWrite, reported: Bool) async throws {
+    /// Returns the queue IDs it dropped, cascade included.
+    @discardableResult
+    private func supersede(_ write: GuardedSeratoWrite, reported: Bool) async throws -> Set<Int64> {
         if let target = write.cleanupTargetFileID, !write.isOrphanedCleanup {
             try await cancelDuplicateCleanup(target, result: .superseded("Duplicate cleanup was superseded; its remaining steps were cancelled."))
-            return
+            return []
         }
-        try await database.writer.write { database in
+        return try await database.writer.write { database in
             try Self.dropQueuedWrite(write, disposition: .superseded, reported: reported, in: database)
         }
     }
@@ -2303,13 +2382,35 @@ public actor OperationEngine {
     /// An audio write that was attempted and whose target then changed cannot
     /// be told apart from an interrupted write of our own, so it is reported
     /// as interrupted and never retried.
+    /// Dropping a rename also drops, in the same transaction, every later
+    /// queued write it strands, and theirs in turn (#199).
+    @discardableResult
     private static func dropQueuedWrite(_ write: GuardedSeratoWrite, disposition: SeratoWriteDisposition, detail: String? = nil,
-                                        reported: Bool, in database: GRDB.Database) throws
+                                        reported: Bool, in database: GRDB.Database) throws -> Set<Int64>
     {
-        guard try SeratoWriteQueue.delete(write, in: database) else { return }
-        let attemptedAudioWrite = write.attempts > 0 && [SeratoWriteKind.fileTagWrite, .trashFile].contains(write.write.kind)
-        try SeratoWriteDispositions.record(eventID: write.eventId, kind: write.write.kind, disposition: attemptedAudioWrite ? .interrupted : disposition,
-                                           detail: detail ?? write.lastError, reported: reported, in: database)
+        var drops = [(entry: SeratoStrandedWrite(write: write, detail: detail ?? write.lastError, newPathHeld: false), disposition: disposition)]
+        var dropped: Set<Int64> = []
+        var next = 0
+        while next < drops.count {
+            let (drop, dropDisposition) = drops[next]
+            next += 1
+            let partlyLanded = try drop.write.queueID.map { queueID in try SeratoWriteQueue.hasRenameProgress(queueID: queueID, in: database) } == true
+            guard try SeratoWriteQueue.delete(drop.write, in: database), let queueID = drop.write.queueID else { continue }
+            dropped.insert(queueID)
+            let attemptedAudioWrite = drop.write.attempts > 0 && [SeratoWriteKind.fileTagWrite, .trashFile].contains(drop.write.write.kind)
+            try SeratoWriteDispositions.record(eventID: drop.write.eventId, kind: drop.write.write.kind,
+                                               disposition: attemptedAudioWrite ? .interrupted : dropDisposition, detail: drop.detail,
+                                               reported: reported, newPathHeld: drop.newPathHeld || partlyLanded, in: database)
+            drops += try SeratoWriteQueue.writesStranded(by: drop.write, in: database).map { stranded in (stranded, SeratoWriteDisposition.superseded) }
+            // A stranded cleanup step cancels its whole cleanup, as `cancelDuplicateCleanup` does.
+            if next > 1, let target = drop.write.cleanupTargetFileID {
+                drops += try SeratoWriteQueue.fetch(cleanupTargetFileID: target, in: database).map { step in
+                    (SeratoStrandedWrite(write: step, detail: drop.detail, newPathHeld: false), SeratoWriteDisposition.superseded)
+                }
+                try DuplicateCleanupStore.delete(targetFileID: target, in: database)
+            }
+        }
+        return dropped
     }
 
     private func recordAttempt(_ writes: [GuardedSeratoWrite]) async throws {
@@ -2477,11 +2578,18 @@ public actor OperationEngine {
                                                      drainAuthorization: LibrarySyncReadiness.Authorization?, in database: GRDB.Database) throws
     {
         var stale = Set<Int64>()
+        var dropped = Set<Int64>()
         for write in writes {
             guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
-            if try SeratoWriteQueue.state(of: write, in: database) != .current {
-                stale.insert(queueID)
+            switch try SeratoWriteQueue.state(of: write, in: database) {
+            case .current: break
+            case .changed: stale.insert(queueID)
+            case .missing: dropped.insert(queueID)
             }
+        }
+        // A row gone since the attempt loaded it was dropped, as by a rename cascade (#199).
+        if !dropped.isEmpty {
+            throw ExternalWriteInterruption.superseded(dropped)
         }
         if !stale.isEmpty {
             throw ExternalWriteInterruption.stale(stale)
@@ -2586,13 +2694,12 @@ public actor OperationEngine {
                              supersededCount: run.superseded.count, conflictBlockedCount: blocked.count, missingTargetCount: run.missingTarget.count)
     }
 
-    /// Returns the queue IDs of rows whose write found no Serato entry at its path.
-    private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite], reported: Bool) async throws -> Set<Int64> {
+    private func applySeratoWrite(_ write: SeratoPendingWrite, guardedWrites: [GuardedSeratoWrite]) async throws {
         switch write {
         case .rename:
             preconditionFailure("Queued renames are applied by applySeratoRenameBatch, never one row at a time")
-        case let .metadataUpdate(update):
-            return try await applySeratoMetadataUpdateBatch([update], guardedWrites: guardedWrites, reported: reported)
+        case .metadataUpdate:
+            preconditionFailure("Queued metadata updates are applied by applySeratoMetadataUpdateBatch, never one row at a time")
         case .addTrack:
             preconditionFailure("Queued adds are registered by applySeratoAddTracks, never one row at a time")
         case let .fileTagWrite(write):
@@ -2604,7 +2711,6 @@ public actor OperationEngine {
         case let .trashFile(trash):
             try await applyTrashFileOperation(trash, guardedWrites: guardedWrites)
         }
-        return []
     }
 
     private func applyTrashFileOperation(_ trash: SeratoPendingTrash, guardedWrites: [GuardedSeratoWrite]) async throws {
@@ -2850,31 +2956,25 @@ public actor OperationEngine {
     /// therefore did not land. Without a database V2 nothing is written, not
     /// even the crates, so a rename lands in all three file sets together.
     private func applySeratoRenameBatch(_ renameRows: [GuardedSeratoWrite], guardedWrites: [GuardedSeratoWrite]) async throws -> Set<Int64> {
-        let renames = renameRows.compactMap { row -> SeratoPendingRename? in
-            guard case let .rename(rename) = row.write else { return nil }
-            return rename
+        let renames = try renameRows.map { row -> QueuedRename in
+            guard case let .rename(rename) = row.write else { preconditionFailure("A rename batch holds only rename rows") }
+            guard let queueID = row.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
+            return QueuedRename(queueID: queueID, pair: SeratoPathRename(
+                oldPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: rename.oldAbsolutePath),
+                newPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: rename.newAbsolutePath)
+            ))
         }
         guard !renames.isEmpty else { return [] }
-        let pairs = renames.map { rename in
-            SeratoPathRename(
-                oldPath: SeratoLibraryLocator.seratoRelativePath(
-                    fromAbsolute: rename.oldAbsolutePath
-                ),
-                newPath: SeratoLibraryLocator.seratoRelativePath(
-                    fromAbsolute: rename.newAbsolutePath
-                )
-            )
+        var progress = try await database.writer.read { database in
+            try SeratoWriteQueue.renameProgress(of: renames.map(\.queueID), in: database)
         }
 
         var databaseV2Error: Error?
-        var missingFromDatabase = Set<UInt32>()
         let databaseV2Path = try requireSeratoDatabase(waitingCount: renameRows.count)
         do {
-            let result = try await performExternalWrite(guardedWrites) { _ in try batchRewriteDatabasePaths(
-                databasePath: databaseV2Path,
-                renames: pairs
-            ) }
-            missingFromDatabase = Set(result.unmatchedIndices)
+            try await rewriteRenames(renames, in: databaseV2Path, progress: &progress, guardedWrites: guardedWrites) { store, pairs in
+                try batchRewriteDatabasePaths(databasePath: store, renames: pairs)
+            }
         } catch let error as ExternalWriteInterruption {
             throw error
         } catch {
@@ -2893,16 +2993,12 @@ public actor OperationEngine {
             )
         }
 
-        var missingEverywhere = missingFromDatabase
         var perCrateFailures: [(URL, Error)] = []
         for crateFile in crateFiles {
-            try await requireExternalWriteEligibility(guardedWrites)
             do {
-                let result = try await performExternalWrite(guardedWrites) { _ in try batchRewriteCratePaths(
-                    cratePath: crateFile.path,
-                    renames: pairs
-                ) }
-                missingEverywhere.formIntersection(result.unmatchedIndices)
+                try await rewriteRenames(renames, in: crateFile.path, progress: &progress, guardedWrites: guardedWrites) { store, pairs in
+                    try batchRewriteCratePaths(cratePath: store, renames: pairs)
+                }
             } catch let error as ExternalWriteInterruption {
                 throw error
             } catch {
@@ -2912,13 +3008,74 @@ public actor OperationEngine {
         }
 
         try requireSuccessfulSeratoRenames(databaseError: databaseV2Error, crateFailures: perCrateFailures)
-        for index in missingFromDatabase.sorted() {
-            let oldPath = pairs[Int(index)].oldPath
-            await note(missingEverywhere.contains(index)
-                ? "Serato's database and crates have no entry at \(oldPath); the rename was not applied there."
-                : "Serato's database has no entry at \(oldPath); only its crates were updated.")
+        func unmatched(_ rename: QueuedRename, in store: String) -> Bool {
+            progress[rename.queueID]?[store] == false
         }
-        return Set(missingEverywhere.compactMap { index in renameRows[Int(index)].queueID })
+        let missingFromDatabase = renames.filter { rename in unmatched(rename, in: databaseV2Path) }
+        var missingEverywhere = Set<Int64>()
+        for rename in missingFromDatabase {
+            let everywhere = crateFiles.allSatisfy { crateFile in unmatched(rename, in: crateFile.path) }
+            if everywhere {
+                missingEverywhere.insert(rename.queueID)
+            }
+            await note(everywhere
+                ? "Serato's database and crates have no entry at \(rename.pair.oldPath); the rename was not applied there."
+                : "Serato's database has no entry at \(rename.pair.oldPath); only its crates were updated.")
+        }
+        return missingEverywhere
+    }
+
+    private struct QueuedRename: Sendable {
+        let queueID: Int64
+        let pair: SeratoPathRename
+    }
+
+    /// Rewrites one Serato file for the renames it has not yet taken and
+    /// records them in the same transaction. A retry after a supersession,
+    /// failure or restart then skips the files a rename already reached:
+    /// rewriting a landed chain or swap again would move its records twice.
+    private func rewriteRenames(_ renames: [QueuedRename], in store: String, progress: inout [Int64: [String: Bool]],
+                                guardedWrites: [GuardedSeratoWrite],
+                                rewrite: @escaping @Sendable (String, [SeratoPathRename]) throws -> SeratoBatchWriteResult) async throws
+    {
+        let candidates = renames.filter { rename in progress[rename.queueID]?[store] == nil }
+        guard !candidates.isEmpty else { return }
+        try await requireExternalWriteEligibility(guardedWrites)
+        let written = try await performExternalWrite(guardedWrites) { database, io -> RenameStoreWrite in
+            let taken = try SeratoWriteQueue.renameProgress(of: candidates.map(\.queueID), in: database)
+            let recorded = candidates.compactMap { rename in
+                taken[rename.queueID]?[store].map { matched in SeratoRenameOutcome(queueID: rename.queueID, matched: matched) }
+            }
+            let pending = candidates.filter { rename in taken[rename.queueID]?[store] == nil }
+            guard !pending.isEmpty else { return RenameStoreWrite(outcomes: recorded, landedNotDurable: nil) }
+            let outcomes: [SeratoRenameOutcome]
+            var landedNotDurable: CoreError?
+            do {
+                let unmatched = try Set(rewrite(store, pending.map(\.pair)).unmatchedIndices)
+                outcomes = pending.enumerated().map { position, rename in
+                    SeratoRenameOutcome(queueID: rename.queueID, matched: !unmatched.contains(UInt32(position)))
+                }
+            } catch let error as CoreError {
+                guard case .LandedNotDurable = error else { throw error }
+                // The file was replaced, so its renames must not run again; which records it held is unknown.
+                landedNotDurable = error
+                outcomes = pending.map { rename in SeratoRenameOutcome(queueID: rename.queueID, matched: true) }
+            }
+            io.recordReturned()
+            try SeratoWriteQueue.recordRenameProgress(outcomes, store: store, in: database)
+            return RenameStoreWrite(outcomes: recorded + outcomes, landedNotDurable: landedNotDurable)
+        }
+        for outcome in written.outcomes {
+            progress[outcome.queueID, default: [:]][store] = outcome.matched
+        }
+        if let landedNotDurable = written.landedNotDurable {
+            throw landedNotDurable
+        }
+    }
+
+    private struct RenameStoreWrite: Sendable {
+        let outcomes: [SeratoRenameOutcome]
+        let landedNotDurable: CoreError?
     }
 
     /// The path of `database V2`. A missing file is not evidence that Serato
@@ -2997,7 +3154,7 @@ public actor OperationEngine {
                 }
                 try await applySeratoAddTracks(adds)
             default:
-                try await missingTarget.formUnion(applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites, reported: reported))
+                try await applySeratoWrite(remaining[index].write, guardedWrites: guardedWrites)
                 index += 1
             }
         }
@@ -3137,7 +3294,8 @@ public actor OperationEngine {
             }
             let moved = try physicalMoves.move(payload, file: file, expectedSource: expectedPhysicalSource)
             effectiveMutation = .renameFile(RenameFilePayload(fileId: payload.fileId, newPath: payload.newPath,
-                                                              previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true))
+                                                              previousPath: payload.previousPath, newVolumeUuid: moved.volumeUuid, newInode: moved.inode, physicalMove: true,
+                                                              newMtimeNanoseconds: moved.mtimeNanoseconds))
         }
         let result = try executeMutation(mutation: effectiveMutation, batchId: batchId, in: database)
         guard !result.seratoWrites.isEmpty else {
@@ -3195,6 +3353,9 @@ public actor OperationEngine {
         case let .observeFileMetadata(payload):
             let eventId = try FileIdentityObservationMutation.apply(payload.observation, batchId: batchId, timestamp: timestampMillis, in: db,
                                                                     metadataEvidence: payload.evidence, expectedMetadata: payload.expectedMetadata)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .recordSubsecondModificationTime(payload):
+            let eventId = try SubsecondModificationTimeMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .setFileLibraryState(payload):
             let eventId = try FileLibraryStateMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
@@ -3262,6 +3423,9 @@ public actor OperationEngine {
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(eventId: eventId, seratoWrites: seratoWrites)
+        case let .songFamily(operation):
+            let eventId = try SongFamilyMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         }
     }
 
@@ -3285,6 +3449,7 @@ public actor OperationEngine {
             inode: fileRecord.inode,
             fileSize: fileRecord.fileSize,
             mtime: fileRecord.mtime,
+            mtimeNanoseconds: fileRecord.mtimeNanoseconds,
             lightweightHash: fileRecord.lightweightHash,
             bitrateKbps: fileRecord.bitrateKbps,
             metadata: SeratoMetadata(
@@ -3333,6 +3498,7 @@ public actor OperationEngine {
             inode: payload.inode,
             fileSize: payload.fileSize,
             mtime: payload.mtime,
+            mtimeNanoseconds: payload.mtimeNanoseconds,
             lightweightHash: payload.lightweightHash,
             fingerprintStatus: .pending,
             bitrateKbps: payload.bitrateKbps,
@@ -3431,6 +3597,7 @@ public actor OperationEngine {
         let originalPath = fileRecord.path
         let originalVolumeUuid = fileRecord.volumeUuid
         let originalInode = fileRecord.inode
+        let originalMtimeNanoseconds = fileRecord.mtimeNanoseconds
 
         fileRecord.path = payload.newPath
         if let newVolumeUuid = payload.newVolumeUuid {
@@ -3438,6 +3605,7 @@ public actor OperationEngine {
         }
         if let newInode = payload.newInode {
             fileRecord.inode = newInode
+            fileRecord.mtimeNanoseconds = payload.newMtimeNanoseconds ?? fileRecord.mtimeNanoseconds
         }
         try fileRecord.update(db)
 
@@ -3449,7 +3617,8 @@ public actor OperationEngine {
             newInode: payload.newInode,
             previousVolumeUuid: payload.newVolumeUuid == nil ? nil : originalVolumeUuid,
             previousInode: payload.newInode == nil ? nil : originalInode,
-            physicalMove: payload.physicalMove
+            physicalMove: payload.physicalMove,
+            newMtimeNanoseconds: payload.newMtimeNanoseconds
         )
         let inversePayload = RenameFilePayload(
             fileId: payload.fileId,
@@ -3459,7 +3628,8 @@ public actor OperationEngine {
             newInode: payload.newInode == nil ? nil : originalInode,
             previousVolumeUuid: payload.newVolumeUuid,
             previousInode: payload.newInode,
-            physicalMove: payload.physicalMove
+            physicalMove: payload.physicalMove,
+            newMtimeNanoseconds: payload.newInode == nil ? nil : originalMtimeNanoseconds
         )
 
         let eventId = try insertEvent(
@@ -3777,12 +3947,9 @@ public actor OperationEngine {
         }
 
         // D-A note: apply-time candidate staleness is enforced BEFORE this
-        // transaction by `AutoTaggerService.staleFileIDs`, which re-stats the
-        // file on disk and compares to the payload's on-disk-at-lookup
-        // snapshot. It can't run here — this closure is inside the writer
-        // transaction and must not do file I/O — and a DB-vs-DB comparison
-        // would be a no-op anyway (nothing mutates `files.fileSize`/`mtime`
-        // after indexing; see D-B).
+        // transaction by `AutoTaggerService.staleFileIDs` (and, for a redo, by
+        // `requireRedoneFilesUnchanged`), which compare a live stat taken outside
+        // the writer transaction, since this closure must not do file I/O.
 
         // Snapshot the file's Serato metadata + track link before
         // mutating, so the inverse can restore them exactly.
@@ -3837,10 +4004,12 @@ public actor OperationEngine {
             guard let existingId = existingTrack.id else {
                 throw OperationEngineError.insertDidNotReturnRowId
             }
-            // Undo retains an empty fingerprint row for FK stability. Reusing
-            // that unreferenced row must seed kept fields just like creation.
-            let isEmptyOrphan = try existingTrack == TrackRecord(id: existingId, fingerprintHash: payload.fingerprintHash)
-                && FileRecord.filter(Column("track_id") == existingId).fetchCount(db) == 0
+            // Undo retains an empty fingerprint row for FK stability, and song
+            // grouping links a file to one. Reusing a bare row no other library
+            // file depends on must seed kept fields just like creation; a
+            // retired file keeps its link but no longer names the recording.
+            let isEmptyOrphan = try existingTrack.isBare
+                && FileRecord.otherActiveFileReferencingTrack(existingId, excluding: payload.fileID, in: db) == nil
             existingTrack.acoustidId = payload.acoustID
             existingTrack.musicbrainzRecordingId = payload.recordingMBID
             existingTrack.musicbrainzReleaseId = payload.releaseMBID
@@ -4203,6 +4372,7 @@ public enum TrackMutation: Sendable {
     case observeFileLocation(ObserveFileLocationPayload)
     case observeFileIdentity(ObserveFileIdentityPayload)
     case observeFileMetadata(ObserveFileMetadataPayload)
+    case recordSubsecondModificationTime(RecordSubsecondModificationTimePayload)
     case beginFileImport(BeginFileImportPayload)
     case setMetadata(SetMetadataPayload)
     case commitMetadataToSerato(CommitMetadataToSeratoPayload)
@@ -4216,6 +4386,7 @@ public enum TrackMutation: Sendable {
     /// `decodeInverseMutation` during undo. Never constructed by
     /// feature code directly.
     case revertMusicBrainzMatch(RevertMusicBrainzMatchPayload)
+    case songFamily(SongFamilyOperation)
 }
 
 /// Move the file at `fileId` to the user's Trash via
@@ -4332,12 +4503,21 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     /// engine can't do that stat inside its write transaction, so the guard
     /// runs in the async apply path, not here.
     ///
-    /// Optional so an event JOURNALED by an earlier build of this branch —
-    /// before D-A added these fields — still decodes (both come back nil);
-    /// such a legacy event predates the check, so revalidation skips it.
+    /// Optional so events journaled before D-A (all nil) or before migration
+    /// 018 (no nanoseconds or inode) still decode for undo. Revalidation
+    /// treats any missing field as unconfirmed, so such a payload is stale.
     /// `AutoTagRowModel.payload()` always populates them for a fresh apply.
     public let expectedFileSize: Int64?
     public let expectedMtime: Int64?
+    public var expectedMtimeNanoseconds: Int64?
+    public var expectedInode: Int64?
+
+    /// The reviewed on-disk identity, or nil when the payload never recorded one.
+    public var expectedFreshness: FileFreshnessSnapshot? {
+        guard let expectedFileSize, let expectedMtime else { return nil }
+        return FileFreshnessSnapshot(fileSize: expectedFileSize, inode: expectedInode, mtime: expectedMtime, mtimeNanoseconds: expectedMtimeNanoseconds)
+    }
+
     // Cherry-picked display fields — absent (nil) means not applied:
     public let artist: String?
     public let title: String?
@@ -4382,6 +4562,8 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         fingerprintHash: Data,
         expectedFileSize: Int64? = nil,
         expectedMtime: Int64? = nil,
+        expectedMtimeNanoseconds: Int64? = nil,
+        expectedInode: Int64? = nil,
         artist: String?,
         title: String?,
         album: String?,
@@ -4406,6 +4588,8 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         self.fingerprintHash = fingerprintHash
         self.expectedFileSize = expectedFileSize
         self.expectedMtime = expectedMtime
+        self.expectedMtimeNanoseconds = expectedMtimeNanoseconds
+        self.expectedInode = expectedInode
         self.artist = artist
         self.title = title
         self.album = album
@@ -4482,6 +4666,8 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
     public let inode: Int64
     public let fileSize: Int64
     public let mtime: Int64
+    /// Nil in payloads journaled before migration 018 (see `FileMetadata.mtimeNanoseconds`).
+    public var mtimeNanoseconds: Int64?
     public let lightweightHash: Data?
     public let bitrateKbps: Int?
     public let metadata: SeratoMetadata
@@ -4492,6 +4678,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         inode: Int64,
         fileSize: Int64,
         mtime: Int64,
+        mtimeNanoseconds: Int64? = nil,
         lightweightHash: Data? = nil,
         bitrateKbps: Int? = nil,
         metadata: SeratoMetadata = .empty
@@ -4501,6 +4688,7 @@ public struct IndexNewFilePayload: Codable, Sendable, Equatable {
         self.inode = inode
         self.fileSize = fileSize
         self.mtime = mtime
+        self.mtimeNanoseconds = mtimeNanoseconds
         self.lightweightHash = lightweightHash
         self.bitrateKbps = bitrateKbps
         self.metadata = metadata
@@ -4615,6 +4803,9 @@ public struct RenameFilePayload: Codable, Sendable, Equatable {
     public let newInode: Int64?
     public let previousVolumeUuid: String?
     public let previousInode: Int64?
+    /// The destination's subsecond modification time on a cross-volume rename, which the
+    /// destination volume may keep at a coarser precision than the source.
+    public let newMtimeNanoseconds: Int64?
 
     public init(
         fileId: Int64,
@@ -4624,8 +4815,10 @@ public struct RenameFilePayload: Codable, Sendable, Equatable {
         newInode: Int64? = nil,
         previousVolumeUuid: String? = nil,
         previousInode: Int64? = nil,
-        physicalMove: Bool? = nil
+        physicalMove: Bool? = nil,
+        newMtimeNanoseconds: Int64? = nil
     ) {
+        self.newMtimeNanoseconds = newMtimeNanoseconds
         self.physicalMove = physicalMove
         self.fileId = fileId
         self.newPath = newPath
@@ -4786,6 +4979,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
     /// rather than silently corrupting the current state (findings #3999114450,
     /// #3999974010). Detected from the event log in `undoBatch`.
     case undoSupersededByLaterMatch(fileId: Int64)
+    /// The file changed on disk since the match was undone, so redoing it could label different audio.
+    case redoFileChanged(fileId: Int64)
     /// Undo or redo of a match was refused because the audio file's tags no
     /// longer hold either end of the match for these fields: a later tag edit
     /// that the inverse would overwrite (#111).
@@ -4840,6 +5035,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Fingerprint collision for file id \(fileId): its fingerprint already identifies recording \(existingMBID), which other files depend on, but this match names \(incomingMBID). Refusing to overwrite the shared identity."
         case let .undoSupersededByLaterMatch(fileId):
             "Can't undo this MusicBrainz match for file id \(fileId): a later match replaced it. Undo the newer match first."
+        case let .redoFileChanged(fileId):
+            "Can't redo this MusicBrainz match for file id \(fileId): the audio file changed since the match was undone. Re-scan it before matching again."
         case let .undoWouldOverwriteFileTags(fileId, fields, direction):
             "Can't \(direction.verb) this MusicBrainz change for file id \(fileId): its audio file's \(fields.joined(separator: ", ")) changed since, and \(direction.gerund) would overwrite that edit."
         case let .undoFileUnavailable(fileId, path, direction):

@@ -31,6 +31,7 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
     public let inode: Int64
     public let fileSize: Int64
     public let mtime: Int64
+    public let mtimeNanoseconds: Int64?
     public let lightweightHash: Data?
     public let bitrateKbps: Int?
     public let artist: String?
@@ -39,12 +40,13 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
     public let fingerprintStatus: FingerprintStatus
 
     static let columnsSQL = """
-    files.id, files.membership_revision, files.path, files.volume_uuid, files.inode, files.file_size, files.mtime,
+    files.id, files.membership_revision, files.path, files.volume_uuid, files.inode, files.file_size, files.mtime, files.mtime_nanoseconds,
     files.lightweight_hash, files.bitrate_kbps, files.artist, files.title, files.album, files.fingerprint_status
     """
 
     public var identity: FileMetadata {
-        FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, lightweightHash: lightweightHash)
+        FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, mtimeNanoseconds: mtimeNanoseconds,
+                     lightweightHash: lightweightHash)
     }
 
     init(row: Row) throws {
@@ -55,6 +57,7 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
         inode = row["inode"]
         fileSize = row["file_size"]
         mtime = row["mtime"]
+        mtimeNanoseconds = row["mtime_nanoseconds"]
         lightweightHash = row["lightweight_hash"]
         bitrateKbps = row["bitrate_kbps"]
         artist = row["artist"]
