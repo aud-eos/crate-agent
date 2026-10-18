@@ -517,7 +517,7 @@ final class PR123FilesystemSyncRegressionTests: XCTestCase {
         try handle.seek(toOffset: outsideHashWindows ? UInt64(LightweightHashCalculator.windowSize + 1024) : 44)
         try handle.write(contentsOf: Data([4, 3, 2, 1]))
         try handle.close()
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: TimeInterval(original.mtime))], ofItemAtPath: file.path)
+        try setModificationTime(of: file.path, seconds: Int(original.mtime), nanoseconds: Int(original.mtimeNanoseconds ?? 0))
         let changed = try FileMetadataCollector.collectVerified(at: file.path)
         XCTAssertEqual(changed.inode, original.inode)
         XCTAssertEqual(changed.volumeUuid, original.volumeUuid)

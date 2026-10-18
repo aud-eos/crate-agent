@@ -162,7 +162,7 @@ final class PagedSelectionController<Provider: PagedSelectionProvider>: Observab
             do {
                 let counts = try await provider.summary(in: snapshot)
                 guard let self, version == readVersion, !Task.isCancelled else { return }
-                summary = .init(total: counts.total, inScope: counts.inScope, scopeCount: counts.scopeCount, removed: removed)
+                summary = .init(total: counts.total, inScope: counts.inScope, scopeCount: counts.scopeCount, removed: removed, scopeSelected: counts.scopeSelected)
                 refreshVisible()
                 isBusy = false
                 if failedCommand == nil {

@@ -69,6 +69,7 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
 {
     case fileLocationObserved = "file_location_observed"
     case fileIdentityObserved = "file_identity_observed"
+    case fileModificationTimeRecorded = "file_modification_time_recorded"
     case fileLibraryStateChanged = "file_library_state_changed"
     case fileImportRequested = "file_import_requested"
     case trackImported = "track_imported"
@@ -83,6 +84,15 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case fileRemovedFromCrates = "file_removed_from_crates"
     case musicBrainzMatchApplied = "music_brainz_match_applied"
     case musicBrainzMatchReverted = "music_brainz_match_reverted"
+    case songFamilyCreated = "song_family_created"
+    case songFamilyMembersAttached = "song_family_members_attached"
+    case songFamilyMembersDetached = "song_family_members_detached"
+    case songFamiliesMerged = "song_families_merged"
+    case songFamilySplit = "song_family_split"
+    case songFamilyRepresentativeChanged = "song_family_representative_changed"
+    case songFamilyRestored = "song_family_restored"
+    case songFamilyRecordingLinked = "song_family_recording_linked"
+    case songFamilyRecordingUnlinked = "song_family_recording_unlinked"
     case duplicateLabelsKeptBoth = "duplicate_labels_kept_both"
     case duplicateLabelsReopened = "duplicate_labels_reopened"
 
@@ -106,7 +116,10 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
             // re-synced (finding #3999974011).
             true
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened:
             false
         }

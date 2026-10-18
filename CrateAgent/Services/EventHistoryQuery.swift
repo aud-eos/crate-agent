@@ -45,17 +45,27 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
 
 /// Why a batch's queued changes were not applied, for its History row.
 public struct NotAppliedSummary: Sendable, Equatable {
-    public static let none = NotAppliedSummary(changeCount: 0, fileCount: 0, reasons: [])
+    public static let none = NotAppliedSummary(changeCount: 0, fileCount: 0, resolvedChangeCount: 0, listedFileCount: 0, reasons: [])
 
-    /// Distinct not-applied changes, each counted once.
+    /// Distinct changes still not applied, each counted once.
     public let changeCount: Int
     /// Distinct files those changes touch.
     public let fileCount: Int
-    /// One plain-language line per disposition, with its count.
+    /// Changes recorded as not applied that a later write, such as a
+    /// Re-sync, applied.
+    public let resolvedChangeCount: Int
+    /// Entries `EventHistoryQuery.loadNotAppliedFiles` lists: every file with
+    /// a recorded change, open or resolved.
+    public let listedFileCount: Int
+    /// One plain-language line per disposition of the open changes, with its count.
     public let reasons: [String]
+
+    public var hasRecordedChanges: Bool {
+        changeCount + resolvedChangeCount > 0
+    }
 }
 
-/// One file whose queued changes in a batch were not applied.
+/// One file whose queued changes in a batch were recorded as not applied.
 public struct NotAppliedFile: Sendable, Equatable, Identifiable {
     public var id: String {
         fileID.map { fileID in "file:\(fileID)" } ?? "event:\(firstEventID)"
@@ -64,13 +74,20 @@ public struct NotAppliedFile: Sendable, Equatable, Identifiable {
     /// Nil when the change's event names no file.
     public let fileID: Int64?
     let firstEventID: Int64
+    let cursor: NotAppliedFileCursor
     /// Nil when the file is no longer in the library.
     public let path: String?
+    /// Why each of the file's open changes was not applied.
     public let reasons: [String]
+    /// `true` when later writes applied every recorded change.
+    public var isResolved: Bool {
+        reasons.isEmpty
+    }
+
     /// `true` when re-syncing this file through
     /// `OperationEngine.resyncSeratoForBatch(_:fileID:)` can replay its
-    /// changes: the batch is re-syncable and the file's events project onto
-    /// Serato or audio-tag writes.
+    /// changes: the batch is re-syncable, some change is still open, and the
+    /// file's events project onto Serato or audio-tag writes.
     public let canResync: Bool
 }
 
@@ -78,25 +95,30 @@ public enum EventHistoryQuery {
     public static let notAppliedFilePageSize = 50
 
     /// One page of the files `batch`'s not-applied changes touch, with each
-    /// file's reasons. Loaded only when the History row is expanded.
+    /// file's open reasons, resuming after `after`, the last file of the
+    /// previous page. A page shorter than `limit` is the last one. Loaded
+    /// only when the History row is expanded.
     public static func loadNotAppliedFiles(for batch: BatchSummary, database: LibraryDatabase,
-                                           limit: Int = notAppliedFilePageSize, offset: Int = 0) async throws -> [NotAppliedFile]
+                                           limit: Int = notAppliedFilePageSize, after: NotAppliedFile? = nil) async throws -> [NotAppliedFile]
     {
-        precondition(limit > 0 && offset >= 0)
+        precondition(limit > 0)
         let batchID = batch.batchId
+        let cursor = after?.cursor
         let records = try await database.writer.read { db in
-            try SeratoWriteDispositions.notAppliedFiles(batchID: batchID, limit: limit, offset: offset, in: db)
+            try SeratoWriteDispositions.notAppliedFiles(batchID: batchID, after: cursor, limit: limit, in: db)
         }
         return records.map { record in
-            NotAppliedFile(fileID: record.fileID, firstEventID: record.firstEventID, path: record.path,
-                           reasons: reasons(record.byDisposition),
-                           canResync: batch.canResync && record.fileID != nil && record.path != nil && canResyncBatch(typeList: record.eventTypes))
+            let open = reasons(record.byDisposition)
+            return NotAppliedFile(fileID: record.fileID, firstEventID: record.firstEventID, cursor: record.cursor, path: record.path, reasons: open,
+                                  canResync: batch.canResync && !open.isEmpty && record.fileID != nil && record.path != nil
+                                      && canResyncBatch(typeList: record.eventTypes))
         }
     }
 
     static func notAppliedSummary(_ counts: NotAppliedBatchCounts?) -> NotAppliedSummary {
         guard let counts else { return .none }
-        return NotAppliedSummary(changeCount: counts.changes, fileCount: counts.files, reasons: reasons(counts.byDisposition))
+        return NotAppliedSummary(changeCount: counts.changes, fileCount: counts.files, resolvedChangeCount: counts.resolvedChanges,
+                                 listedFileCount: counts.listedFiles, reasons: reasons(counts.byDisposition))
     }
 
     private static func reasons(_ counts: SeratoWriteDispositionCounts) -> [String] {
@@ -212,6 +234,7 @@ public enum EventHistoryQuery {
             EventType.trackAddedToSerato.rawValue,
             EventType.fileLocationObserved.rawValue,
             EventType.fileIdentityObserved.rawValue,
+            EventType.fileModificationTimeRecorded.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
             EventType.fileImportRequested.rawValue,
             EventType.fileTrashed.rawValue,
@@ -255,6 +278,8 @@ public enum EventHistoryQuery {
             return "Observed location for \(count) file\(pluralS)"
         case .fileIdentityObserved:
             return "Observed identity for \(count) file\(pluralS)"
+        case .fileModificationTimeRecorded:
+            return "Recorded precise modification time for \(count) file\(pluralS)"
         case .fileLibraryStateChanged:
             return "Observed library state for \(count) file\(pluralS)"
         case .fileImportRequested:
@@ -283,10 +308,32 @@ public enum EventHistoryQuery {
             return "Applied MusicBrainz match to \(count) track\(pluralS)"
         case .musicBrainzMatchReverted:
             return "Reverted MusicBrainz match on \(count) track\(pluralS)"
+        case .songFamilyCreated:
+            return "Created \(songFamilies(count))"
+        case .songFamilyMembersAttached:
+            return "Added versions to \(songFamilies(count))"
+        case .songFamilyMembersDetached:
+            return "Removed versions from \(songFamilies(count))"
+        case .songFamiliesMerged:
+            return "Merged song families into \(songFamilies(count))"
+        case .songFamilySplit:
+            return "Split \(songFamilies(count))"
+        case .songFamilyRepresentativeChanged:
+            return "Changed the main version of \(songFamilies(count))"
+        case .songFamilyRestored:
+            return "Restored \(songFamilies(count))"
+        case .songFamilyRecordingLinked:
+            return "Linked \(count) file\(pluralS) to \(count == 1 ? "its recording" : "their recordings") for grouping"
+        case .songFamilyRecordingUnlinked:
+            return "Unlinked \(count) file\(pluralS) from \(count == 1 ? "its grouping recording" : "their grouping recordings")"
         case .duplicateLabelsKeptBoth:
             return "Kept every copy in \(count) duplicate group\(pluralS) whose labels disagree"
         case .duplicateLabelsReopened:
             return "Reopened label review for \(count) duplicate group\(pluralS)"
         }
+    }
+
+    private static func songFamilies(_ count: Int) -> String {
+        count == 1 ? "1 song family" : "\(count) song families"
     }
 }

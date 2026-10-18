@@ -137,6 +137,7 @@ public actor FingerprintWorker {
     /// this again will pick up any newly-pending rows.
     @discardableResult
     public func processAllPendingOnce() async throws -> Progress {
+        try await adoptLegacyBases()
         let pendingCount = try await fetchPendingCount()
         if pendingCount > 0 {
             let batch = try await fetchPendingBatch(limit: max(pendingCount, concurrency * 4))
@@ -176,9 +177,14 @@ public actor FingerprintWorker {
                 }
             }
         }
+        var adoptedLegacyBases = false
         while !Task.isCancelled {
             var pendingCount = 0
             do {
+                if !adoptedLegacyBases {
+                    try await adoptLegacyBases()
+                    adoptedLegacyBases = true
+                }
                 pendingCount = try await fetchPendingCount()
                 if pendingCount == 0 {
                     try? await Task.sleep(nanoseconds: pollIntervalNanos)
@@ -526,6 +532,13 @@ public actor FingerprintWorker {
     }
 
     // MARK: - DB helpers
+
+    private func adoptLegacyBases() async throws {
+        let adopted = try await database.writer.write { db in try FingerprintPersistence.adoptLegacyBasesMatchingTheirRows(in: db) }
+        if adopted > 0 {
+            Self.logger.info("Adopted \(adopted) fingerprint bases recorded before subsecond file times")
+        }
+    }
 
     private func fetchPendingCount() async throws -> Int {
         try await database.writer.read { db in

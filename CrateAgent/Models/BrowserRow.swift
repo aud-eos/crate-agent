@@ -39,6 +39,14 @@ public struct BrowserRow:
     public var membershipRevision: Int64
     public var fileAvailability: FileAvailability
     public var processingBlockReason: String? = nil
+    /// Song-family placement, present only in the Library projection.
+    public var familyId: Int64? = nil
+    public var familyRole: LibraryFamilyRole? = nil
+    /// Distinct recordings of the family in the current status scope.
+    public var familyVersions: Int? = nil
+    public var recordingId: Int64? = nil
+    /// Whether this file's recording is the family's saved manual main version.
+    public var savedMain: Bool? = nil
 
     public var canProcess: Bool {
         processingBlockReason == nil && FileProcessingEligibility.isProcessable(membership: libraryMembership, availability: fileAvailability)

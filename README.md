@@ -12,6 +12,10 @@ other screens while the app remains open. See the [Auto-Tag guide](docs/auto-tag
 Use the shared Comfortable/Compact density setting to adjust spacing throughout
 the app.
 
+In **Library**, alternate versions of a song (Instrumental, Acapella, Clean)
+can be grouped into a song family that shows one main row with a version count;
+expand it to see the alternates. See [song families](docs/song-families.md).
+
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the
 [list-control contract](docs/list-controls.md) for scopes, keyboard controls, and
@@ -196,4 +200,4 @@ soulseek-mcp/      MCP server binary exposing soulseek-core to Claude
 
 ## License
 
-TBD. Intended for personal use by the author for now.
+Copyright (c) 2026 AUDEOS, LLC. All rights reserved. The source is public for reference only; see [LICENSE](./LICENSE).

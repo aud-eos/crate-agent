@@ -169,6 +169,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             inode: inodeCounter,
             fileSize: 1000,
             mtime: 0,
+            mtimeNanoseconds: 0,
             chromaprintFingerprint: fingerprintHashes.map(FingerprintEncoder.serialize),
             fingerprintStatus: fingerprintStatus,
             album: album
@@ -179,6 +180,21 @@ final class AutoTaggerServiceTests: XCTestCase {
             try record.insert(db)
         }
         return try XCTUnwrap(record.id)
+    }
+
+    /// A stubbed live stat of an indexed fixture file: its indexed inode, which an in-place edit
+    /// keeps, with the given size and time.
+    private func liveStat(in database: LibraryDatabase, fileSize: Int64, mtime: Int64) -> FileFreshnessReading {
+        { path in
+            let inode = (try? database.writer.read { db in
+                try Int64.fetchOne(db, sql: "SELECT inode FROM files WHERE path = ?", arguments: [path])
+            }) ?? nil
+            return FileFreshnessSnapshot(fileSize: fileSize, inode: inode, mtime: mtime, mtimeNanoseconds: 0)
+        }
+    }
+
+    private func indexedInode(of fileID: Int64, in database: LibraryDatabase) throws -> Int64 {
+        try XCTUnwrap(database.writer.read { db in try FileRecord.fetchOne(db, key: fileID) }?.inode)
     }
 
     private func fingerprintBase64(for hashes: [UInt32]) -> String {
@@ -361,7 +377,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             fingerprintFunction: { _ in
                 try database.writer.write { db in
                     _ = try FingerprintPersistence.write(fileID: fileID, fingerprint: newerBytes, status: .done,
-                                                         freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 123), in: db)
+                                                         freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, inode: 1, mtime: 123, mtimeNanoseconds: 0), in: db)
                 }
                 throw NSError(domain: "decode-test", code: 1)
             }
@@ -927,7 +943,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             fingerprintFunction: { _ in recomputedHashes },
             audioTagsReader: stubAudioTagsReader(),
             // Current on-disk identity differs from the indexed 1000/0 → stale.
-            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 2000, mtime: 999) }
+            fileFreshnessReader: liveStat(in: database, fileSize: 2000, mtime: 999)
         )
 
         await service.run(fileIDs: [fileID])
@@ -977,7 +993,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             audioTagsReader: stubAudioTagsReader(),
             // The file's on-disk identity is stable at (2000, 999) — differs
             // from the index snapshot (1000, 0), so the FIRST scan recomputes.
-            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 2000, mtime: 999) }
+            fileFreshnessReader: liveStat(in: database, fileSize: 2000, mtime: 999)
         )
 
         await service.run(fileIDs: [fileID])
@@ -1017,7 +1033,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             },
             audioTagsReader: stubAudioTagsReader(),
             // Matches the indexed snapshot (fileSize 1000, mtime 0) → fresh.
-            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 0) }
+            fileFreshnessReader: liveStat(in: database, fileSize: 1000, mtime: 0)
         )
 
         await service.run(fileIDs: [fileID])
@@ -1087,16 +1103,67 @@ final class AutoTaggerServiceTests: XCTestCase {
         )
     }
 
+    /// #118, through production stat: a same-length edit within one second is a change for both a
+    /// reviewed candidate and a cached fingerprint, while an unchanged file reuses its recomputed
+    /// fingerprint. A basis recorded with whole seconds only cannot confirm anything.
+    func testSameSecondSameLengthEditIsDetectedForCandidatesAndCachedFingerprints() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audio = directory.appendingPathComponent("track.mp3")
+        let second = 1_800_000_000
+        try Data("original".utf8).write(to: audio)
+        try setModificationTime(of: audio.path, seconds: second, nanoseconds: 100_000_000)
+        let identity = try XCTUnwrap(FileMetadataCollector.collect(at: audio.path))
+        let database = try makeDatabase()
+        let fileID = try await database.writer.write { db -> Int64 in
+            var record = FileRecord(path: audio.path, volumeUuid: identity.volumeUuid, inode: identity.inode, fileSize: identity.fileSize,
+                                    mtime: identity.mtime, chromaprintFingerprint: FingerprintEncoder.serialize([1, 2, 3]), fingerprintStatus: .done,
+                                    fingerprintedSize: identity.fileSize, fingerprintedMtime: identity.mtime)
+            record.libraryMembership = .active
+            record.fileAvailability = .available
+            try record.insert(db)
+            return try XCTUnwrap(record.id)
+        }
+        let decodes = FingerprintCallCounter()
+        let recording = makeRecording()
+        let service = AutoTaggerService(
+            database: database,
+            acoustIDClient: StubAcoustIDClient { _ in [AcoustIDResult(id: "a", score: 0.95, recordingIDs: ["mb-1"])] },
+            musicBrainzClient: StubMusicBrainzClient { _ in recording },
+            keyStore: StubKeyProvider(),
+            fingerprintFunction: { _ in
+                decodes.increment()
+                return [7, 8, 9]
+            },
+            audioTagsReader: stubAudioTagsReader()
+        )
+
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(decodes.value, 1, "a basis without subsecond time cannot confirm the stored fingerprint")
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(decodes.value, 1, "the recomputed basis survives persistence and confirms the unchanged file")
+        let reviewed = try XCTUnwrap(service.candidate(for: fileID))
+
+        try overwriteInPlace(audio.path, with: Data("replaced".utf8))
+        try setModificationTime(of: audio.path, seconds: second, nanoseconds: 900_000_000)
+        let stale = try await service.staleFileIDs(for: [AutoTagRowModel(candidate: reviewed).payload()])
+        XCTAssertEqual(stale, [fileID], "the reviewed candidate no longer describes the file")
+        await service.run(fileIDs: [fileID])
+        XCTAssertEqual(decodes.value, 2, "the cached fingerprint no longer describes the file")
+    }
+
     // MARK: - D-A: apply-time candidate revalidation
 
     private func makeMatchPayload(
         fileID: Int64,
         expectedFileSize: Int64 = 1000,
         expectedMtime: Int64 = 0,
+        expectedInode: Int64? = nil,
         recordingMBID: String = "rec",
         fingerprintHash: Data = Data([0x01])
     ) -> ApplyMusicBrainzMatchPayload {
-        ApplyMusicBrainzMatchPayload(
+        var payload = ApplyMusicBrainzMatchPayload(
             fileID: fileID,
             acoustID: "aid",
             recordingMBID: recordingMBID,
@@ -1108,6 +1175,9 @@ final class AutoTaggerServiceTests: XCTestCase {
             expectedMtime: expectedMtime,
             artist: "A", title: "T", album: "Al", year: 1994
         )
+        payload.expectedInode = expectedInode
+        payload.expectedMtimeNanoseconds = 0
+        return payload
     }
 
     private func makeService(
@@ -1148,7 +1218,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             keyStore: StubKeyProvider(),
             fingerprintFunction: { _ in [9, 9, 9] },
             audioTagsReader: stubAudioTagsReader(),
-            fileFreshnessReader: { _ in FileFreshnessSnapshot(fileSize: 7777, mtime: 8888) }
+            fileFreshnessReader: liveStat(in: database, fileSize: 7777, mtime: 8888)
         )
 
         await service.run(fileIDs: [fileID])
@@ -1156,8 +1226,8 @@ final class AutoTaggerServiceTests: XCTestCase {
         guard let candidate = service.candidate(for: fileID) else {
             return XCTFail("expected a resolved candidate")
         }
-        XCTAssertEqual(candidate.expectedFileSize, 7777, "expected size must be the on-disk value, not the DB 1000")
-        XCTAssertEqual(candidate.expectedMtime, 8888, "expected mtime must be the on-disk value, not the DB 0")
+        XCTAssertEqual(candidate.expectedFreshness.fileSize, 7777, "expected size must be the on-disk value, not the DB 1000")
+        XCTAssertEqual(candidate.expectedFreshness.mtime, 8888, "expected mtime must be the on-disk value, not the DB 0")
     }
 
     /// Collisions are found per row, in apply order, including two rows of one batch that share a
@@ -1180,7 +1250,7 @@ final class AutoTaggerServiceTests: XCTestCase {
             try onlyItsOwn.insert(db)
             try db.execute(sql: "UPDATE files SET track_id = ? WHERE id = ?", arguments: [onlyItsOwn.id, ownRowCorrection])
         }
-        let service = makeService(database: database) { _ in FileFreshnessSnapshot(fileSize: 1000, mtime: 0) }
+        let service = makeService(database: database, fileFreshnessReader: liveStat(in: database, fileSize: 1000, mtime: 0))
         let payloads = [
             makeMatchPayload(fileID: clean, recordingMBID: "clean", fingerprintHash: Data([0xD4])),
             makeMatchPayload(fileID: collidingWithLibrary, recordingMBID: "different", fingerprintHash: libraryOwned),
@@ -1198,11 +1268,10 @@ final class AutoTaggerServiceTests: XCTestCase {
     func testStaleFileIDsFlagsFileChangedSinceLookup() async throws {
         let database = try makeDatabase()
         let fileID = try insertFile(in: database, path: "/music/edited.mp3")
+        let inode = try indexedInode(of: fileID, in: database)
         // Current on-disk (2000, 999) differs from the lookup snapshot (1000, 0).
-        let service = makeService(database: database) { _ in
-            FileFreshnessSnapshot(fileSize: 2000, mtime: 999)
-        }
-        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
+        let service = makeService(database: database, fileFreshnessReader: liveStat(in: database, fileSize: 2000, mtime: 999))
+        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0, expectedInode: inode)
 
         let stale = try await service.staleFileIDs(for: [payload])
         XCTAssertEqual(stale, [fileID])
@@ -1213,10 +1282,9 @@ final class AutoTaggerServiceTests: XCTestCase {
     func testStaleFileIDsPassesUnchangedFile() async throws {
         let database = try makeDatabase()
         let fileID = try insertFile(in: database, path: "/music/unchanged.mp3")
-        let service = makeService(database: database) { _ in
-            FileFreshnessSnapshot(fileSize: 1000, mtime: 0)
-        }
-        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
+        let inode = try indexedInode(of: fileID, in: database)
+        let service = makeService(database: database, fileFreshnessReader: liveStat(in: database, fileSize: 1000, mtime: 0))
+        let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0, expectedInode: inode)
 
         let stale = try await service.staleFileIDs(for: [payload])
         XCTAssertTrue(stale.isEmpty)
@@ -1234,18 +1302,14 @@ final class AutoTaggerServiceTests: XCTestCase {
         XCTAssertEqual(stale, [fileID])
     }
 
-    /// A legacy payload lacking the on-disk snapshot (both expected fields
-    /// nil — journaled before D-A) can't be revalidated and is treated as
-    /// NOT stale, even when the file would otherwise appear changed. It must
-    /// never crash by force-unwrapping the missing snapshot.
-    func testStaleFileIDsSkipsLegacyPayloadWithoutSnapshot() async throws {
+    /// A legacy payload lacking the on-disk snapshot (journaled before D-A) cannot prove the
+    /// reviewed file is unchanged, so it is stale and the row is reviewed again (#118).
+    func testStaleFileIDsFlagsLegacyPayloadWithoutSnapshot() async throws {
         let database = try makeDatabase()
         let fileID = try insertFile(in: database, path: "/music/legacy.mp3")
         // Reader would report a wildly different size/mtime, but the payload
         // has no captured snapshot to compare against.
-        let service = makeService(database: database) { _ in
-            FileFreshnessSnapshot(fileSize: 999_999, mtime: 123_456)
-        }
+        let service = makeService(database: database, fileFreshnessReader: liveStat(in: database, fileSize: 999_999, mtime: 123_456))
         let payload = ApplyMusicBrainzMatchPayload(
             fileID: fileID,
             acoustID: nil,
@@ -1260,7 +1324,7 @@ final class AutoTaggerServiceTests: XCTestCase {
         )
 
         let stale = try await service.staleFileIDs(for: [payload])
-        XCTAssertTrue(stale.isEmpty, "a legacy event with no captured snapshot must not be flagged stale")
+        XCTAssertEqual(stale, [fileID], "a payload with no captured snapshot cannot confirm the file")
     }
 
     /// A database read failure during apply-time revalidation must PROPAGATE,
@@ -1270,9 +1334,7 @@ final class AutoTaggerServiceTests: XCTestCase {
     func testStaleFileIDsThrowsWhenDatabaseReadFails() async throws {
         let database = try makeDatabase()
         let fileID = try insertFile(in: database, path: "/music/x.mp3")
-        let service = makeService(database: database) { _ in
-            FileFreshnessSnapshot(fileSize: 1000, mtime: 0)
-        }
+        let service = makeService(database: database, fileFreshnessReader: liveStat(in: database, fileSize: 1000, mtime: 0))
         // Drop the table the revalidation reads, so the fetch throws.
         try await database.writer.write { db in try db.execute(sql: "DROP TABLE files") }
         let payload = makeMatchPayload(fileID: fileID, expectedFileSize: 1000, expectedMtime: 0)
@@ -1349,9 +1411,10 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         // The freshness reader returns a DIFFERENT stat pre- vs post-decode,
         // simulating the file changing while `fingerprintFunction` read it.
+        let inode = try indexedInode(of: fileID, in: database)
         let freshness = SequencedFreshnessReader(snapshots: [
-            FileFreshnessSnapshot(fileSize: 1000, mtime: 0), // pre-decode basis
-            FileFreshnessSnapshot(fileSize: 2000, mtime: 999), // post-decode: changed
+            FileFreshnessSnapshot(fileSize: 1000, inode: inode, mtime: 0, mtimeNanoseconds: 0), // pre-decode basis
+            FileFreshnessSnapshot(fileSize: 2000, inode: inode, mtime: 999, mtimeNanoseconds: 0), // post-decode: changed
         ])
         let service = AutoTaggerService(
             database: database,
@@ -1460,9 +1523,10 @@ final class AutoTaggerServiceTests: XCTestCase {
 
         // Freshness reader: the freshness check sees the unchanged file (basis),
         // then the lookup snapshot sees the replacement.
+        let inode = try indexedInode(of: fileID, in: database)
         let freshness = SequencedFreshnessReader(snapshots: [
-            FileFreshnessSnapshot(fileSize: 1000, mtime: 0), // storedFingerprintIsFresh → fresh
-            FileFreshnessSnapshot(fileSize: 5000, mtime: 777), // lookup snapshot → changed
+            FileFreshnessSnapshot(fileSize: 1000, inode: inode, mtime: 0, mtimeNanoseconds: 0), // storedFingerprintIsFresh → fresh
+            FileFreshnessSnapshot(fileSize: 5000, inode: inode, mtime: 777, mtimeNanoseconds: 0), // lookup snapshot → changed
         ])
         let service = AutoTaggerService(
             database: database,
