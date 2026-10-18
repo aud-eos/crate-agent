@@ -26,6 +26,7 @@ struct SeratoPlayCountSummary: Equatable, Sendable {
 /// that can be reused, so a play whose path two files claimed at that
 /// moment, or none, stays unattributed.
 enum SeratoPlayCounts {
+    static let table = "serato_play_counts"
     private static let logger = Logger(subsystem: "com.crateagent.app", category: "SeratoPlayCounts")
     private static let pathChangeEvents: [EventType] = [.fileRenamed, .fileLocationObserved, .fileIdentityObserved]
 
@@ -34,6 +35,16 @@ enum SeratoPlayCounts {
         let fileID: Int64
         let start: Int64
         let end: Int64
+    }
+
+    /// Every file's attributed plays. The table holds at most one row per played file.
+    static func all(in database: GRDB.Database) throws -> [Int64: Int] {
+        var counts: [Int64: Int] = [:]
+        let rows = try Row.fetchCursor(database, sql: "SELECT file_id, play_count FROM \(table)")
+        while let row = try rows.next() {
+            counts[row["file_id"]] = row["play_count"]
+        }
+        return counts
     }
 
     static func rebuild(from scan: SeratoHistoryScan, in database: GRDB.Database) throws -> SeratoPlayCountSummary {
@@ -52,8 +63,8 @@ enum SeratoPlayCounts {
             let previous = counts[fileID] ?? (0, 0)
             counts[fileID] = (previous.plays + 1, max(previous.lastPlayedAt, play.startedAt))
         }
-        try database.execute(sql: "DELETE FROM serato_play_counts")
-        let insert = try database.makeStatement(sql: "INSERT INTO serato_play_counts (file_id, play_count, last_played_at) VALUES (?, ?, ?)")
+        try database.execute(sql: "DELETE FROM \(table)")
+        let insert = try database.makeStatement(sql: "INSERT INTO \(table) (file_id, play_count, last_played_at) VALUES (?, ?, ?)")
         for (fileID, count) in counts {
             try insert.execute(arguments: [fileID, count.plays, Int64(count.lastPlayedAt)])
         }

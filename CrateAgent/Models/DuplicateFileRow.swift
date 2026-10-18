@@ -49,15 +49,15 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
 
     static let columnsSQL = """
     files.id, files.membership_revision, files.path, files.volume_uuid, files.inode, files.file_size, files.mtime,
-    files.lightweight_hash, files.bitrate_kbps, files.artist, files.title, files.album, files.fingerprint_status,
-    (SELECT play_count FROM serato_play_counts WHERE serato_play_counts.file_id = files.id) AS serato_play_count
+    files.lightweight_hash, files.bitrate_kbps, files.artist, files.title, files.album, files.fingerprint_status
     """
 
     public var identity: FileMetadata {
         FileMetadata(path: path, volumeUuid: volumeUuid, inode: inode, fileSize: fileSize, mtime: mtime, lightweightHash: lightweightHash)
     }
 
-    init(row: Row) throws {
+    /// `playCounts` is `SeratoPlayCounts.all(in:)`; a file absent from it has no attributed plays.
+    init(row: Row, playCounts: [Int64: Int]) throws {
         id = row["id"]
         membershipRevision = row["membership_revision"]
         path = row["path"]
@@ -75,7 +75,7 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
             throw DuplicateScanError.unknownFingerprintStatus(status)
         }
         self.fingerprintStatus = fingerprintStatus
-        seratoPlayCount = row["serato_play_count"] ?? 0
+        seratoPlayCount = id.flatMap { identifier in playCounts[identifier] } ?? 0
     }
 }
 
