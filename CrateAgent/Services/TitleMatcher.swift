@@ -119,6 +119,26 @@ public enum TitleMatcher {
         return segments
     }
 
+    /// `title` without each annotation, as `annotationSegments` reads them,
+    /// whose inner content `shouldRemove` accepts.
+    static func removingAnnotations(from title: String, where shouldRemove: (String) -> Bool) -> String {
+        let remaining = NSMutableString(string: title)
+        if let dashSegment = trailingDashSegment(in: title), shouldRemove(dashSegment),
+           let match = trailingDashSegmentPattern?.firstMatch(in: title, range: NSRange(title.startIndex..., in: title))
+        {
+            remaining.replaceCharacters(in: match.range, with: " ")
+        }
+        for regex in [parenthesizedSegment, bracketedSegment].compactMap(\.self) {
+            let text = remaining as String
+            for match in regex.matches(in: text, range: NSRange(location: 0, length: remaining.length)).reversed()
+                where match.numberOfRanges > 1 && shouldRemove(remaining.substring(with: match.range(at: 1)))
+            {
+                remaining.replaceCharacters(in: match.range, with: " ")
+            }
+        }
+        return remaining as String
+    }
+
     /// True when the current title carries an annotation MB's proposal
     /// doesn't preserve: either a `()`/`[]`/trailing-dash segment whose
     /// (normalized) content is absent from the proposed title, or — as a

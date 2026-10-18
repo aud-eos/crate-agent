@@ -78,16 +78,33 @@ public enum VersionLabel: String, CaseIterable, Codable, Sendable {
     /// Diana") are not labels.
     public static func labels(in title: String) -> Set<VersionLabel> {
         TitleMatcher.annotationSegments(in: title).reduce(into: Set<VersionLabel>()) { labels, segment in
-            var remaining = " \(segment.lowercased().replacingOccurrences(of: #"[^\p{L}\p{N}]+"#, with: " ", options: .regularExpression)) "
-            for entry in termsByLength {
-                let needle = " \(entry.term) "
-                guard remaining.contains(needle) else { continue }
-                remaining = remaining.replacingOccurrences(of: needle, with: "  ")
-                if let label = entry.label {
-                    labels.insert(label)
-                }
-            }
+            labels.formUnion(terms(in: segment).compactMap(\.self))
         }
+    }
+
+    /// Whether an annotation's content names a version, labelled or not
+    /// ("Clean", "DJ Snake Remix", "Club Mix").
+    static func namesVersion(_ segment: String) -> Bool {
+        !terms(in: segment).isEmpty
+    }
+
+    /// Compiled once: Find Versions reads every candidate's labels.
+    private static let nonWordRun = try? NSRegularExpression(pattern: #"[^\p{L}\p{N}]+"#)
+
+    /// The annotation terms in `segment`, longest first, each as its label
+    /// or nil for an unlabelled DJ annotation.
+    private static func terms(in segment: String) -> [VersionLabel?] {
+        let lowercased = segment.lowercased()
+        let words = nonWordRun?.stringByReplacingMatches(in: lowercased, range: NSRange(lowercased.startIndex..., in: lowercased), withTemplate: " ")
+        var remaining = " \(words ?? lowercased) "
+        var found: [VersionLabel?] = []
+        for entry in termsByLength {
+            let needle = " \(entry.term) "
+            guard remaining.contains(needle) else { continue }
+            remaining = remaining.replacingOccurrences(of: needle, with: "  ")
+            found.append(entry.label)
+        }
+        return found
     }
 
     /// `labels` in reading order, content rating first.

@@ -408,7 +408,7 @@ enum SongFamilyMutation {
                            in: database)
     }
 
-    private static func currentFingerprintHash(of file: FileRecord) -> Data? {
+    static func currentFingerprintHash(of file: FileRecord) -> Data? {
         guard file.fingerprintStatus == .done, let fingerprint = file.chromaprintFingerprint,
               (file.fingerprintedSize ?? file.fileSize) == file.fileSize, (file.fingerprintedMtime ?? file.mtime) == file.mtime
         else {
@@ -503,15 +503,19 @@ enum SongFamilyMutation {
     private static func familiesToDissolve(for trackIds: [Int64], joining familyID: Int64?, batchId: String,
                                            in database: GRDB.Database) throws -> Set<Int64>
     {
-        let linkedByBatch = try Int64.fetchAll(database, EventRecord.select(Column("file_id"))
-            .filter(Column("batch_id") == batchId && Column("event_type") == EventType.songFamilyRecordingLinked.rawValue))
-        let liveBeforeBatch: SQL = """
-        EXISTS (SELECT 1 FROM files WHERE files.track_id = tracks.id AND \(sql: FileProcessingEligibility.activeSQL) \
-        AND files.id NOT IN \(linkedByBatch))
-        """
         var dissolving = Set<Int64>()
+        // Read only once a recording is in another family: a batch grouping
+        // thousands of new recordings never needs it.
+        var batchLinks: [Int64]?
         for track in try TrackRecord.filter(keys: trackIds).fetchAll(database) {
             guard let current = track.workId, current != familyID, !dissolving.contains(current), let trackID = track.id else { continue }
+            let linkedByBatch = try batchLinks ?? Int64.fetchAll(database, EventRecord.select(Column("file_id"))
+                .filter(Column("batch_id") == batchId && Column("event_type") == EventType.songFamilyRecordingLinked.rawValue))
+            batchLinks = linkedByBatch
+            let liveBeforeBatch: SQL = """
+            EXISTS (SELECT 1 FROM files WHERE files.track_id = tracks.id AND \(sql: FileProcessingEligibility.activeSQL) \
+            AND files.id NOT IN \(linkedByBatch))
+            """
             let liveVersions = try versionsByTrack(TrackRecord.filter(Column("work_id") == current).filter(liveBeforeBatch), in: database)
             guard Set(liveVersions.values).count >= 2 else {
                 dissolving.insert(current)
