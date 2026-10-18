@@ -1120,7 +1120,8 @@ public actor OperationEngine {
         case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
-             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked: nil
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened: nil
         }
     }
 
@@ -1508,7 +1509,8 @@ public actor OperationEngine {
              .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
-             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened:
             false
         }
     }
@@ -1607,7 +1609,8 @@ public actor OperationEngine {
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
-             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened:
             return []
         }
     }
@@ -1885,6 +1888,10 @@ public actor OperationEngine {
             // we don't have yet. Document as unsupported rather
             // than half-undo.
             throw OperationEngineError.undoNotSupported(eventType: event.eventType)
+        case .duplicateLabelsKeptBoth:
+            return try .duplicateLabelReview(.reopen(decoder.decode(DuplicateLabelReviewPayload.self, from: inverseJsonData)))
+        case .duplicateLabelsReopened:
+            return try .duplicateLabelReview(.keepBoth(decoder.decode(DuplicateLabelReviewPayload.self, from: inverseJsonData)))
         case .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested:
             // Observation inverses preserve audit evidence, not permission to
             // reverse an external Serato decision or re-add its membership.
@@ -3366,6 +3373,9 @@ public actor OperationEngine {
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(eventId: eventId, seratoWrites: seratoWrites)
+        case let .duplicateLabelReview(operation):
+            let eventId = try DuplicateLabelReviewMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         case let .songFamily(operation):
             let eventId = try SongFamilyMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
@@ -4301,6 +4311,7 @@ public enum TrackMutation: Sendable {
     /// feature code directly.
     case revertMusicBrainzMatch(RevertMusicBrainzMatchPayload)
     case songFamily(SongFamilyOperation)
+    case duplicateLabelReview(DuplicateLabelReviewOperation)
 }
 
 /// Move the file at `fileId` to the user's Trash via

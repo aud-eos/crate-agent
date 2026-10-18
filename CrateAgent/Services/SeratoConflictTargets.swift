@@ -54,6 +54,12 @@ enum SeratoConflictTargets {
             try includeSharedTrack(payload.applied.fingerprintHash, in: &target, database: database)
         case let .songFamily(operation):
             fileID = try includeRecordingLink(operation, in: &target, database: database)
+        case let .duplicateLabelReview(.keepBoth(payload)), let .duplicateLabelReview(.reopen(payload)):
+            fileID = nil
+            target.fileIDs.formUnion(payload.fileIds)
+            for file in try FileRecord.fetchAll(database, keys: payload.fileIds) {
+                target.include(file)
+            }
         }
         if let fileID {
             target.fileIDs.insert(fileID)

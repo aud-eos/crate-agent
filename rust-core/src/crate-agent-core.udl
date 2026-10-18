@@ -91,6 +91,13 @@ namespace crate_agent_core {
   [Throws=CoreError]
   sequence<SeratoTrackRecord> read_database_records_strict(string database_path);
 
+  // Strictly read every `Sessions/*.session` file under Serato's
+  // `History` directory and return the deck loads Serato marked as
+  // played. Read-only; any unrecognised structure fails with the
+  // session's file name so the caller keeps its previous play counts.
+  [Throws=CoreError]
+  SeratoHistoryScan read_serato_history(string history_directory);
+
   // Update Serato's metadata for a single track inside `database V2`.
   // For each `Some(...)` field in `update`, the corresponding `t*`
   // record in the matching `otrk` is set (creating it if absent);
@@ -291,6 +298,22 @@ dictionary AudioTagUpdate {
   // undo when the match added a year to a previously-yearless file).
   // Takes precedence over `year`.
   boolean clear_year = false;
+};
+
+// One played deck load from Serato History. `path` is absolute, as
+// Serato recorded it at play time; `started_at` is Unix seconds.
+dictionary SeratoHistoryPlay {
+  string path;
+  u64 started_at;
+};
+
+// Every played file entry across the History sessions, plus counts of
+// what was skipped: unplayed loads and non-file (streaming) entries.
+dictionary SeratoHistoryScan {
+  sequence<SeratoHistoryPlay> plays;
+  u32 session_count;
+  u32 unplayed_count;
+  u32 non_file_count;
 };
 
 dictionary AudioTags {

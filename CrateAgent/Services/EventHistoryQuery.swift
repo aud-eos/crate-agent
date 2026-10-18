@@ -326,6 +326,10 @@ public enum EventHistoryQuery {
             return "Linked \(count) file\(pluralS) to \(count == 1 ? "its recording" : "their recordings") for grouping"
         case .songFamilyRecordingUnlinked:
             return "Unlinked \(count) file\(pluralS) from \(count == 1 ? "its grouping recording" : "their grouping recordings")"
+        case .duplicateLabelsKeptBoth:
+            return "Kept every copy in \(count) duplicate group\(pluralS) whose labels disagree"
+        case .duplicateLabelsReopened:
+            return "Reopened label review for \(count) duplicate group\(pluralS)"
         }
     }
 

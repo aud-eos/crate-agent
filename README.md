@@ -68,6 +68,18 @@ such as Clean and Dirty edits, are listed as kept. Copies in another format or
 encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
 listen and check each one yourself.
 
+Identical copies whose titles name different versions, such as "(Clean)" and
+"(Dirty)", or "(Instrumental)" and nothing, are marked **labels disagree**: at
+least one label is wrong. They are never pre-selected and no keeper is chosen
+for you. Pick the keeper, optionally give it another copy's title, or keep every
+copy; both are undoable from History. Choose **Labels disagree** in the **Show** menu to review them together.
+
+**Cleanup → Duplicates** suggests a keeper for each group: the better quality, then
+the copy in its artist's folder, then the one Serato played most, then the oldest.
+Play counts come from Serato History, which is read only while Serato is closed and
+never written; each row shows its plays, and **Workers** shows how many plays were
+matched to library files, including plays at an earlier path of a renamed file.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing

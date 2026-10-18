@@ -37,6 +37,7 @@ public final class AppServices: ObservableObject {
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
+    let playCountService: SeratoPlayCountService
     @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
     @Published private(set) var syncPhase: SeratoLibrarySyncSession.SyncPhase?
     @Published private(set) var syncFileInfoFailures: [String] = []
@@ -121,6 +122,7 @@ public final class AppServices: ObservableObject {
     private var fingerprintMilestones = FingerprintActivityMilestones()
     private var scanMilestones = ScanActivityMilestones()
     private var scanActivitySubscription: AnyCancellable?
+    private var playCountSubscription: AnyCancellable?
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -218,6 +220,7 @@ public final class AppServices: ObservableObject {
                                                stopProcessing: { taggingService.cancel() },
                                                checkpointStore: SyncCheckpointStore(database: database), watchRoots: watchConfiguration.watchedPaths)
         syncSession = session
+        playCountService = SeratoPlayCountService(database: database, seratoLocator: seratoLocator, watchdog: seratoWatchdog)
         let resumeFromEventId = watchConfiguration.resumeEventID {
             UserPreferences.lastFSEventId(forWatchedPath: $0)
         }
@@ -278,6 +281,11 @@ public final class AppServices: ObservableObject {
         scanActivitySubscription = session.$scanProgress.sink { [weak self] progress in
             guard let self else { return }
             logActivity(scanMilestones.entries(for: progress), category: .scan)
+        }
+        // A finished sync means Serato is closed; the service re-reads History only if it or the library's paths changed.
+        playCountSubscription = session.$state.sink { [weak self] state in
+            guard case .ready = state, let service = self?.playCountService else { return }
+            Task { await service.refresh() }
         }
         session.$phase.assign(to: &$syncPhase)
         session.$fileInfoFailures.assign(to: &$syncFileInfoFailures)
