@@ -86,15 +86,15 @@ enum AutoTagFileSearch {
             \(BrowserRow.browserFetchSQL)
             \(whereClause)
             ORDER BY artist, title, id
-            LIMIT ? OFFSET ?
+            LIMIT :limit OFFSET :offset
             """,
-            arguments: [pattern, pattern, pattern, pattern, resultCap, page * resultCap]
+            arguments: ["query": pattern, "limit": resultCap, "offset": page * resultCap]
         )
 
         let totalMatchCount = try Int.fetchOne(
             db,
             sql: "SELECT COUNT(*) FROM files \(whereClause)",
-            arguments: [pattern, pattern, pattern, pattern]
+            arguments: ["query": pattern]
         ) ?? matches.count
 
         return Results(matches: matches, totalMatchCount: totalMatchCount, page: page)

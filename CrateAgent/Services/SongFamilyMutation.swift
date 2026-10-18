@@ -143,6 +143,8 @@ public enum SongFamilyError: LocalizedError, Equatable {
     /// identity source already claims; grouping never shares or rewrites it.
     case fingerprintCollision(file: String, otherFile: String?)
     case linkChanged(file: String)
+    /// A file the command was authorized for changed after it was shown.
+    case changedSinceShown(file: String)
     /// The recording belongs to a family that still has two or more live
     /// versions, named here.
     case memberAlreadyInFamily(recording: String, familyVersions: [String])
@@ -174,6 +176,8 @@ public enum SongFamilyError: LocalizedError, Equatable {
             "“\(file)” has the same audio fingerprint as a recording crate-agent already identified, so it treats them as one recording and can't group them as separate versions."
         case let .linkChanged(file):
             "“\(file)” was linked to a different recording since this was recorded."
+        case let .changedSinceShown(file):
+            "“\(file)” changed after it was shown. Review it and try again."
         case let .memberAlreadyInFamily(recording, familyVersions):
             "“\(recording)” is already in a song family with \(familyVersions.map { version in "“\(version)”" }.formatted(.list(type: .and))). Merge the families instead."
         case let .notAMember(recording):
@@ -453,6 +457,13 @@ enum SongFamilyMutation {
     /// What makes recordings one version: rows that share a MusicBrainz
     /// recording are one version, every other row is its own.
     static let versionKeySQL = "COALESCE(tracks.musicbrainz_recording_id, 'track:' || tracks.id)"
+
+    /// The families the user can see, with their live version counts as
+    /// `family_id, versions`: every family with two or more live versions.
+    static let liveFamiliesSQL = """
+    SELECT work_id AS family_id, COUNT(DISTINCT \(versionKeySQL)) AS versions FROM tracks
+    WHERE work_id IS NOT NULL AND \(liveTrackSQL) GROUP BY work_id HAVING COUNT(DISTINCT \(versionKeySQL)) >= 2
+    """
 
     private static func versionsByTrack(_ request: QueryInterfaceRequest<TrackRecord>, in database: GRDB.Database) throws -> [Int64: String] {
         try Row.fetchAll(database, request.select(Column("id"), SQL(sql: versionKeySQL).forKey("version")))

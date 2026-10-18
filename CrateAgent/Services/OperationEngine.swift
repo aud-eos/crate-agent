@@ -450,15 +450,20 @@ public actor OperationEngine {
     /// `expectedMetadata` rejects the batch with `metadataChanged` when a
     /// row's metadata no longer matches the snapshot the caller derived
     /// its values from.
+    ///
+    /// `authorizingMembershipTokens` names files no mutation acts on whose
+    /// selection still authorizes the batch (a family change acting on
+    /// selected rows); each must be current inside the transaction.
     @discardableResult
     public func applyBatch(
         _ mutations: [TrackMutation],
         batchId: String,
         expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+        authorizingMembershipTokens: [FileMembershipToken] = [],
         expectedMetadata: [Int64: SeratoMetadata] = [:]
     ) async throws -> [Int64] {
         try await executeBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
-                               expectedMetadata: expectedMetadata)
+                               authorizingMembershipTokens: authorizingMembershipTokens, expectedMetadata: expectedMetadata)
     }
 
     func applyFilesystemObservations(_ mutations: [TrackMutation], batchId: String,
@@ -567,11 +572,13 @@ public actor OperationEngine {
 
     private func executeBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              authorizingMembershipTokens: [FileMembershipToken] = [],
                               expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [Int64]
     {
         let executionResults = try await journalBatch(mutations, batchId: batchId, expectedMembershipTokens: expectedMembershipTokens,
+                                                      authorizingMembershipTokens: authorizingMembershipTokens,
                                                       expectedMetadata: expectedMetadata, filesystemObservation: filesystemObservation,
                                                       moveExpectation: moveExpectation)
         try await routeSeratoWrites(executionResults.flatMap(\.seratoWrites), batchId: batchId)
@@ -580,6 +587,7 @@ public actor OperationEngine {
 
     private func journalBatch(_ mutations: [TrackMutation], batchId: String,
                               expectedMembershipTokens: [Int64: FileMembershipToken]? = nil,
+                              authorizingMembershipTokens: [FileMembershipToken] = [],
                               expectedMetadata: [Int64: SeratoMetadata] = [:],
                               filesystemObservation: Bool = false,
                               moveExpectation: FilesystemMoveExpectation? = nil) async throws -> [GuardedExecutionResult]
@@ -595,6 +603,11 @@ public actor OperationEngine {
             for (fileID, metadata) in expectedMetadata {
                 guard try FileRecord.fetchOne(db, key: fileID)?.seratoMetadata == metadata else {
                     throw OperationEngineError.metadataChanged(fileId: fileID)
+                }
+            }
+            for token in authorizingMembershipTokens {
+                guard try FileRecord.fetchOne(db, key: token.fileId)?.membershipRevision == token.revision else {
+                    throw FileProcessingEligibilityError.superseded(fileId: token.fileId)
                 }
             }
             let results = try mutations.map { mutation in

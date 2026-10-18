@@ -116,8 +116,8 @@ public enum TitleMatcher {
     /// stripped). Order: parenthesized groups, then bracketed groups, then
     /// the trailing dash suffix, each in left-to-right order of appearance.
     public static func annotationSegments(in title: String) -> [String] {
-        var segments = regexCaptures(pattern: #"\(([^()]*)\)"#, in: title)
-        segments.append(contentsOf: regexCaptures(pattern: #"\[([^\[\]]*)\]"#, in: title))
+        var segments = regexCaptures(parenthesizedSegment, in: title)
+        segments.append(contentsOf: regexCaptures(bracketedSegment, in: title))
         if let dashSegment = trailingDashSegment(in: title) {
             segments.append(dashSegment)
         }
@@ -181,7 +181,7 @@ public enum TitleMatcher {
     private static func trailingDashSegment(in title: String) -> String? {
         guard let lastNonWhitespaceCharacter = title.trimmingCharacters(in: .whitespaces).last,
               lastNonWhitespaceCharacter != ")",
-              lastNonWhitespaceCharacter != "]", let regex = try? NSRegularExpression(pattern: #"\s[-–]\s+(.+)$"#) else { return nil }
+              lastNonWhitespaceCharacter != "]", let regex = trailingDashSegmentPattern else { return nil }
         let range = NSRange(title.startIndex..., in: title)
         guard let match = regex.firstMatch(in: title, range: range),
               match.numberOfRanges > 1,
@@ -192,8 +192,13 @@ public enum TitleMatcher {
         return String(title[capturedRange])
     }
 
-    private static func regexCaptures(pattern: String, in text: String) -> [String] {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+    /// Compiled once: Library ranks family titles through these on every page query.
+    private static let parenthesizedSegment = try? NSRegularExpression(pattern: #"\(([^()]*)\)"#)
+    private static let bracketedSegment = try? NSRegularExpression(pattern: #"\[([^\[\]]*)\]"#)
+    private static let trailingDashSegmentPattern = try? NSRegularExpression(pattern: #"\s[-–]\s+(.+)$"#)
+
+    private static func regexCaptures(_ regex: NSRegularExpression?, in text: String) -> [String] {
+        guard let regex else { return [] }
         let range = NSRange(text.startIndex..., in: text)
         return regex.matches(in: text, range: range).compactMap { match in
             guard match.numberOfRanges > 1, let capturedRange = Range(match.range(at: 1), in: text) else {
