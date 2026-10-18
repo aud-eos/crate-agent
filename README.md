@@ -64,6 +64,12 @@ such as Clean and Dirty edits, are listed as kept. Copies in another format or
 encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
 listen and check each one yourself.
 
+Identical copies whose titles name different versions, such as "(Clean)" and
+"(Dirty)", or "(Instrumental)" and nothing, are marked **labels disagree**: at
+least one label is wrong. They are never pre-selected and no keeper is chosen
+for you. Pick the keeper, optionally give it another copy's title, or keep every
+copy; both are undoable from History. Choose **Labels disagree** in the **Show** menu to review them together.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing

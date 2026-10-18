@@ -283,6 +283,10 @@ public enum EventHistoryQuery {
             return "Applied MusicBrainz match to \(count) track\(pluralS)"
         case .musicBrainzMatchReverted:
             return "Reverted MusicBrainz match on \(count) track\(pluralS)"
+        case .duplicateLabelsKeptBoth:
+            return "Kept every copy in \(count) duplicate group\(pluralS) whose labels disagree"
+        case .duplicateLabelsReopened:
+            return "Reopened label review for \(count) duplicate group\(pluralS)"
         }
     }
 }

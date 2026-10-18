@@ -361,6 +361,17 @@ authorized with: identical contents or PCM, or a fingerprint match only for a fi
 the user selected. If that transaction rolls back on a conflict, the recheck runs
 again when the step resumes.
 
+A confirmed group whose titles name different `VersionLabel`s (the one version
+vocabulary, shared with `TitleMatcher` and song-family suggestions) is a label
+review. It is never pre-selected, and the panel chooses no keeper for it. Giving
+the keeper another copy's title is `OperationEngine.applyMetadataEdit`, the
+same row, V2 and tag batch as Cleanup's fixes. Keeping every copy is the
+`duplicateLabelReview` mutation. It records the group's signature (a digest of the
+member file ids and their content or PCM digests) in `duplicate_label_reviews`,
+after rechecking in the transaction that those files are still identical and still
+disagree. Its inverse deletes the row. Any changed, removed or added copy changes
+the signature, so the review is shown again.
+
 Only a registered sequence with a confirmed own V2 removal may retain an absent
 member during reconciliation. An unstarted queued removal has no exemption.
 Retirement, replacement, a changed keeper, or a saved re-add cancels old cleanup.

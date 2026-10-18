@@ -83,6 +83,8 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case fileRemovedFromCrates = "file_removed_from_crates"
     case musicBrainzMatchApplied = "music_brainz_match_applied"
     case musicBrainzMatchReverted = "music_brainz_match_reverted"
+    case duplicateLabelsKeptBoth = "duplicate_labels_kept_both"
+    case duplicateLabelsReopened = "duplicate_labels_reopened"
 
     /// Whether this event type projects onto Serato/audio-file writes that
     /// `OperationEngine.resyncSeratoForBatch` can idempotently replay from the
@@ -104,7 +106,8 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
             // re-synced (finding #3999974011).
             true
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened:
             false
         }
     }
