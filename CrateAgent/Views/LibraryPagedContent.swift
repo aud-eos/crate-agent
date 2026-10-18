@@ -12,7 +12,7 @@ struct LibraryPagedContent: View {
     let density: AppDensity
     let showsFilenames: Bool
     var readiness: LibrarySyncReadiness?
-    var preview: AudioPreviewPlayer?
+    var player: TrackPlayer?
     let onAction: (Int64, LibraryBrowserAction) -> Void
 
     private var enabled: Bool {
@@ -70,7 +70,7 @@ struct LibraryPagedContent: View {
     }
 
     private var table: some View {
-        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, preview: preview),
+        PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, player: player),
                    accessibilityLabel: "Library files", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
                    isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
                    onSelect: { rows, selected in
@@ -89,7 +89,8 @@ struct LibraryPagedContent: View {
                        var query = model.query
                        query.sort = .init(column: column, ascending: ascending)
                        model.setQuery(query)
-                   }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, contentRevision: readiness?.scopeRevision ?? 0, onFocus: { identifier, index in model.focus(id: identifier, index: index) })
+                   }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled, contentRevision: readiness?.scopeRevision ?? 0, onFocus: { identifier, index in model.focus(id: identifier, index: index) },
+                   onSpace: player.map { player in { row in player.toggle(PlayerTrack(row)) } })
     }
 
     private func menu(for identifier: Int64) -> NSMenu? {
