@@ -17,6 +17,7 @@ struct HistoryView: View {
     @State private var isLoading: Bool = false
     @State private var loadError: String?
     @State private var actionError: String?
+    @State private var actionNotice: String?
     @State private var undoInFlightBatchId: String?
     @State private var resyncInFlightBatchId: String?
 
@@ -60,7 +61,9 @@ struct HistoryView: View {
             .listStyle(.inset)
             .overlay(alignment: .bottom) {
                 if let actionError {
-                    actionErrorBanner(actionError)
+                    actionBanner(actionError, systemImage: "exclamationmark.triangle.fill", tint: .orange) { self.actionError = nil }
+                } else if let actionNotice {
+                    actionBanner(actionNotice, systemImage: "checkmark.circle", tint: .green) { self.actionNotice = nil }
                 }
             }
         }
@@ -83,10 +86,17 @@ struct HistoryView: View {
                     StatusBadge(title: batch.isUndoBatch ? "Undo batch" : "Recorded changes",
                                 systemImage: batch.isUndoBatch ? "arrow.uturn.backward.circle" : "clock")
                 }
-                if batch.notApplied.changeCount > 0 {
-                    StatusBadge(title: SeratoWriteDispositionMessages.historyBadge(count: batch.notApplied.changeCount),
-                                systemImage: "exclamationmark.triangle", tint: .orange)
-                        .help(SeratoWriteDispositionMessages.historyHelp)
+                if batch.notApplied.hasRecordedChanges {
+                    if batch.notApplied.changeCount > 0 {
+                        StatusBadge(title: SeratoWriteDispositionMessages.historyBadge(count: batch.notApplied.changeCount),
+                                    systemImage: "exclamationmark.triangle", tint: .orange)
+                            .help(SeratoWriteDispositionMessages.historyHelp)
+                    }
+                    if batch.notApplied.resolvedChangeCount > 0 {
+                        Label(SeratoWriteDispositionMessages.resolvedSummary(count: batch.notApplied.resolvedChangeCount), systemImage: "checkmark.circle")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                     ForEach(batch.notApplied.reasons, id: \.self) { reason in
                         Text(reason)
                             .font(.callout)
@@ -126,13 +136,13 @@ struct HistoryView: View {
         .padding(.vertical, density.rowPadding)
     }
 
-    private func actionErrorBanner(_ message: String) -> some View {
+    private func actionBanner(_ message: String, systemImage: String, tint: Color, dismiss: @escaping () -> Void) -> some View {
         ActionBar {
-            Label(message, systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+            Label(message, systemImage: systemImage)
+                .foregroundStyle(tint)
                 .fixedSize(horizontal: false, vertical: true)
         } actions: {
-            Button("Dismiss") { actionError = nil }
+            Button("Dismiss", action: dismiss)
                 .controlSize(density.controlSize)
         }
         .padding(.horizontal, density.pagePadding)
@@ -171,16 +181,18 @@ struct HistoryView: View {
         defer { resyncInFlightBatchId = nil }
         do {
             let outcome = try await services.operationEngine.resyncSeratoForBatch(batch.batchId, fileID: fileID)
-            actionError = nil
-            // If the resync ended with queued-only writes, surface
-            // it on the inline banner too — the activity strip
-            // message scrolls past quickly, but History's banner
-            // stays visible until the user dismisses or undoes.
+            // The activity strip's message scrolls past quickly, so History
+            // keeps the outcome on its own banner until dismissed.
             if outcome.missingTargetCount > 0 || (outcome.queuedCount > 0 && outcome.appliedCount == 0) {
                 actionError = outcome.summaryMessage
+                actionNotice = nil
+            } else {
+                actionError = nil
+                actionNotice = outcome.summaryMessage
             }
         } catch {
             actionError = "Re-sync failed: \(error.localizedDescription)"
+            actionNotice = nil
         }
         await reload()
     }
@@ -197,11 +209,12 @@ private struct NotAppliedFilesList: View {
     @State private var isExpanded = false
     @State private var files: [NotAppliedFile] = []
     @State private var isLoading = false
+    @State private var reachedEnd = false
     @State private var loadError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.detailSpacing) {
-            Button(isExpanded ? SeratoWriteDispositionMessages.hideFiles : SeratoWriteDispositionMessages.showFiles(count: batch.notApplied.fileCount)) {
+            Button(isExpanded ? SeratoWriteDispositionMessages.hideFiles : SeratoWriteDispositionMessages.showFiles(count: batch.notApplied.listedFileCount)) {
                 isExpanded.toggle()
                 if isExpanded, files.isEmpty {
                     Task { await loadPage() }
@@ -217,8 +230,8 @@ private struct NotAppliedFilesList: View {
                     ActionErrorMessage(message: loadError)
                 } else if isLoading {
                     ProgressView().controlSize(.small)
-                } else if files.count < batch.notApplied.fileCount {
-                    Button(SeratoWriteDispositionMessages.showMoreFiles(remaining: batch.notApplied.fileCount - files.count)) {
+                } else if !reachedEnd {
+                    Button(SeratoWriteDispositionMessages.showMoreFiles(remaining: batch.notApplied.listedFileCount - files.count)) {
                         Task { await loadPage() }
                     }
                     .buttonStyle(.link)
@@ -234,6 +247,11 @@ private struct NotAppliedFilesList: View {
                     .font(.callout)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+                if file.isResolved {
+                    Label(SeratoWriteDispositionMessages.fileResolved, systemImage: "checkmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(file.reasons, id: \.self) { reason in
                     Text(reason).font(.caption).foregroundStyle(.secondary)
                 }
@@ -243,23 +261,39 @@ private struct NotAppliedFilesList: View {
                 Button("Re-sync") {
                     Task {
                         await resync(file)
-                        files = []
-                        await loadPage()
+                        await reloadLoadedFiles()
                     }
                 }
                 .controlSize(.small)
+                .accessibilityLabel(SeratoWriteDispositionMessages.fileResyncLabel(fileName: fileName(file)))
                 .disabled(actionsDisabled)
                 .seratoWriteGated(help: SeratoWriteDispositionMessages.fileResyncHelp, runningHelp: SeratoGateMessages.quitBefore("re-syncing"))
             }
         }
     }
 
+    private func fileName(_ file: NotAppliedFile) -> String {
+        file.path.map { path in (path as NSString).lastPathComponent } ?? SeratoWriteDispositionMessages.fileNoLongerInLibrary
+    }
+
     private func loadPage() async {
+        await load(after: files.last, limit: EventHistoryQuery.notAppliedFilePageSize) { page in files + page }
+    }
+
+    /// Re-reads the files already shown in one query and swaps them in, so
+    /// the list never empties while it reloads.
+    private func reloadLoadedFiles() async {
+        await load(after: nil, limit: max(files.count, EventHistoryQuery.notAppliedFilePageSize)) { page in page }
+    }
+
+    private func load(after last: NotAppliedFile?, limit: Int, merge: ([NotAppliedFile]) -> [NotAppliedFile]) async {
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
         do {
-            files += try await EventHistoryQuery.loadNotAppliedFiles(for: batch, database: database, offset: files.count)
+            let page = try await EventHistoryQuery.loadNotAppliedFiles(for: batch, database: database, limit: limit, after: last)
+            files = merge(page)
+            reachedEnd = page.count < limit
             loadError = nil
         } catch {
             loadError = "Could not load the affected files: \(error.localizedDescription)"

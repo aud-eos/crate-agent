@@ -487,6 +487,11 @@ applied and one reason line per disposition. Its Show files button pages the
 affected files through `EventHistoryQuery.loadNotAppliedFiles`, each with its
 own reasons; a file whose events project onto Serato or audio-tag writes can be
 re-synced alone through `OperationEngine.resyncSeratoForBatch(_:fileID:)`.
+Dispositions stay append-only. When a later write for the same event and kind
+completes, the queue records it in `serato_write_resolutions`, which History reads to
+show that change as applied by a later re-sync rather than deleting its record.
+The file list pages by `(path, entry)` keyset, so a change recorded between page
+loads cannot skip or repeat a file.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.

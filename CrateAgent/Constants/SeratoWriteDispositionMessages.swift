@@ -30,7 +30,17 @@ enum SeratoWriteDispositionMessages {
     static let hideFiles = "Hide files"
 
     static func showMoreFiles(remaining: Int) -> String {
-        "Show more files (\(remaining) remaining)"
+        remaining > 0 ? "Show more files (\(remaining) remaining)" : "Show more files"
+    }
+
+    static func resolvedSummary(count: Int) -> String {
+        "\(changes(count, nil)) applied by a later re-sync"
+    }
+
+    static let fileResolved = "Applied by a later re-sync"
+
+    static func fileResyncLabel(fileName: String) -> String {
+        "Re-sync \(fileName)"
     }
 
     static let fileNoLongerInLibrary = "File no longer in the library"
