@@ -372,6 +372,7 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     let finalFiles = try await scanner.identityProjectionsForConflictAnalysis()
                     let retainedEvidence = finalFiles.compactMap { file -> SyncFileEvidence? in
                         guard let identifier = file.id, !summary.trashChangedFileIDs.contains(identifier),
+                              !summary.trashUncheckedFileIDs.contains(identifier),
                               let stored = evidence[identifier], stored.identity == file.identity,
                               stored.membershipRevision == file.membershipRevision else { return nil }
                         return stored

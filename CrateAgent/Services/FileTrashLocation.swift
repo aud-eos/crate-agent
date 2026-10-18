@@ -164,28 +164,51 @@ enum FileTrashLocation {
 /// is gone although no event named where it went: a restart whose replay had no FSEvents
 /// history (a volume without an event store keeps none), or a file inside a trashed folder (#234).
 struct NativeTrashIndex {
-    private var trashByVolume: [String: String?] = [:]
-    private var itemsByTrash: [String: [Int64: [String]]] = [:]
+    enum Lookup: Equatable {
+        case found(FileMetadata)
+        case notFound
+        /// The Trash, or a folder in it, could not be listed (without Full Disk Access), so
+        /// a missing row may really be trashed.
+        case unchecked
+    }
 
-    /// The verified Trash item holding `file`. Nil when no item is `file`, or when the volume has
-    /// no Trash or it cannot be listed (without Full Disk Access), as before such a search existed.
-    mutating func locate(_ file: FileRecord) throws -> FileMetadata? {
-        guard let trash = try trashDirectory(for: file) else { return nil }
-        let items = itemsByTrash[trash] ?? Self.regularFiles(under: trash)
-        itemsByTrash[trash] = items
-        for candidate in items[file.inode] ?? [] {
+    private struct Listing {
+        var itemsByInode: [Int64: [String]] = [:]
+        var complete = true
+    }
+
+    private var trashByVolume: [String: TrashDirectory] = [:]
+    private var listingByTrash: [String: Listing] = [:]
+
+    private enum TrashDirectory {
+        case path(String)
+        case absent
+        case unreadable
+    }
+
+    /// The verified Trash item holding `file`, searched only when nothing recorded where it went.
+    mutating func locate(_ file: FileRecord) throws -> Lookup {
+        let trash: String
+        switch try trashDirectory(for: file) {
+        case let .path(path): trash = path
+        case .absent: return .notFound
+        case .unreadable: return .unchecked
+        }
+        let listing = listingByTrash[trash] ?? Self.regularFiles(under: trash)
+        listingByTrash[trash] = listing
+        for candidate in listing.itemsByInode[file.inode] ?? [] {
             do {
                 if let location = try FileTrashLocation.capture(at: candidate, for: file) {
-                    return location
+                    return .found(location)
                 }
             } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
                 continue
             }
         }
-        return nil
+        return listing.complete ? .notFound : .unchecked
     }
 
-    private mutating func trashDirectory(for file: FileRecord) throws -> String? {
+    private mutating func trashDirectory(for file: FileRecord) throws -> TrashDirectory {
         if let cached = trashByVolume[file.volumeUuid] {
             return cached
         }
@@ -193,27 +216,33 @@ struct NativeTrashIndex {
         while !FileManager.default.fileExists(atPath: directory.path), directory.path != "/" {
             directory.deleteLastPathComponent()
         }
-        let trash: String?
+        let trash: TrashDirectory
         do {
-            trash = try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: directory, create: false).path
-        } catch let error as CocoaError where [.fileNoSuchFile, .fileReadNoSuchFile, .fileReadNoPermission].contains(error.code) {
-            trash = nil
+            trash = try .path(FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: directory, create: false).path)
+        } catch let error as CocoaError where [.fileNoSuchFile, .fileReadNoSuchFile].contains(error.code) {
+            trash = .absent
+        } catch let error as CocoaError where error.code == .fileReadNoPermission {
+            trash = .unreadable
         }
         trashByVolume[file.volumeUuid] = trash
         return trash
     }
 
-    /// Unreadable folders inside Trash are skipped; their items can only stay unverified.
-    private static func regularFiles(under trash: String) -> [Int64: [String]] {
-        var items: [Int64: [String]] = [:]
+    private static func regularFiles(under trash: String) -> Listing {
+        var listing = Listing()
+        var unreadable = false
         let enumerator = FileManager.default.enumerator(at: URL(fileURLWithPath: trash), includingPropertiesForKeys: nil,
-                                                        errorHandler: { _, _ in true })
+                                                        errorHandler: { _, _ in
+                                                            unreadable = true
+                                                            return true
+                                                        })
         while let item = enumerator?.nextObject() as? URL {
             var status = stat()
             guard lstat(item.path, &status) == 0, status.st_mode & S_IFMT == S_IFREG else { continue }
-            items[Int64(status.st_ino), default: []].append(item.path)
+            listing.itemsByInode[Int64(status.st_ino), default: []].append(item.path)
         }
-        return items
+        listing.complete = enumerator != nil && !unreadable
+        return listing
     }
 }
 

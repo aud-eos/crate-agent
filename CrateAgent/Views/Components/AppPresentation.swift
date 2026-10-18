@@ -73,6 +73,7 @@ struct LibrarySyncStatusView: View {
                 .map { disposition in " · " + SeratoWriteDispositionMessages.summary(disposition, count: summary.notAppliedWrites[disposition]) }.joined()
                 + (summary.notAppliedWrites.unrecognized > 0 ? " · " + SeratoWriteDispositionMessages.unrecognizedSummary(count: summary.notAppliedWrites.unrecognized) : "")
                 + (summary.trashChangedFileIDs.isEmpty ? "" : " · \(summary.trashChangedFileIDs.count) changed in Trash, checked next sync")
+                + (summary.trashUncheckedFileIDs.isEmpty ? "" : " · \(summary.trashUncheckedFileIDs.count) missing, but Trash couldn't be checked: grant Full Disk Access")
                 + (summary.duplicateCleanupMessage.map { " · " + $0 } ?? "")
         }
     }
@@ -83,7 +84,7 @@ struct LibrarySyncStatusView: View {
         case .failed: "exclamationmark.triangle.fill"
         case .waitingForSerato: "clock"
         case .reconciling: "arrow.triangle.2.circlepath"
-        case let .ready(summary): summary.pathConflictCount > 0 || summary.notAppliedWrites.total > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle"
+        case let .ready(summary): summary.needsAttention ? "exclamationmark.triangle.fill" : "checkmark.circle"
         }
     }
 
@@ -93,7 +94,7 @@ struct LibrarySyncStatusView: View {
         case .failed: .red
         case .waitingForSerato: .orange
         case .reconciling: .accentColor
-        case let .ready(summary): summary.pathConflictCount > 0 || summary.notAppliedWrites.total > 0 ? .orange : .secondary
+        case let .ready(summary): summary.needsAttention ? .orange : .secondary
         }
     }
 }

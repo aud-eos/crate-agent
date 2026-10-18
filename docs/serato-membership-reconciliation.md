@@ -206,8 +206,10 @@ A trashed folder reports only a directory rename, which requests reconciliation.
 So when reconciliation finds an indexed path gone and no recorded item verifies,
 `NativeTrashIndex` lists that volume's Trash recursively, once per pass. An item
 with the row's inode that `FileTrashLocation.capture` verifies marks the row trashed
-(#234). A Trash that cannot be listed, for example without Full Disk Access, leaves
-the row missing. A trashed row
+(#234). A Trash that cannot be fully listed, for example without Full Disk Access,
+leaves the row missing but counts it in `trashUncheckedFileIDs`: the sync banner
+reports it with a warning, and the row stays out of the checkpoint so a later sync
+searches again. A trashed row
 without a persisted item (recorded before this table existed) cannot be verified
 and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
