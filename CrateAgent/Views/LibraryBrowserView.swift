@@ -22,7 +22,7 @@ struct LibraryBrowserView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            PageHeading("Library", subtitle: "Search your indexed Serato tracks. Select a track to rename it or show it in Finder.")
+            PageHeading("Library", subtitle: "Search your indexed Serato tracks. Right-click a track to rename, open or reveal it in Finder.")
                 .padding(density.pagePadding)
             statusHeader
             Divider()
@@ -36,7 +36,7 @@ struct LibraryBrowserView: View {
             ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
             if let model {
                 LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness,
-                                    player: services.trackPlayer)
+                                    player: services.trackPlayer, opener: services.fileOpener)
                 { identifier, action in
                     Task { await perform(action, for: identifier) }
                 } onFamilyAction: { row, action in
@@ -234,8 +234,10 @@ struct LibraryBrowserView: View {
                                            album: record.album, bpm: record.bpm, musicalKey: record.musicalKey,
                                            libraryMembership: record.libraryMembership, fileAvailability: record.fileAvailability,
                                            membershipRevision: record.membershipRevision)
-            case .finder:
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: record.path)])
+            case let .open(target):
+                await services.fileOpener.open(fileID: identifier, with: target)
+            case .reveal:
+                await services.fileOpener.reveal(fileID: identifier)
             }
         } catch { model.error = error.localizedDescription }
     }

@@ -56,6 +56,7 @@ struct MainWindowView: View {
                 detailView
             }
             Divider()
+            FileOpenFailureBanner(opener: services.fileOpener)
             NowPlayingBar(player: services.trackPlayer)
             AutoTagActivityView(session: services.autoTagSession) { selection = .autoTag }
             ActivityStrip()
@@ -98,7 +99,7 @@ struct MainWindowView: View {
         case .cleanup:
             LibraryHygieneView()
         case .autoTag:
-            AutoTaggerView(session: services.autoTagSession, player: services.trackPlayer, readiness: services.readiness, conflictRevision: services.readiness.scopeRevision)
+            AutoTaggerView(session: services.autoTagSession, player: services.trackPlayer, opener: services.fileOpener, readiness: services.readiness, conflictRevision: services.readiness.scopeRevision)
         case .history:
             HistoryView()
         case .workers:

@@ -4,6 +4,7 @@ enum ListControlLabels {
     static let clearSelection = "Clear selection"
     static let noMatches = "No search matches"
     static let resetSearch = "Clear search or change the filter to see more results."
+    static let spaceActionHelp = "Space plays or pauses the focused track. Shift-Space selects or deselects it; Command-O opens it."
 }
 
 struct ListSearchField: View {

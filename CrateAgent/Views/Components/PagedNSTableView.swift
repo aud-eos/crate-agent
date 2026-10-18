@@ -20,8 +20,14 @@ final class PagedNSTableView: NSTableView {
     var focusChanged: ((Int) -> Void)?
     /// Returns whether the row handled the disclosure key.
     var disclosureIntent: ((Int, Bool) -> Bool)?
-    /// Handles Space for the focused row instead of toggling its selection.
-    var spaceAction: ((Int) -> Bool)?
+    /// Handles Space for the focused row instead of toggling its selection;
+    /// Shift-Space then toggles the selection.
+    var spaceAction: ((Int) -> Bool)? {
+        didSet { setAccessibilityHelp(spaceAction == nil ? nil : ListControlLabels.spaceActionHelp) }
+    }
+
+    /// Handles Command-O for the focused row.
+    var openAction: ((Int) -> Bool)?
 
     func focusRow(_ index: Int, modifiers: NSEvent.ModifierFlags, selecting: Bool) {
         guard index >= 0, index < numberOfRows else { return }
@@ -51,7 +57,9 @@ final class PagedNSTableView: NSTableView {
         case 121: next = min(numberOfRows - 1, selectedRow + step)
         case 116: next = max(0, selectedRow - step)
         case 49:
-            if spaceAction?(selectedRow) != true {
+            guard !event.isARepeat else { return }
+            let modifiers = event.modifierFlags.intersection(Self.shortcutModifiers)
+            if modifiers == .shift || spaceAction?(selectedRow) != true {
                 selectionIntent?(selectedRow, [.command])
             }
             return
@@ -67,6 +75,17 @@ final class PagedNSTableView: NSTableView {
         }
         focusRow(next, modifiers: event.modifierFlags, selecting: true)
     }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let isOpen = event.modifierFlags.intersection(Self.shortcutModifiers) == .command && event.charactersIgnoringModifiers?.lowercased() == "o"
+        if isOpen, window?.firstResponder === self, selectedRow >= 0, openAction?(selectedRow) == true {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// Modifiers a shortcut is defined by; Caps Lock, Fn and the numeric-pad flag are ignored.
+    private static let shortcutModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
 
     override func selectAll(_: Any?) {
         selectMatchingRows?()
