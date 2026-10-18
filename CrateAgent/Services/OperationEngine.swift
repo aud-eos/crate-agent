@@ -1883,9 +1883,14 @@ public actor OperationEngine {
         }
         var run = SegmentRun()
         var ready: [SeratoWriteSegment.Entry] = []
+        var cascaded: Set<Int64> = []
         let pass = try await loadQueue()
         for loaded in pass {
             guard let queueID = loaded.queueID else { continue }
+            guard !cascaded.contains(queueID) else {
+                run.superseded.insert(loaded.eventId)
+                continue
+            }
             let predecessor = run.blocked
             let readiness = readiness
             let classification = try await database.writer.read { database -> (GuardedSeratoWrite, SeratoConflictQueueDisposition, SeratoQueueDependency)? in
@@ -1894,7 +1899,11 @@ public actor OperationEngine {
                 let (disposition, dependency) = try SeratoConflictQueue.classify(current, blocked: predecessor, readiness: readiness, in: database)
                 return (current, disposition, dependency)
             }
-            guard let (queued, disposition, dependency) = classification else { continue }
+            guard let (queued, disposition, dependency) = classification else {
+                // Dropped since the pass loaded it, as by a rename cascade (#199).
+                run.superseded.insert(loaded.eventId)
+                continue
+            }
             if disposition == .blocked {
                 run.block(queued, dependency: dependency)
                 continue
@@ -1904,7 +1913,7 @@ public actor OperationEngine {
                 continue
             }
             guard disposition == .eligible, !queued.isOrphanedCleanup, try await isEligible(queued) else {
-                try await supersede(queued, reported: reported)
+                try await cascaded.formUnion(supersede(queued, reported: reported))
                 run.superseded.insert(queued.eventId)
                 continue
             }
@@ -2007,6 +2016,10 @@ public actor OperationEngine {
                 current.oldPathRefilled = entry.write.oldPathRefilled
                 return SeratoWriteSegment.Entry(write: current, dependency: entry.dependency)
             }
+        }
+        // A row gone since the pass loaded it was dropped, as by a rename cascade (#199).
+        for (entry, current) in zip(segment.entries, stored) where current == nil {
+            run.superseded.insert(entry.write.eventId)
         }
         var dependencies: [Int64: SeratoQueueDependency] = [:]
         var candidates: [GuardedSeratoWrite] = []
@@ -2222,12 +2235,14 @@ public actor OperationEngine {
 
     /// Drops a queued write that can no longer apply, recording why. A
     /// cleanup step's write cancels the whole cleanup it belongs to.
-    private func supersede(_ write: GuardedSeratoWrite, reported: Bool) async throws {
+    /// Returns the queue IDs it dropped, cascade included.
+    @discardableResult
+    private func supersede(_ write: GuardedSeratoWrite, reported: Bool) async throws -> Set<Int64> {
         if let target = write.cleanupTargetFileID, !write.isOrphanedCleanup {
             try await cancelDuplicateCleanup(target, result: .superseded("Duplicate cleanup was superseded; its remaining steps were cancelled."))
-            return
+            return []
         }
-        try await database.writer.write { database in
+        return try await database.writer.write { database in
             try Self.dropQueuedWrite(write, disposition: .superseded, reported: reported, in: database)
         }
     }
@@ -2235,30 +2250,35 @@ public actor OperationEngine {
     /// An audio write that was attempted and whose target then changed cannot
     /// be told apart from an interrupted write of our own, so it is reported
     /// as interrupted and never retried.
+    /// Dropping a rename also drops, in the same transaction, every later
+    /// queued write it strands, and theirs in turn (#199).
+    @discardableResult
     private static func dropQueuedWrite(_ write: GuardedSeratoWrite, disposition: SeratoWriteDisposition, detail: String? = nil,
-                                        reported: Bool, in database: GRDB.Database) throws
+                                        reported: Bool, in database: GRDB.Database) throws -> Set<Int64>
     {
-        guard try SeratoWriteQueue.delete(write, in: database) else { return }
-        let attemptedAudioWrite = write.attempts > 0 && [SeratoWriteKind.fileTagWrite, .trashFile].contains(write.write.kind)
-        try SeratoWriteDispositions.record(eventID: write.eventId, kind: write.write.kind, disposition: attemptedAudioWrite ? .interrupted : disposition,
-                                           detail: detail ?? write.lastError, reported: reported, in: database)
-        if case let .rename(rename) = write.write, let queueID = write.queueID {
-            try dropRenames(into: rename.oldAbsolutePath, after: queueID, leftBy: write, reported: reported, in: database)
+        var drops = [(entry: SeratoStrandedWrite(write: write, detail: detail ?? write.lastError, newPathHeld: false), disposition: disposition)]
+        var dropped: Set<Int64> = []
+        var next = 0
+        while next < drops.count {
+            let (drop, dropDisposition) = drops[next]
+            next += 1
+            let partlyLanded = try drop.write.queueID.map { queueID in try SeratoWriteQueue.hasRenameProgress(queueID: queueID, in: database) } == true
+            guard try SeratoWriteQueue.delete(drop.write, in: database), let queueID = drop.write.queueID else { continue }
+            dropped.insert(queueID)
+            let attemptedAudioWrite = drop.write.attempts > 0 && [SeratoWriteKind.fileTagWrite, .trashFile].contains(drop.write.write.kind)
+            try SeratoWriteDispositions.record(eventID: drop.write.eventId, kind: drop.write.write.kind,
+                                               disposition: attemptedAudioWrite ? .interrupted : dropDisposition, detail: drop.detail,
+                                               reported: reported, newPathHeld: drop.newPathHeld || partlyLanded, in: database)
+            drops += try SeratoWriteQueue.writesStranded(by: drop.write, in: database).map { stranded in (stranded, SeratoWriteDisposition.superseded) }
+            // A stranded cleanup step cancels its whole cleanup, as `cancelDuplicateCleanup` does.
+            if next > 1, let target = drop.write.cleanupTargetFileID {
+                drops += try SeratoWriteQueue.fetch(cleanupTargetFileID: target, in: database).map { step in
+                    (SeratoStrandedWrite(write: step, detail: drop.detail, newPathHeld: false), SeratoWriteDisposition.superseded)
+                }
+                try DuplicateCleanupStore.delete(targetFileID: target, in: database)
+            }
         }
-    }
-
-    /// A dropped rename never moved the record at its old path, so a later
-    /// queued rename into that path would land on top of it (#199). Each
-    /// rename dropped here carries the drop on along its own chain. A path the
-    /// file's own earlier, also dropped, rename never reached holds no record.
-    private static func dropRenames(into path: String, after queueID: Int64, leftBy dropped: GuardedSeratoWrite, reported: Bool,
-                                    in database: GRDB.Database) throws
-    {
-        guard try !SeratoWriteQueue.renameNeverArrived(fileID: dropped.token.fileId, at: path, before: dropped.eventId, in: database) else { return }
-        for arrival in try SeratoWriteQueue.queuedRenames(into: path, after: queueID, in: database) {
-            try dropQueuedWrite(arrival, disposition: .superseded, detail: SeratoWriteDispositionMessages.unmovedOccupant(at: path),
-                                reported: reported, in: database)
-        }
+        return dropped
     }
 
     private func recordAttempt(_ writes: [GuardedSeratoWrite]) async throws {
@@ -2426,11 +2446,18 @@ public actor OperationEngine {
                                                      drainAuthorization: LibrarySyncReadiness.Authorization?, in database: GRDB.Database) throws
     {
         var stale = Set<Int64>()
+        var dropped = Set<Int64>()
         for write in writes {
             guard let queueID = write.queueID else { throw OperationEngineError.insertDidNotReturnRowId }
-            if try SeratoWriteQueue.state(of: write, in: database) != .current {
-                stale.insert(queueID)
+            switch try SeratoWriteQueue.state(of: write, in: database) {
+            case .current: break
+            case .changed: stale.insert(queueID)
+            case .missing: dropped.insert(queueID)
             }
+        }
+        // A row gone since the attempt loaded it was dropped, as by a rename cascade (#199).
+        if !dropped.isEmpty {
+            throw ExternalWriteInterruption.superseded(dropped)
         }
         if !stale.isEmpty {
             throw ExternalWriteInterruption.stale(stale)

@@ -301,10 +301,15 @@ earlier rename's old path, the earlier rename skips the old-path occupancy check
 even when the two land in different bounded segments. It keeps every other
 identity check. A rename that some store already took also skips that check, so
 it finishes in the rest. When a rename is dropped, the same transaction drops every
-later queued rename into its old path, transitively and each with its own
-disposition, because the record there never moved (#199). The exception is an
-old path that the same file's latest earlier rename, also not applied, never
-reached: no record waits there. Expected supersession removes only
+later queued rename into its old path, because the record there never moved
+(#199), and the same file's later queued writes that reference the dropped
+rename's new path, because another file's record may still sit there. Each
+drop is transitive, compared by `SeratoPath.normalized`, and records its own
+disposition; an indexed `rename_new_path_key` keeps the cascade linear in the
+queue. The exception is an old path that the same file's latest earlier rename
+never reached, because that rename was dropped while another record still held
+its new path (`new_path_held`): no record waits there. A rename that V2 took counts as
+arrived. Expected supersession removes only
 the obsolete queued work and records a `serato_write_dispositions` row so the drop
 stays visible after a restart; unexpected I/O failure stays visible and retryable.
 

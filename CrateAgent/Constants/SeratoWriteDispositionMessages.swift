@@ -17,6 +17,10 @@ enum SeratoWriteDispositionMessages {
         "Not applied: the rename that would have moved the track already at \((path as NSString).lastPathComponent) was not applied."
     }
 
+    static func unarrivedRename(at path: String) -> String {
+        "Not applied: this file's rename to \((path as NSString).lastPathComponent) was not applied, so Serato still lists it at its old path."
+    }
+
     static func unrecognizedSummary(count: Int) -> String {
         "\(changes(count, "queued")) not applied for a reason this version does not recognize"
     }
