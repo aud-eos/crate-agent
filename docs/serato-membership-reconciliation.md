@@ -579,6 +579,23 @@ the start of each sync: a replayable event is rebuilt into queue rows from its
 journal, a destructive one is recorded as `legacyUnrecoverable`, and the fence is
 deleted in the same transaction. The checkpoint is derived evidence; queued intent
 lives in the queue.
+
+Publication is staged so that no writer transaction grows with the library
+(#238). Every row of `sync_saved_occurrences`, `sync_file_evidence` and
+`sync_file_stats` carries a `generation`, and only the generation the
+`sync_checkpoint` header names is current; every reader filters on it.
+`SyncCheckpointStore.publish` checks publishability in a read, removes rows
+outside the current generation, and writes the next generation in transactions of
+1,000 rows (`defaultChunkSize`). A final short transaction re-checks the
+revision, effect fences and queue, verifies that the current generation is still
+the one staging started from and that every staged row is present, then points
+the header at the new generation and clears `sync_dirty_files`. Readiness opens
+only after that commit. The superseded generation is deleted afterwards, in
+chunks. Until the flip, readers and the fast path see the previous checkpoint
+whole. A crash or cancellation mid-staging leaves it current, with the same
+meaning as a crash before publishing, and the next publish deletes the orphaned
+rows first. A library change during staging moves the revision, so the flip
+fails with `changed` and the sync re-runs. One store publishes at a time.
 Any code that performs a physical or Serato-side effect records its fence with
 `SyncCheckpointStore.beginEffect` in a transaction that commits before the effect
 starts. It clears the fence only after the effect completes or is explicitly
