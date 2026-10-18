@@ -340,6 +340,10 @@ public enum EventHistoryQuery {
             return "Reopened label review for \(count) duplicate group\(pluralS)"
         case .queuedSeratoChangeDiscarded:
             return QueuedChangeDiscardMessages.batchPhrase(count: count)
+        case .musicBrainzWorkRecorded:
+            return MusicBrainzWorkMessages.recordedPhrase(count: count)
+        case .musicBrainzWorkCleared:
+            return MusicBrainzWorkMessages.clearedPhrase(count: count)
         }
     }
 

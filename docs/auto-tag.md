@@ -90,7 +90,8 @@ the search, selected tracks, progress, proposals, edits, approvals and focus.
 running app; it is not restored after quitting and relaunching.
 
 **Apply approved tracks (N)** applies the approved proposals through the normal
-operation engine. It checks whether files changed since review: size, inode and
+operation engine. A match also records the MusicBrainz work its recording
+performs, which [Find Versions](song-families.md#musicbrainz-works) groups by. It checks whether files changed since review: size, inode and
 modification time to the nanosecond must all still match what the review read, so a
 same-length edit within one second or an atomic replacement sends the track back for
 review. A stored fingerprint is reused only under the same rule, and redoing an undone

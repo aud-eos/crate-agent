@@ -1127,7 +1127,8 @@ public actor OperationEngine {
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
-             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded: nil
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared: nil
         }
     }
 
@@ -1516,7 +1517,8 @@ public actor OperationEngine {
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
-             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded:
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             false
         }
     }
@@ -1616,7 +1618,8 @@ public actor OperationEngine {
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
-             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded:
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             return []
         }
     }
@@ -2052,6 +2055,8 @@ public actor OperationEngine {
             return try .songFamily(.unlinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
         case .songFamilyRecordingUnlinked:
             return try .songFamily(.relinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
+        case .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
+            return try .recordMusicBrainzWork(decoder.decode(RecordMusicBrainzWorkPayload.self, from: inverseJsonData))
         }
     }
 
@@ -3520,6 +3525,9 @@ public actor OperationEngine {
         case let .discardQueuedSeratoChange(payload):
             let eventId = try QueuedChangeDiscardMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .recordMusicBrainzWork(payload):
+            let eventId = try MusicBrainzWorkMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         }
     }
 
@@ -4051,6 +4059,7 @@ public actor OperationEngine {
                 releaseMBID: existingTrack.musicbrainzReleaseId,
                 artistMBID: existingTrack.musicbrainzArtistId,
                 isrc: existingTrack.isrc,
+                workMBID: existingTrack.musicbrainzWorkId,
                 artist: existingTrack.artist,
                 title: existingTrack.title,
                 album: existingTrack.album,
@@ -4071,6 +4080,7 @@ public actor OperationEngine {
             existingTrack.musicbrainzReleaseId = payload.releaseMBID
             existingTrack.musicbrainzArtistId = payload.artistMBID
             existingTrack.isrc = payload.isrc
+            existingTrack.musicbrainzWorkId = payload.workMBID
             applyMusicBrainzDisplayFields(payload, to: &existingTrack, seedKeptFields: isEmptyOrphan)
             try existingTrack.update(db)
             trackID = existingId
@@ -4090,7 +4100,8 @@ public actor OperationEngine {
                 musicbrainzRecordingId: payload.recordingMBID,
                 musicbrainzReleaseId: payload.releaseMBID,
                 musicbrainzArtistId: payload.artistMBID,
-                isrc: payload.isrc
+                isrc: payload.isrc,
+                musicbrainzWorkId: payload.workMBID
             )
             applyMusicBrainzDisplayFields(payload, to: &newTrack, seedKeptFields: true)
             try newTrack.insert(db)
@@ -4456,6 +4467,9 @@ public enum TrackMutation: Sendable {
     /// Drops a queued change that cannot apply; produced only by
     /// `discardQueuedChange(batchID:fileID:)`, in the batch that reverts it.
     case discardQueuedSeratoChange(DiscardQueuedSeratoChangePayload)
+    /// Records an already-matched recording's MusicBrainz work; produced by
+    /// `MusicBrainzWorkBackfill` and by undoing it.
+    case recordMusicBrainzWork(RecordMusicBrainzWorkPayload)
 }
 
 /// Move the file at `fileId` to the user's Trash via
@@ -4507,6 +4521,8 @@ public struct TrackIdentifiers: Codable, Sendable, Equatable {
     public let releaseMBID: String?
     public let artistMBID: String?
     public let isrc: String?
+    /// Nil in snapshots journaled before #262, which recorded no work.
+    public let workMBID: String?
     public let artist: String?
     public let title: String?
     public let album: String?
@@ -4518,6 +4534,7 @@ public struct TrackIdentifiers: Codable, Sendable, Equatable {
         releaseMBID: String?,
         artistMBID: String?,
         isrc: String?,
+        workMBID: String? = nil,
         artist: String?,
         title: String?,
         album: String?,
@@ -4528,6 +4545,7 @@ public struct TrackIdentifiers: Codable, Sendable, Equatable {
         self.releaseMBID = releaseMBID
         self.artistMBID = artistMBID
         self.isrc = isrc
+        self.workMBID = workMBID
         self.artist = artist
         self.title = title
         self.album = album
@@ -4542,7 +4560,7 @@ public struct TrackIdentifiers: Codable, Sendable, Equatable {
 /// tags.
 ///
 /// Identity fields (`acoustID`, `recordingMBID`, `releaseMBID`,
-/// `artistMBID`, `isrc`) are ALWAYS written to the track row. Display
+/// `artistMBID`, `isrc`, `workMBID`) are ALWAYS written to the track row. Display
 /// fields (`artist`, `title`, `album`, `year`) are cherry-picked — a
 /// `nil` field is not applied, leaving the prior value in place.
 ///
@@ -4561,6 +4579,9 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public let releaseMBID: String?
     public let artistMBID: String?
     public let isrc: String?
+    /// The work the recording performs (`MBRecording.workMBID`). Nil when
+    /// MusicBrainz relates it to none, and in matches journaled before #262.
+    public let workMBID: String?
     public let fingerprintHash: Data
     /// The file's ACTUAL on-disk identity (`fileSize`/`mtime`, read via the
     /// freshness stat — NOT the DB-indexed `FileRecord` values, which no
@@ -4637,6 +4658,7 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         releaseMBID: String?,
         artistMBID: String?,
         isrc: String?,
+        workMBID: String? = nil,
         fingerprintHash: Data,
         expectedFileSize: Int64? = nil,
         expectedMtime: Int64? = nil,
@@ -4663,6 +4685,7 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
         self.releaseMBID = releaseMBID
         self.artistMBID = artistMBID
         self.isrc = isrc
+        self.workMBID = workMBID
         self.fingerprintHash = fingerprintHash
         self.expectedFileSize = expectedFileSize
         self.expectedMtime = expectedMtime

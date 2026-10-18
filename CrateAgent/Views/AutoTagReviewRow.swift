@@ -130,6 +130,7 @@ struct AutoTagRowModel {
             releaseMBID: candidate.chosenRelease.id,
             artistMBID: candidate.artistMBID,
             isrc: candidate.isrc,
+            workMBID: candidate.workMBID,
             fingerprintHash: candidate.fingerprintHash,
             // The file's indexed identity at lookup time, so the mutation
             // can reject a candidate that went stale before Apply (D-A).
