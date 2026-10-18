@@ -42,6 +42,8 @@ extension TrackMutation {
     var processingFileID: Int64? {
         switch self {
         case .indexNewFile, .observeFileLocation, .observeFileIdentity, .observeFileMetadata, .recordSubsecondModificationTime, .setFileLibraryState, .beginFileImport, .removeFile, .songFamily: nil
+        // Records a review of several files, each rechecked in the transaction.
+        case .duplicateLabelReview: nil
         case let .setMetadata(payload): payload.isSeratoAuthoritative == true ? nil : payload.fileId
         case let .renameFile(payload): payload.fileId
         case let .commitMetadataToSerato(payload): payload.fileId
