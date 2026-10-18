@@ -140,6 +140,7 @@ public final class LibraryDatabase {
         AddSeratoPlayCountsMigration.register(in: &migrator)
         AddSyncCheckpointGenerationsMigration.register(in: &migrator)
         AddRecordingDiscriminatorsMigration.register(in: &migrator)
+        AddMusicBrainzWorkMigration.register(in: &migrator)
         return migrator
     }
 }

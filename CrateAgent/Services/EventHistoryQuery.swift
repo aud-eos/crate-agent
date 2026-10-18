@@ -346,6 +346,10 @@ public enum EventHistoryQuery {
             return "Gave \(count) file\(pluralS) a recording of \(count == 1 ? "its" : "their") own for grouping"
         case .recordingRejoined:
             return "Returned \(count) file\(pluralS) to \(count == 1 ? "its" : "their") shared recording"
+        case .musicBrainzWorkRecorded:
+            return MusicBrainzWorkMessages.recordedPhrase(count: count)
+        case .musicBrainzWorkCleared:
+            return MusicBrainzWorkMessages.clearedPhrase(count: count)
         }
     }
 

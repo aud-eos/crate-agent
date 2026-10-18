@@ -107,7 +107,8 @@ enum QueuedChangeDiscardMutation {
              .songFamilyMembersDetached, .songFamiliesMerged, .songFamilySplit, .songFamilyRepresentativeChanged,
              .songFamilyRestored, .songFamilyRecordingLinked, .songFamilyRecordingUnlinked, .duplicateLabelsKeptBoth,
              .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
-             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined:
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             []
         }
     }
@@ -159,7 +160,8 @@ enum QueuedChangeDiscardMutation {
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged, .songFamilySplit,
              .songFamilyRepresentativeChanged, .songFamilyRestored, .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
-             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined:
+             .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             return []
         }
     }

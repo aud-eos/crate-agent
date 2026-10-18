@@ -34,7 +34,8 @@ file stats. In **Workers**, **Re-scan File Info** forces a complete refresh and 
 be stopped while it is running. Fingerprinting waits for validated readiness, then
 continues as independent background work. Workers also shows library-wide
 fingerprint and file coverage, failed or invalid results with their reasons, and
-retries them ([Workers](docs/workers.md)). Removing a track from Serato
+retries them; **Record Works** fills in the MusicBrainz works of tracks matched
+before matches recorded them ([Workers](docs/workers.md)). Removing a track from Serato
 retires its crate-agent entry while preserving the audio, recording identity, and
 History. Missing audio that Serato still references remains a member but cannot
 be processed. The main window and menu bar show waiting, sync results, or an error

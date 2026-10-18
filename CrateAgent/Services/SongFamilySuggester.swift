@@ -30,8 +30,8 @@ public struct SongFamilySuggestedRecording: Identifiable, Sendable, Equatable {
 /// user applies it.
 public struct SongFamilySuggestion: Identifiable, Sendable, Equatable {
     public enum Confidence: Sendable, Equatable {
-        /// Same artist and title stem, every version naming different labels.
-        /// Pre-checked.
+        /// Every two versions perform one MusicBrainz work or name different
+        /// labels. Pre-checked.
         case high
         /// A near match: versions that repeat a label, or one that needs
         /// existing families merged. Unchecked.
@@ -46,7 +46,8 @@ public struct SongFamilySuggestion: Identifiable, Sendable, Equatable {
         case merge(into: Int64, merged: [Int64])
     }
 
-    /// The normalized artist and title stem the files share.
+    /// The normalized artist and title stem the files share, or their
+    /// artist and MusicBrainz work when no file has a stem.
     public let id: String
     public let title: String
     public let artist: String?
@@ -155,17 +156,22 @@ public struct SongFamilySuggester: Sendable {
         let length: String?
         let trackID: Int64?
         let musicBrainzRecordingID: String?
+        let musicBrainzWorkID: String?
         let familyID: Int64?
         let audioDigest: Data?
         let contentDigest: Data?
         let isFingerprinted: Bool
         let key: String?
+        /// The normalized artist and the work, joining one artist's versions
+        /// of a work whose titles differ.
+        let workKey: String?
     }
 
     private struct Candidate {
         let file: SongFamilySuggestedFile
         let trackID: Int64?
         let musicBrainzRecordingID: String?
+        let musicBrainzWorkID: String?
         let familyID: Int64?
         let audioDigest: Data?
         let contentDigest: Data?
@@ -177,6 +183,7 @@ public struct SongFamilySuggester: Sendable {
                 labels: VersionLabel.labels(in: indexed.title ?? ""), membershipRevision: indexed.membershipRevision)
             trackID = indexed.trackID
             musicBrainzRecordingID = indexed.musicBrainzRecordingID
+            musicBrainzWorkID = indexed.musicBrainzWorkID
             familyID = indexed.familyID
             audioDigest = indexed.audioDigest
             contentDigest = indexed.contentDigest
@@ -193,8 +200,7 @@ public struct SongFamilySuggester: Sendable {
     }
 
     private static func scan(in database: GRDB.Database) throws -> SongFamilySuggestions {
-        let groups = try Dictionary(grouping: indexedFiles(in: database), by: \.key)
-            .filter { key, members in key != nil && members.count > 1 }.mapValues { members in members.map(Candidate.init) }
+        let groups = try candidateGroups(indexedFiles(in: database))
         let unlinked = groups.values.joined().filter { candidate in candidate.trackID == nil && candidate.isFingerprinted }.map(\.file.id)
         let fingerprints = try fingerprintHashes(of: unlinked, in: database)
         let fingerprintTracks = try tracks(matching: Set(fingerprints.values), in: database)
@@ -202,7 +208,6 @@ public struct SongFamilySuggester: Sendable {
         var sameAudio: [[SongFamilySuggestedFile]] = []
         var awaitingFingerprint = 0
         for (key, members) in groups {
-            guard let key else { continue }
             var placed: [Placed] = []
             var unplaced: [Data: [Candidate]] = [:]
             for candidate in members {
@@ -245,12 +250,56 @@ public struct SongFamilySuggester: Sendable {
         return SongFamilySuggestions(suggestions: suggestions, sameAudio: sameAudio, awaitingFingerprint: awaitingFingerprint)
     }
 
+    /// Files sharing an artist and title stem, or an artist and a
+    /// MusicBrainz work, joined transitively. A file without work data still
+    /// joins by its stem. Groups are keyed by their smallest stem key, or by
+    /// a work key when no member has a stem.
+    private static func candidateGroups(_ files: [IndexedFile]) -> [String: [Candidate]] {
+        var groups: [String: [IndexedFile]] = [:]
+        for file in files {
+            if let key = file.key ?? file.workKey {
+                groups[key, default: []].append(file)
+            }
+        }
+        // Only the few groups holding works are joined, so the scan stays one
+        // pass over a library without work data.
+        var joinedInto: [String: String] = [:]
+        func root(of key: String) -> String {
+            var current = key
+            while let next = joinedInto[current] {
+                current = next
+            }
+            return current
+        }
+        var groupByWork: [String: String] = [:]
+        for file in files {
+            guard let workKey = file.workKey, let groupKey = file.key ?? file.workKey else { continue }
+            guard let earlier = groupByWork[workKey] else {
+                groupByWork[workKey] = groupKey
+                continue
+            }
+            let (first, second) = (root(of: groupKey), root(of: earlier))
+            guard first != second else { continue }
+            let ordered = [first, second].sorted { lhs, rhs in
+                (lhs.hasPrefix(workKeyPrefix) ? 1 : 0, lhs) < (rhs.hasPrefix(workKeyPrefix) ? 1 : 0, rhs)
+            }
+            joinedInto[ordered[1]] = ordered[0]
+        }
+        for joined in joinedInto.keys {
+            groups[root(of: joined), default: []] += groups.removeValue(forKey: joined) ?? []
+        }
+        return groups.filter { _, members in members.count > 1 }.mapValues { members in members.map(Candidate.init) }
+    }
+
+    /// Normalized words hold only letters and digits, so no stem key has it.
+    private static let workKeyPrefix = "work:"
+
     private static func indexedFiles(in database: GRDB.Database) throws -> [IndexedFile] {
         try Row.fetchAll(database, sql: """
         WITH live_families AS (\(SongFamilyMutation.liveFamiliesSQL))
         SELECT files.id, files.path, files.membership_revision, COALESCE(files.title, tracks.title) AS title,
                COALESCE(files.artist, tracks.artist) AS artist, files.length, files.track_id,
-               tracks.musicbrainz_recording_id AS recording_mbid, live_families.family_id,
+               tracks.musicbrainz_recording_id AS recording_mbid, tracks.musicbrainz_work_id AS work_mbid, live_families.family_id,
                files.fingerprint_status = '\(FingerprintStatus.done.rawValue)' AND files.chromaprint_fingerprint IS NOT NULL AS fingerprinted,
                \(DuplicateDigestStore.confirmingDigestColumn(.audio, of: "audio_cache")) AS audio_digest,
                \(DuplicateDigestStore.confirmingDigestColumn(.content, of: "content_cache")) AS content_digest
@@ -262,10 +311,13 @@ public struct SongFamilySuggester: Sendable {
         """).map { row in
             let title: String? = row["title"]
             let artist: String? = row["artist"]
+            let workID: String? = row["work_mbid"]
+            let workKey = workID.flatMap { workID in artist.flatMap(normalizedArtist).map { normalized in workKeyPrefix + normalized + "\n" + workID } }
             return IndexedFile(id: row["id"], membershipRevision: row["membership_revision"], path: row["path"], title: title, artist: artist,
                                length: row["length"], trackID: row["track_id"], musicBrainzRecordingID: row["recording_mbid"],
-                               familyID: row["family_id"], audioDigest: row["audio_digest"], contentDigest: row["content_digest"],
-                               isFingerprinted: row["fingerprinted"], key: key(artist: artist, title: title))
+                               musicBrainzWorkID: workID, familyID: row["family_id"], audioDigest: row["audio_digest"],
+                               contentDigest: row["content_digest"], isFingerprinted: row["fingerprinted"], key: key(artist: artist, title: title),
+                               workKey: workKey)
         }
     }
 
@@ -359,8 +411,14 @@ public struct SongFamilySuggester: Sendable {
         let recordings = Dictionary(grouping: adding, by: \.recordingKey).map { recordingKey, files in
             SongFamilySuggestedRecording(id: recordingKey, files: files.map(\.candidate.file).sorted { lhs, rhs in lhs.id < rhs.id })
         }.sorted { lhs, rhs in (lhs.files.first?.id ?? 0) < (rhs.files.first?.id ?? 0) }
-        let versionLabels = Dictionary(grouping: members, by: \.versionKey).values.map { version in Set(version.map(\.candidate.file.labels)) }
-        let labelsDiffer = versionLabels.allSatisfy { labels in labels.count == 1 } && Set(versionLabels.flatMap(\.self)).count == versionLabels.count
+        let versions = Dictionary(grouping: members, by: \.versionKey).values.map { version in
+            (labels: Set(version.map(\.candidate.file.labels)), workID: version.lazy.compactMap(\.candidate.musicBrainzWorkID).first)
+        }
+        let versionsDistinct = versions.allSatisfy { version in version.labels.count == 1 } && versions.indices.allSatisfy { first in
+            versions.indices.filter { second in second > first }.allSatisfy { second in
+                versions[first].workID.map { workID in workID == versions[second].workID } == true || versions[first].labels != versions[second].labels
+            }
+        }
         let shown = members.map(\.candidate.file).min { lhs, rhs in
             (SongFamilyRepresentative.rank(title: lhs.title, isMusicBrainzMatched: false), lhs.id)
                 < (SongFamilyRepresentative.rank(title: rhs.title, isMusicBrainzMatched: false), rhs.id)
@@ -372,7 +430,7 @@ public struct SongFamilySuggester: Sendable {
             false
         }
         return SongFamilySuggestion(
-            id: key, title: shown.title, artist: shown.artist, confidence: labelsDiffer && !isMerge ? .high : .medium, target: target,
+            id: key, title: shown.title, artist: shown.artist, confidence: versionsDistinct && !isMerge ? .high : .medium, target: target,
             recordings: recordings,
             existingFiles: members.filter { member in member.familyID != nil }.map(\.candidate.file).sorted { lhs, rhs in lhs.id < rhs.id }
         )
@@ -391,14 +449,18 @@ public struct SongFamilySuggester: Sendable {
     /// (`VersionLabel`) or a featured artist; both sides drop featured
     /// artists, punctuation, case and diacritics.
     static func key(artist: String?, title: String?) -> String? {
-        guard let artist, let title else { return nil }
+        guard let artist, let title, let normalizedArtist = normalizedArtist(artist) else { return nil }
         let stem = TitleMatcher.removingAnnotations(from: title) { segment in
             VersionLabel.namesVersion(segment) || featuredCreditWords.contains(words(segment).first ?? "")
         }
-        let normalizedArtist = words(removing(featuredArtistCredit, from: artist))
         let normalizedStem = words(removing(featuredTitleCredit, from: stem))
-        guard !normalizedArtist.isEmpty, !normalizedStem.isEmpty else { return nil }
-        return normalizedArtist.joined(separator: " ") + "\n" + normalizedStem.joined(separator: " ")
+        guard !normalizedStem.isEmpty else { return nil }
+        return normalizedArtist + "\n" + normalizedStem.joined(separator: " ")
+    }
+
+    private static func normalizedArtist(_ artist: String) -> String? {
+        let normalized = words(removing(featuredArtistCredit, from: artist))
+        return normalized.isEmpty ? nil : normalized.joined(separator: " ")
     }
 
     private static func removing(_ pattern: NSRegularExpression?, from text: String) -> String {

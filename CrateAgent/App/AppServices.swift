@@ -41,6 +41,7 @@ public final class AppServices: ObservableObject {
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
     let playCountService: SeratoPlayCountService
+    let musicBrainzWorkBackfill: MusicBrainzWorkBackfill
     @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
     @Published private(set) var syncPhase: SeratoLibrarySyncSession.SyncPhase?
     @Published private(set) var syncFileInfoFailures: [String] = []
@@ -208,12 +209,14 @@ public final class AppServices: ObservableObject {
         let lookupCache = LookupCache(
             directory: applicationSupportUrl.appendingPathComponent("crate-agent/lookup-cache", isDirectory: true)
         )
+        let musicBrainzClient = MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache)
         let taggingService = AutoTaggerService(
             database: database,
             acoustIDClient: AcoustIDClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
-            musicBrainzClient: MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
+            musicBrainzClient: musicBrainzClient,
             readiness: readiness
         )
+        musicBrainzWorkBackfill = MusicBrainzWorkBackfill(database: database, engine: engine, client: musicBrainzClient)
         autoTaggerService = taggingService
         autoTagSession = AutoTagSession(
             database: database, lookupService: autoTaggerService,

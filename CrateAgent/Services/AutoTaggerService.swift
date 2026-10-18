@@ -477,6 +477,7 @@ final class AutoTaggerService: ObservableObject {
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
+            workMBID: recording.workMBID,
             // E-A: nothing to propose when the assembled display name is
             // empty — nil, never "", so a sparse match can never default
             // to blanking an existing artist on Confirm-All. Checked on

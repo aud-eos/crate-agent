@@ -44,6 +44,18 @@ final class SongFamilySuggesterTests: XCTestCase {
         XCTAssertEqual(found.awaitingFingerprint, 1)
     }
 
+    func testGroupsOneArtistsMatchedRecordingsOfOneWorkWhoseTitlesDiffer() async throws {
+        let german = try await addFile(artist: "Nena", title: "99 Luftballons", recording: "rec-de", work: "work-99")
+        let english = try await addFile(artist: "Nena", title: "99 Red Balloons", recording: "rec-en", work: "work-99")
+        let instrumental = try await addFile(artist: "Nena", title: "99 Luftballons (Instrumental)")
+        _ = try await addFile(artist: "Goldfinger", title: "99 Red Balloons", recording: "rec-cover", work: "work-99")
+
+        let found = try await suggester.suggestions()
+
+        XCTAssertEqual(found.suggestions.map(\.confidence), [.high])
+        XCTAssertEqual(found.suggestions.map { suggestion in suggestion.recordings.flatMap(\.files).map(\.id) }, [[german, english, instrumental]])
+    }
+
     func testLeavesSameAudioOutForDuplicates() async throws {
         let clean = try await addFile(artist: "Artist", title: "Song (Clean)")
         let dirty = try await addFile(artist: "Artist", title: "Song (Dirty)")
@@ -96,7 +108,9 @@ final class SongFamilySuggesterTests: XCTestCase {
     }
 
     @discardableResult
-    private func addFile(artist: String, title: String, fingerprinted: Bool = true, fingerprint: Data? = nil) async throws -> Int64 {
+    private func addFile(artist: String, title: String, fingerprinted: Bool = true, fingerprint: Data? = nil,
+                         recording: String? = nil, work: String? = nil) async throws -> Int64
+    {
         nextInode += 1
         let inode = nextInode
         let chromaprint = fingerprinted ? fingerprint ?? Data("fingerprint-\(inode)".utf8) : nil
@@ -104,6 +118,11 @@ final class SongFamilySuggesterTests: XCTestCase {
             var file = FileRecord(path: self.audioFixture.path("/Music/\(inode).mp3"), volumeUuid: "volume", inode: inode, fileSize: 10, mtime: 10,
                                   chromaprintFingerprint: chromaprint, fingerprintStatus: chromaprint == nil ? .pending : .done,
                                   artist: artist, title: title)
+            if let recording {
+                var track = TrackRecord(fingerprintHash: Data("track-\(inode)".utf8), musicbrainzRecordingId: recording, musicbrainzWorkId: work)
+                try track.insert(connection)
+                file.trackId = track.id
+            }
             file.libraryMembership = .active
             file.fileAvailability = .available
             try self.audioFixture.prepare(&file)

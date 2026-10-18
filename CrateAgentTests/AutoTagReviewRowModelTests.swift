@@ -44,6 +44,7 @@ final class AutoTagReviewRowModelTests: XCTestCase {
             chosenRelease: release,
             availableReleases: availableReleases ?? [release],
             isrc: "ISRC0000001",
+            workMBID: "work-1",
             proposedArtist: proposedArtist,
             proposedTitle: proposedTitle,
             proposedAlbum: proposedAlbum,
@@ -90,6 +91,7 @@ final class AutoTagReviewRowModelTests: XCTestCase {
         XCTAssertEqual(payload.acoustID, candidate.acoustID)
         XCTAssertEqual(payload.artistMBID, candidate.artistMBID)
         XCTAssertEqual(payload.isrc, candidate.isrc)
+        XCTAssertEqual(payload.workMBID, candidate.workMBID)
         XCTAssertEqual(payload.fingerprintHash, candidate.fingerprintHash)
     }
 

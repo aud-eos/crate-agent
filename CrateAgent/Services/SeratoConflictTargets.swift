@@ -61,6 +61,11 @@ enum SeratoConflictTargets {
             }
         case let .recordingIdentity(operation):
             fileID = try includeRecordingSeparation(operation, in: &target, database: database)
+        case let .recordMusicBrainzWork(payload):
+            // Writes only `tracks.musicbrainz_work_id`; no file, path or
+            // Serato field mirrors it, so it targets the recording alone.
+            fileID = nil
+            target.sharedTrackIDs.insert(payload.trackId)
         case let .duplicateLabelReview(.keepBoth(payload)), let .duplicateLabelReview(.reopen(payload)):
             fileID = nil
             target.fileIDs.formUnion(payload.fileIds)

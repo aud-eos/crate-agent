@@ -27,6 +27,9 @@ public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var musicbrainzReleaseId: String?
     public var musicbrainzArtistId: String?
     public var isrc: String?
+    /// The MusicBrainz work the matched recording performs
+    /// (`MBRecording.workMBID`); not the local song family in `workId`.
+    public var musicbrainzWorkId: String?
     public var artist: String?
     public var title: String?
     public var album: String?
@@ -45,6 +48,7 @@ public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
         musicbrainzReleaseId: String? = nil,
         musicbrainzArtistId: String? = nil,
         isrc: String? = nil,
+        musicbrainzWorkId: String? = nil,
         artist: String? = nil,
         title: String? = nil,
         album: String? = nil,
@@ -62,6 +66,7 @@ public struct TrackRecord: Codable, FetchableRecord, MutablePersistableRecord,
         self.musicbrainzReleaseId = musicbrainzReleaseId
         self.musicbrainzArtistId = musicbrainzArtistId
         self.isrc = isrc
+        self.musicbrainzWorkId = musicbrainzWorkId
         self.artist = artist
         self.title = title
         self.album = album
@@ -92,7 +97,7 @@ extension TrackRecord {
     /// Whether an identity source (AcoustID, MusicBrainz, ISRC) has claimed this row.
     var hasRecordingIdentity: Bool {
         acoustidId != nil || musicbrainzRecordingId != nil || musicbrainzReleaseId != nil
-            || musicbrainzArtistId != nil || isrc != nil
+            || musicbrainzArtistId != nil || isrc != nil || musicbrainzWorkId != nil
     }
 
     /// A row holding only its fingerprint (and possibly a song family), as

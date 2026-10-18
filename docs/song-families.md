@@ -209,6 +209,12 @@ the rules above and a collision is refused by name.
   Both sides drop a trailing featured credit (`feat.`, `ft.`, `featuring`; for
   the artist also `&`), punctuation, case and diacritics. Words in the base title
   are kept, so "Dirty Diana" is not "Diana".
+- **Shared work.** Matched files with the same normalized artist whose
+  recordings perform one MusicBrainz work (`tracks.musicbrainz_work_id`) are
+  candidates too, even when their titles differ ("99 Luftballons" and
+  "99 Red Balloons"). Both links join transitively, so a file with no work
+  data still joins by its stem. Another artist's recording of the work, a
+  cover, is not joined.
 - **Recordings.** Each candidate is placed on the recording grouping would link
   it to. Linked files keep their recording; an unlinked file takes the
   recording its current recording key names
@@ -224,12 +230,11 @@ the rules above and a collision is refused by name.
   with members in one live family adds the others to it; one whose members are
   all grouped already is not shown. One spanning several live families merges
   them into the family holding most of its files, then adds the rest.
-- **Confidence.** A suggestion is **Strong** (pre-checked) when every version
-  names a different set of labels, and **Near** (unchecked) when versions repeat
-  a set or the suggestion merges families. Recordings that share a MusicBrainz
-  recording are one version, as everywhere else. A shared MusicBrainz work is
-  meant to be the strongest signal, but crate-agent does not record work IDs
-  yet (#262).
+- **Confidence.** A suggestion is **Strong** (pre-checked) when every two
+  versions perform the same MusicBrainz work or name different sets of labels,
+  and **Near** (unchecked) when two versions with no shared work repeat a set,
+  or the suggestion merges families. Recordings that share a MusicBrainz
+  recording are one version, as everywhere else.
 - **Checklist.** One row per suggested family, showing each file's title,
   version label and length. The family checkbox is mixed while only some
   versions are checked; unchecking a version leaves it out. A new family needs
@@ -242,6 +247,21 @@ the rules above and a collision is refused by name.
 suggestions. The scan reads the library on a database reader, off the main
 actor, so Library stays responsive while it runs. Budgets: scan under 2 s, main
 actor stalls under 100 ms, and an apply's longest writer wait under 500 ms.
+
+## MusicBrainz works
+
+A MusicBrainz match records the work its recording performs in
+`tracks.musicbrainz_work_id`, beside the other MusicBrainz identifiers, and
+undo restores it with them (`CanonicalTrackOwnership`). Recording lookups ask
+for `work-rels`; cached lookups from before #262 have no relations, so their
+cache key moved to `mb:complete-v3:` and they are fetched again.
+
+A recording can perform several works. The recorded one is the lowest work
+MBID among its performance relations, leaving out medley parts; a recording
+that performs only medley parts records none.
+
+Recordings matched before works were recorded get theirs from **Record Works**
+in Workers (`MusicBrainzWorkBackfill`; see [Workers](workers.md)).
 
 ## History and undo
 

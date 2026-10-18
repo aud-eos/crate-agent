@@ -102,7 +102,7 @@ public struct MBRecordingDetails: Codable, Equatable, Sendable {
     }
 }
 
-/// `GET /ws/2/recording/<mbid>?inc=releases+release-groups+artist-credits+isrcs`.
+/// `GET /ws/2/recording/<mbid>?inc=releases+release-groups+artist-credits+isrcs+work-rels`.
 ///
 /// Decoding is lenient: a sparse response (no releases, no ISRCs, no
 /// artist credit) never throws — every collection defaults to empty
@@ -125,6 +125,7 @@ public struct MBRecording: Codable, Equatable {
     let isrcs: [String]
     let disambiguation: String?
     let durationMilliseconds: Int?
+    let relations: [MBRelation]
 
     public init(
         title: String,
@@ -134,7 +135,8 @@ public struct MBRecording: Codable, Equatable {
         isrcs: [String],
         id: String? = nil,
         disambiguation: String? = nil,
-        durationMilliseconds: Int? = nil
+        durationMilliseconds: Int? = nil,
+        relations: [MBRelation] = []
     ) {
         self.id = id
         self.title = title
@@ -144,6 +146,7 @@ public struct MBRecording: Codable, Equatable {
         self.isrcs = isrcs
         self.disambiguation = disambiguation
         self.durationMilliseconds = durationMilliseconds
+        self.relations = relations
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -152,6 +155,7 @@ public struct MBRecording: Codable, Equatable {
         case artistCredit = "artist-credit"
         case releases
         case isrcs
+        case relations
     }
 
     public init(from decoder: Decoder) throws {
@@ -164,12 +168,22 @@ public struct MBRecording: Codable, Equatable {
         isrcs = try container.decodeIfPresent([String].self, forKey: .isrcs) ?? []
         disambiguation = try container.decodeIfPresent(String.self, forKey: .disambiguation)
         durationMilliseconds = try container.decodeIfPresent(Int.self, forKey: .durationMilliseconds)
+        relations = try container.decodeIfPresent([MBRelation].self, forKey: .relations) ?? []
     }
 
     func replacingReleases(with releases: [MBRelease]) -> MBRecording {
         MBRecording(title: title, artistCredit: artistCredit, releases: releases,
                     releaseGroup: Self.earliestReleaseGroup(in: releases), isrcs: isrcs, id: id,
-                    disambiguation: disambiguation, durationMilliseconds: durationMilliseconds)
+                    disambiguation: disambiguation, durationMilliseconds: durationMilliseconds, relations: relations)
+    }
+
+    /// The work this recording performs. A recording can perform several
+    /// (a medley, a mashup), so the choice is fixed: performance relations
+    /// to a work, leaving out medley parts, and of those the lowest work
+    /// MBID. A medley alone names no work.
+    var workMBID: String? {
+        relations.filter { relation in relation.type == "performance" && !relation.attributes.contains("medley") }
+            .compactMap(\.work?.id).min()
     }
 
     private static func earliestReleaseGroup(in releases: [MBRelease]) -> MBReleaseGroup? {
@@ -185,6 +199,39 @@ public struct MBRecording: Codable, Equatable {
     /// remains the right source for the *lead* artist's MBID.
     var creditedArtistName: String {
         artistCredit.map { $0.name + $0.joinPhrase }.joined()
+    }
+}
+
+/// One relationship from `inc=work-rels`. Only performance relations to a
+/// work are read; other relation types decode and are ignored.
+public struct MBRelation: Codable, Equatable {
+    let type: String
+    let attributes: [String]
+    let work: MBWorkReference?
+
+    public init(type: String, attributes: [String] = [], work: MBWorkReference?) {
+        self.type = type
+        self.attributes = attributes
+        self.work = work
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, attributes, work
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(String.self, forKey: .type)
+        attributes = try container.decodeIfPresent([String].self, forKey: .attributes) ?? []
+        work = try container.decodeIfPresent(MBWorkReference.self, forKey: .work)
+    }
+}
+
+public struct MBWorkReference: Codable, Equatable {
+    let id: String
+
+    public init(id: String) {
+        self.id = id
     }
 }
 
@@ -343,6 +390,8 @@ struct MatchCandidate: Equatable {
     var chosenRelease: MBRelease
     let availableReleases: [MBRelease]
     let isrc: String?
+    /// The work the recording performs (`MBRecording.workMBID`).
+    let workMBID: String?
     // Proposed tag values shown to the user before applying the mutation.
     /// `nil` when MusicBrainz's recording has an empty `artist-credit` —
     /// there is nothing to propose. Never an empty string: a sparse
