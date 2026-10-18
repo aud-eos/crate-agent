@@ -374,7 +374,7 @@ pub fn batch_update_database_records(
         .into_iter()
         .map(|entry| (entry.track_path, entry.update))
         .collect();
-    let count = database.batch_update_track_metadata(&map);
+    let count = database.batch_update_track_metadata(&map)?;
     if count > 0 {
         database.write_to_path(&path)?;
     }

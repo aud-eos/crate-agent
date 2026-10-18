@@ -32,6 +32,7 @@ final class OwnedProcessingAudioFixture: @unchecked Sendable {
         file.inode = identity.inode
         file.fileSize = identity.fileSize
         file.mtime = identity.mtime
+        file.mtimeNanoseconds = identity.mtimeNanoseconds
         file.lightweightHash = identity.lightweightHash
     }
 

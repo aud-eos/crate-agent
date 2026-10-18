@@ -56,7 +56,7 @@ struct SeratoConflictAnalyzer: Sendable {
         }
         var conflicts: [SeratoPathConflict] = []
         var scope = SeratoConflictScope()
-        var observationsByBytes: [Data: ConflictPathObservation] = [:]
+        var observationsByBytes: [PathBytes: ConflictPathObservation] = [:]
         func observe(_ path: String, into target: inout SeratoConflictTarget) throws -> [SeratoConflictOccurrence] {
             let indexedVolumes = Set((filesByPath[path] ?? []).map { index in files[index].volumeUuid }.filter { volume in volume != LegacyFileIdentity.unknownVolume })
             var occurrences: [SeratoConflictOccurrence] = []
@@ -65,7 +65,7 @@ struct SeratoConflictAnalyzer: Sendable {
                 let absolutePath = record.path.hasPrefix("/") ? record.path : "/" + record.path
                 let rawPathBytes = Data(record.path.utf8)
                 let observation: ConflictPathObservation
-                if let cached = observationsByBytes[rawPathBytes] {
+                if let cached = observationsByBytes[PathBytes(bytes: rawPathBytes)] {
                     observation = cached
                 } else {
                     do {
@@ -76,7 +76,7 @@ struct SeratoConflictAnalyzer: Sendable {
                         }
                     } catch is CancellationError { throw CancellationError() }
                     catch { observation = .failed(error.localizedDescription) }
-                    observationsByBytes[rawPathBytes] = observation
+                    observationsByBytes[PathBytes(bytes: rawPathBytes)] = observation
                 }
                 if case let .existing(identity) = observation {
                     target.physicalIdentities.insert(identity)

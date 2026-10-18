@@ -12,6 +12,10 @@ other screens while the app remains open. See the [Auto-Tag guide](docs/auto-tag
 Use the shared Comfortable/Compact density setting to adjust spacing throughout
 the app.
 
+In **Library**, alternate versions of a song (Instrumental, Acapella, Clean)
+can be grouped into a song family that shows one main row with a version count;
+expand it to see the alternates. See [song families](docs/song-families.md).
+
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the
 [list-control contract](docs/list-controls.md) for scopes, keyboard controls, and
@@ -63,6 +67,12 @@ contents or decoded audio are offered together. Files that share a fingerprint b
 such as Clean and Dirty edits, are listed as kept. Copies in another format or
 encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
 listen and check each one yourself.
+
+Identical copies whose titles name different versions, such as "(Clean)" and
+"(Dirty)", or "(Instrumental)" and nothing, are marked **labels disagree**: at
+least one label is wrong. They are never pre-selected and no keeper is chosen
+for you. Pick the keeper, optionally give it another copy's title, or keep every
+copy; both are undoable from History. Choose **Labels disagree** in the **Show** menu to review them together.
 
 **Cleanup → Duplicates** suggests a keeper for each group: the better quality, then
 the copy in its artist's folder, then the one Serato played most, then the oldest.
@@ -196,4 +206,4 @@ soulseek-mcp/      MCP server binary exposing soulseek-core to Claude
 
 ## License
 
-TBD. Intended for personal use by the author for now.
+Copyright (c) 2026 AUDEOS, LLC. All rights reserved. The source is public for reference only; see [LICENSE](./LICENSE).

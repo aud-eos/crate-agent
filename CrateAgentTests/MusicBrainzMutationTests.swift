@@ -42,6 +42,32 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(events, 0)
     }
 
+    @MainActor
+    func testGroupingCannotLinkAConflictedFileToItsRecording() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let protectedID = try XCTUnwrap(protected.id)
+        let fingerprintBytes = sampleFingerprintBytes
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE files SET fingerprint_status = 'done', chromaprint_fingerprint = ? WHERE id = ?",
+                                 arguments: [fingerprintBytes, protectedID])
+        }
+        let fingerprinted = try await fixture.row(protected)
+        try fixture.save(paths: [protected.path, protected.path.decomposedStringWithCanonicalMapping])
+        let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: fixture.reader.read(), files: [fingerprinted])
+        let authorization = gate.prepareDrain()
+        try gate.install(analysis.scope, for: authorization)
+        try gate.markReady(authorization)
+        do {
+            try await fixture.engine.apply(.songFamily(.linkRecording(fileId: protectedID)))
+            XCTFail("The conflicted file was linked to a recording")
+        } catch is SeratoPathConflictError {}
+        let after = try await fixture.row(protected)
+        XCTAssertNil(after.trackId)
+    }
+
     private let audioFixture = OwnedProcessingAudioFixture()
 
     override func tearDownWithError() throws {
@@ -990,6 +1016,55 @@ final class MusicBrainzMutationTests: XCTestCase {
         }
     }
 
+    /// A redo has no review-time snapshot, so it compares the live file with the row identity our
+    /// own tag writes keep current: an external same-length edit within one second refuses it (#118).
+    /// A row indexed before subsecond times were kept still redoes when its file is unchanged:
+    /// size, whole seconds and inode match, and the missing nanoseconds prove nothing either way.
+    func testRedoProceedsForAnUnchangedLegacyRow() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(fileID: file1, fingerprintHash: sha256(sampleFingerprintBytes))),
+            batchId: "match"
+        )
+        let undoBatchId = try await engine.undoBatch("match")
+        try await database.writer.write { db in
+            try db.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL WHERE id = ?", arguments: [file1])
+        }
+
+        try await engine.undoBatch(undoBatchId)
+
+        let trackID = try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db, key: file1)).trackId }
+        XCTAssertNotNil(trackID)
+    }
+
+    func testRedoIsRefusedAfterAnExternalSameSecondEdit() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, file1) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder)
+        }
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(fileID: file1, fingerprintHash: sha256(sampleFingerprintBytes))),
+            batchId: "match"
+        )
+        let undoBatchId = try await engine.undoBatch("match")
+        let path = try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db, key: file1)).path }
+        let before = try XCTUnwrap(FileMetadataCollector.collect(at: path))
+        try overwriteInPlace(path, with: Data(repeating: 99, count: Int(before.fileSize)))
+        try setModificationTime(of: path, seconds: Int(before.mtime), nanoseconds: 500_000_000)
+
+        do {
+            try await engine.undoBatch(undoBatchId)
+            XCTFail("a redo must not label audio that changed after the undo")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .redoFileChanged(fileId: file1))
+        }
+        let trackID = try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db, key: file1)).trackId }
+        XCTAssertNil(trackID)
+    }
+
     /// Undoing a match on a shared pre-existing row must restore the row's
     /// captured previous identity even when an OLDER file still references it —
     /// that older file's state is exactly what `previousTrackIdentifiers`
@@ -1709,6 +1784,34 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(recorder.calls.last?.update, tagUpdate(artist: "Disk Artist"))
     }
 
+    func testUndoOfAMatchRecordedWithoutFileTagsChecksEveryAppliedField() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
+        }
+        recorder.disk = AudioTags.none.applying([tagUpdate(title: "Disk Title")])
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: nil, title: "Same Title", album: nil, year: nil, currentFileTitle: "Disk Title"
+            )),
+            batchId: "legacy-match"
+        )
+        // Events from before the pre-match file tags were captured carry only the row snapshot.
+        try await database.writer.write { db in
+            try db.execute(sql: "UPDATE events SET payload_json = json_remove(payload_json, '$.previousFileTags', '$.previousFileYear') WHERE batch_id = ?",
+                           arguments: ["legacy-match"])
+        }
+        try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(title: "Later Edit"))), batchId: "edit")
+
+        do {
+            try await engine.undoBatch("legacy-match")
+            XCTFail("expected the undo to be refused")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .undoWouldOverwriteFileTags(fileId: fileId, fields: ["title"], direction: .undo))
+        }
+    }
+
     func testQueuedTagEditKeepsAMatchFieldThatEqualsTheCapturedValue() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, _, fileId) = try await MainActor.run {
@@ -1745,7 +1848,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertTrue(recorder.calls.isEmpty)
     }
 
-    func testTagsChangedBeforeAQueuedConfirmRunsGetTheMatchBack() async throws {
+    func testTagsChangedInPlaceBeforeAQueuedConfirmRunsGetTheMatchBack() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, _, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder, seratoIsRunning: true)
@@ -1759,7 +1862,8 @@ final class MusicBrainzMutationTests: XCTestCase {
             )),
             batchId: "exact-confirm-while-running"
         )
-        // Serato rewrites the tags from its cached copy before it quits.
+        // The tags change in place, keeping the file's size and mtime, so the
+        // physical-target check still authorizes the queued write.
         recorder.disk = AudioTags.none.applying([tagUpdate(artist: "Nas", title: "Serato Title", album: "Illmatic", year: 1990)])
 
         await runningState?.stop()

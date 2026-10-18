@@ -53,6 +53,8 @@ public actor ImportCoordinator {
         case awaitingSerato(DeferredSeratoBatch)
         case skipped
         case blocked(String)
+        /// The file changed between its stat and its import mutations.
+        case notAdded(String)
     }
 
     public static let alreadyImportingMessage = "already being imported"
@@ -115,6 +117,8 @@ public actor ImportCoordinator {
                 filesSkipped += 1
             case let .blocked(message):
                 blockedFiles.append(message)
+            case let .notAdded(message):
+                filesNotAdded.append(message)
             }
         }
         let shortfalls: [String: DeferredSeratoShortfall]
@@ -194,6 +198,7 @@ public actor ImportCoordinator {
                         inode: fileMetadata.inode,
                         fileSize: fileMetadata.fileSize,
                         mtime: fileMetadata.mtime,
+                        mtimeNanoseconds: fileMetadata.mtimeNanoseconds,
                         lightweightHash: fileMetadata.lightweightHash,
                         bitrateKbps: bitrateKbps,
                         metadata: seratoMetadata
@@ -220,13 +225,7 @@ public actor ImportCoordinator {
         } catch let readiness as LibrarySyncReadinessError {
             return .blocked("\(fileUrl.lastPathComponent): \(readiness.localizedDescription)")
         } catch {
-            // Most likely cause: path already in the DB (path is UNIQUE).
-            // That's a no-op for the user — they re-dropped a file
-            // crate-agent already knew about.
-            Self.logger.info(
-                "indexNewFile rejected (likely duplicate path): \(error.localizedDescription, privacy: .public)"
-            )
-            return .skipped
+            return Self.unimported(fileUrl, error: error)
         }
 
         do {
@@ -245,11 +244,20 @@ public actor ImportCoordinator {
         } catch let conflict as SeratoPathConflictError {
             return .blocked(conflict.localizedDescription)
         } catch {
-            Self.logger.error(
-                "addTrackToSerato for \(absolutePath, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
-            )
-            return .skipped
+            return Self.unimported(fileUrl, error: error)
         }
+    }
+
+    /// A file whose import mutations threw is reported with its reason, never
+    /// counted as skipped: a file that changed meanwhile can be dropped again,
+    /// and anything else, such as an ambiguous legacy identity, needs fixing.
+    private static func unimported(_ fileUrl: URL, error: Error) -> FileImportOutcome {
+        let fileName = fileUrl.lastPathComponent
+        if case FileProcessingEligibilityError.superseded = error {
+            return .notAdded("\(fileName): \(changedBeforeAddMessage)")
+        }
+        logger.error("importing \(fileUrl.path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+        return .blocked("\(fileName): \(error.localizedDescription)")
     }
 
     private func readMetadataAndBitrate(from path: String) -> (SeratoMetadata, Int?) {

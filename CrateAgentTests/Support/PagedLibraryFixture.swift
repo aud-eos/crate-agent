@@ -35,6 +35,7 @@ final class PagedLibraryFixture {
     func reset() throws {
         try pool.write { connection in
             try connection.execute(sql: "DELETE FROM files WHERE id > 30000")
+            try connection.execute(sql: "UPDATE files SET track_id = NULL; DELETE FROM tracks; DELETE FROM works")
             for identifier in [1, 2, 3, 4, 15001, 30000] {
                 var file = Self.file(identifier)
                 try file.save(connection)
