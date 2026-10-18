@@ -155,9 +155,10 @@ public enum DuplicateFinder {
     /// biggest first, then by key.
     public static func findDuplicates(in database: Database, mode: Mode) throws -> [DuplicateGroup<DuplicateFileRow>] {
         var membersByKey: [String: [DuplicateConfirmation.Member]] = [:]
+        let playCounts = try SeratoPlayCounts.all(in: database)
         let rows = try Row.fetchCursor(database, sql: memberSQL(for: mode))
         while let row = try rows.next() {
-            let file = try DuplicateFileRow(row: row)
+            let file = try DuplicateFileRow(row: row, playCounts: playCounts)
             let evidence = try DuplicateDigestStore.evidence(from: row, kind: mode.digestKind)
             membersByKey[groupKey(mode: mode, fileSize: file.fileSize, keyBytes: row["group_blob"]), default: []]
                 .append(.init(file: file, evidence: evidence))

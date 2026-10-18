@@ -27,6 +27,8 @@ struct DuplicatesPanel: View {
     /// (DuplicateKeeperPicker.chooseDefaultKeeper). Per-group radio
     /// taps write into this dictionary.
     @State private var keeperOverrides: [String: Int64] = [:]
+    /// The last file clicked; Command-O opens it.
+    @State private var focusedFileID: Int64?
     /// Per group needing listening, the files the user explicitly checked
     /// for Trash. Such groups never pre-select anything.
     @State private var listeningSelections: [String: Set<Int64>] = [:]
@@ -96,6 +98,7 @@ struct DuplicatesPanel: View {
             PageHeading("Duplicate tracks", subtitle: "Choose one keeper per group. Review the other copies before moving them to Trash.")
                 .padding(density.pagePadding)
             SeratoRunningBanner(message: SeratoGateMessages.quitBefore("resolving duplicates"))
+            PlayCountStalenessNote(service: services.playCountService)
             modeBar.disabled(isScanning || isResolving)
             Divider()
             ResultListHeader(results: $results, enabled: !isScanning && !isResolving)
@@ -107,6 +110,7 @@ struct DuplicatesPanel: View {
                 batchActionBar
             }
         }
+        .fileOpenShortcut(services.fileOpener, fileID: focusedFileID)
         .task { await rescan() }
         .task { await rescanAsLibraryChanges() }
         .onDisappear {
@@ -566,6 +570,11 @@ struct DuplicatesPanel: View {
                         Text("\(bitrate) kbps")
                             .foregroundStyle(.secondary)
                     }
+                    if file.seratoPlayCount > 0 {
+                        Text(SeratoPlayCountMessages.plays(file.seratoPlayCount))
+                            .foregroundStyle(.secondary)
+                            .help(SeratoPlayCountMessages.explanation)
+                    }
                     if group.mode == .perceptual {
                         statusBadge(file.fingerprintStatus)
                     }
@@ -574,9 +583,9 @@ struct DuplicatesPanel: View {
             }
             Spacer()
             Button {
-                NSWorkspace.shared.activateFileViewerSelecting(
-                    [URL(fileURLWithPath: file.path)]
-                )
+                if let identifier = file.id {
+                    Task { await services.fileOpener.reveal(fileID: identifier) }
+                }
             } label: {
                 Label("Reveal", systemImage: "magnifyingglass")
                     .labelStyle(.iconOnly)
@@ -585,6 +594,14 @@ struct DuplicatesPanel: View {
             .help("Show this file in Finder so you can review or delete it manually.")
         }
         .padding(.vertical, density.rowPadding)
+        .background(file.id == focusedFileID ? Color.accentColor.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { focusedFileID = file.id })
+        .contextMenu {
+            if let identifier = file.id {
+                FileOpenMenuItems(opener: services.fileOpener, fileID: identifier, path: file.path)
+            }
+        }
     }
 
     @ViewBuilder
@@ -931,6 +948,24 @@ struct DuplicatesPanel: View {
             }
         } catch {
             services.syncSession.reportFailure(error.localizedDescription)
+        }
+    }
+}
+
+/// Keeper suggestions rank by plays, so a failed History read is shown
+/// where those suggestions are made, not only in Workers.
+private struct PlayCountStalenessNote: View {
+    @ObservedObject var service: SeratoPlayCountService
+
+    var body: some View {
+        if case let .failed(reason) = service.status {
+            Label(SeratoPlayCountMessages.stale(reason), systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
         }
     }
 }

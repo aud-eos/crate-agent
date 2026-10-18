@@ -15,7 +15,9 @@ longer in Serato.
 
 The reconciler reads identity projections in pages of 256, without fingerprint
 blobs, and checks only indexed locations and paths in the saved snapshot. It does
-not enumerate a music folder or Trash. Ownership mismatches and offline volumes
+not enumerate a music folder. It lists a volume's Trash at most once per pass, and
+only for a row whose indexed path is gone with no verifiable recorded Trash item
+(see below). Ownership mismatches and offline volumes
 cannot retire a row. File availability is recorded independently of membership.
 Retirement retains file ID, recording association, fingerprint, and History.
 
@@ -197,7 +199,17 @@ different file requests reconciliation; a missing or trashed row keeps its state
 until then, and an available row becomes `unknown`. A removal
 event at that Trash path, or any reconciliation that finds the indexed path
 missing, keeps the row trashed only while that exact item still verifies;
-otherwise it becomes missing. A trashed row
+otherwise it becomes missing. Events are not the only evidence of a Trash move. A
+volume attached with `-nobrowse` (or any volume without an FSEvents store) keeps no
+event history, so a move made while crate-agent was not running is never replayed.
+A trashed folder reports only a directory rename, which requests reconciliation.
+So when reconciliation finds an indexed path gone and no recorded item verifies,
+`NativeTrashIndex` lists that volume's Trash recursively, once per pass. An item
+with the row's inode that `FileTrashLocation.capture` verifies marks the row trashed
+(#234). A Trash that cannot be fully listed, for example without Full Disk Access,
+leaves the row missing but counts it in `trashUncheckedFileIDs`: the sync banner
+reports it with a warning, and the row stays out of the checkpoint so a later sync
+searches again. A trashed row
 without a persisted item (recorded before this table existed) cannot be verified
 and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
@@ -303,6 +315,69 @@ retired, or removed audio supersedes the old request. A new explicit drop can
 establish new intent under the existing membership-revision rules; the older row
 it supersedes no longer blocks the new import. This work does not change shared
 recording ownership rules (#113).
+
+### Serato History play counts
+
+`serato_play_counts` is derived external evidence, like the fingerprint and
+audio-digest caches. It is not a mutation and does not bypass invariant 1: there
+is no user intent to journal and nothing to undo. `SeratoPlayCountService` only
+reads `_Serato_/History`, and never writes `files`, tags or any Serato file.
+
+- **When it refreshes:** each sync reaching `.ready` (at startup, after Serato
+  quits, and after filesystem-driven reconciliations) asks for a refresh, but
+  History is parsed again only when its inputs changed since the last read: the
+  `Sessions` files' names, sizes and modification times, or the library's path
+  history (file count, highest file id, and highest path-change event id). A
+  failed read records its inputs too, so a corrupt session is not re-parsed on
+  every sync; it is retried once History or the library changes. While Serato
+  runs, the refresh is skipped and the last table kept. A read during which the
+  watchdog's lifecycle revision changed is discarded, so a session Serato may be
+  appending to is never trusted.
+- **How it parses:** the Rust parser (`read_serato_history`) reads
+  `History/Sessions/*.session` strictly. The parse needs the `vrsn` header, then
+  only `oent` records with one `adat` each. Each `adat` needs a played flag
+  (field 50), and played entries also need a UTF-16 path (field 2) and a start
+  time (field 28).
+  - Loaded-but-unplayed entries are counted and skipped.
+  - Entries whose path is not absolute, such as streaming tracks
+    (`_783160.beatsource`), are skipped by that rule and counted as non-file.
+  - AppleDouble sidecars (`._*.session`) hold Finder metadata, not sessions,
+    and are skipped by name.
+  - A session file over 64 MiB fails the read before it is loaded.
+  - Any other structure fails the whole read, naming the session file. Workers
+    shows the error, Duplicates notes that play counts may be out of date with
+    the same reason, and the previous table is kept.
+- **How plays are attributed:** a play counts for the file that was at its path
+  when it started. Each file's past paths come from its `file_renamed`,
+  `file_location_observed` and `file_identity_observed` events, chained in
+  journal (`event_id`) order. Each event's old path covers the time since the
+  previous change, and the current path covers the time since the last one.
+  - Event times are when crate-agent applied or noticed a change, not when the
+    file moved on disk: a move made while crate-agent was not running is dated
+    at the next scan, so plays between the move and that scan count at the old
+    path.
+  - A file's first-seen path covers all earlier time, so plays from before the
+    file was indexed count for it if it was at that path then.
+  - Paths are compared by `SeratoPath.normalized`, so History's absolute paths
+    match V2's root-relative ones, and NFD matches NFC. Comparison is
+    case-sensitive, like the rest of the app's path matching: on a
+    case-insensitive APFS volume, a play Serato logged under different letter
+    case than the file's path is unattributed (a known undercount).
+  - A play at a path no file held then, or that two files claimed at that
+    moment, is unattributed. It is counted in the Workers summary and the log,
+    and never guessed.
+- **How it is stored:** parsing runs off the database, and attribution (the
+  event fetch, decode and per-play lookup) runs in a read transaction. The write
+  transaction only re-checks the library path signature and applies the
+  difference: rows for files whose count changed, and deletions for files that
+  no longer have plays. When the counts equal the stored ones, nothing is
+  written, so open views observing the table, such as Duplicates, do not
+  rescan. If the library's paths changed between attribution and the write,
+  the write is skipped and the refresh runs again. On 30,000 files with 65,000
+  path-change events, no writer wait exceeds the 500 ms budget
+  (`SeratoPlayCountPerformanceTests`).
+- **How it is used:** `DuplicateKeeperPicker` ranks most plays between the
+  bucket match and the oldest mtime. Duplicates rows show "N plays".
 
 ## Physical effects and duplicate cleanup
 

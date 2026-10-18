@@ -56,10 +56,20 @@ still operate on the clicked file.
 The play button at the start of each Library row, beside each file in
 **Cleanup → Duplicates**, and beside each **Auto-Tag** review plays the track from
 about 30% in, past DJ intros, and keeps playing to the end. Press it again to pause
-and resume; in Library, Space does the same for the focused row. The now-playing
-bar at the bottom of the window shows the title and artist, elapsed and total time,
-a scrub bar, play/pause, ±10 s skip and stop. One track plays at a time, app-wide,
-across screens. Playback only reads the file.
+and resume; in Library, Space does the same for the focused row, and Shift-Space
+selects or deselects it. The now-playing bar at the bottom of the window shows the
+title and artist, elapsed and total time, a scrub bar, play/pause, ±10 s skip and
+stop. One track plays at a time, app-wide, across screens. Playback only reads the
+file, and stops with a visible error if the file stops delivering audio, for
+example when its drive is ejected.
+
+Right-click a track in Library, Duplicates or Auto-Tag for **Open in** its default
+app, an **Open With** list of other apps that can open it plus **Other…** to pick
+any app, and **Reveal in Finder**. Command-O opens the focused Library row, the
+last-clicked Duplicates file, or the Auto-Tag review in focus (or last clicked in
+List mode). Playing, opening and revealing first check that the file at the row's
+path is still that row's recording; a missing or replaced file is refused with a
+dismissible message at the bottom of the window.
 
 Duplicates are checked in full before cleanup is offered: byte-level matches by
 hashing every byte, perceptual matches by decoding. Only files with identical
@@ -73,6 +83,12 @@ Identical copies whose titles name different versions, such as "(Clean)" and
 least one label is wrong. They are never pre-selected and no keeper is chosen
 for you. Pick the keeper, optionally give it another copy's title, or keep every
 copy; both are undoable from History. Choose **Labels disagree** in the **Show** menu to review them together.
+
+**Cleanup → Duplicates** suggests a keeper for each group: the better quality, then
+the copy in its artist's folder, then the one Serato played most, then the oldest.
+Play counts come from Serato History, which is read only while Serato is closed and
+never written; each row shows its plays, and **Workers** shows how many plays were
+matched to library files, including plays at an earlier path of a renamed file.
 
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
