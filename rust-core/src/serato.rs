@@ -474,33 +474,100 @@ fn walk_nested_fields<'payload>(
     true
 }
 
+/// A top-level `otrk` taken out of a Serato file: its full TLV encoding and
+/// its position among all top-level records before the removal, so a restore
+/// can put it back byte-exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeratoRemovedRecord {
+    pub index: u32,
+    pub record: Vec<u8>,
+}
+
 /// Drop every top-level `otrk` whose path field (`pfil` for
 /// database V2, `ptrk` for `.crate`) matches `target_path` by NFC form.
 /// Non-otrk records and otrks pointing elsewhere are preserved
-/// byte-exact. Returns the count of otrks removed.
+/// byte-exact. Returns each removed otrk with its original position.
 fn remove_otrks_referencing_path(
     records: &mut Vec<TlvRecord>,
     path_tag: &[u8; 4],
     target_path: &str,
-) -> usize {
+) -> Vec<(usize, TlvRecord)> {
     let target = PathKeys::new([target_path]);
-    let original_len = records.len();
-    records.retain(|record| {
-        if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &target) {
-            return true;
-        }
-        let Ok(nested) = TlvRecord::parse_all(&record.payload) else {
+    let mut removed = Vec::new();
+    let mut kept = Vec::with_capacity(records.len());
+    for (index, record) in std::mem::take(records).into_iter().enumerate() {
+        let matches = &record.tag == TAG_OTRK
+            && otrk_has_path_in(&record.payload, path_tag, &target)
             // Unparseable otrk: preserve verbatim. Better to leave a
             // weird-but-existing entry alone than to drop something
             // we don't understand.
-            return true;
-        };
-        let matches = nested.iter().any(|nested_record| {
-            nested_record.tag == *path_tag && target.matches_field(&nested_record.payload)
-        });
-        !matches
-    });
-    original_len - records.len()
+            && TlvRecord::parse_all(&record.payload).is_ok_and(|nested| {
+                nested.iter().any(|nested_record| {
+                    nested_record.tag == *path_tag && target.matches_field(&nested_record.payload)
+                })
+            });
+        if matches {
+            removed.push((index, record));
+        } else {
+            kept.push(record);
+        }
+    }
+    *records = kept;
+    removed
+}
+
+fn encode_removed_records(
+    removed: Vec<(usize, TlvRecord)>,
+) -> Result<Vec<SeratoRemovedRecord>, SeratoError> {
+    removed
+        .into_iter()
+        .map(|(index, record)| {
+            let mut encoded = Vec::with_capacity(8 + record.payload.len());
+            TlvRecord::write_all(std::slice::from_ref(&record), &mut encoded)?;
+            Ok(SeratoRemovedRecord {
+                index: u32::try_from(index)
+                    .map_err(|_| SeratoError::InvalidFile("record index exceeds u32".into()))?,
+                record: encoded,
+            })
+        })
+        .collect()
+}
+
+/// Reinserts captured otrks at their original positions, ascending, so each
+/// earlier insertion restores the offsets the later ones were captured at.
+/// Does nothing when an otrk already holds `target_path`: the track came back
+/// some other way and a second copy would duplicate it. Returns the number
+/// reinserted.
+fn restore_otrks(
+    records: &mut Vec<TlvRecord>,
+    path_tag: &[u8; 4],
+    target_path: &str,
+    removed: &[SeratoRemovedRecord],
+) -> Result<usize, SeratoError> {
+    let target = PathKeys::new([target_path]);
+    if records.iter().any(|record| {
+        &record.tag == TAG_OTRK && otrk_has_path_in(&record.payload, path_tag, &target)
+    }) {
+        return Ok(0);
+    }
+    let mut decoded = Vec::with_capacity(removed.len());
+    for entry in removed {
+        let mut parsed = TlvRecord::parse_all(&entry.record)?;
+        match (parsed.pop(), parsed.is_empty()) {
+            (Some(record), true) if &record.tag == TAG_OTRK => decoded.push((entry.index, record)),
+            _ => {
+                return Err(SeratoError::InvalidFile(
+                    "removed record is not a single otrk".into(),
+                ))
+            }
+        }
+    }
+    decoded.sort_by_key(|(index, _)| *index);
+    let count = decoded.len();
+    for (index, record) in decoded {
+        records.insert((index as usize).min(records.len()), record);
+    }
+    Ok(count)
 }
 
 fn rewrite_path_in_otrks(
@@ -690,13 +757,23 @@ impl CrateFile {
         rewritten.len()
     }
 
-    /// Drop every otrk in this crate whose `ptrk` points at
-    /// `target_path`. Used by the duplicate-resolver after the file
-    /// has been trashed so the crate no longer holds a broken
-    /// reference. Other otrks in the crate (and non-otrk records)
-    /// are preserved byte-exact.
-    pub fn remove_track(&mut self, target_path: &str) -> usize {
-        remove_otrks_referencing_path(&mut self.records, TAG_PTRK, target_path)
+    /// Drop every otrk whose path field points at `target_path`, returning
+    /// what was removed so it can be restored. Must only run while Serato is
+    /// NOT running; the Swift caller gates via `SeratoWatchdog`.
+    pub fn remove_track_capturing(
+        &mut self,
+        target_path: &str,
+    ) -> Result<Vec<SeratoRemovedRecord>, SeratoError> {
+        let removed = remove_otrks_referencing_path(&mut self.records, TAG_PTRK, target_path);
+        encode_removed_records(removed)
+    }
+
+    pub fn restore_removed_records(
+        &mut self,
+        target_path: &str,
+        removed: &[SeratoRemovedRecord],
+    ) -> Result<usize, SeratoError> {
+        restore_otrks(&mut self.records, TAG_PTRK, target_path, removed)
     }
 }
 
@@ -837,14 +914,23 @@ impl DatabaseV2 {
         rewrite_paths_in_otrks(&mut self.records, TAG_PFIL, renames).len()
     }
 
-    /// Drop every otrk whose `pfil` points at `target_path`. Used
-    /// by the duplicate-resolver after the file has been trashed.
-    /// Like `update_track_metadata` / `add_track`, must only be
-    /// called while Serato is NOT running — Serato caches the
-    /// library in memory and overwrites the disk version on save.
-    /// The Swift caller gates via `SeratoWatchdog`.
-    pub fn remove_track(&mut self, target_path: &str) -> usize {
-        remove_otrks_referencing_path(&mut self.records, TAG_PFIL, target_path)
+    /// Drop every otrk whose path field points at `target_path`, returning
+    /// what was removed so it can be restored. Must only run while Serato is
+    /// NOT running; the Swift caller gates via `SeratoWatchdog`.
+    pub fn remove_track_capturing(
+        &mut self,
+        target_path: &str,
+    ) -> Result<Vec<SeratoRemovedRecord>, SeratoError> {
+        let removed = remove_otrks_referencing_path(&mut self.records, TAG_PFIL, target_path);
+        encode_removed_records(removed)
+    }
+
+    pub fn restore_removed_records(
+        &mut self,
+        target_path: &str,
+        removed: &[SeratoRemovedRecord],
+    ) -> Result<usize, SeratoError> {
+        restore_otrks(&mut self.records, TAG_PFIL, target_path, removed)
     }
 
     /// Which of `paths` this database holds a track at.
@@ -1993,7 +2079,10 @@ mod tests {
             ],
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let removed = database.remove_track("Users/x/Music/A/remove.mp3");
+        let removed = database
+            .remove_track_capturing(("Users/x/Music/A/remove.mp3"))
+            .unwrap()
+            .len();
         assert_eq!(removed, 1);
         assert_eq!(database.track_count(), 2);
         let after = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
@@ -2011,7 +2100,10 @@ mod tests {
             &["Users/x/Music/A/Track.mp3"],
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let removed = database.remove_track("Users/x/Music/A/nonexistent.mp3");
+        let removed = database
+            .remove_track_capturing(("Users/x/Music/A/nonexistent.mp3"))
+            .unwrap()
+            .len();
         assert_eq!(removed, 0);
         assert_eq!(database.track_count(), 1, "no otrks dropped on a miss");
     }
@@ -2025,11 +2117,158 @@ mod tests {
             &["Users/x/Music/A/keep.mp3", "Users/x/Music/A/remove.mp3"],
         );
         let mut crate_file = CrateFile::from_bytes(&bytes).unwrap();
-        let removed = crate_file.remove_track("Users/x/Music/A/remove.mp3");
+        let removed = crate_file
+            .remove_track_capturing(("Users/x/Music/A/remove.mp3"))
+            .unwrap()
+            .len();
         assert_eq!(removed, 1);
         let after = CrateFile::from_bytes(&crate_file.to_bytes().unwrap()).unwrap();
         let paths = after.track_paths();
         assert_eq!(paths, vec!["Users/x/Music/A/keep.mp3"]);
+    }
+
+    fn otrk_with_metadata(path_tag: &[u8; 4], path: &str, title: &str) -> TlvRecord {
+        let fields = [
+            TlvRecord {
+                tag: *b"ttyp",
+                payload: encode_utf16be("mp3"),
+            },
+            TlvRecord {
+                tag: *path_tag,
+                payload: encode_utf16be(path),
+            },
+            TlvRecord {
+                tag: *b"tsng",
+                payload: encode_utf16be(title),
+            },
+            TlvRecord {
+                tag: *b"tbpm",
+                payload: encode_utf16be("128"),
+            },
+        ];
+        let mut payload = Vec::new();
+        TlvRecord::write_all(&fields, &mut payload).unwrap();
+        TlvRecord {
+            tag: *TAG_OTRK,
+            payload,
+        }
+    }
+
+    fn library_bytes(records: &[TlvRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        TlvRecord::write_all(records, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn capture_then_restore_round_trips_crate_bytes() {
+        let original = synthetic_library(
+            "1.0/Serato ScratchLive Crate",
+            TAG_PTRK,
+            &["Music/A/a.mp3", "Music/B/b.mp3", "Music/C/c.mp3"],
+        );
+        let mut crate_file = CrateFile::from_bytes(&original).unwrap();
+        let removed = crate_file.remove_track_capturing("Music/B/b.mp3").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].index, 2);
+        assert_eq!(crate_file.track_paths().len(), 2);
+
+        let restored = crate_file
+            .restore_removed_records("Music/B/b.mp3", &removed)
+            .unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(crate_file.to_bytes().unwrap(), original);
+    }
+
+    #[test]
+    fn capture_then_restore_round_trips_database_v2_bytes() {
+        let original = library_bytes(&[
+            TlvRecord {
+                tag: *b"vrsn",
+                payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+            },
+            otrk_with_metadata(TAG_PFIL, "Music/A/a.mp3", "Alpha"),
+            otrk_with_metadata(TAG_PFIL, "Music/B/b.mp3", "Bravo"),
+            TlvRecord {
+                tag: *b"oent",
+                payload: vec![1, 2, 3],
+            },
+            otrk_with_metadata(TAG_PFIL, "Music/C/c.mp3", "Charlie"),
+        ]);
+        let mut database = DatabaseV2::from_bytes(&original).unwrap();
+        let removed = database.remove_track_capturing("Music/B/b.mp3").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].index, 2);
+
+        let restored = database
+            .restore_removed_records("Music/B/b.mp3", &removed)
+            .unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(database.to_bytes().unwrap(), original);
+    }
+
+    #[test]
+    fn restore_skips_paths_already_present_and_appends_past_end() {
+        let original = synthetic_library(
+            "1.0/Serato ScratchLive Crate",
+            TAG_PTRK,
+            &["Music/A/a.mp3", "Music/B/b.mp3"],
+        );
+        let mut crate_file = CrateFile::from_bytes(&original).unwrap();
+        let removed = crate_file.remove_track_capturing("Music/B/b.mp3").unwrap();
+        crate_file
+            .restore_removed_records("Music/B/b.mp3", &removed)
+            .unwrap();
+        let again = crate_file
+            .restore_removed_records("Music/B/b.mp3", &removed)
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(crate_file.to_bytes().unwrap(), original);
+
+        let past_end = vec![SeratoRemovedRecord {
+            index: 99,
+            record: library_bytes(&[synthetic_otrk(TAG_PTRK, "Music/Z/z.mp3")]),
+        }];
+        let restored = crate_file
+            .restore_removed_records("Music/Z/z.mp3", &past_end)
+            .unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(
+            crate_file.track_paths().last().map(String::as_str),
+            Some("Music/Z/z.mp3")
+        );
+    }
+
+    #[test]
+    fn restore_inserts_multiple_records_at_their_original_indices() {
+        let original = library_bytes(&[
+            TlvRecord {
+                tag: *b"vrsn",
+                payload: encode_utf16be("1.0/Serato ScratchLive Crate"),
+            },
+            synthetic_otrk(TAG_PTRK, "Music/A/a.mp3"),
+            synthetic_otrk(TAG_PTRK, "Music/B/dup.mp3"),
+            synthetic_otrk(TAG_PTRK, "Music/C/c.mp3"),
+            synthetic_otrk(TAG_PTRK, "Music/B/dup.mp3"),
+        ]);
+        let mut crate_file = CrateFile::from_bytes(&original).unwrap();
+        let mut removed = crate_file
+            .remove_track_capturing("Music/B/dup.mp3")
+            .unwrap();
+        assert_eq!(
+            removed
+                .iter()
+                .map(|record| record.index)
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+        removed.reverse();
+
+        let restored = crate_file
+            .restore_removed_records("Music/B/dup.mp3", &removed)
+            .unwrap();
+        assert_eq!(restored, 2);
+        assert_eq!(crate_file.to_bytes().unwrap(), original);
     }
 
     // ===== path pre-filter adversarial fixtures =====
@@ -2188,7 +2427,10 @@ mod tests {
             );
 
             let mut removed = original.clone();
-            assert_eq!(removed.remove_track(requested), 1);
+            assert_eq!(
+                removed.remove_track_capturing((requested)).unwrap().len(),
+                1
+            );
             assert_eq!(
                 removed.records,
                 vec![original.records[0].clone(), unrelated.clone()]
@@ -2215,7 +2457,10 @@ mod tests {
             );
 
             let mut removed = original.clone();
-            assert_eq!(removed.remove_track(requested), 1);
+            assert_eq!(
+                removed.remove_track_capturing((requested)).unwrap().len(),
+                1
+            );
             assert_eq!(removed.track_paths(), vec![UNRELATED_PATH]);
         }
     }
@@ -2323,11 +2568,20 @@ mod tests {
             expected.extend(non_matching_records(path_tag));
             let (removed, remaining) = if path_tag == TAG_PFIL {
                 let mut database = DatabaseV2 { records };
-                (database.remove_track(PREFILTER_TARGET), database.records)
+                (
+                    database
+                        .remove_track_capturing((PREFILTER_TARGET))
+                        .unwrap()
+                        .len(),
+                    database.records,
+                )
             } else {
                 let mut crate_file = CrateFile { records };
                 (
-                    crate_file.remove_track(PREFILTER_TARGET),
+                    crate_file
+                        .remove_track_capturing((PREFILTER_TARGET))
+                        .unwrap()
+                        .len(),
                     crate_file.records,
                 )
             };
@@ -2398,7 +2652,10 @@ mod tests {
             &["Users/x/Music/A/only.mp3"],
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let removed = database.remove_track("Users/x/Music/A/only.mp3");
+        let removed = database
+            .remove_track_capturing(("Users/x/Music/A/only.mp3"))
+            .unwrap()
+            .len();
         assert_eq!(removed, 1);
         let after = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
         // Database has no otrks left but the vrsn header survived.

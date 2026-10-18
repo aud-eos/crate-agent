@@ -7,7 +7,7 @@ use crate::serato;
 use crate::tags;
 use fingerprint_core as fingerprint;
 
-pub use crate::serato::{SeratoMetadataUpdate, SeratoTrackRecord};
+pub use crate::serato::{SeratoMetadataUpdate, SeratoRemovedRecord, SeratoTrackRecord};
 pub use crate::serato_history::{SeratoHistoryPlay, SeratoHistoryScan};
 pub use crate::tags::{AudioTagUpdate, AudioTags};
 
@@ -294,23 +294,69 @@ pub fn remove_track_from_database(
     database_path: String,
     track_path: String,
 ) -> Result<u32, CoreError> {
+    let removed = remove_track_from_database_capturing(database_path, track_path)?;
+    Ok(u32::try_from(removed.len()).expect("remove count exceeded u32"))
+}
+
+pub fn remove_track_from_database_capturing(
+    database_path: String,
+    track_path: String,
+) -> Result<Vec<SeratoRemovedRecord>, CoreError> {
     let path = PathBuf::from(database_path);
     let mut database = serato::DatabaseV2::read_from_path(&path)?;
-    let count = database.remove_track(&track_path);
-    if count > 0 {
+    let removed = database.remove_track_capturing(&track_path)?;
+    if !removed.is_empty() {
         database.write_to_path(&path)?;
     }
-    Ok(u32::try_from(count).expect("remove count exceeded u32"))
+    Ok(removed)
 }
 
 pub fn remove_path_from_crate(crate_path: String, track_path: String) -> Result<u32, CoreError> {
+    let removed = remove_path_from_crate_capturing(crate_path, track_path)?;
+    Ok(u32::try_from(removed.len()).expect("remove count exceeded u32"))
+}
+
+pub fn remove_path_from_crate_capturing(
+    crate_path: String,
+    track_path: String,
+) -> Result<Vec<SeratoRemovedRecord>, CoreError> {
     let path = PathBuf::from(crate_path);
     let mut crate_file = serato::CrateFile::read_from_path(&path)?;
-    let count = crate_file.remove_track(&track_path);
-    if count > 0 {
+    let removed = crate_file.remove_track_capturing(&track_path)?;
+    if !removed.is_empty() {
         crate_file.write_to_path(&path)?;
     }
-    Ok(u32::try_from(count).expect("remove count exceeded u32"))
+    Ok(removed)
+}
+
+/// Reinserts records captured by the `*_capturing` removals. The path tag
+/// follows the file's extension: `.crate` and `.scrate` hold `ptrk`, anything
+/// else is a database V2 holding `pfil`.
+pub fn restore_removed_records(
+    file_path: String,
+    track_path: String,
+    records: Vec<SeratoRemovedRecord>,
+) -> Result<u32, CoreError> {
+    let path = PathBuf::from(file_path);
+    let is_crate_shaped = path
+        .extension()
+        .is_some_and(|extension| extension == "crate" || extension == "scrate");
+    let restored = if is_crate_shaped {
+        let mut crate_file = serato::CrateFile::read_from_path(&path)?;
+        let restored = crate_file.restore_removed_records(&track_path, &records)?;
+        if restored > 0 {
+            crate_file.write_to_path(&path)?;
+        }
+        restored
+    } else {
+        let mut database = serato::DatabaseV2::read_from_path(&path)?;
+        let restored = database.restore_removed_records(&track_path, &records)?;
+        if restored > 0 {
+            database.write_to_path(&path)?;
+        }
+        restored
+    };
+    Ok(u32::try_from(restored).expect("restore count exceeded u32"))
 }
 
 pub fn database_track_count(database_path: String) -> Result<u32, CoreError> {

@@ -75,6 +75,22 @@ namespace crate_agent_core {
   [Throws=CoreError]
   u32 remove_path_from_crate(string crate_path, string track_path);
 
+  // Same removals, returning each dropped `otrk` as its full TLV encoding
+  // plus its position among the file's top-level records, so
+  // `restore_removed_records` can put it back byte-exact.
+  [Throws=CoreError]
+  sequence<SeratoRemovedRecord> remove_track_from_database_capturing(string database_path, string track_path);
+
+  [Throws=CoreError]
+  sequence<SeratoRemovedRecord> remove_path_from_crate_capturing(string crate_path, string track_path);
+
+  // Reinserts captured records at their original positions, ascending.
+  // Works on database V2 (`pfil`) and `.crate`/`.scrate` (`ptrk`) files,
+  // chosen by extension. Reinserts nothing when the file already holds
+  // `track_path`. Returns the number reinserted.
+  [Throws=CoreError]
+  u32 restore_removed_records(string file_path, string track_path, sequence<SeratoRemovedRecord> records);
+
   // Number of `otrk` entries in a `database V2` file. Useful for
   // progress reporting on full library scans.
   [Throws=CoreError]
@@ -207,6 +223,13 @@ dictionary DecodedAudioDigest {
 dictionary SeratoPathRename {
   string old_path;
   string new_path;
+};
+
+// An `otrk` removed from a Serato file: its full TLV encoding (tag, length,
+// payload) and its position among all top-level records before removal.
+dictionary SeratoRemovedRecord {
+  u32 index;
+  bytes record;
 };
 
 // What a Serato batch write did. `unmatched_indices` lists, in order, the
