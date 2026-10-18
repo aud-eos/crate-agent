@@ -4,12 +4,13 @@ import XCTest
 
 /// 30,000 processable files on a temporary WAL database: every file has
 /// a 32-byte lightweight hash, 24,000 have a 4 KB Chromaprint
-/// fingerprint, 300 byte-level pairs and 400 perceptual pairs.
+/// fingerprint, 300 byte-level pairs and 1,650 perceptual pairs (the
+/// owner's 3,300 colliding files), each with a cached audio digest.
 final class DuplicateScanPerformanceTests: XCTestCase {
     private static let fileCount = 30000
     private static let fingerprintedCount = 24000
     private static let bytePairs = 300
-    private static let perceptualPairs = 400
+    private static let perceptualPairs = 1650
 
     private func makeFixture() throws -> (directory: URL, database: LibraryDatabase) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("DuplicateScan-\(UUID().uuidString)")
@@ -29,6 +30,19 @@ final class DuplicateScanPerformanceTests: XCTestCase {
                 file.libraryMembership = .active
                 file.fileAvailability = .available
                 try file.insert(connection)
+                let basis = DigestBasis(fileSize: 5_000_000, mtime: 0, inode: Int64(identifier), modifiedNanoseconds: 0, changedSeconds: 0, changedNanoseconds: 0)
+                if identifier <= Self.bytePairs * 2 {
+                    try DuplicateDigestStore.save([DigestResult(fileID: Int64(identifier), basis: basis,
+                                                                evidence: .content(Self.bytes(seed: hashSeed, count: 32)))],
+                                                  kind: .content, in: connection)
+                }
+                if identifier <= Self.perceptualPairs * 2 {
+                    try DuplicateDigestStore.save([DigestResult(
+                        fileID: Int64(identifier), basis: basis,
+                        evidence: .decoded(.init(format: "mp3/mp3", pcmDigest: Self.bytes(seed: fingerprintSeed, count: 32),
+                                                 fullFingerprintDigest: Self.bytes(seed: fingerprintSeed, count: 32), durationSeconds: 240))
+                    )], kind: .audio, in: connection)
+                }
             }
         }
         return (directory, database)
@@ -56,6 +70,7 @@ final class DuplicateScanPerformanceTests: XCTestCase {
 
         XCTAssertEqual(scan.byteLevel.count, Self.bytePairs)
         XCTAssertEqual(scan.perceptual.count, Self.perceptualPairs)
+        XCTAssertTrue((scan.byteLevel + scan.perceptual).allSatisfy { group in group.check == .confirmed })
         XCTAssertEqual(scan.byteLevel.reduce(0) { total, group in total + group.size }, Self.bytePairs * 2,
                        "Only group members may be decoded")
         XCTAssertEqual(scan.perceptual.reduce(0) { total, group in total + group.size }, Self.perceptualPairs * 2)

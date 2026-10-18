@@ -56,6 +56,7 @@ struct MainWindowView: View {
                 detailView
             }
             Divider()
+            NowPlayingBar(player: services.trackPlayer)
             AutoTagActivityView(session: services.autoTagSession) { selection = .autoTag }
             ActivityStrip()
                 .environmentObject(services.activityLog)
@@ -97,7 +98,7 @@ struct MainWindowView: View {
         case .cleanup:
             LibraryHygieneView()
         case .autoTag:
-            AutoTaggerView(session: services.autoTagSession, readiness: services.readiness, conflictRevision: services.readiness.scopeRevision)
+            AutoTaggerView(session: services.autoTagSession, player: services.trackPlayer, readiness: services.readiness, conflictRevision: services.readiness.scopeRevision)
         case .history:
             HistoryView()
         case .workers:

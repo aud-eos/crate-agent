@@ -36,11 +36,17 @@ struct PendingDuplicateCleanup: Sendable {
     var waitingEventID: Int64?
     var removedV2 = false
     var failure: String?
+    /// Rechecked against cached digests in every attempt of the first
+    /// step's transaction, including a resume after a rolled-back attempt;
+    /// later steps rely on the identity revalidation. Nil only for intents
+    /// saved before digests existed, which can no longer start.
+    let evidenceRequirement: DuplicateEvidenceRequirement?
 
-    init(target: FileActionAuthority, keeper: FileActionAuthority, batchID: String) {
+    init(target: FileActionAuthority, keeper: FileActionAuthority, batchID: String, evidenceRequirement: DuplicateEvidenceRequirement?) {
         self.target = target
         self.keeper = keeper
         self.batchID = batchID
+        self.evidenceRequirement = evidenceRequirement
     }
 
     var mutations: [TrackMutation] {
