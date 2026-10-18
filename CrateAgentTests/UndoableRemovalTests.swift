@@ -172,6 +172,85 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
+    func testUndoRefusesWhenTheTrashItemIsGoneAndChangesNothing() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine)
+        try FileManager.default.removeItem(at: Self.trashDirectory(fixture).appendingPathComponent("target.wav"))
+        let before = try await libraryState(cleaned, in: fixture)
+
+        await assertUndoBlocked(cleaned, engine: engine, reason: .trashItemMissing)
+
+        let after = try await libraryState(cleaned, in: fixture)
+        XCTAssertEqual(after, before)
+        XCTAssertFalse(after.hasRowAtOriginalPath)
+    }
+
+    func testUndoRefusesWhenTheOriginalPathIsOccupied() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine)
+        let occupant = Data("a different file".utf8)
+        try occupant.write(to: URL(fileURLWithPath: cleaned.target.path))
+        let before = try await libraryState(cleaned, in: fixture)
+
+        await assertUndoBlocked(cleaned, engine: engine, reason: .originalPathOccupied)
+
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: cleaned.target.path)), occupant)
+        let after = try await libraryState(cleaned, in: fixture)
+        XCTAssertEqual(after, before)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: Self.trashDirectory(fixture).appendingPathComponent("target.wav").path))
+    }
+
+    func testUndoOfAQueuedCleanupDropsItsPendingRows() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine, whileSeratoRuns: true)
+
+        try await engine.undoBatch(cleaned.batchID)
+
+        let queued = try await fixture.database.writer.read { database in try SeratoWriteQueue.fetch(fileID: XCTUnwrap(cleaned.target.id), in: database) }
+        XCTAssertTrue(queued.isEmpty)
+        fixture.lifecycle.running = false
+        fixture.watchdog.refresh()
+        try await engine.drainPendingSeratoUpdates()
+        try await assertFileRestored(cleaned, in: fixture)
+        for (path, bytes) in cleaned.originalBytes {
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
+        }
+    }
+
+    private struct LibraryState: Equatable {
+        let storeBytes: [String: Data]
+        let eventCount: Int
+        let hasRowAtOriginalPath: Bool
+    }
+
+    private func libraryState(_ cleaned: CleanedDuplicate, in fixture: SeratoRemovalFixture) async throws -> LibraryState {
+        let storeBytes = try cleaned.originalBytes.keys.reduce(into: [String: Data]()) { bytes, path in
+            bytes[path] = try Data(contentsOf: URL(fileURLWithPath: path))
+        }
+        return try await fixture.database.writer.read { database in
+            try LibraryState(storeBytes: storeBytes, eventCount: EventRecord.fetchCount(database),
+                             hasRowAtOriginalPath: FileRecord.filter(Column("path") == cleaned.target.path).fetchCount(database) > 0)
+        }
+    }
+
+    private func assertUndoBlocked(_ cleaned: CleanedDuplicate, engine: OperationEngine, reason expected: RestoreBlockReason) async {
+        do {
+            try await engine.undoBatch(cleaned.batchID)
+            XCTFail("Undo must refuse with \(expected)")
+        } catch let OperationEngineError.restoreBlocked(path, reason) {
+            XCTAssertEqual(path, cleaned.target.path)
+            XCTAssertEqual(reason, expected)
+        } catch {
+            XCTFail("Unexpected error \(error)")
+        }
+    }
+
     private struct CleanedDuplicate {
         let target: FileRecord
         let batchID: String
@@ -181,8 +260,9 @@ final class UndoableRemovalTests: XCTestCase {
 
     /// Cleans `target.wav`, a duplicate of `keeper.wav` held in database V2 and both crate kinds.
     /// `otherCrates`, by name, are saved as well, `extraDatabaseRecords` are appended to V2, and `completes: false` lets a cleanup step fail.
+    /// `whileSeratoRuns` starts Serato before the cleanup, so its steps stay queued.
     private func cleanDuplicate(_ fixture: SeratoRemovalFixture, engine: OperationEngine, otherCrates: [String: Data] = [:],
-                                extraDatabaseRecords: Data = Data(), completes: Bool = true) async throws -> CleanedDuplicate
+                                extraDatabaseRecords: Data = Data(), completes: Bool = true, whileSeratoRuns: Bool = false) async throws -> CleanedDuplicate
     {
         let keeper = try await fixture.add("keeper.wav", bytes: FinalRemovalIntegrationTests.wav())
         let target = try await fixture.add("target.wav", bytes: FinalRemovalIntegrationTests.wav())
@@ -198,8 +278,12 @@ final class UndoableRemovalTests: XCTestCase {
             bytes[path] = try Data(contentsOf: URL(fileURLWithPath: path))
         }
         let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("undoable", files: [keeper, target], in: fixture.database)
+        if whileSeratoRuns {
+            fixture.lifecycle.running = true
+            fixture.watchdog.refresh()
+        }
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
-        XCTAssertEqual(outcome.trashedCount, completes ? 1 : 0)
+        XCTAssertEqual(outcome.trashedCount, completes && !whileSeratoRuns ? 1 : 0)
         return CleanedDuplicate(target: target, batchID: outcome.batchId, originalBytes: originalBytes)
     }
 

@@ -108,6 +108,8 @@ public actor OperationEngine {
 
     private enum DuplicateCleanupInterruption: Error {
         case alreadyPending
+        /// Undo removed the cleanup while this pass was suspended.
+        case withdrawn
     }
 
     struct MutationContext: Sendable {
@@ -306,6 +308,9 @@ public actor OperationEngine {
                     if isNew, try DuplicateCleanupStore.fetch(targetFileID: fileID, in: database) != nil {
                         throw DuplicateCleanupInterruption.alreadyPending
                     }
+                    if !isNew, try DuplicateCleanupStore.fetch(targetFileID: fileID, in: database)?.step != intent.step {
+                        throw DuplicateCleanupInterruption.withdrawn
+                    }
                     try intent.target.validate(in: database, audioWasTrashed: intent.step == 3)
                     try intent.keeper.validate(in: database)
                     if intent.step == 0 {
@@ -358,7 +363,7 @@ public actor OperationEngine {
                 }
                 duplicateCleanupResults[fileID] = .pending
                 return
-            } catch DuplicateCleanupInterruption.alreadyPending {
+            } catch is DuplicateCleanupInterruption {
                 return
             } catch {
                 let message = error.localizedDescription
@@ -382,13 +387,20 @@ public actor OperationEngine {
     private func cancelDuplicateCleanup(_ fileID: Int64, result: DuplicateCleanupResult, reported explicitReported: Bool? = nil) async throws {
         let reported = explicitReported ?? (LibrarySyncReadiness.drainAuthorization == nil)
         try await database.writer.write { database in
-            for write in try SeratoWriteQueue.fetch(cleanupTargetFileID: fileID, in: database) {
-                try Self.dropQueuedWrite(write, disposition: .superseded, reported: reported, in: database)
-            }
-            try DuplicateCleanupStore.delete(targetFileID: fileID, in: database)
+            try Self.dropCleanup(fileID, disposition: .superseded, reported: reported, in: database)
         }
         duplicateCleanupResults[fileID] = result
         try await refreshQueueDepth()
+    }
+
+    /// Drops a cleanup's intent and every queued effect it still owns, recording each dropped effect.
+    private static func dropCleanup(_ targetFileID: Int64, disposition: SeratoWriteDisposition, detail: String? = nil, reported: Bool,
+                                    in database: GRDB.Database) throws
+    {
+        for write in try SeratoWriteQueue.fetch(cleanupTargetFileID: targetFileID, in: database) {
+            try dropQueuedWrite(write, disposition: disposition, detail: detail, reported: reported, in: database)
+        }
+        try DuplicateCleanupStore.delete(targetFileID: targetFileID, in: database)
     }
 
     private static func duplicateCleanupFailureMessage(_ intent: PendingDuplicateCleanup, error: Error) -> String {
@@ -1647,15 +1659,31 @@ public actor OperationEngine {
             throw OperationEngineError.batchNotFound(batchId: batchId)
         }
 
+        let unfinished = try await unfinishedCleanups(batchId: batchId)
+        let queueIDs = Set(unfinished.flatMap(\.writes).map(\.queueID))
+        let owner = UUID()
+        let claimed = claim(queueIDs, owner: owner)
+        defer { release(claimed, owner: owner) }
+        if let applying = unfinished.first(where: { cleanup in !Set(cleanup.writes.map(\.queueID)).isSubset(of: claimed) }) {
+            throw OperationEngineError.queuedChangeApplying(path: applying.path)
+        }
+        let unmoved = unfinished.reduce(into: Set<Int64>()) { eventIDs, cleanup in eventIDs.formUnion(cleanup.unmovedTrashEventIDs) }
+        let revertedEvents = events.filter { event in event.eventId.map(unmoved.contains) != true }
+
         // Pre-decode every inverse before mutating anything. If any
         // event in the batch is non-reversible, we fail clean — no
         // partial undo state lands in the DB.
-        let inverseMutations = try events.compactMap { event in
+        let inverseMutations = try revertedEvents.compactMap { event in
             try Self.decodeInverseMutation(event: event)
         }
-        let guards = try await inverseGuards(for: events)
-        let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
         let context = mutationContext
+        try await database.writer.read { database in
+            for case let .restoreFromTrash(payload) in inverseMutations {
+                _ = try RemovalRestoreMutation.requireRestorable(payload, resolver: context.availabilityResolver, in: database)
+            }
+        }
+        let guards = try await inverseGuards(for: revertedEvents)
+        let undoBatchId = "undo:\(batchId):\(UUID().uuidString)"
         // One transaction for every inverse mutation in the batch.
         // Undo is conceptually atomic: either the whole batch
         // reverts or none of it does. With N transactions (the
@@ -1664,14 +1692,58 @@ public actor OperationEngine {
         let results = try await PhysicalFileMoveTransaction.write(to: database.writer, batchId: undoBatchId) { database, moves in
             try authorization?.check()
             try Self.requireInverseGuards(guards, in: database)
+            for cleanup in unfinished {
+                try Self.dropUndoneCleanup(cleanup, batchId: batchId, in: database)
+            }
             let results = try inverseMutations.map { mutation in
                 try Self.executeAndLog(context: context, mutation: mutation, batchId: undoBatchId, in: database, physicalMoves: moves)
             }
             try authorization?.check()
             return results
         }
+        for cleanup in unfinished {
+            duplicateCleanupResults[cleanup.targetFileID] = nil
+        }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
+        if !unfinished.isEmpty {
+            try await refreshQueueDepth()
+        }
         return undoBatchId
+    }
+
+    /// A cleanup of the batch being undone that has not finished, with the
+    /// queued effects it still owns as undo read them.
+    private struct UnfinishedCleanup: Sendable {
+        let targetFileID: Int64
+        let path: String
+        let writes: [DiscardedSeratoWrite]
+        /// `.fileTrashed` events whose Trash move is queued and never reached
+        /// its I/O, so the file never left its path and there is nothing to restore.
+        let unmovedTrashEventIDs: Set<Int64>
+    }
+
+    private func unfinishedCleanups(batchId: String) async throws -> [UnfinishedCleanup] {
+        try await database.writer.read { database in
+            try DuplicateCleanupStore.fetchAll(in: database).filter { intent in intent.batchID == batchId }.map { intent in
+                let targetFileID = intent.target.token.fileId
+                let rows = try SeratoWriteQueue.fetch(cleanupTargetFileID: targetFileID, in: database)
+                let unmoved = rows.filter { row in row.write.kind == .trashFile && !row.mayHaveLanded }.map(\.eventId)
+                return try UnfinishedCleanup(targetFileID: targetFileID, path: intent.target.identity.path, writes: rows.map(DiscardedSeratoWrite.init),
+                                             unmovedTrashEventIDs: Set(unmoved))
+            }
+        }
+    }
+
+    /// Ends an unfinished cleanup that undo reverts, dropping the effects it
+    /// still has queued, so none lands after the undo. Refuses when the
+    /// cleanup moved on since undo read it.
+    private static func dropUndoneCleanup(_ cleanup: UnfinishedCleanup, batchId: String, in database: GRDB.Database) throws {
+        guard try DuplicateCleanupStore.fetch(targetFileID: cleanup.targetFileID, in: database)?.batchID == batchId,
+              try SeratoWriteQueue.fetch(cleanupTargetFileID: cleanup.targetFileID, in: database).map(DiscardedSeratoWrite.init) == cleanup.writes
+        else {
+            throw OperationEngineError.queuedChangeChanged(path: cleanup.path)
+        }
+        try dropCleanup(cleanup.targetFileID, disposition: .discarded, detail: RemovalUndoMessages.undoneBeforeLanding, reported: true, in: database)
     }
 
     /// What applying `events`' inverses must still find: no later match

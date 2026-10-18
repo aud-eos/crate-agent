@@ -64,33 +64,43 @@ enum RemovalRestoreMutation {
         let removalEventType: EventType
     }
 
-    /// Moves the file back from its recorded Trash item into the re-indexed row
-    /// at its original path, refusing when the item is gone or changed, or the
-    /// path holds another file.
-    static func restoreFromTrash(_ payload: RestoreFromTrashPayload, batchId: String, timestamp: Int64,
-                                 physicalMoves: PhysicalFileMoveTransaction?, resolver: FileAvailabilityResolver,
-                                 in database: GRDB.Database) throws -> Int64
+    /// The recorded Trash item `payload` moves back, refusing when the item is
+    /// gone or changed, or the original path holds another file. Undo checks
+    /// this before it changes anything, and the restore again under the writer.
+    static func requireRestorable(_ payload: RestoreFromTrashPayload, resolver: FileAvailabilityResolver,
+                                  in database: GRDB.Database) throws -> FileMetadata
     {
-        func blocked(_ reason: RestoreBlockReason) -> OperationEngineError {
-            .restoreBlocked(path: payload.originalPath, reason: reason)
-        }
         guard let trashItem = try SeratoRemovalCaptureStore.trashDestination(eventID: payload.removalEventID, in: database)?.identity else {
-            throw blocked(.trashItemNotRecorded)
+            throw blocked(payload, .trashItemNotRecorded)
         }
         switch try resolver.inspect(path: trashItem.path, volumeID: trashItem.volumeUuid) {
         case .trashed:
             guard try FileTrashLocation.availability(of: trashItem, resolver: resolver) == .trashed else {
-                throw blocked(FileManager.default.fileExists(atPath: trashItem.path) ? .trashItemChanged : .trashItemMissing)
+                throw blocked(payload, FileManager.default.fileExists(atPath: trashItem.path) ? .trashItemChanged : .trashItemMissing)
             }
-        case .available: throw blocked(.trashItemNotInTrash)
-        case .missing, .offline, .inaccessible, .unknown: throw blocked(.trashItemMissing)
+        case .available: throw blocked(payload, .trashItemNotInTrash)
+        case .missing, .offline, .inaccessible, .unknown: throw blocked(payload, .trashItemMissing)
         }
-        guard !FileManager.default.fileExists(atPath: payload.originalPath) else { throw blocked(.originalPathOccupied) }
+        guard !FileManager.default.fileExists(atPath: payload.originalPath) else { throw blocked(payload, .originalPathOccupied) }
+        return trashItem
+    }
+
+    private static func blocked(_ payload: RestoreFromTrashPayload, _ reason: RestoreBlockReason) -> OperationEngineError {
+        .restoreBlocked(path: payload.originalPath, reason: reason)
+    }
+
+    /// Moves the file back from its recorded Trash item into the re-indexed row
+    /// at its original path.
+    static func restoreFromTrash(_ payload: RestoreFromTrashPayload, batchId: String, timestamp: Int64,
+                                 physicalMoves: PhysicalFileMoveTransaction?, resolver: FileAvailabilityResolver,
+                                 in database: GRDB.Database) throws -> Int64
+    {
+        let trashItem = try requireRestorable(payload, resolver: resolver, in: database)
         guard let physicalMoves else { preconditionFailure("Restoring from Trash runs only inside a physical move transaction") }
         guard var file = try FileRecord.filter(Column("path") == payload.originalPath).fetchOne(database),
               let fileID = file.id, file.identity == payload.identity
         else {
-            throw blocked(.fileNotRestored)
+            throw blocked(payload, .fileNotRestored)
         }
         let restored = try physicalMoves.restore(trashItem, to: payload.originalPath)
         file.volumeUuid = restored.volumeUuid

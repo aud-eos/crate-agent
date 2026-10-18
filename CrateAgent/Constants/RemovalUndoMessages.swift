@@ -16,6 +16,8 @@ enum RemovalUndoMessages {
         return "Can't undo removing \(name): \(cause)."
     }
 
+    static let undoneBeforeLanding = "Not applied: the removal was undone before it reached Serato or the Trash."
+
     static let redoNotSupported = "A removal that was undone can't be redone from History yet. Remove the file again instead."
 
     /// `unrecorded` stores no longer exist either, and may never have had records removed.
