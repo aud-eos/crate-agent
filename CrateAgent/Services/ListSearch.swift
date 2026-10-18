@@ -9,15 +9,22 @@ enum ListSearch {
         predicate()
     }
 
-    /// ASCII text, most of a library, is matched by SQLite itself; the Swift
-    /// fold runs only for a field or search with other characters, whose byte
-    /// length differs from its character length. Calling into Swift for every
-    /// row is what took a searched 30,000-file Library view over its budget.
+    /// Pure-ASCII fields and searches, most of a library, are matched by
+    /// SQLite itself, which equals the Swift fold for ASCII; anything else,
+    /// detected by a byte length that differs from the character length, goes
+    /// through the fold. Calling into Swift for every field of every row is
+    /// what took a searched 30,000-file Library view over its budget.
     static func predicate(prefix: String = "", parameter: String = ":query") -> String {
-        let text = "(" + ["artist", "title", "album", "path"].map { field in "COALESCE(\(prefix)\(field), '')" }
-            .joined(separator: " || char(10) || ") + ")"
-        let folds = "length(CAST(\(text) AS BLOB)) != length(\(text)) OR length(CAST(\(parameter) AS BLOB)) != length(\(parameter))"
-        return "(instr(lower(\(text)), lower(\(parameter))) > 0 OR ((\(folds)) AND \(functionName)(\(text), \(parameter))))"
+        let asciiSearch = isASCII(parameter)
+        return "(" + ["artist", "title", "album", "path"].map { field in
+            let column = "\(prefix)\(field)"
+            return "(CASE WHEN \(column) IS NULL THEN 0 WHEN \(asciiSearch) AND \(isASCII(column)) "
+                + "THEN instr(lower(\(column)), lower(\(parameter))) > 0 ELSE \(functionName)(\(column), \(parameter)) END)"
+        }.joined(separator: " OR ") + ")"
+    }
+
+    private static func isASCII(_ expression: String) -> String {
+        "length(CAST(\(expression) AS BLOB)) = length(\(expression))"
     }
 
     static func normalized(_ text: String) -> String {
