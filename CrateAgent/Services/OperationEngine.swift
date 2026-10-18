@@ -2462,6 +2462,7 @@ public actor OperationEngine {
             }
             if write.queueID.map(missingTarget.contains) != true {
                 try SeratoWriteQueue.rebaseMetadata(after: write, in: database)
+                try SeratoWriteDispositions.recordResolution(eventID: write.eventId, kind: write.write.kind, in: database)
             }
             try DuplicateCleanupStore.completeEffect(of: write, in: database)
         }

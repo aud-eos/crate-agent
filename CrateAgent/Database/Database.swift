@@ -129,6 +129,7 @@ public final class LibraryDatabase {
         AddSeratoRenameProgressMigration.register(in: &migrator)
         AddFileDigestsMigration.register(in: &migrator)
         AddSongFamiliesMigration.register(in: &migrator)
+        AddSeratoWriteResolutionsMigration.register(in: &migrator)
         return migrator
     }
 }

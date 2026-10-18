@@ -500,23 +500,46 @@ enum SeratoWriteDispositions {
         return result
     }
 
-    /// Per History batch: not-applied changes by disposition, each event
-    /// counted once per disposition, the distinct events overall, and the
-    /// files they touch.
+    /// Records that a queued write for `eventID` completed after it had been
+    /// recorded as not applied, without touching the append-only dispositions:
+    /// History derives the resolved state from this row. Writes that were never
+    /// dropped add nothing.
+    static func recordResolution(eventID: Int64, kind: SeratoWriteKind, in database: Database) throws {
+        try database.execute(sql: """
+        INSERT INTO serato_write_resolutions (event_id, kind, disposition_id, resolved_at)
+        SELECT event_id, kind, MAX(id), ? FROM serato_write_dispositions WHERE event_id = ? AND kind = ? GROUP BY event_id, kind
+        ON CONFLICT(event_id, kind) DO UPDATE SET disposition_id = excluded.disposition_id, resolved_at = excluded.resolved_at
+        """, arguments: [SeratoWriteQueue.now(), eventID, kind.rawValue])
+    }
+
+    /// A disposition `d` no later write for the same event and kind resolved.
+    private static let isOpen = """
+    NOT EXISTS (SELECT 1 FROM serato_write_resolutions r WHERE r.event_id = d.event_id AND r.kind = d.kind AND r.disposition_id >= d.id)
+    """
+
+    /// Per History batch: open not-applied changes by disposition, each event
+    /// counted once per disposition; the distinct open events and the files
+    /// they touch; and how many changes and files were recorded at all.
     static func notAppliedByBatch(_ batchIDs: [String], in database: Database) throws -> [String: NotAppliedBatchCounts] {
         guard !batchIDs.isEmpty else { return [:] }
-        let placeholders = batchIDs.map { _ in "?" }.joined(separator: ",")
+        let placeholders = databaseQuestionMarks(count: batchIDs.count)
         var result: [String: NotAppliedBatchCounts] = [:]
         for row in try Row.fetchAll(database, sql: """
-        SELECT d.batch_id, COUNT(DISTINCT d.event_id) AS changes, COUNT(DISTINCT COALESCE(e.file_id, -d.event_id)) AS files
-        FROM serato_write_dispositions d LEFT JOIN events e ON e.event_id = d.event_id
-        WHERE d.batch_id IN (\(placeholders)) GROUP BY d.batch_id
+        SELECT batch_id, COUNT(DISTINCT CASE WHEN open THEN event_id END) AS open_changes, COUNT(DISTINCT event_id) AS changes,
+               COUNT(DISTINCT CASE WHEN open THEN entry_key END) AS open_files, COUNT(DISTINCT entry_key) AS files
+        FROM (SELECT d.batch_id, d.event_id, COALESCE(e.file_id, -d.event_id) AS entry_key, \(isOpen) AS open
+              FROM serato_write_dispositions d LEFT JOIN events e ON e.event_id = d.event_id
+              WHERE d.batch_id IN (\(placeholders)))
+        GROUP BY batch_id
         """, arguments: StatementArguments(batchIDs)) {
-            result[row["batch_id"]] = NotAppliedBatchCounts(changes: row["changes"], files: row["files"])
+            let changes: Int = row["changes"]
+            let openChanges: Int = row["open_changes"]
+            result[row["batch_id"]] = NotAppliedBatchCounts(changes: openChanges, files: row["open_files"],
+                                                            resolvedChanges: changes - openChanges, listedFiles: row["files"])
         }
         for row in try Row.fetchAll(database, sql: """
-        SELECT batch_id, disposition, COUNT(DISTINCT event_id) AS count FROM serato_write_dispositions
-        WHERE batch_id IN (\(placeholders)) GROUP BY batch_id, disposition
+        SELECT batch_id, disposition, COUNT(DISTINCT event_id) AS count FROM serato_write_dispositions d
+        WHERE batch_id IN (\(placeholders)) AND \(isOpen) GROUP BY batch_id, disposition
         """, arguments: StatementArguments(batchIDs)) {
             let batchID: String = row["batch_id"]
             if let disposition = SeratoWriteDisposition(rawValue: row["disposition"]) {
@@ -529,19 +552,38 @@ enum SeratoWriteDispositions {
     }
 
     /// One page of a batch's not-applied changes grouped by file, ordered by
-    /// path; changes whose event has no file each form their own entry.
-    static func notAppliedFiles(batchID: String, limit: Int, offset: Int, in database: Database) throws -> [NotAppliedFileRecord] {
-        try Row.fetchAll(database, sql: """
-        SELECT e.file_id, MIN(d.event_id) AS first_event_id, f.path,
-               GROUP_CONCAT(DISTINCT d.event_id || ':' || d.disposition) AS dispositions, GROUP_CONCAT(DISTINCT e.event_type) AS event_types
-        FROM serato_write_dispositions d
-        LEFT JOIN events e ON e.event_id = d.event_id
-        LEFT JOIN files f ON f.id = e.file_id
-        WHERE d.batch_id = ?
-        GROUP BY COALESCE(e.file_id, -d.event_id)
-        ORDER BY f.path IS NULL, f.path, first_event_id
-        LIMIT ? OFFSET ?
-        """, arguments: [batchID, limit, offset]).map { row in
+    /// path and then entry key; changes whose event has no file each form
+    /// their own entry, after every file. Paging resumes after `cursor`, so a
+    /// change recorded between loads cannot skip or repeat an entry.
+    static func notAppliedFiles(batchID: String, after cursor: NotAppliedFileCursor?, limit: Int, in database: Database) throws -> [NotAppliedFileRecord] {
+        var arguments: StatementArguments = [batchID]
+        let resume: String
+        switch cursor {
+        case nil:
+            resume = "1"
+        case let .some(cursor) where cursor.path != nil:
+            resume = "(path IS NULL OR path > ? OR (path = ? AND entry_key > ?))"
+            arguments += [cursor.path, cursor.path, cursor.entryKey]
+        case let .some(cursor):
+            resume = "(path IS NULL AND entry_key > ?)"
+            arguments += [cursor.entryKey]
+        }
+        arguments += [limit]
+        return try Row.fetchAll(database, sql: """
+        SELECT * FROM (
+            SELECT COALESCE(e.file_id, -d.event_id) AS entry_key, e.file_id, MIN(d.event_id) AS first_event_id, f.path,
+                   GROUP_CONCAT(DISTINCT CASE WHEN \(isOpen) THEN d.event_id || ':' || d.disposition END) AS dispositions,
+                   GROUP_CONCAT(DISTINCT e.event_type) AS event_types
+            FROM serato_write_dispositions d
+            LEFT JOIN events e ON e.event_id = d.event_id
+            LEFT JOIN files f ON f.id = e.file_id
+            WHERE d.batch_id = ?
+            GROUP BY entry_key
+        )
+        WHERE \(resume)
+        ORDER BY path IS NULL, path, entry_key
+        LIMIT ?
+        """, arguments: arguments).map { row in
             var byDisposition = SeratoWriteDispositionCounts()
             for pair in (row["dispositions"] as String?)?.split(separator: ",") ?? [] {
                 let raw = pair.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
@@ -552,23 +594,40 @@ enum SeratoWriteDispositions {
                 }
             }
             let eventTypes = (row["event_types"] as String?)?.split(separator: ",").map(String.init) ?? []
-            return NotAppliedFileRecord(fileID: row["file_id"], firstEventID: row["first_event_id"], path: row["path"],
-                                        byDisposition: byDisposition, eventTypes: eventTypes)
+            return NotAppliedFileRecord(cursor: NotAppliedFileCursor(path: row["path"], entryKey: row["entry_key"]), fileID: row["file_id"],
+                                        firstEventID: row["first_event_id"], byDisposition: byDisposition, eventTypes: eventTypes)
         }
     }
 }
 
 struct NotAppliedBatchCounts: Sendable, Equatable {
+    /// Open changes: not applied and not resolved by a later write.
     var changes: Int
+    /// Files the open changes touch.
     var files: Int
+    /// Changes a later write for the same event applied.
+    var resolvedChanges = 0
+    /// Files with any recorded change, open or resolved.
+    var listedFiles = 0
     var byDisposition = SeratoWriteDispositionCounts()
 }
 
+/// Where one not-applied page ends, in the list's `(path, entry key)` order.
+struct NotAppliedFileCursor: Sendable, Equatable {
+    let path: String?
+    let entryKey: Int64
+}
+
 struct NotAppliedFileRecord: Sendable, Equatable {
+    let cursor: NotAppliedFileCursor
     let fileID: Int64?
     let firstEventID: Int64
-    let path: String?
-    /// This file's not-applied changes, each event counted once per disposition.
+    var path: String? {
+        cursor.path
+    }
+
+    /// This file's open not-applied changes, each event counted once per
+    /// disposition. Empty when later writes resolved all of them.
     let byDisposition: SeratoWriteDispositionCounts
     let eventTypes: [String]
 }
