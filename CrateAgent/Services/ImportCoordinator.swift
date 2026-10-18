@@ -194,6 +194,7 @@ public actor ImportCoordinator {
                         inode: fileMetadata.inode,
                         fileSize: fileMetadata.fileSize,
                         mtime: fileMetadata.mtime,
+                        mtimeNanoseconds: fileMetadata.mtimeNanoseconds,
                         lightweightHash: fileMetadata.lightweightHash,
                         bitrateKbps: bitrateKbps,
                         metadata: seratoMetadata

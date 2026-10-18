@@ -57,8 +57,7 @@ final class RecordingAlternativesTests: XCTestCase {
         XCTAssertEqual(candidate.currentFileTitle, "Original Title")
         XCTAssertEqual(candidate.currentFileAlbum, "Original Album")
         XCTAssertEqual(candidate.currentFileYear, 1999)
-        XCTAssertEqual(candidate.expectedFileSize, 1000)
-        XCTAssertEqual(candidate.expectedMtime, 10)
+        XCTAssertEqual(candidate.expectedFreshness, FileFreshnessSnapshot(fileSize: 1000, inode: 1, mtime: 10, mtimeNanoseconds: 0))
         XCTAssertEqual(candidate.fingerprintHash, Data(SHA256.hash(data: FingerprintEncoder.serialize([1, 2, 3]))))
         let row = AutoTagRowModel(candidate: candidate)
         XCTAssertEqual(row.currentArtist, "Original Artist")
@@ -241,7 +240,7 @@ final class RecordingAlternativesTests: XCTestCase {
     private func insertFile(in database: LibraryDatabase) async throws -> Int64 {
         let fileID = try await database.writer.write { connection in
             var file = FileRecord(path: "/fixture/alternative.mp3", volumeUuid: "TEST", inode: 1, fileSize: 1000, mtime: 10,
-                                  chromaprintFingerprint: FingerprintEncoder.serialize([1, 2, 3]), fingerprintStatus: .done,
+                                  mtimeNanoseconds: 0, chromaprintFingerprint: FingerprintEncoder.serialize([1, 2, 3]), fingerprintStatus: .done,
                                   album: "Stale library album")
             try file.insert(connection)
             return try XCTUnwrap(file.id)
@@ -317,7 +316,7 @@ private final class MutableAlternativeBaseline: @unchecked Sendable {
     }
 
     var freshness: FileFreshnessSnapshot {
-        lock.withLock { FileFreshnessSnapshot(fileSize: changed ? 2000 : 1000, mtime: changed ? 20 : 10) }
+        lock.withLock { FileFreshnessSnapshot(fileSize: changed ? 2000 : 1000, inode: 1, mtime: changed ? 20 : 10, mtimeNanoseconds: 0) }
     }
 
     func replaceTagsAndFreshness() {

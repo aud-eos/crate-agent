@@ -92,9 +92,7 @@ final class AutoTaggerService: ObservableObject {
         fingerprintFunction: @escaping FingerprintWorker.FingerprintFunction = { try fingerprintAudioFile(filePath: $0) },
         audioTagsReader: @escaping AudioTagsReading = { try readAudioTags(filePath: $0) },
         fileFreshnessReader: @escaping FileFreshnessReading = { path in
-            FileMetadataCollector.collect(at: path).map {
-                FileFreshnessSnapshot(fileSize: $0.fileSize, mtime: $0.mtime)
-            }
+            FileMetadataCollector.collect(at: path).map(FileFreshnessSnapshot.init)
         },
         readiness: LibrarySyncReadiness? = nil
     ) {
@@ -198,10 +196,7 @@ final class AutoTaggerService: ObservableObject {
         if case LookupError.unauthorized = error {
             return musicBrainzUnauthorizedMessage
         }
-        if let lookupError = error as? LookupError {
-            return describe(lookupError)
-        }
-        return String(describing: error)
+        return UserFacingErrorMessage.message(for: error)
     }
 
     /// Cancels the in-flight pass, if any. Already-resolved rows in `rows`
@@ -292,7 +287,7 @@ final class AutoTaggerService: ObservableObject {
                 // only the bare reason, since the view already prefixes it
                 // with "Stopped — ".
                 guard generation == runGeneration else { return }
-                let reason = Self.describe(lookupError)
+                let reason = lookupError.localizedDescription
                 haltReason = "Auto-tag pass stopped: \(reason)"
                 stopUnresolvedRows(among: fileIDs, message: reason, generation: generation)
                 return
@@ -312,7 +307,7 @@ final class AutoTaggerService: ObservableObject {
                 return
             } catch {
                 guard generation == runGeneration else { return }
-                rows[fileID] = .failed(String(describing: error))
+                rows[fileID] = .failed(UserFacingErrorMessage.message(for: error))
                 continue
             }
             // The lookup completed; only publish if a newer scan hasn't taken
@@ -361,7 +356,7 @@ final class AutoTaggerService: ObservableObject {
                 // failing (and re-hammering) each file individually.
                 throw lookupError
             case .rateLimited, .transport:
-                return .failed(Self.describe(lookupError))
+                return .failed(lookupError.localizedDescription)
             }
         }
     }
@@ -390,8 +385,7 @@ final class AutoTaggerService: ObservableObject {
         // This is what apply-time revalidation (`staleFileIDs`) re-checks
         // against. Falls back to the indexed values only if the stat fails
         // (the file was just read for tags, so that's degenerate).
-        let lookupFreshness = await onDiskFreshness(ofFileAt: file.path)
-            ?? FileFreshnessSnapshot(fileSize: file.fileSize, mtime: file.mtime)
+        let lookupFreshness = await onDiskFreshness(ofFileAt: file.path) ?? file.freshness
 
         // Reject the row if the file changed between when the fingerprint was
         // taken (its basis) and this lookup snapshot — including the
@@ -401,7 +395,7 @@ final class AutoTaggerService: ObservableObject {
         // apply-time revalidation would pass and write that match onto the new
         // audio (finding #4000405424). A nil basis (stat failed at fingerprint
         // time) can't prove a change, so we proceed.
-        if let fingerprintBasis, fingerprintBasis != lookupFreshness {
+        if let fingerprintBasis, !fingerprintBasis.isConfirmed(by: lookupFreshness) {
             throw AutoTaggerRowFailure(
                 "file \(fileID) changed on disk between fingerprinting and lookup — re-scan to match the current audio"
             )
@@ -476,8 +470,7 @@ final class AutoTaggerService: ObservableObject {
             recordingMBID: recording.id ?? alternative.recordingID,
             artistMBID: artistCredit?.artist.id,
             fingerprintHash: baseline.fingerprintHash,
-            expectedFileSize: baseline.freshness.fileSize,
-            expectedMtime: baseline.freshness.mtime,
+            expectedFreshness: baseline.freshness,
             chosenRelease: chosenRelease,
             availableReleases: recording.releases,
             isrc: recording.isrcs.first,
@@ -510,21 +503,6 @@ final class AutoTaggerService: ObservableObject {
         Int(dateString.prefix(4))
     }
 
-    private static func describe(_ error: LookupError) -> String {
-        switch error {
-        case .unauthorized:
-            "the AcoustID API key was rejected (401 Unauthorized)"
-        case .rateLimited:
-            "the lookup was rate-limited and retries were exhausted"
-        case .server:
-            "the lookup server returned repeated errors"
-        case let .offline(message):
-            "the network is unavailable (\(message))"
-        case let .transport(message):
-            message
-        }
-    }
-
     // MARK: - Fingerprint on demand
 
     /// Returns the file's stored fingerprint bytes, computing and
@@ -542,11 +520,7 @@ final class AutoTaggerService: ObservableObject {
             // live file still matches it. Returned so `lookUpCandidate` can
             // reject a candidate whose file changes between here and the lookup
             // snapshot (finding #4000405424).
-            let basis = FileFreshnessSnapshot(
-                fileSize: file.fingerprintedSize ?? file.fileSize,
-                mtime: file.fingerprintedMtime ?? file.mtime
-            )
-            return (existing, basis)
+            return (existing, file.fingerprintBasis)
         }
         guard let fileID = file.id else {
             throw AutoTaggerRowFailure("file has no row id")
@@ -624,12 +598,10 @@ final class AutoTaggerService: ObservableObject {
                 guard let fileID = original.id,
                       let current = try FileRecord.fetchOne(db, key: fileID),
                       current.path == original.path,
-                      current.fileSize == original.fileSize,
-                      current.mtime == original.mtime,
+                      current.freshness == original.freshness,
                       current.fingerprintStatus == original.fingerprintStatus,
                       current.chromaprintFingerprint == original.chromaprintFingerprint,
-                      current.fingerprintedSize == original.fingerprintedSize,
-                      current.fingerprintedMtime == original.fingerprintedMtime
+                      current.fingerprintBasis == original.fingerprintBasis
                 else { return }
                 // Compare and write in one transaction: a failure of stale .done
                 // bytes is real, but cannot erase a concurrent successful decode.
@@ -640,24 +612,18 @@ final class AutoTaggerService: ObservableObject {
     }
 
     /// Whether the file's stored `.done` fingerprint can still be trusted for
-    /// a lookup (findings D-B, #3999114461): true when the file's CURRENT
-    /// on-disk size+mtime match the basis the fingerprint was computed from.
-    /// That basis is the fingerprint's OWN recorded snapshot
-    /// (`fingerprintedSize`/`fingerprintedMtime`), so a recompute re-syncs it
-    /// and an edited-then-recomputed file stops re-decoding on every scan. For
-    /// rows fingerprinted before migration #009 or by the background worker
-    /// those columns are nil; there the index-time `fileSize`/`mtime` snapshot
-    /// still IS the fingerprint's basis, so we fall back to it. When the file
-    /// can't be stat'd we can't prove it changed, so the stored bytes are
+    /// a lookup (findings D-B, #3999114461, #118): true when the file's CURRENT
+    /// on-disk identity confirms `FileRecord.fingerprintBasis` to the
+    /// nanosecond and inode. A basis recorded before migration 018 cannot
+    /// confirm anything, so it is recomputed once and then reused. When the
+    /// file can't be stat'd we can't prove it changed, so the stored bytes are
     /// kept — the imminent tag read fails loudly if the file is genuinely gone.
     private func storedFingerprintIsFresh(for file: FileRecord) async -> Bool {
         guard let current = await onDiskFreshness(ofFileAt: file.path) else { return true }
-        let basisSize = file.fingerprintedSize ?? file.fileSize
-        let basisMtime = file.fingerprintedMtime ?? file.mtime
-        return current.fileSize == basisSize && current.mtime == basisMtime
+        return file.fingerprintBasis.isConfirmed(by: current)
     }
 
-    /// Reads the file's current on-disk size+mtime off the main actor via
+    /// Reads the file's current `FileFreshnessSnapshot` off the main actor via
     /// the injected `fileFreshnessReader`. Nil when the file can't be
     /// stat'd (missing/unreadable). The single seam both the D-B fingerprint
     /// freshness check and the D-A apply-time revalidation read through.
@@ -710,12 +676,8 @@ final class AutoTaggerService: ObservableObject {
         var stale: Set<Int64> = []
         for payload in payloads {
             guard pathByFileID[payload.fileID] != nil else { stale.insert(payload.fileID); continue }
-            guard let expectedFileSize = payload.expectedFileSize,
-                  let expectedMtime = payload.expectedMtime
-            else {
-                // Legacy event journaled before D-A captured the on-disk
-                // snapshot — nothing to revalidate against, and it predates
-                // the check by definition. Treat as not stale.
+            guard let expected = payload.expectedFreshness else {
+                stale.insert(payload.fileID) // no reviewed on-disk identity to revalidate against
                 continue
             }
             guard let path = pathByFileID[payload.fileID] else {
@@ -726,8 +688,8 @@ final class AutoTaggerService: ObservableObject {
                 stale.insert(payload.fileID) // file missing/unreadable now
                 continue
             }
-            if current.fileSize != expectedFileSize || current.mtime != expectedMtime {
-                stale.insert(payload.fileID) // edited/replaced since review
+            if !expected.isConfirmed(by: current) {
+                stale.insert(payload.fileID) // edited/replaced since review, or reviewed without subsecond identity
             }
         }
         return stale
@@ -819,12 +781,12 @@ final class AutoTaggerService: ObservableObject {
 
 /// A resolution failure local to one file (not found, no fingerprint, no
 /// releases, etc.) — distinct from `LookupError`, which is reserved for the
-/// remote lookup clients. Its `description` is what callers show for that
+/// remote lookup clients. Its description is what callers show for that
 /// row's `.failed` reason.
-private struct AutoTaggerRowFailure: Error, CustomStringConvertible {
-    let description: String
+private struct AutoTaggerRowFailure: LocalizedError {
+    let errorDescription: String?
     init(_ description: String) {
-        self.description = description
+        errorDescription = description
     }
 }
 
@@ -833,24 +795,12 @@ private struct AutoTaggerRowFailure: Error, CustomStringConvertible {
 /// audio file is required.
 typealias AudioTagsReading = @Sendable (String) throws -> AudioTags
 
-/// Reads a file's current on-disk size + mtime, used to decide whether a
+/// Reads a file's current on-disk identity, used to decide whether a
 /// stored `.done` fingerprint is still valid for the file's current bytes
 /// (finding D-B). Production reads via `FileMetadataCollector` (same `stat`
 /// path that captured the indexed snapshot, so the units match); tests
 /// inject a stub. Returns nil when the file can't be stat'd.
 public typealias FileFreshnessReading = @Sendable (String) -> FileFreshnessSnapshot?
-
-/// A file's current on-disk identity, in the same units as
-/// `FileRecord.fileSize`/`mtime` (bytes; mtime seconds since the epoch).
-public struct FileFreshnessSnapshot: Equatable, Sendable {
-    public let fileSize: Int64
-    public let mtime: Int64
-
-    public init(fileSize: Int64, mtime: Int64) {
-        self.fileSize = fileSize
-        self.mtime = mtime
-    }
-}
 
 /// Seam over `AcoustIDClient.lookup` so tests can stub AcoustID without a
 /// real network call.

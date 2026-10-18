@@ -88,4 +88,16 @@ extension TrackRecord {
               try otherFilesReference() else { return nil }
         return existingRecordingMBID
     }
+
+    /// Whether an identity source (AcoustID, MusicBrainz, ISRC) has claimed this row.
+    var hasRecordingIdentity: Bool {
+        acoustidId != nil || musicbrainzRecordingId != nil || musicbrainzReleaseId != nil
+            || musicbrainzArtistId != nil || isrc != nil
+    }
+
+    /// A row holding only its fingerprint (and possibly a song family), as
+    /// fingerprint grouping creates it and match undo leaves it.
+    var isBare: Bool {
+        self == TrackRecord(id: id, fingerprintHash: fingerprintHash, workId: workId)
+    }
 }

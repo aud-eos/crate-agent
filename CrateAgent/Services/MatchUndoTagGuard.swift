@@ -106,7 +106,7 @@ enum MatchUndoTagGuard {
         catch {
             // A file that vanished mid-read is reported as unavailable, not as a tag-read failure.
             try requireUnchanged(read)
-            let reason = access(path, R_OK) == 0 ? "its tags could not be read: \(String(describing: error))" : describing(errno: errno)
+            let reason = access(path, R_OK) == 0 ? "its tags could not be read: \(UserFacingErrorMessage.message(for: error))" : describing(errno: errno)
             throw OperationEngineError.undoFileUnreadable(fileId: fileID, path: path, reason: reason, direction: direction)
         }
         try requireUnchanged(read)

@@ -20,7 +20,7 @@ enum FileImportIdentity {
 
     static func matchesAttributes(_ file: FileRecord, identity: FileMetadata) -> Bool {
         SeratoPath.normalized(file.path) == SeratoPath.normalized(identity.path)
-            && file.inode == identity.inode && file.fileSize == identity.fileSize && file.mtime == identity.mtime
+            && file.inode == identity.inode && file.fileSize == identity.fileSize && file.hasSameModificationTime(as: identity)
             && (file.lightweightHash == nil || file.lightweightHash == identity.lightweightHash)
     }
 }

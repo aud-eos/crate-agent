@@ -334,12 +334,10 @@ struct MatchCandidate: Equatable {
     /// `AutoTaggerService` alongside the rest of the candidate so the
     /// review UI never has to re-derive it.
     let fingerprintHash: Data
-    /// The file's indexed identity (`FileRecord.fileSize`/`mtime`) as read
-    /// at lookup time. Threaded into `ApplyMusicBrainzMatchPayload` so the
-    /// mutation can reject a candidate that went stale between review and
-    /// Apply (finding D-A).
-    let expectedFileSize: Int64
-    let expectedMtime: Int64
+    /// The file's on-disk identity as read at lookup time. Threaded into
+    /// `ApplyMusicBrainzMatchPayload` so Apply can reject a candidate that went
+    /// stale between review and Apply (finding D-A, #118).
+    let expectedFreshness: FileFreshnessSnapshot
     /// Mutable so "pick a different release" can update it without
     /// re-resolving the whole candidate.
     var chosenRelease: MBRelease
