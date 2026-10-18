@@ -145,4 +145,68 @@ final class SyncCheckpointStoreTests: XCTestCase {
         }
         do { _ = try await store.load(); XCTFail("Corrupt cache was accepted") } catch is DecodingError {}
     }
+    /// A publish stages rows across many transactions; until it completes,
+    /// readers keep the previous checkpoint whole and readiness stays closed,
+    /// and a later publish leaves no staged leftovers (#238).
+    @MainActor
+    func testInterruptedPublishKeepsThePreviousCheckpointAndLeavesNoRows() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        var files: [FileRecord] = []
+        for name in ["first.wav", "second.wav", "third.wav"] {
+            try await files.append(fixture.add(name))
+        }
+        try fixture.save(paths: files.map(\.path))
+        let snapshot = try await fixture.reader.read()
+        let evidence = try files.map { file in
+            try SyncFileEvidence(fileID: XCTUnwrap(file.id), membershipRevision: file.membershipRevision,
+                                 identity: file.identity, readIdentity: AudioFileReadIdentity.read(at: file.path), bitrateProbed: true)
+        }
+        func checkpoint(revision: Int64, artist: String, files: [SyncFileEvidence]) -> LibrarySyncCheckpoint {
+            let header = SyncCheckpointHeader(libraryID: snapshot.libraryID, source: snapshot.source, localRevision: revision,
+                                              watchRoots: [fixture.directory.path], eventID: 0, hadConflicts: false)
+            let records = snapshot.records.map { record in SavedSeratoOccurrence(pathBytes: record.pathBytes, metadata: .init(artist: artist)) }
+            return LibrarySyncCheckpoint(header: header, records: records, files: files)
+        }
+        let revision = try await SyncCheckpointStore(database: fixture.database).currentRevision()
+        let published = checkpoint(revision: revision, artist: "Published", files: evidence)
+        try await SyncCheckpointStore(database: fixture.database).publish(published, expectedRevision: revision)
+        enum Interruption: Error { case crashed }
+        let crashing = SyncCheckpointStore(database: fixture.database, chunkSize: 1) { throw Interruption.crashed }
+        let gate = LibrarySyncReadiness()
+        do {
+            try await crashing.publish(checkpoint(revision: revision, artist: "Staged", files: Array(evidence.prefix(2))),
+                                       expectedRevision: revision, ready: gate.prepareDrain())
+            XCTFail("The interrupted publish completed")
+        } catch Interruption.crashed {}
+        let surviving = try await SyncCheckpointStore(database: fixture.database).load()
+        XCTAssertEqual(surviving?.records.map(\.metadata.artist), ["Published", "Published", "Published"])
+        XCTAssertEqual(surviving?.files, evidence)
+        let validation = try await SyncCheckpointStore(database: fixture.database).validateFileStats(expectedRevision: revision)
+        XCTAssertEqual(Set(validation.validatedFileIDs), Set(evidence.map(\.fileID)))
+        XCTAssertThrowsError(try gate.capture())
+        let database = fixture.database
+        let editing = SyncCheckpointStore(database: fixture.database, chunkSize: 1) {
+            try await database.writer.write { connection in
+                try connection.execute(sql: "UPDATE files SET title = title || '!' WHERE id = ?", arguments: [evidence[0].fileID])
+            }
+        }
+        do {
+            try await editing.publish(checkpoint(revision: revision, artist: "Superseded", files: evidence), expectedRevision: revision, ready: gate.prepareDrain())
+            XCTFail("A publish whose library changed while staging completed")
+        } catch SyncCheckpointError.changed {}
+        XCTAssertEqual(try await SyncCheckpointStore(database: fixture.database).load()?.records.map(\.metadata.artist), ["Published", "Published", "Published"])
+        XCTAssertThrowsError(try gate.capture())
+        let current = try await SyncCheckpointStore(database: fixture.database).currentRevision()
+        let final = checkpoint(revision: current, artist: "Final", files: [evidence[2]])
+        try await SyncCheckpointStore(database: fixture.database, chunkSize: 1).publish(final, expectedRevision: current, ready: gate.prepareDrain())
+        XCTAssertNoThrow(try gate.capture())
+        let loaded = try await SyncCheckpointStore(database: fixture.database).load()
+        XCTAssertEqual(loaded?.records.map(\.metadata.artist), ["Final", "Final", "Final"])
+        XCTAssertEqual(loaded?.files, [evidence[2]])
+        let rowCounts = try await fixture.database.writer.read { connection in
+            try SyncCheckpointStore.generationTables.map { table in try Int.fetchOne(connection, sql: "SELECT COUNT(*) FROM \(table)") ?? -1 }
+        }
+        XCTAssertEqual(rowCounts, [3, 1, 1])
+    }
 }
