@@ -68,10 +68,12 @@ public enum VersionLabel: String, CaseIterable, Codable, Sendable {
     static let annotationTerms: [String] = allCases.flatMap(\.terms) + otherAnnotationTerms
 
     /// Longest first, so "radio edit" is read as Radio rather than also Edit.
-    private static let termsByLength: [(term: String, label: VersionLabel?)] =
+    /// Each term is padded once into the whole-word needle `terms(in:)` seeks.
+    private static let termsByLength: [(needle: String, label: VersionLabel?)] =
         (allCases.flatMap { label in label.terms.map { term in (term, Optional(label)) } }
             + otherAnnotationTerms.map { term in (term, nil) })
         .sorted { lhs, rhs in lhs.0.count > rhs.0.count }
+        .map { term, label in (" \(term) ", label) }
 
     /// The labels named in `title`'s annotations: its `(...)` and `[...]`
     /// groups and a trailing `- ...` suffix. Words in the base title ("Dirty
@@ -99,9 +101,8 @@ public enum VersionLabel: String, CaseIterable, Codable, Sendable {
         var remaining = " \(words ?? lowercased) "
         var found: [VersionLabel?] = []
         for entry in termsByLength {
-            let needle = " \(entry.term) "
-            guard remaining.contains(needle) else { continue }
-            remaining = remaining.replacingOccurrences(of: needle, with: "  ")
+            guard remaining.contains(entry.needle) else { continue }
+            remaining = remaining.replacingOccurrences(of: entry.needle, with: "  ")
             found.append(entry.label)
         }
         return found

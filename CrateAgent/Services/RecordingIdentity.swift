@@ -42,12 +42,13 @@ enum RecordingIdentity {
     /// the key needs. Files without a current fingerprint are left out.
     static func keys(ofFiles fileIDs: [Int64], in database: Database) throws -> [Int64: Data] {
         guard !fileIDs.isEmpty else { return [:] }
-        let rows = try Row.fetchCursor(database, sql: """
+        let statement = try database.cachedStatement(sql: """
         SELECT files.id, files.chromaprint_fingerprint, files.fingerprint_status, files.fingerprinted_size, files.fingerprinted_mtime,
                files.file_size, files.mtime, \(discriminatorColumns(of: "separation"))
         FROM files LEFT JOIN \(table) AS separation ON separation.file_id = files.id
         WHERE files.id IN (SELECT value FROM json_each(?))
-        """, arguments: ["[" + fileIDs.map(String.init).joined(separator: ",") + "]"])
+        """)
+        let rows = try Row.fetchCursor(statement, arguments: ["[" + fileIDs.map(String.init).joined(separator: ",") + "]"])
         var keys: [Int64: Data] = [:]
         while let row = try rows.next() {
             let fileID: Int64 = row["id"]
