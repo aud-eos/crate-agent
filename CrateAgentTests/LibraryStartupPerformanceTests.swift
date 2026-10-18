@@ -69,6 +69,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         _ = try updateDatabaseRecord(databasePath: fixture.locator.databaseV2Url.path, trackPath: file.path,
                                      update: SeratoMetadataUpdate(artist: nil, title: "Changed during navigation", album: nil, genre: nil,
                                                                   bpm: nil, key: nil, comment: nil, length: nil, label: nil))
+        LibraryNavigationFixture.prepareWindowChrome()
         let model = try LibraryBrowserModel(database: fixture.database)
         await model.start()
         let selection = LibraryNavigationSelection()
