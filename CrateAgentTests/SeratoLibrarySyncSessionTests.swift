@@ -200,7 +200,8 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         try await session.synchronize()
         fixture.lifecycle.running = true
         fixture.watchdog.refresh()
-        _ = try await fixture.engine.resolveDuplicate(target: target, keeper: keeper, batchID: "keeper-conflict")
+        _ = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("keeper-conflict", files: [keeper, target], in: fixture.database)
+        _ = try await fixture.engine.resolveDuplicate(target: target, keeper: keeper, batchID: "keeper-conflict", requirement: .identicalContent)
         try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(independent.id), metadata: .init(title: "Independent"), previousMetadata: .empty)))
         try fixture.save(paths: paths + [paths[0].decomposedStringWithCanonicalMapping])
         fixture.lifecycle.running = false
@@ -520,6 +521,62 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
                                         reconciler: SeratoMembershipReconciler(database: fixture.database, operationEngine: fixture.engine, reader: reader),
                                         scanner: LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator),
                                         operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: gate)
+    }
+
+    /// Rows indexed before subsecond times were kept get them from their verified stat
+    /// evidence on the next incremental sync, without re-reading the audio (#118).
+    func testIncrementalSyncRecordsSubsecondTimeOfLegacyRowsFromStatEvidence() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("legacy.wav", bytes: FinalRemovalIntegrationTests.wav())
+        try fixture.save(paths: [file.path])
+        let session = SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler,
+                                               scanner: LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator),
+                                               operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: gate,
+                                               checkpointStore: SyncCheckpointStore(database: fixture.database))
+        try await session.synchronize()
+        try await fixture.database.writer.write { database in try database.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL") }
+
+        let counters = LibrarySyncMetrics()
+        try await LibrarySyncMetrics.$current.withValue(counters) { try await session.synchronize() }
+
+        let row = try await fixture.row(file)
+        XCTAssertNotNil(row.mtimeNanoseconds)
+        XCTAssertEqual(row.mtimeNanoseconds, FileMetadataCollector.collect(at: file.path)?.mtimeNanoseconds)
+        XCTAssertEqual(row.membershipRevision, file.membershipRevision)
+        XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
+    }
+
+    /// A file edited after the plan verified its evidence keeps only its own row for the
+    /// next sync; the rest of the library's subsecond times are still recorded.
+    func testFileChangedAfterPlanningLeavesOnlyItsOwnSubsecondTimeForLater() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let steady = try await fixture.add("steady.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let edited = try await fixture.add("edited.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 1))
+        try fixture.save(paths: [steady.path, edited.path])
+        try await fixture.database.writer.write { database in try database.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL") }
+        let files = try await [fixture.row(steady), fixture.row(edited)]
+        var evidence: [Int64: SyncFileEvidence] = [:]
+        for file in files {
+            let identifier = try XCTUnwrap(file.id)
+            evidence[identifier] = try SyncFileEvidence(fileID: identifier, membershipRevision: file.membershipRevision,
+                                                        identity: file.identity, readIdentity: AudioFileReadIdentity.read(at: file.path), bitrateProbed: true)
+        }
+        let snapshot = try await fixture.reader.read()
+        let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: snapshot, files: files)
+        let plan = try await LibraryRefreshPlanner(evidence: evidence, validatedFileIDs: Set(files.compactMap(\.id)))
+            .makePlan(request: .incremental, snapshot: snapshot, indexedFiles: files, previousRecords: snapshot.records,
+                      dirtyFileIDs: [], dirtyPaths: [], analysis: analysis)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.25)], ofItemAtPath: edited.path)
+
+        _ = try await fixture.reconciler.reconcile(snapshot, analysis: analysis, plan: plan)
+
+        let recorded = try await fixture.row(steady)
+        let skipped = try await fixture.row(edited)
+        XCTAssertEqual(recorded.mtimeNanoseconds, FileMetadataCollector.collect(at: steady.path)?.mtimeNanoseconds)
+        XCTAssertNil(skipped.mtimeNanoseconds)
     }
 
     func testRequiredFilesystemReconciliationRetainsFailedHeadAndCheckpoint() async throws {

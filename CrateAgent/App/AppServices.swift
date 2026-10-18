@@ -26,10 +26,12 @@ public final class AppServices: ObservableObject {
     public let seratoWatchdog: SeratoWatchdog
     public let seratoLocator: SeratoLibraryLocator
     public let operationEngine: OperationEngine
+    let songFamilies: SongFamilyService
     public let filesystemSyncCoordinator: FilesystemSyncCoordinator
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
+    public let duplicateEvidenceVerifier: DuplicateEvidenceVerifier
     public let activityLog: ActivityLog
     let trackPlayer = TrackPlayer()
     let autoTaggerService: AutoTaggerService
@@ -158,6 +160,7 @@ public final class AppServices: ObservableObject {
             readiness: readiness
         )
         operationEngine = engine
+        songFamilies = SongFamilyService(engine: engine, database: database)
 
         let filesystemCoordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
@@ -179,6 +182,7 @@ public final class AppServices: ObservableObject {
 
         let worker = FingerprintWorker(database: database, readiness: readiness)
         fingerprintWorker = worker
+        duplicateEvidenceVerifier = DuplicateEvidenceVerifier(database: database)
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and

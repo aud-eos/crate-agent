@@ -73,6 +73,28 @@ final class DropImportTests: XCTestCase {
         let membership = try await fixture.database.writer.read { database in try FileRecord.fetchAll(database).map(\.libraryMembership) }
         XCTAssertEqual(membership, [.active])
     }
+
+    func testADropThatCannotTellWhichIndexedFileItIsReportsWhy() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        try fixture.save(paths: [])
+        let composed = "Café.wav".precomposedStringWithCanonicalMapping
+        let first = try await fixture.add(composed, membership: .pendingImport, bytes: FinalRemovalIntegrationTests.wav())
+        // The same file indexed again under its path's other Unicode form.
+        try await fixture.database.writer.write { database in
+            var twin = first
+            twin.id = nil
+            let decomposed = first.path.decomposedStringWithCanonicalMapping
+            twin.path = decomposed == first.path ? first.path.precomposedStringWithCanonicalMapping : decomposed
+            try twin.insert(database)
+        }
+
+        let result = await ImportCoordinator(operationEngine: fixture.engine, database: fixture.database)
+            .importDroppedItems([URL(fileURLWithPath: first.path)])
+
+        XCTAssertEqual(result.filesSkipped, 0)
+        XCTAssertEqual(result.blockedFiles, ["\(composed): \(SeratoReconciliationError.ambiguousIdentity(SeratoPath.normalized(first.path)).localizedDescription)"])
+    }
 }
 
 extension DropImportTests {

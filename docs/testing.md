@@ -112,9 +112,10 @@ IDs independently of Library's row type.
 
 `DuplicateScanPerformanceTests` builds a temporary WAL database with 30,000
 processable files: 32-byte lightweight hashes on all of them, 4 KB Chromaprint
-fingerprints on 24,000, 300 byte-level pairs and 400 perceptual pairs. It runs
-both duplicate modes plus fingerprint coverage, asserts that only the 1,400
-group members are decoded, and asserts a 1 s budget. `DUPLICATE_SCAN` output
+fingerprints on 24,000, 300 byte-level pairs with
+cached content digests and 1,650 perceptual pairs with cached audio digests (the owner's 3,300 colliding files). It runs both duplicate
+modes plus fingerprint coverage, asserts that only the 3,900 group members are
+decoded, and asserts a 1 s budget. `DUPLICATE_SCAN` output
 is attached as evidence. Before SQL grouping, the same fixture took 1.34 s to
 load every full row and group it in Swift; the SQL scan takes about 0.17 s.
 
@@ -214,7 +215,10 @@ only lower the priority of the matching Test-host executable when needed.
 `STARTUP_FULL`, `STARTUP_RESTART`, and `STARTUP_NAVIGATION` appear in the log and
 XCTest attachments. Hard assertions require ready within two seconds, content
 rendering/navigation within 500 ms, zero unchanged parser/tag/bitrate/hash reads,
-and one changed row after a single parse. Phase timings contain no paths or metadata.
+and one changed row after a single parse. The slow-path sync after that parse
+(`slow_path_after_parse`) must finish within 30 s; it measured 34.8 s before path keys
+hashed their full bytes (#218) and 12.6 s after, in the optimized settings above.
+Phase timings contain no paths or metadata.
 The file cache is warm after setup; tiny WAVs, one temporary directory, and a
 controlled replay boundary do not predict cold-disk or external-drive latency.
 

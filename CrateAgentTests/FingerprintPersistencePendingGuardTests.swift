@@ -29,7 +29,7 @@ final class FingerprintPersistencePendingGuardTests: XCTestCase {
         try await database.writer.write { db in
             _ = try FingerprintPersistence.write(
                 fileID: fileID, fingerprint: Data([0xAA]), status: .done,
-                freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, mtime: 999), in: db
+                freshnessBasis: FileFreshnessSnapshot(fileSize: 2000, inode: 1, mtime: 999, mtimeNanoseconds: 0), in: db
             )
         }
 

@@ -12,6 +12,10 @@ other screens while the app remains open. See the [Auto-Tag guide](docs/auto-tag
 Use the shared Comfortable/Compact density setting to adjust spacing throughout
 the app.
 
+In **Library**, alternate versions of a song (Instrumental, Acapella, Clean)
+can be grouped into a song family that shows one main row with a version count;
+expand it to see the alternates. See [song families](docs/song-families.md).
+
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the
 [list-control contract](docs/list-controls.md) for scopes, keyboard controls, and
@@ -56,6 +60,13 @@ and resume; in Library, Space does the same for the focused row. The now-playing
 bar at the bottom of the window shows the title and artist, elapsed and total time,
 a scrub bar, play/pause, ±10 s skip and stop. One track plays at a time, app-wide,
 across screens. Playback only reads the file.
+
+Duplicates are checked in full before cleanup is offered: byte-level matches by
+hashing every byte, perceptual matches by decoding. Only files with identical
+contents or decoded audio are offered together. Files that share a fingerprint but differ in audio,
+such as Clean and Dirty edits, are listed as kept. Copies in another format or
+encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
+listen and check each one yourself.
 
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
@@ -183,4 +194,4 @@ soulseek-mcp/      MCP server binary exposing soulseek-core to Claude
 
 ## License
 
-TBD. Intended for personal use by the author for now.
+Copyright (c) 2026 AUDEOS, LLC. All rights reserved. The source is public for reference only; see [LICENSE](./LICENSE).
