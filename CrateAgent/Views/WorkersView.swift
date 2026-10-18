@@ -232,8 +232,8 @@ private struct PlayCountCard: View {
                 Text(SeratoPlayCountMessages.skipped(summary)).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
             case .skippedWhileSeratoRunning:
                 Text(SeratoPlayCountMessages.skippedWhileSeratoRunning).font(.callout)
-            case let .failed(message):
-                Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            case let .failed(reason):
+                Text(SeratoPlayCountMessages.failed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
             Text(SeratoPlayCountMessages.explanation).font(.caption).foregroundStyle(.secondary)
         }

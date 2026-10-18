@@ -1,8 +1,9 @@
 import Foundation
 
 /// Keeps `serato_play_counts` in step with Serato History. History is read
-/// only while Serato is closed, since Serato appends to it while running;
-/// a skipped or failed refresh keeps the previous table.
+/// only while Serato is closed, since Serato appends to it while running,
+/// and only when its session files or the library's paths changed since the
+/// last read; a skipped or failed refresh keeps the previous table.
 @MainActor
 final class SeratoPlayCountService: ObservableObject {
     enum Status: Equatable {
@@ -10,21 +11,38 @@ final class SeratoPlayCountService: ObservableObject {
         case refreshing
         case refreshed(SeratoPlayCountSummary)
         case skippedWhileSeratoRunning
+        /// The reason the last read failed; the counts shown are older.
         case failed(String)
     }
+
+    /// What a refresh read: every session file's name, size and modification
+    /// time, and the library's path history.
+    private struct Inputs: Equatable {
+        let sessions: [SeratoHistorySessionStamp]
+        let library: SeratoLibraryPathSignature
+    }
+
+    typealias HistoryReader = @Sendable (_ historyDirectory: String) async throws -> SeratoHistoryScan
 
     @Published private(set) var status: Status = .notRefreshed
 
     private let database: LibraryDatabase
     private let seratoLocator: SeratoLibraryLocator
     private let watchdog: SeratoWatchdog
+    private let readHistory: HistoryReader
     private var isRefreshing = false
     private var refreshRequested = false
+    /// The inputs of the last completed read and its outcome, restored when
+    /// nothing changed since.
+    private var lastRead: (inputs: Inputs, outcome: Status)?
 
-    init(database: LibraryDatabase, seratoLocator: SeratoLibraryLocator, watchdog: SeratoWatchdog) {
+    init(database: LibraryDatabase, seratoLocator: SeratoLibraryLocator, watchdog: SeratoWatchdog,
+         readHistory: @escaping HistoryReader = { historyDirectory in try readSeratoHistory(historyDirectory: historyDirectory) })
+    {
         self.database = database
         self.seratoLocator = seratoLocator
         self.watchdog = watchdog
+        self.readHistory = readHistory
     }
 
     /// A request made while a refresh runs is coalesced into one more pass.
@@ -47,18 +65,70 @@ final class SeratoPlayCountService: ObservableObject {
             return
         }
         let revision = watchdog.stateRevision
-        let historyDirectory = seratoLocator.historyDirectoryUrl.path
-        status = .refreshing
+        let historyDirectory = seratoLocator.historyDirectoryUrl
+        var inputs: Inputs?
         do {
-            let scan = try await Task.detached { try readSeratoHistory(historyDirectory: historyDirectory) }.value
+            let sessions = try await Task.detached { try SeratoHistorySessionStamp.all(in: historyDirectory) }.value
+            let library = try await database.writer.read { connection in try SeratoPlayCounts.librarySignature(in: connection) }
+            let current = Inputs(sessions: sessions, library: library)
+            inputs = current
+            if let lastRead, lastRead.inputs == current {
+                status = lastRead.outcome
+                return
+            }
+            status = .refreshing
+            let scan = try await readHistory(historyDirectory.path)
             guard watchdog.isClosed(atRevision: revision) else {
                 status = .skippedWhileSeratoRunning
                 return
             }
-            let summary = try await database.writer.write { connection in try SeratoPlayCounts.rebuild(from: scan, in: connection) }
-            status = .refreshed(summary)
+            let plan = try await database.writer.read { connection in try SeratoPlayCounts.plan(from: scan, in: connection) }
+            if plan.changesTable {
+                guard try await database.writer.write({ connection in try SeratoPlayCounts.apply(plan, in: connection) }) else {
+                    refreshRequested = true
+                    return
+                }
+            }
+            finish(Inputs(sessions: sessions, library: plan.library), outcome: .refreshed(plan.summary))
         } catch {
-            status = .failed(SeratoPlayCountMessages.failed((error as? CoreError)?.message ?? error.localizedDescription))
+            let reason = (error as? CoreError)?.message ?? error.localizedDescription
+            if let inputs {
+                finish(inputs, outcome: .failed(reason))
+            } else {
+                status = .failed(reason)
+            }
         }
+    }
+
+    private func finish(_ inputs: Inputs, outcome: Status) {
+        lastRead = (inputs, outcome)
+        status = outcome
+    }
+}
+
+/// One History session file as the directory lists it; a changed name, size
+/// or modification time means Serato wrote History since the last read.
+struct SeratoHistorySessionStamp: Equatable, Sendable {
+    let name: String
+    let size: Int
+    let modified: Date
+
+    private static let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
+
+    static func all(in historyDirectory: URL) throws -> [SeratoHistorySessionStamp] {
+        let sessions = historyDirectory.appendingPathComponent("Sessions", isDirectory: true)
+        let entries: [URL]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(at: sessions, includingPropertiesForKeys: keys)
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
+        }
+        return try entries.map { entry in
+            let values = try entry.resourceValues(forKeys: Set(keys))
+            guard let size = values.fileSize, let modified = values.contentModificationDate else {
+                throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: entry.path])
+            }
+            return SeratoHistorySessionStamp(name: entry.lastPathComponent, size: size, modified: modified)
+        }.sorted { first, second in first.name < second.name }
     }
 }

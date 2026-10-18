@@ -18,6 +18,9 @@ const SUPPORTED_VERSION: &str = "1.0/Serato Scratch LIVE Review";
 const FIELD_FULL_PATH: u32 = 2;
 const FIELD_START_TIME: u32 = 28;
 const FIELD_PLAYED: u32 = 50;
+/// Real sessions are kilobytes to a few megabytes; anything past this is not
+/// a session Serato wrote, and reading it whole would stall the refresh.
+pub const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One deck load that Serato marked as played.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,10 +61,7 @@ pub fn read_history(history_directory: &Path) -> Result<SeratoHistoryScan, Serat
     let mut session_paths = Vec::new();
     for entry in entries {
         let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "session")
-        {
+        if is_session_file(&path) {
             session_paths.push(path);
         }
     }
@@ -71,6 +71,19 @@ pub fn read_history(history_directory: &Path) -> Result<SeratoHistoryScan, Serat
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let size = std::fs::metadata(&session_path)
+            .map_err(|error| {
+                SeratoError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("History session {name}: {error}"),
+                ))
+            })?
+            .len();
+        if size > MAX_SESSION_BYTES {
+            return Err(SeratoError::InvalidFile(format!(
+                "History session {name} is {size} bytes, over the {MAX_SESSION_BYTES}-byte limit for a session"
+            )));
+        }
         let bytes = std::fs::read(&session_path).map_err(|error| {
             SeratoError::Io(std::io::Error::new(
                 error.kind(),
@@ -83,6 +96,19 @@ pub fn read_history(history_directory: &Path) -> Result<SeratoHistoryScan, Serat
         scan.session_count += 1;
     }
     Ok(scan)
+}
+
+/// A `*.session` file Serato wrote. AppleDouble sidecars (`._1.session`),
+/// which macOS leaves on non-HFS volumes and archives, hold Finder metadata,
+/// not a session, and are skipped by this rule.
+fn is_session_file(path: &Path) -> bool {
+    let is_session = path
+        .extension()
+        .is_some_and(|extension| extension == "session");
+    let is_apple_double = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("._"));
+    is_session && !is_apple_double
 }
 
 fn read_session(bytes: &[u8], scan: &mut SeratoHistoryScan) -> Result<(), SeratoError> {
@@ -254,6 +280,7 @@ mod tests {
                 )]),
             ),
             ("notes.txt", b"not a session".to_vec()),
+            ("._1.session", b"\x00\x05\x16\x07 Finder metadata".to_vec()),
         ]);
 
         let scan = read_history(directory.path()).expect("synthetic history parses");
@@ -310,6 +337,23 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must be rejected"));
             assert!(error.to_string().contains(name), "{name}: {error}");
         }
+    }
+
+    #[test]
+    fn an_oversized_session_fails_without_being_read() {
+        let directory = history(&[]);
+        let oversized = std::fs::File::create(directory.path().join("Sessions/huge.session"))
+            .expect("session file");
+        oversized
+            .set_len(MAX_SESSION_BYTES + 1)
+            .expect("sparse oversized session");
+        let error = read_history(directory.path())
+            .err()
+            .expect("an oversized session must be rejected");
+        assert!(
+            error.to_string().contains("huge.session") && error.to_string().contains("limit"),
+            "{error}"
+        );
     }
 
     #[test]

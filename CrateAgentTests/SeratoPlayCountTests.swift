@@ -156,4 +156,117 @@ final class SeratoPlayCountTests: XCTestCase {
         let afterFailure = try await playCounts()
         XCTAssertEqual(afterFailure[file], 1, "The previous table survives a failed parse")
     }
+
+    private actor ReadCounter {
+        private(set) var reads = 0
+
+        func record() {
+            reads += 1
+        }
+    }
+
+    private final class TableWriteCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        var writes: Int {
+            lock.withLock { count }
+        }
+
+        func record() {
+            lock.withLock { count += 1 }
+        }
+    }
+
+    func testHistoryIsReadAgainOnlyWhenItOrTheLibraryPathsChangedAndUnchangedCountsAreNotRewritten() async throws {
+        let file = try await database.writer.write { connection in
+            _ = try self.insertFile("/Music/H/other.mp3", in: connection)
+            return try self.insertFile("/Music/H/track.mp3", in: connection)
+        }
+        try SyntheticSeratoHistory.write([play("/Music/H/track.mp3", at: 10)], session: "1", seratoDirectory: locator.seratoDirectory)
+        let counter = ReadCounter()
+        service = SeratoPlayCountService(database: database, seratoLocator: locator, watchdog: watchdog) { directory in
+            await counter.record()
+            return try readSeratoHistory(historyDirectory: directory)
+        }
+        let tableWrites = TableWriteCounter()
+        let observation = try DatabaseRegionObservation(tracking: Table(SeratoPlayCounts.table))
+            .start(in: database.writer, onError: { error in XCTFail("Play-count observation failed: \(error)") },
+                   onChange: { _ in tableWrites.record() })
+        defer { observation.cancel() }
+
+        await service.refresh()
+        await service.refresh()
+        var reads = await counter.reads
+        XCTAssertEqual(reads, 1, "Nothing changed, so History is not parsed again")
+        XCTAssertEqual(tableWrites.writes, 1)
+        guard case .refreshed = service.status else { return XCTFail("Unchanged inputs keep the last outcome, got \(service.status)") }
+
+        _ = try await database.writer.write { connection in try self.insertFile("/Music/H/unplayed.mp3", in: connection) }
+        await service.refresh()
+        reads = await counter.reads
+        XCTAssertEqual(reads, 2, "A new library file can claim a played path")
+        XCTAssertEqual(tableWrites.writes, 1, "Equal counts leave the table, and every observer of it, untouched")
+
+        try SyntheticSeratoHistory.write([play("/Music/H/track.mp3", at: 20)], session: "2", seratoDirectory: locator.seratoDirectory)
+        await service.refresh()
+        reads = await counter.reads
+        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(tableWrites.writes, 2)
+        let counts = try await playCounts()
+        XCTAssertEqual(counts[file], 2)
+    }
+
+    func testAReadDuringWhichSeratoStartedIsDiscarded() async throws {
+        let file = try await database.writer.write { connection in
+            _ = try self.insertFile("/Music/J/other.mp3", in: connection)
+            return try self.insertFile("/Music/J/track.mp3", in: connection)
+        }
+        try SyntheticSeratoHistory.write([play("/Music/J/track.mp3", at: 10)], session: "1", seratoDirectory: locator.seratoDirectory)
+        await service.refresh()
+        try SyntheticSeratoHistory.write([play("/Music/J/track.mp3", at: 20)], session: "2", seratoDirectory: locator.seratoDirectory)
+        let serato = serato!
+        let watchdog = watchdog!
+        service = SeratoPlayCountService(database: database, seratoLocator: locator, watchdog: watchdog) { directory in
+            let scan = try readSeratoHistory(historyDirectory: directory)
+            await MainActor.run {
+                serato.running = true
+                watchdog.refresh()
+            }
+            return scan
+        }
+
+        await service.refresh()
+
+        XCTAssertEqual(service.status, .skippedWhileSeratoRunning)
+        let counts = try await playCounts()
+        XCTAssertEqual(counts[file], 1, "History read while Serato may have been appending to it is not trusted")
+    }
+
+    func testPlaysBeforeAnObservedIdentityChangeCountAtThePreviousPath() async throws {
+        let file = try await database.writer.write { connection in
+            _ = try self.insertFile("/Music/K/other.mp3", in: connection)
+            let moved = try self.insertFile("/Music/K/new.mp3", in: connection)
+            let previous = FileMetadata(path: "/Music/K/old.mp3", volumeUuid: "play-count-fixture", inode: 2, fileSize: 4096, mtime: 1)
+            let current = FileMetadata(path: "/Music/K/new.mp3", volumeUuid: "play-count-fixture", inode: 2, fileSize: 4096, mtime: 1)
+            for (offset, before, after) in [(UInt32(100), previous, current), (UInt32(200), current, current)] {
+                _ = try OperationEngine.insertEvent(batchId: "identity-\(offset)", timestamp: self.milliseconds(offset), fileId: moved,
+                                                    eventType: .fileIdentityObserved,
+                                                    forwardPayload: ObserveFileIdentityPayload(fileId: moved, expectedRevision: 0, previousIdentity: before, identity: after),
+                                                    inversePayload: ObserveFileIdentityPayload(fileId: moved, expectedRevision: 1, previousIdentity: after, identity: before),
+                                                    in: connection)
+            }
+            return moved
+        }
+        try SyntheticSeratoHistory.write([
+            play("/Music/K/old.mp3", at: 50),
+            play("/Music/K/old.mp3", at: 150),
+            play("/Music/K/new.mp3", at: 250),
+        ], session: "1", seratoDirectory: locator.seratoDirectory)
+
+        await service.refresh()
+
+        let counts = try await playCounts()
+        XCTAssertEqual(counts[file], 2, "Before the move at its old path, and after it at the new one; a tag-only observation keeps the path")
+    }
 }

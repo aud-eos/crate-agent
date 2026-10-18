@@ -15,11 +15,35 @@ struct SeratoPlayCountSummary: Equatable, Sendable {
     let nonFileCount: Int
 }
 
-/// Attributes Serato History plays to library files and rebuilds
-/// `serato_play_counts`. The table is derived external evidence, like the
-/// fingerprint cache: there is no user intent and no inverse, so it is
-/// rebuilt wholesale rather than through `applyMutation`, and it never
-/// writes `files`, tags or Serato.
+/// What the library's path history looked like when plays were attributed:
+/// any import, removal or path change moves it. Path changes always journal
+/// one of `SeratoPlayCounts.pathChangeEvents`.
+struct SeratoLibraryPathSignature: Equatable, Sendable {
+    let fileCount: Int
+    let highestFileID: Int64?
+    let highestPathChangeEventID: Int64?
+}
+
+/// The attributed counts for one History read, and the row changes that
+/// bring `serato_play_counts` to them.
+struct SeratoPlayCountPlan: Sendable {
+    let summary: SeratoPlayCountSummary
+    let library: SeratoLibraryPathSignature
+    /// Files whose count is new or changed.
+    let upserts: [Int64: Int]
+    /// Files that no longer have attributed plays.
+    let deletions: [Int64]
+
+    var changesTable: Bool {
+        !upserts.isEmpty || !deletions.isEmpty
+    }
+}
+
+/// Attributes Serato History plays to library files and keeps
+/// `serato_play_counts` equal to the result. The table is derived external
+/// evidence, like the fingerprint cache: there is no user intent and no
+/// inverse, so it is rewritten directly rather than through `applyMutation`,
+/// and it never writes `files`, tags or Serato.
 ///
 /// A play counts for the file that was at its path when it started. Each
 /// file's past paths come from its path-change events; a path is a label
@@ -28,7 +52,7 @@ struct SeratoPlayCountSummary: Equatable, Sendable {
 enum SeratoPlayCounts {
     static let table = "serato_play_counts"
     private static let logger = Logger(subsystem: "com.crateagent.app", category: "SeratoPlayCounts")
-    private static let pathChangeEvents: [EventType] = [.fileRenamed, .fileLocationObserved, .fileIdentityObserved]
+    static let pathChangeEvents: [EventType] = [.fileRenamed, .fileLocationObserved, .fileIdentityObserved]
 
     /// A file's stay at one path, in event-log milliseconds: [start, end).
     private struct Occupancy {
@@ -47,9 +71,23 @@ enum SeratoPlayCounts {
         return counts
     }
 
-    static func rebuild(from scan: SeratoHistoryScan, in database: GRDB.Database) throws -> SeratoPlayCountSummary {
+    static func librarySignature(in database: GRDB.Database) throws -> SeratoLibraryPathSignature {
+        let types = pathChangeEvents.map(\.rawValue)
+        let placeholders = types.map { _ in "?" }.joined(separator: ", ")
+        let row = try Row.fetchOne(database, sql: """
+        SELECT (SELECT COUNT(*) FROM files) AS file_count, (SELECT MAX(id) FROM files) AS highest_file_id,
+               (SELECT MAX(event_id) FROM events WHERE event_type IN (\(placeholders)) AND file_id IS NOT NULL) AS highest_event_id
+        """, arguments: StatementArguments(types))
+        guard let row else { throw SeratoPlayCountError.missingSignature }
+        return SeratoLibraryPathSignature(fileCount: row["file_count"], highestFileID: row["highest_file_id"],
+                                          highestPathChangeEventID: row["highest_event_id"])
+    }
+
+    /// Reads only; run it in a read transaction so attribution never holds the writer.
+    static func plan(from scan: SeratoHistoryScan, in database: GRDB.Database) throws -> SeratoPlayCountPlan {
+        let library = try librarySignature(in: database)
         let occupancies = try occupanciesByPath(in: database)
-        var counts: [Int64: (plays: Int, lastPlayedAt: UInt64)] = [:]
+        var counts: [Int64: Int] = [:]
         var unattributed = 0
         for play in scan.plays {
             let startedAt = Int64(play.startedAt) * 1000
@@ -60,29 +98,47 @@ enum SeratoPlayCounts {
                 unattributed += 1
                 continue
             }
-            let previous = counts[fileID] ?? (0, 0)
-            counts[fileID] = (previous.plays + 1, max(previous.lastPlayedAt, play.startedAt))
+            counts[fileID, default: 0] += 1
         }
-        try database.execute(sql: "DELETE FROM \(table)")
-        let insert = try database.makeStatement(sql: "INSERT INTO \(table) (file_id, play_count, last_played_at) VALUES (?, ?, ?)")
-        for (fileID, count) in counts {
-            try insert.execute(arguments: [fileID, count.plays, Int64(count.lastPlayedAt)])
-        }
+        let stored = try all(in: database)
         let summary = SeratoPlayCountSummary(sessionCount: Int(scan.sessionCount), playCount: scan.plays.count,
                                              attributedCount: scan.plays.count - unattributed, unattributedCount: unattributed,
                                              unplayedCount: Int(scan.unplayedCount), nonFileCount: Int(scan.nonFileCount))
+        return SeratoPlayCountPlan(summary: summary, library: library,
+                                   upserts: counts.filter { fileID, count in stored[fileID] != count },
+                                   deletions: stored.keys.filter { fileID in counts[fileID] == nil }.sorted())
+    }
+
+    /// Writes only the plan's row changes. Returns false, writing nothing,
+    /// when the library's paths changed since the plan was attributed.
+    static func apply(_ plan: SeratoPlayCountPlan, in database: GRDB.Database) throws -> Bool {
+        guard try librarySignature(in: database) == plan.library else { return false }
+        let delete = try database.makeStatement(sql: "DELETE FROM \(table) WHERE file_id = ?")
+        for fileID in plan.deletions {
+            try delete.execute(arguments: [fileID])
+        }
+        let upsert = try database.makeStatement(sql: """
+        INSERT INTO \(table) (file_id, play_count) VALUES (?, ?) ON CONFLICT(file_id) DO UPDATE SET play_count = excluded.play_count
+        """)
+        for (fileID, count) in plan.upserts {
+            try upsert.execute(arguments: [fileID, count])
+        }
+        let summary = plan.summary
         logger.info("""
         Serato History: \(summary.sessionCount) sessions, \(summary.playCount) plays, \(summary.attributedCount) attributed, \
-        \(summary.unattributedCount) unattributed, \(summary.unplayedCount) unplayed, \(summary.nonFileCount) non-file
+        \(summary.unattributedCount) unattributed, \(summary.unplayedCount) unplayed, \(summary.nonFileCount) non-file; \
+        \(plan.upserts.count) counts written, \(plan.deletions.count) removed
         """)
-        return summary
+        return true
     }
 
     private static func occupanciesByPath(in database: GRDB.Database) throws -> [String: [Occupancy]] {
         var changesByFile: [Int64: [(timestamp: Int64, oldPath: String, newPath: String)]] = [:]
+        // Journal order, not timestamps: a file's changes chain old path to
+        // new path in the order they were applied, even if the clock moved.
         let events = try EventRecord
             .filter(pathChangeEvents.map(\.rawValue).contains(Column("event_type")) && Column("file_id") != nil)
-            .order(Column("timestamp"), Column("event_id"))
+            .order(Column("event_id"))
             .fetchCursor(database)
         while let event = try events.next() {
             guard let fileID = event.fileId else { continue }
@@ -126,10 +182,12 @@ enum SeratoPlayCounts {
 
 enum SeratoPlayCountError: LocalizedError, Equatable {
     case unexpectedEvent(String)
+    case missingSignature
 
     var errorDescription: String? {
         switch self {
         case let .unexpectedEvent(type): "Play-count attribution read an unexpected \(type) event."
+        case .missingSignature: "Play-count attribution could not read the library's path history."
         }
     }
 }

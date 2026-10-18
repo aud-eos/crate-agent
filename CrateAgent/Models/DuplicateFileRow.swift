@@ -18,14 +18,6 @@ public protocol DuplicateFileSource: SeratoConflictTargetFile, Hashable, Sendabl
     var seratoPlayCount: Int { get }
 }
 
-extension FileRecord: DuplicateFileSource {
-    /// `files` rows do not carry the derived History cache; only
-    /// `DuplicateFileRow`, which the Duplicates scan fetches, joins it.
-    public var seratoPlayCount: Int {
-        0
-    }
-}
-
 /// One member of a duplicate group, fetched by
 /// `DuplicateFinder.findDuplicates(in:mode:)`. Carries the reviewed
 /// membership revision and physical identity so the resolver can

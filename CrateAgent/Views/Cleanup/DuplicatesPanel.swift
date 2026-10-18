@@ -77,6 +77,7 @@ struct DuplicatesPanel: View {
             PageHeading("Duplicate tracks", subtitle: "Choose one keeper per group. Review the other copies before moving them to Trash.")
                 .padding(density.pagePadding)
             SeratoRunningBanner(message: SeratoGateMessages.quitBefore("resolving duplicates"))
+            PlayCountStalenessNote(service: services.playCountService)
             modeBar.disabled(isScanning || isResolving)
             Divider()
             ResultListHeader(results: $results, enabled: !isScanning && !isResolving)
@@ -805,6 +806,24 @@ struct DuplicatesPanel: View {
             }
         } catch {
             services.syncSession.reportFailure(error.localizedDescription)
+        }
+    }
+}
+
+/// Keeper suggestions rank by plays, so a failed History read is shown
+/// where those suggestions are made, not only in Workers.
+private struct PlayCountStalenessNote: View {
+    @ObservedObject var service: SeratoPlayCountService
+
+    var body: some View {
+        if case let .failed(reason) = service.status {
+            Label(SeratoPlayCountMessages.stale(reason), systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
         }
     }
 }

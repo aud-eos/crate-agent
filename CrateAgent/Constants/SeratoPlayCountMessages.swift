@@ -9,6 +9,10 @@ enum SeratoPlayCountMessages {
         "Could not read Serato History; keeping the last counts. \(reason)"
     }
 
+    static func stale(_ reason: String) -> String {
+        "Play counts may be out of date: \(reason)"
+    }
+
     static func refreshed(_ summary: SeratoPlayCountSummary) -> String {
         "\(summary.attributedCount) of \(summary.playCount) plays matched to library files across \(summary.sessionCount) sessions."
     }

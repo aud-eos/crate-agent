@@ -3,14 +3,17 @@ import GRDB
 import XCTest
 
 /// Production-scale History: 30,000 library files, 5,000 of them renamed
-/// once, and 266 sessions holding 43,000 entries, of which 30,500 were
-/// played (a quarter of those at a renamed file's earlier path).
+/// once, two owned tag writes per file (60,000 `file_identity_observed`
+/// events, which attribution must decode), and 266 sessions holding 43,000
+/// entries, of which 30,500 were played (a quarter of those at a renamed
+/// file's earlier path).
 final class SeratoPlayCountPerformanceTests: XCTestCase {
     private static let fileCount = 30000
     private static let renamedCount = 5000
     private static let sessionCount = 266
     private static let entryCount = 43000
     private static let playedCount = 30500
+    private static let tagWritesPerFile = 2
     private static let renamedAt: UInt32 = 1_700_500_000
 
     @MainActor
@@ -25,6 +28,16 @@ final class SeratoPlayCountPerformanceTests: XCTestCase {
                 file.libraryMembership = .active
                 file.fileAvailability = .available
                 try file.insert(connection)
+                let identity = file.identity
+                for write in 0 ..< Self.tagWritesPerFile {
+                    _ = try OperationEngine.insertEvent(batchId: "tag-\(identifier)-\(write)", timestamp: Int64(Self.renamedAt + 1000) * 1000, fileId: Int64(identifier),
+                                                        eventType: .fileIdentityObserved,
+                                                        forwardPayload: ObserveFileIdentityPayload(fileId: Int64(identifier), expectedRevision: Int64(write),
+                                                                                                   previousIdentity: identity, identity: identity),
+                                                        inversePayload: ObserveFileIdentityPayload(fileId: Int64(identifier), expectedRevision: Int64(write + 1),
+                                                                                                   previousIdentity: identity, identity: identity),
+                                                        in: connection)
+                }
                 if identifier <= Self.renamedCount {
                     let previous = Self.path(identifier, renamed: true)
                     _ = try OperationEngine.insertEvent(batchId: "scale-\(identifier)", timestamp: Int64(Self.renamedAt) * 1000, fileId: Int64(identifier),
@@ -51,9 +64,13 @@ final class SeratoPlayCountPerformanceTests: XCTestCase {
         }
         let service = SeratoPlayCountService(database: database, seratoLocator: locator, watchdog: SeratoWatchdog { [] })
 
+        let probe = WriterHoldProbe()
+        probe.start(database) { nil }
         let start = ContinuousClock.now
         await service.refresh()
         let elapsed = start.duration(to: .now)
+        let waits = await probe.stop()
+        let longestWriterWait = try XCTUnwrap(waits.first).duration
 
         guard case let .refreshed(summary) = service.status else {
             return XCTFail("Refresh did not finish: \(service.status)")
@@ -63,8 +80,9 @@ final class SeratoPlayCountPerformanceTests: XCTestCase {
         XCTAssertEqual(summary.attributedCount, Self.playedCount, "Every play maps to the file at its path at the time")
         XCTAssertEqual(summary.unplayedCount, Self.entryCount - Self.playedCount)
         XCTAssertLessThan(elapsed, .milliseconds(1500))
+        XCTAssertLessThan(longestWriterWait, .milliseconds(500), "Parsing and attribution must not hold the writer")
 
-        let metrics = "SERATO_PLAY_COUNTS files=\(Self.fileCount) renamed=\(Self.renamedCount) sessions=\(Self.sessionCount) entries=\(Self.entryCount) played=\(Self.playedCount) refresh=\(elapsed)"
+        let metrics = "SERATO_PLAY_COUNTS files=\(Self.fileCount) renamed=\(Self.renamedCount) sessions=\(Self.sessionCount) entries=\(Self.entryCount) played=\(Self.playedCount) identity_events=\(Self.fileCount * Self.tagWritesPerFile) refresh=\(elapsed) writer_probes=\(waits.count) longest_writer_wait=\(longestWriterWait)"
         print(metrics)
         let attachment = XCTAttachment(string: metrics)
         attachment.lifetime = .keepAlways
