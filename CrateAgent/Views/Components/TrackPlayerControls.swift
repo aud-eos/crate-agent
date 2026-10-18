@@ -52,7 +52,8 @@ struct NowPlayingBar: View {
                     HStack(spacing: density.spacing) {
                         ActionErrorMessage(message: failure)
                         Spacer(minLength: density.spacing)
-                        Button(TrackPlayerMessages.dismiss, action: player.dismissFailure)
+                        Button(CommonLabels.dismiss, action: player.dismissFailure)
+                            .accessibilityLabel(TrackPlayerMessages.dismissFailure)
                     }
                 }
                 if let track = player.track {

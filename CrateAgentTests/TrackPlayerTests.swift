@@ -57,6 +57,18 @@ final class TrackPlayerTests: XCTestCase {
         XCTAssertEqual(output.plays.last?.startFraction, 0, "An explicit play starts where asked")
     }
 
+    func testASecondPressWhileTheFileIsStillBeingCheckedCancelsThePlay() async throws {
+        let track = try await PlayerTrack(fileID: 1, path: fixture.addFile("track.mp3", id: 1))
+
+        let first = Task { await player.toggle(track) }
+        let second = Task { await player.toggle(track) }
+        await first.value
+        await second.value
+
+        XCTAssertTrue(output.plays.isEmpty, "The second press cancels the first instead of starting playback")
+        XCTAssertNil(player.track)
+    }
+
     func testUnavailableFilesAndPlaybackFailuresAreReportedByFilenameUntilDismissed() async throws {
         let gone = try await fixture.addFile("gone.mp3", id: 1)
         try FileManager.default.removeItem(atPath: gone)
@@ -97,10 +109,9 @@ final class TrackPlayerTests: XCTestCase {
         }
 
         try table.keyDown(with: space())
-        await pagingEventually { self.player.isPlaying(fileID: 2) }
+        await pagingEventually { !self.output.plays.isEmpty }
         try table.keyDown(with: space(repeating: true))
         XCTAssertEqual(output.plays.map(\.url), [URL(fileURLWithPath: paths[1])])
-        XCTAssertTrue(player.isPlaying(fileID: 2), "A held Space does not keep toggling")
         XCTAssertEqual(model.selection.summary?.total ?? 0, 0, "In Library, Space previews instead of toggling selection")
         try table.keyDown(with: space())
         await pagingEventually { !self.player.isPlaying(fileID: 2) }

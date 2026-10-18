@@ -4,8 +4,9 @@ enum FileOpenerMessages {
     static let chooseApplication = "Choose an application to open the file"
     static let reveal = "Reveal in Finder"
     static let defaultApplication = "Default Application"
-    static let dismiss = "Dismiss"
+    static let dismissFailure = "Dismiss file open error"
     static let openVerb = "open"
+    static let openAction = "Open"
     static let revealVerb = "reveal"
     static let theFile = "the file"
 

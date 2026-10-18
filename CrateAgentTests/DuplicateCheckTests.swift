@@ -12,9 +12,9 @@ final class DuplicateCheckTests: XCTestCase {
     func testOnlyIdenticalDecodedAudioIsOfferedForCleanup() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
-        let clean = try await addFingerprinted(fixture, "song-clean.wav", wav(frequency: 440, title: "Song (Clean)"))
-        let copy = try await addFingerprinted(fixture, "song-copy.wav", wav(frequency: 440, title: "Song (Clean) copy"))
-        let dirty = try await addFingerprinted(fixture, "song-dirty.wav", wav(frequency: 660, title: "Song (Dirty)"))
+        let clean = try await addFingerprinted(fixture, "song-clean.wav", TestAudio.wav(frequency: 440, title: "Song (Clean)"))
+        let copy = try await addFingerprinted(fixture, "song-copy.wav", TestAudio.wav(frequency: 440, title: "Song (Clean) copy"))
+        let dirty = try await addFingerprinted(fixture, "song-dirty.wav", TestAudio.wav(frequency: 660, title: "Song (Dirty)"))
 
         let unchecked = try await groups(fixture)
         XCTAssertEqual(unchecked.map(\.check), [.checking])
@@ -55,9 +55,9 @@ final class DuplicateCheckTests: XCTestCase {
     func testFingerprintMatchIsNeverPreselectedAndOnlyTheChosenFileIsRemoved() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
-        let sixteenBit = try await addFingerprinted(fixture, "master-16.wav", wav(frequency: 440, bitsPerSample: 16))
-        let twentyFourBit = try await addFingerprinted(fixture, "master-24.wav", wav(frequency: 440, bitsPerSample: 24))
-        let reencoded = try await addFingerprinted(fixture, "reencode-24.wav", wav(frequency: 440, bitsPerSample: 24, lowBits: 2))
+        let sixteenBit = try await addFingerprinted(fixture, "master-16.wav", TestAudio.wav(frequency: 440, bitsPerSample: 16))
+        let twentyFourBit = try await addFingerprinted(fixture, "master-24.wav", TestAudio.wav(frequency: 440, bitsPerSample: 24))
+        let reencoded = try await addFingerprinted(fixture, "reencode-24.wav", TestAudio.wav(frequency: 440, bitsPerSample: 24, lowBits: 2))
         try fixture.save(paths: [sixteenBit.path, twentyFourBit.path, reencoded.path].map(SeratoLibraryLocator.seratoRelativePath))
         try await DuplicateEvidenceVerifier(database: fixture.database).verifyPendingFiles(mode: .perceptual)
 
@@ -93,37 +93,5 @@ final class DuplicateCheckTests: XCTestCase {
 
     private func groups(_ fixture: SeratoRemovalFixture, mode: DuplicateFinder.Mode = .perceptual) async throws -> [DuplicateFinder.DuplicateGroup<DuplicateFileRow>] {
         try await fixture.database.writer.read { connection in try DuplicateFinder.findDuplicates(in: connection, mode: mode) }
-    }
-
-    /// Ten seconds of a mono sine. 24-bit files carry `lowBits` below the
-    /// 16-bit range, so their PCM differs from the 16-bit master, and from
-    /// each other, while sounding the same.
-    /// `title` adds a RIFF INFO tag chunk.
-    private func wav(frequency: Double, bitsPerSample: Int = 16, lowBits: Int32 = 1, title: String? = nil) -> Data {
-        let sampleRate = 44100
-        let bytesPerSample = bitsPerSample / 8
-        var samples = Data()
-        for index in 0 ..< sampleRate * 10 {
-            let value = Int32(sin(2 * Double.pi * frequency * Double(index) / Double(sampleRate)) * 20000)
-            let encoded = bitsPerSample == 24 ? (value << 8) | lowBits : value
-            samples += little(encoded).prefix(bytesPerSample)
-        }
-        var info = Data()
-        if let title {
-            var value = Data(title.utf8) + Data([0])
-            if value.count.isMultiple(of: 2) == false {
-                value += Data([0])
-            }
-            info = Data("LIST".utf8) + little(UInt32(12 + value.count)) + Data("INFOINAM".utf8) + little(UInt32(value.count)) + value
-        }
-        var bytes = Data("RIFF".utf8) + little(UInt32(36 + info.count + samples.count)) + Data("WAVEfmt ".utf8)
-        bytes += little(UInt32(16)) + little(UInt16(1)) + little(UInt16(1)) + little(UInt32(sampleRate))
-        bytes += little(UInt32(sampleRate * bytesPerSample)) + little(UInt16(bytesPerSample)) + little(UInt16(bitsPerSample))
-        return bytes + info + Data("data".utf8) + little(UInt32(samples.count)) + samples
-    }
-
-    private func little(_ value: some FixedWidthInteger) -> Data {
-        var encoded = value.littleEndian
-        return withUnsafeBytes(of: &encoded) { buffer in Data(buffer) }
     }
 }
