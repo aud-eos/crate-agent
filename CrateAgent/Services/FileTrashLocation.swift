@@ -160,6 +160,92 @@ enum FileTrashLocation {
     }
 }
 
+/// Trash items by inode, listed at most once per Trash directory, for rows whose indexed path
+/// is gone although no event named where it went: a restart whose replay had no FSEvents
+/// history (a volume without an event store keeps none), or a file inside a trashed folder (#234).
+struct NativeTrashIndex {
+    enum Lookup: Equatable {
+        case found(FileMetadata)
+        case notFound
+        /// The Trash, or a folder in it, could not be listed (without Full Disk Access), so
+        /// a missing row may really be trashed.
+        case unchecked
+    }
+
+    private struct Listing {
+        var itemsByInode: [Int64: [String]] = [:]
+        var complete = true
+    }
+
+    private var trashByVolume: [String: TrashDirectory] = [:]
+    private var listingByTrash: [String: Listing] = [:]
+
+    private enum TrashDirectory {
+        case path(String)
+        case absent
+        case unreadable
+    }
+
+    /// The verified Trash item holding `file`, searched only when nothing recorded where it went.
+    mutating func locate(_ file: FileRecord) throws -> Lookup {
+        let trash: String
+        switch try trashDirectory(for: file) {
+        case let .path(path): trash = path
+        case .absent: return .notFound
+        case .unreadable: return .unchecked
+        }
+        let listing = listingByTrash[trash] ?? Self.regularFiles(under: trash)
+        listingByTrash[trash] = listing
+        for candidate in listing.itemsByInode[file.inode] ?? [] {
+            do {
+                if let location = try FileTrashLocation.capture(at: candidate, for: file) {
+                    return .found(location)
+                }
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue
+            }
+        }
+        return listing.complete ? .notFound : .unchecked
+    }
+
+    private mutating func trashDirectory(for file: FileRecord) throws -> TrashDirectory {
+        if let cached = trashByVolume[file.volumeUuid] {
+            return cached
+        }
+        var directory = URL(fileURLWithPath: file.path).deletingLastPathComponent()
+        while !FileManager.default.fileExists(atPath: directory.path), directory.path != "/" {
+            directory.deleteLastPathComponent()
+        }
+        let trash: TrashDirectory
+        do {
+            trash = try .path(FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: directory, create: false).path)
+        } catch let error as CocoaError where [.fileNoSuchFile, .fileReadNoSuchFile].contains(error.code) {
+            trash = .absent
+        } catch let error as CocoaError where error.code == .fileReadNoPermission {
+            trash = .unreadable
+        }
+        trashByVolume[file.volumeUuid] = trash
+        return trash
+    }
+
+    private static func regularFiles(under trash: String) -> Listing {
+        var listing = Listing()
+        var unreadable = false
+        let enumerator = FileManager.default.enumerator(at: URL(fileURLWithPath: trash), includingPropertiesForKeys: nil,
+                                                        errorHandler: { _, _ in
+                                                            unreadable = true
+                                                            return true
+                                                        })
+        while let item = enumerator?.nextObject() as? URL {
+            var status = stat()
+            guard lstat(item.path, &status) == 0, status.st_mode & S_IFMT == S_IFREG else { continue }
+            listing.itemsByInode[Int64(status.st_ino), default: []].append(item.path)
+        }
+        listing.complete = enumerator != nil && !unreadable
+        return listing
+    }
+}
+
 enum FileTrashLocationError: LocalizedError, Equatable {
     case unverifiable(path: String)
     /// The Trash item a write relied on changed before commit. Row-level staleness: callers

@@ -1,3 +1,4 @@
+import CoreServices
 @testable import CrateAgent
 import Foundation
 import GRDB
@@ -15,6 +16,11 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
 
     private func nativeTrashCapture(replaying: Bool) async throws {
         let mount = try ownedVolume()
+        if replaying {
+            var volume = stat()
+            XCTAssertEqual(stat(mount.path, &volume), 0)
+            XCTAssertNotNil(FSEventsCopyUUIDForDevice(volume.st_dev), "Replay needs FSEvents history; attach the test volume without -nobrowse")
+        }
         let music = mount.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: music, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: music) }
@@ -153,6 +159,44 @@ final class PR123LegacyImportAndTrashTests: XCTestCase {
         XCTAssertEqual(location.map { SeratoPath.normalized($0.path) }, SeratoPath.normalized(destination.path))
         let reconciliationRequested = await coordinator.takeReconciliationRequest()
         XCTAssertFalse(reconciliationRequested)
+    }
+
+    /// No watcher sees the folder go to Trash, as when the app was not running on a volume that keeps
+    /// no FSEvents history (a nobrowse mount keeps none). Startup reconciliation must still find it (#234).
+    func testReconciliationFindsTrashMoveNoEventReported() async throws {
+        let mount = try ownedVolume()
+        let music = mount.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: music, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: music) }
+        let readiness = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: readiness)
+        defer { fixture.cleanup() }
+        let local = try await fixture.add("unwatched.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let album = music.appendingPathComponent("Album")
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        let source = album.appendingPathComponent("unwatched.wav")
+        try FileManager.default.moveItem(atPath: local.path, toPath: source.path)
+        let file = try await relocate(local, to: FileMetadataCollector.collectVerified(at: source.path), in: fixture)
+        try fixture.save(paths: [file.path])
+        let scanner = LibraryScanner(operationEngine: fixture.engine, database: fixture.database, seratoLocator: fixture.locator)
+        try await SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler, scanner: scanner, operationEngine: fixture.engine,
+                                           watchdog: fixture.watchdog, readiness: readiness).synchronize()
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: album, resultingItemURL: &resultingURL)
+        let trashedAlbum = try XCTUnwrap(resultingURL as URL?).standardizedFileURL
+        defer { try? FileManager.default.removeItem(at: trashedAlbum) }
+
+        let restarted = SeratoLibrarySyncSession(reader: fixture.reader, reconciler: fixture.reconciler, scanner: scanner, operationEngine: fixture.engine,
+                                                 watchdog: fixture.watchdog, readiness: readiness)
+        try await restarted.synchronize()
+
+        let after = try await fixture.row(file)
+        XCTAssertEqual(after.fileAvailability, .trashed)
+        XCTAssertEqual(after.libraryMembership, .active)
+        XCTAssertEqual(after.path, file.path)
+        let location = try await trashLocation(of: file, fixture: fixture)
+        XCTAssertEqual(location.map { SeratoPath.normalized($0.path) }, SeratoPath.normalized(trashedAlbum.appendingPathComponent("unwatched.wav").path))
+        XCTAssertEqual(try savedPaths(fixture), [file.path])
     }
 
     func testWatchConfigurationCreatesOwnedTrashAndScopesCombinedCursor() throws {

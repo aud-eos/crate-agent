@@ -67,12 +67,15 @@ volume is mounted at `/private/tmp/crate-agent-task6-volume` with a
 ```sh
 hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE /path/to/task6.sparseimage
 mkdir -p /private/tmp/crate-agent-task6-volume
-hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume -nobrowse
+hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume
 touch /private/tmp/crate-agent-task6-volume/.task6-test-volume
 touch /private/tmp/crate-agent-task6-volume/.trash-seed
 swift -e 'import Foundation; try FileManager.default.trashItem(at: URL(fileURLWithPath: CommandLine.arguments[1]), resultingItemURL: nil)' \
   /private/tmp/crate-agent-task6-volume/.trash-seed
 ```
+
+Don't attach it with `-nobrowse`: FSEvents keeps no event history for a nobrowse
+volume, so the cursor-replay test would pass or fail on timing alone (#234).
 
 The last step creates the volume's `.Trashes/<uid>`. On a fresh volume,
 `FileManager.url(for: .trashDirectory, …, create: true)` fails with "feature not

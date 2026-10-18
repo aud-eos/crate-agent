@@ -103,6 +103,19 @@ final class FileTrashLocationTests: XCTestCase {
         XCTAssertEqual(row.fileAvailability, .trashed, "the skipped row keeps its state for the next sync")
         XCTAssertEqual(row.libraryMembership, .active)
     }
+
+    func testMissingRowWhoseTrashCannotBeListedIsReportedAsUnchecked() async throws {
+        let fixture = try await TrashedFilesFixture(names: ["unlisted.mp3"], observeTrash: false)
+        defer { fixture.cleanup() }
+        let item = fixture.files[0]
+        let trash = URL(fileURLWithPath: item.trashPath).deletingLastPathComponent().path
+        XCTAssertEqual(chmod(trash, 0), 0)
+        defer { chmod(trash, 0o700) }
+        let summary = try await fixture.reconciler().reconcile(fixture.reader.read())
+        XCTAssertEqual(summary.trashUncheckedFileIDs, [item.fileID], "a Trash that can't be listed must not pass for one that was searched")
+        let row = try await fixture.row(item)
+        XCTAssertEqual(row.fileAvailability, .missing)
+    }
 }
 
 /// Indexed files moved to the native Trash of the task-owned APFS volume and observed there.
@@ -121,7 +134,7 @@ private final class TrashedFilesFixture {
     let coordinator: FilesystemSyncCoordinator
     private(set) var files: [TrashedFile] = []
 
-    init(names: [String], unreadable: Bool = false) async throws {
+    init(names: [String], unreadable: Bool = false, observeTrash: Bool = true) async throws {
         let ownedVolume = URL(fileURLWithPath: "/private/tmp/crate-agent-task6-volume")
         guard FileManager.default.fileExists(atPath: ownedVolume.appendingPathComponent(".task6-test-volume").path) else {
             throw XCTSkip("Requires task-owned APFS volume")
@@ -157,6 +170,7 @@ private final class TrashedFilesFixture {
             try FileManager.default.trashItem(at: source, resultingItemURL: &resultingURL)
             let trashPath = try XCTUnwrap(resultingURL as URL?).path
             files.append(TrashedFile(fileID: fileID, originalPath: source.path, trashPath: trashPath))
+            guard observeTrash else { continue }
             try await coordinator.handleObservations([
                 .init(path: trashPath, isFile: true, wasRenamed: true),
                 .init(path: source.path, isFile: true, wasRemoved: true),
