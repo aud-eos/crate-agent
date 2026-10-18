@@ -10,7 +10,7 @@ enum TrackPlayerMessages {
     static let unavailable = "The file is unavailable, so it can't be played."
     static let unknownFailure = "The audio could not be played."
     static let stalled = "no audio data arrived for several seconds. Check that its drive is still connected."
-    static let dismiss = "Dismiss"
+    static let dismissFailure = "Dismiss playback error"
 
     static func cannotPlay(_ filename: String, detail: String) -> String {
         "Can't play \(filename): \(detail)"

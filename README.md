@@ -31,7 +31,8 @@ retries them ([Workers](docs/workers.md)). Removing a track from Serato
 retires its crate-agent entry while preserving the audio, recording identity, and
 History. Missing audio that Serato still references remains a member but cannot
 be processed. The main window and menu bar show waiting, sync results, or an error
-with **Retry Sync**. A missing or unreadable Serato database stops synchronization;
+with **Retry Sync**; a queued change that keeps failing can be discarded and
+reverted from History. A missing or unreadable Serato database stops synchronization;
 it never means that every track was removed. See the
 [reconciliation contract](docs/serato-membership-reconciliation.md).
 
@@ -66,10 +67,14 @@ example when its drive is ejected.
 Right-click a track in Library, Duplicates or Auto-Tag for **Open in** its default
 app, an **Open With** list of other apps that can open it plus **Other…** to pick
 any app, and **Reveal in Finder**. Command-O opens the focused Library row, the
-last-clicked Duplicates file, or the Auto-Tag review in focus (or last clicked in
-List mode). Playing, opening and revealing first check that the file at the row's
-path is still that row's recording; a missing or replaced file is refused with a
-dismissible message at the bottom of the window.
+Duplicates file or Auto-Tag List mode review with keyboard focus (click or Tab to
+it; not while typing in search), or the Auto-Tag review in Focus mode. Playing,
+opening and revealing first check that the file at the row's path is still that
+row's recording; a missing or replaced file is refused with a dismissible message
+at the bottom of the window. A file whose tags changed outside crate-agent, as when
+Serato writes its analysis into it, is still used when it decodes to the same audio
+as when crate-agent last used or duplicate-checked it. A second press of a play
+button while its file is still being checked cancels it.
 
 Duplicates are checked in full before cleanup is offered: byte-level matches by
 hashing every byte, perceptual matches by decoding. Only files with identical

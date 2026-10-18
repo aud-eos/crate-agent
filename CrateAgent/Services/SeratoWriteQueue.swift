@@ -194,6 +194,12 @@ enum SeratoWriteQueue {
         try Row.fetchAll(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE file_id = ? ORDER BY queue_id", arguments: [fileID]).map(decode)
     }
 
+    static func fetch(eventIDs: [Int64], in database: Database) throws -> [GuardedSeratoWrite] {
+        guard !eventIDs.isEmpty else { return [] }
+        return try Row.fetchAll(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE event_id IN (\(databaseQuestionMarks(count: eventIDs.count))) ORDER BY queue_id",
+                                arguments: StatementArguments(eventIDs)).map(decode)
+    }
+
     static func fetch(queueID: Int64, in database: Database) throws -> GuardedSeratoWrite? {
         try Row.fetchOne(database.cachedStatement(sql: "SELECT \(columns) FROM serato_write_queue WHERE queue_id = ?"), arguments: [queueID]).map(decode)
     }
@@ -410,11 +416,13 @@ enum SeratoWriteQueue {
         Int64(Date().timeIntervalSince1970 * 1000)
     }
 
+    static func payload(of write: GuardedSeratoWrite) -> SeratoQueuedWritePayload {
+        SeratoQueuedWritePayload(write: write.write, originalIdentity: write.originalIdentity, originalReferencePaths: write.originalReferencePaths,
+                                 externalBaseline: write.externalBaseline, baselineKnownFields: write.baselineKnownFields.map { fields in fields.sorted() })
+    }
+
     private static func encode(_ write: GuardedSeratoWrite) throws -> Data {
-        try SyncCheckpointStore.encodeCanonical(SeratoQueuedWritePayload(write: write.write, originalIdentity: write.originalIdentity,
-                                                                         originalReferencePaths: write.originalReferencePaths,
-                                                                         externalBaseline: write.externalBaseline,
-                                                                         baselineKnownFields: write.baselineKnownFields.map { fields in fields.sorted() }))
+        try SyncCheckpointStore.encodeCanonical(payload(of: write))
     }
 
     private static func decode(_ row: Row) throws -> GuardedSeratoWrite {
@@ -467,6 +475,8 @@ enum SeratoWriteDisposition: String, Sendable, CaseIterable {
     case legacyUnrecoverable
     case malformed
     case noSeratoRecord
+    /// Dropped by the user, who reverted the change in the same batch (#163).
+    case discarded
 }
 
 /// Not-applied queued changes by disposition, each counted once per event.
@@ -526,6 +536,12 @@ enum SeratoWriteDispositions {
         SELECT event_id, kind, MAX(id), ? FROM serato_write_dispositions WHERE event_id = ? AND kind = ? GROUP BY event_id, kind
         ON CONFLICT(event_id, kind) DO UPDATE SET disposition_id = excluded.disposition_id, resolved_at = excluded.resolved_at
         """, arguments: [SeratoWriteQueue.now(), eventID, kind.rawValue])
+    }
+
+    /// The open dispositions of `eventID`'s writes, by kind, each the latest recorded.
+    static func openDispositions(eventID: Int64, in database: Database) throws -> [String: String] {
+        try Row.fetchAll(database, sql: "SELECT kind, disposition FROM serato_write_dispositions d WHERE event_id = ? AND \(isOpen) ORDER BY id",
+                         arguments: [eventID]).reduce(into: [:]) { dispositions, row in dispositions[row["kind"]] = row["disposition"] }
     }
 
     /// A disposition `d` no later write for the same event and kind resolved.

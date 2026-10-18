@@ -28,13 +28,15 @@ final class SeratoRemovalFixture {
     let lifecycle = Lifecycle()
     final class Lifecycle { var running = false }
 
-    init(readiness: LibrarySyncReadiness? = nil) throws {
+    /// `fileBacked` opens a WAL database, whose reads proceed while a write
+    /// transaction holds the writer.
+    init(readiness: LibrarySyncReadiness? = nil, fileBacked: Bool = false) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         locator = SeratoLibraryLocator(seratoDirectory: directory)
         try FileManager.default.createDirectory(at: locator.subcratesDirectoryUrl, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: locator.smartCratesDirectoryUrl, withIntermediateDirectories: true)
-        database = try LibraryDatabase.openInMemory()
+        database = try fileBacked ? .openWAL(at: directory.appendingPathComponent("library.sqlite")) : .openInMemory()
         let lifecycle = lifecycle
         watchdog = SeratoWatchdog { lifecycle.running ? ["com.serato.dj"] : [] }
         reader = SeratoMembershipSnapshotReader(locator: locator, watchdog: watchdog)

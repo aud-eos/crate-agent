@@ -10,8 +10,8 @@ struct AutoTaggerView: View {
     @State private var showResetConfirmation = false
     @State private var reviewQuery = ""
     @State private var chooserFile: ChooserFile?
-    /// The last review clicked in List mode; Command-O opens it.
-    @State private var listFocusedFileID: Int64?
+    /// The List mode review with keyboard focus; Command-O opens it.
+    @FocusState private var listFocusedFileID: Int64?
 
     private struct ChooserFile: Identifiable { let id: Int64 }
 
@@ -230,9 +230,7 @@ struct AutoTaggerView: View {
             reviewDetails(fileID, file: file, path: path, isFocused: isFocused)
         }
         .padding(.vertical, density.rowPadding)
-        .background(!isFocused && fileID == listFocusedFileID ? Color.accentColor.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
-        .contentShape(Rectangle())
-        .simultaneousGesture(TapGesture().onEnded { listFocusedFileID = fileID })
+        .fileOpenTarget(isFocused ? nil : fileID, focus: $listFocusedFileID, opener: opener)
         .contextMenu {
             if let file {
                 FileOpenMenuItems(opener: opener, fileID: fileID, path: file.path)

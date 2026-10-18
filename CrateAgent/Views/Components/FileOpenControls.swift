@@ -26,6 +26,14 @@ struct FileOpenMenuItems: View {
 }
 
 extension View {
+    /// Makes this row a Command-O target while it has keyboard focus.
+    /// Clicking or tabbing to the row focuses it; typing in a search field
+    /// takes focus away, so Command-O then opens nothing. VoiceOver gets an
+    /// Open action on the row. Nil `fileID` leaves the row as it is.
+    func fileOpenTarget(_ fileID: Int64?, focus: FocusState<Int64?>.Binding, opener: FileOpener) -> some View {
+        modifier(FileOpenTarget(fileID: fileID, focus: focus, opener: opener))
+    }
+
     /// Command-O opens `fileID`, the panel's focused file, in its default application.
     func fileOpenShortcut(_ opener: FileOpener, fileID: Int64?) -> some View {
         background {
@@ -43,6 +51,27 @@ extension View {
     }
 }
 
+private struct FileOpenTarget: ViewModifier {
+    let fileID: Int64?
+    let focus: FocusState<Int64?>.Binding
+    let opener: FileOpener
+
+    func body(content: Content) -> some View {
+        if let fileID {
+            content
+                .background(focus.wrappedValue == fileID ? Color.accentColor.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+                .focusable()
+                .focused(focus, equals: fileID)
+                .simultaneousGesture(TapGesture().onEnded { focus.wrappedValue = fileID })
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(named: FileOpenerMessages.openAction) { Task { await opener.open(fileID: fileID) } }
+        } else {
+            content
+        }
+    }
+}
+
 /// Shows why the last open or reveal failed, window-wide.
 struct FileOpenFailureBanner: View {
     @ObservedObject var opener: FileOpener
@@ -53,7 +82,8 @@ struct FileOpenFailureBanner: View {
             HStack(spacing: density.spacing) {
                 ActionErrorMessage(message: failure)
                 Spacer(minLength: density.spacing)
-                Button(FileOpenerMessages.dismiss, action: opener.dismissFailure)
+                Button(CommonLabels.dismiss, action: opener.dismissFailure)
+                    .accessibilityLabel(FileOpenerMessages.dismissFailure)
             }
             .padding(.horizontal, density.pagePadding)
             .padding(.vertical, density.rowPadding)
