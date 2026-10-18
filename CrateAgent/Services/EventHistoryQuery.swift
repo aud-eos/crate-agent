@@ -25,6 +25,8 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     /// batch was itself produced by an undoBatch call. Surfaced so
     /// the UI can label "Undo of …" rows differently if desired.
     public let isUndoBatch: Bool
+    /// `true` when `OperationEngine.discardQueuedChange` produced this batch.
+    public let isDiscardBatch: Bool
     /// `true` when at least one event in the batch projects onto
     /// Serato/audio-file writes that `resyncSeratoForBatch` can replay
     /// (`EventType.hasReplayableSeratoProjection`). Drives the "Re-sync
@@ -37,6 +39,9 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     /// Queued Serato or audio-tag changes from this batch that were recorded
     /// as not applied (`serato_write_dispositions`).
     public let notApplied: NotAppliedSummary
+    /// This batch's queued changes that cannot apply, one per file: a write
+    /// failed, or waits behind one that did. Each can be discarded.
+    public let stuckChanges: [QueuedSeratoChange]
 
     public var timestamp: Date {
         Date(timeIntervalSince1970: TimeInterval(firstTimestampMillis) / 1000)
@@ -178,10 +183,11 @@ public enum EventHistoryQuery {
         LIMIT ?
         """
 
-        let (rows, notApplied): ([Row], [String: NotAppliedBatchCounts]) = try await database.writer.read { db in
+        let (rows, notApplied, stuck): ([Row], [String: NotAppliedBatchCounts], [QueuedSeratoChange]) = try await database.writer.read { db in
             let rows = try Row.fetchAll(db, sql: sql, arguments: [limit])
-            return try (rows, SeratoWriteDispositions.notAppliedByBatch(rows.map(\.batchId), in: db))
+            return try (rows, SeratoWriteDispositions.notAppliedByBatch(rows.map(\.batchId), in: db), QueuedSeratoChanges.stuck(in: db))
         }
+        let stuckByBatch = Dictionary(grouping: stuck, by: \.batchID)
 
         let allBatchIds = Set(rows.map(\.batchId))
         return rows.map { row in
@@ -194,9 +200,11 @@ public enum EventHistoryQuery {
                 description: describeBatch(typeCounts: typeCounts),
                 canUndo: canUndoBatch(typeList: typeList),
                 isUndoBatch: row.batchId.hasPrefix("undo:"),
+                isDiscardBatch: row.batchId.hasPrefix(OperationEngine.discardBatchPrefix),
                 canResync: canResyncBatch(typeList: typeList)
                     && !batchHasBeenUndone(row.batchId, allBatchIds: allBatchIds),
-                notApplied: notAppliedSummary(notApplied[row.batchId])
+                notApplied: notAppliedSummary(notApplied[row.batchId]),
+                stuckChanges: stuckByBatch[row.batchId] ?? []
             )
         }
     }
@@ -330,6 +338,8 @@ public enum EventHistoryQuery {
             return "Kept every copy in \(count) duplicate group\(pluralS) whose labels disagree"
         case .duplicateLabelsReopened:
             return "Reopened label review for \(count) duplicate group\(pluralS)"
+        case .queuedSeratoChangeDiscarded:
+            return QueuedChangeDiscardMessages.batchPhrase(count: count)
         }
     }
 

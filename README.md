@@ -31,7 +31,8 @@ retries them ([Workers](docs/workers.md)). Removing a track from Serato
 retires its crate-agent entry while preserving the audio, recording identity, and
 History. Missing audio that Serato still references remains a member but cannot
 be processed. The main window and menu bar show waiting, sync results, or an error
-with **Retry Sync**. A missing or unreadable Serato database stops synchronization;
+with **Retry Sync**; a queued change that keeps failing can be discarded and
+reverted from History. A missing or unreadable Serato database stops synchronization;
 it never means that every track was removed. See the
 [reconciliation contract](docs/serato-membership-reconciliation.md).
 

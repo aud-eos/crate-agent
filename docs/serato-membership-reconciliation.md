@@ -625,7 +625,8 @@ records one `seratoDatabaseMissing` error naming the path and how many changes
 the pass held, and the drain or Re-sync fails with it, so the sync status shows
 it and **Retry Sync** applies the rows once the file is back. On a Mac where
 Serato has never run, sync itself reports `sourceMissing`: open Serato once to
-create its library. Discarding queued changes instead is #163.
+create its library. A queued change that cannot apply can instead be discarded
+from History, as described below.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
@@ -640,6 +641,26 @@ completes, the queue records it in `serato_write_resolutions`, which History rea
 show that change as applied by a later re-sync rather than deleting its record.
 The file list pages by `(path, entry)` keyset, so a change recorded between page
 loads cannot skip or repeat a file.
+
+A queued change that cannot apply, because one of its writes failed or it waits
+behind one that did, is listed on its History batch, one entry per file, with
+**Discard this change…** (#163). The confirmation names the file and the values
+the discard puts back. Confirming runs `OperationEngine.discardQueuedChange(batchID:fileID:)`,
+which in one `discard:` batch drops the change's queued rows with a `discarded`
+disposition through the `discardQueuedSeratoChange` mutation and applies the
+inverses of the change's events, as undo would, with undo's guards. A write that
+never reached its I/O is not written back, since Serato or the file still holds
+the old value. A write that completed, or whose row may have landed
+(`io_started` or `may_have_landed`), is written back with the old value through
+the queue, and the confirmation says so. A write recorded as not applied is left
+alone, except an interrupted one, which may have landed. Undoing the discard
+batch applies the reverted events' inverses, which queue the change again.
+The discard is refused while a drain holds the change's rows, and while a later
+queued change waits behind it (any row the drain would hold behind it, not only
+the same file), which the confirmation lists; discard those first. The rows,
+their attempts and landed marks, the file's membership revision, and the later
+changes are checked again inside the transaction. Changes without an inverse,
+such as imports, removals, Trash and cleanup steps, cannot be discarded.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.

@@ -54,6 +54,7 @@ extension TrackMutation {
         case let .removeFileFromCrates(payload): payload.fileId
         case let .applyMusicBrainzMatch(payload): payload.fileID
         case let .revertMusicBrainzMatch(payload): payload.applied.fileID
+        case let .discardQueuedSeratoChange(payload): payload.fileId
         }
     }
 
