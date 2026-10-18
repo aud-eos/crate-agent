@@ -112,9 +112,10 @@ IDs independently of Library's row type.
 
 `DuplicateScanPerformanceTests` builds a temporary WAL database with 30,000
 processable files: 32-byte lightweight hashes on all of them, 4 KB Chromaprint
-fingerprints on 24,000, 300 byte-level pairs and 400 perceptual pairs. It runs
-both duplicate modes plus fingerprint coverage, asserts that only the 1,400
-group members are decoded, and asserts a 1 s budget. `DUPLICATE_SCAN` output
+fingerprints on 24,000, 300 byte-level pairs with
+cached content digests and 1,650 perceptual pairs with cached audio digests (the owner's 3,300 colliding files). It runs both duplicate
+modes plus fingerprint coverage, asserts that only the 3,900 group members are
+decoded, and asserts a 1 s budget. `DUPLICATE_SCAN` output
 is attached as evidence. Before SQL grouping, the same fixture took 1.34 s to
 load every full row and group it in Swift; the SQL scan takes about 0.17 s.
 

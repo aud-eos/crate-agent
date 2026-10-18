@@ -200,7 +200,8 @@ final class SeratoLibrarySyncSessionTests: XCTestCase {
         try await session.synchronize()
         fixture.lifecycle.running = true
         fixture.watchdog.refresh()
-        _ = try await fixture.engine.resolveDuplicate(target: target, keeper: keeper, batchID: "keeper-conflict")
+        _ = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("keeper-conflict", files: [keeper, target], in: fixture.database)
+        _ = try await fixture.engine.resolveDuplicate(target: target, keeper: keeper, batchID: "keeper-conflict", requirement: .identicalContent)
         try await fixture.engine.apply(.commitMetadataToSerato(.init(fileId: XCTUnwrap(independent.id), metadata: .init(title: "Independent"), previousMetadata: .empty)))
         try fixture.save(paths: paths + [paths[0].decomposedStringWithCanonicalMapping])
         fixture.lifecycle.running = false

@@ -8,6 +8,7 @@ publish = false
 rusty-chromaprint = "0.3"
 symphonia = { version = "0.6", features = ["mp3", "aac", "alac", "isomp4", "aiff"] }
 thiserror = "1"
+sha2 = "0.11"
 
 # Base64url encoding for the AcoustID-compatible compressed fingerprint
 # string (already resolved in the workspace lockfile via other crates).

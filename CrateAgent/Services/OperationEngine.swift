@@ -224,10 +224,13 @@ public actor OperationEngine {
         }
     }
 
-    func resolveDuplicate(target: FileRecord, keeper: FileRecord, batchID: String) async throws -> DuplicateCleanupResult {
+    func resolveDuplicate(target: FileRecord, keeper: FileRecord, batchID: String,
+                          requirement: DuplicateEvidenceRequirement) async throws -> DuplicateCleanupResult
+    {
         try readiness?.requireUnconflicted(.file(target))
         try readiness?.requireUnconflicted(.file(keeper))
-        let intent = try PendingDuplicateCleanup(target: FileActionAuthority(target), keeper: FileActionAuthority(keeper), batchID: batchID)
+        let intent = try PendingDuplicateCleanup(target: FileActionAuthority(target), keeper: FileActionAuthority(keeper), batchID: batchID,
+                                                 evidenceRequirement: requirement)
         let fileID = intent.target.token.fileId
         let existing = try await database.writer.read { database in
             try DuplicateCleanupStore.fetch(targetFileID: fileID, in: database)
@@ -292,6 +295,12 @@ public actor OperationEngine {
                     }
                     try intent.target.validate(in: database, audioWasTrashed: intent.step == 3)
                     try intent.keeper.validate(in: database)
+                    if intent.step == 0 {
+                        guard let requirement = intent.evidenceRequirement else {
+                            throw DuplicateCheckError.notConfirmed(path: intent.target.identity.path)
+                        }
+                        try DuplicateDigestStore.requireConfirmed(target: intent.target, keeper: intent.keeper, requirement: requirement, in: database)
+                    }
                     try readiness?.requireUnconflicted(SeratoConflictTargets.identity(intent.keeper.identity))
                     let result = try Self.executeAndLog(context: context, mutation: mutation, batchId: intent.batchID, in: database)
                     try readiness?.requireUnconflicted(SeratoConflictTargets.identity(intent.keeper.identity))
