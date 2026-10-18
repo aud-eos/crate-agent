@@ -4,6 +4,36 @@ import XCTest
 
 @MainActor
 final class SeratoMembershipReconcilerTests: XCTestCase {
+    /// #118: a same-length edit in the same second, outside the sampled hash windows, is new
+    /// audio. Reconciliation must treat it as a replacement, not an identity-only update that
+    /// keeps the old fingerprint and revision.
+    func testSameSecondInPlaceEditIsReconciledAsReplacement() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("edited.wav", bytes: Data(repeating: 0, count: 3 * LightweightHashCalculator.windowSize))
+        let fileID = try XCTUnwrap(file.id)
+        try fixture.save(paths: [file.path])
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE files SET chromaprint_fingerprint = x'01', fingerprint_status = 'done' WHERE id = ?", arguments: [fileID])
+        }
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: file.path))
+        try handle.seek(toOffset: UInt64(LightweightHashCalculator.windowSize + 1024))
+        try handle.write(contentsOf: Data([1, 2, 3, 4]))
+        try handle.close()
+        let recordedNanoseconds = try XCTUnwrap(file.mtimeNanoseconds)
+        try setModificationTime(of: file.path, seconds: Int(file.mtime), nanoseconds: Int((recordedNanoseconds + 500_000_000) % 1_000_000_000))
+        let edited = try XCTUnwrap(FileMetadataCollector.collect(at: file.path, includeLightweightHash: true))
+        XCTAssertEqual(edited.mtime, file.mtime)
+        XCTAssertEqual(edited.lightweightHash, file.lightweightHash, "the edit must leave the sampled hash unchanged")
+
+        _ = try await fixture.reconcile()
+
+        let row = try await fixture.row(file)
+        XCTAssertNil(row.chromaprintFingerprint)
+        XCTAssertEqual(row.fingerprintStatus, .pending)
+        XCTAssertEqual(row.membershipRevision, file.membershipRevision + 1)
+    }
+
     func testSameRevisionFilesystemObservationRejectsStaleReconciliationState() async throws {
         for (relocate, currentAvailability) in [(false, FileAvailability.available), (true, .available), (true, .missing)] {
             let fixture = try SeratoRemovalFixture()

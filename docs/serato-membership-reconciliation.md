@@ -311,7 +311,21 @@ shared final writer boundary resolves a verified move to the current audio targe
 checks the actual target and original content intent, and rechecks after journal
 lookups under writer serialization. Ordered reference renames retain their explicit
 path transition; an unrelated occupant of an old path cannot authorize rewriting
-or removing that occupant's V2/crate references. Expected supersession removes only
+or removing that occupant's V2/crate references. The one exception is a chain or
+swap within one drain pass: when a later rename moves a different file into an
+earlier rename's old path, the earlier rename skips the old-path occupancy check,
+even when the two land in different bounded segments. It keeps every other
+identity check. A rename that some store already took also skips that check, so
+it finishes in the rest. When a rename is dropped, the same transaction drops every
+later queued rename into its old path, because the record there never moved
+(#199), and the same file's later queued writes that reference the dropped
+rename's new path, because another file's record may still sit there. Each
+drop is transitive, compared by `SeratoPath.normalized`, and records its own
+disposition; an indexed `rename_new_path_key` keeps the cascade linear in the
+queue. The exception is an old path that the same file's latest earlier rename
+never reached, because that rename was dropped while another record still held
+its new path (`new_path_held`): no record waits there. A rename that V2 took counts as
+arrived. Expected supersession removes only
 the obsolete queued work and records a `serato_write_dispositions` row so the drop
 stays visible after a restart; unexpected I/O failure stays visible and retryable.
 
@@ -321,6 +335,13 @@ ordered survivors and rechecks them at the serialized writer boundary. Valid
 survivors stay coalesced; a Serato restart queues them for guarded completion.
 Rejecting one target never discards or reports supersession for its valid siblings,
 and retrying the external subset does not repeat the local mutation journal.
+`serato_rename_progress` records, in each store's writer transaction, which
+queued renames V2 and each crate already took. A retry after supersession,
+failure or restart rewrites only the stores a rename has not reached. Applying a
+landed chain or swap a second time would move its records again. A store rewrite
+that lands just before a crash, ahead of its transaction's commit, is applied
+again on restart. With WAL and `synchronous=NORMAL`, a power loss can also drop
+a committed progress row while the rewritten store survives.
 
 Duplicate cleanup retains the original keeper and target authority for every step.
 V2 removal, both crate forms, and Trash must actually complete before it reports
@@ -410,7 +431,11 @@ path by its NFC form, so a decomposed spelling Finder stored matches a composed
 request, and the reverse. Matching never rewrites a path field's bytes; only a
 rename replaces the matched field, with the requested destination. Two records whose
 spellings are equivalent form a conflict, which the scope above
-keeps away from those writers.
+keeps away from those writers. When both spellings reach a writer anyway, a record
+stored in the requested spelling wins: a metadata update writes that record, and
+equivalent rename sources bound for different destinations match only exactly. A
+metadata batch that sends equivalent paths different updates is refused, and a crate
+renamed from both spellings keeps one entry.
 
 The conflict scope protects indexed file IDs, normalized source/destination and
 historical reference paths, and volume/inode aliases. Operations writing a shared

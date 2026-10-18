@@ -133,8 +133,10 @@ struct AutoTagRowModel {
             fingerprintHash: candidate.fingerprintHash,
             // The file's indexed identity at lookup time, so the mutation
             // can reject a candidate that went stale before Apply (D-A).
-            expectedFileSize: candidate.expectedFileSize,
-            expectedMtime: candidate.expectedMtime,
+            expectedFileSize: candidate.expectedFreshness.fileSize,
+            expectedMtime: candidate.expectedFreshness.mtime,
+            expectedMtimeNanoseconds: candidate.expectedFreshness.mtimeNanoseconds,
+            expectedInode: candidate.expectedFreshness.inode,
             artist: includeArtist ? candidate.proposedArtist : nil,
             title: titleChoice == .keep ? nil : resolvedTitle,
             album: includeAlbum ? candidate.proposedAlbum : nil,
