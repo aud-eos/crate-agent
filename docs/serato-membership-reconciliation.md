@@ -553,7 +553,10 @@ pre-upgrade fence that no longer decodes is removed with a `malformed`
 disposition; the rest of the queue still applies. Only one pass runs at a time:
 a scoped pass leaves a row that depends on an unfinished earlier row for the
 next drain, and with Serato closed that drain waits for the next sync, so a rename
-made during another pass on the same file waits for that pass instead.
+made during another pass on the same file waits for that pass instead. Its database
+transaction can still commit, moving the file, after the pass resolved a row's
+path and before that row's I/O. The pass then resolves and retries those rows
+at the file's current path instead of dropping them as superseded (#260).
 
 The pass groups eligible rows into segments in queue order. Every V2 metadata
 edit joins one rewrite unless a rename, add, or V2 removal queued since that
@@ -701,7 +704,10 @@ deleted in the same transaction. The checkpoint is derived evidence; queued inte
 lives in the queue.
 
 Publication is staged so that no writer transaction grows with the library
-(#238). Every row of `sync_saved_occurrences`, `sync_file_evidence` and
+(#238). WAL checkpoints run on a connection of their own (`WALCheckpointer`),
+never inside a writer commit: while an open Library page's snapshot holds the
+WAL, frames accumulate, and SQLite's automatic checkpoint would copy and sync
+the whole backlog inside the next commit after it closes (#259). Every row of `sync_saved_occurrences`, `sync_file_evidence` and
 `sync_file_stats` carries a `generation`, and only the generation the
 `sync_checkpoint` header names is current; every reader filters on it.
 `SyncCheckpointStore.publish` checks publishability in a read, removes rows

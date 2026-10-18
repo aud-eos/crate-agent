@@ -213,7 +213,11 @@ final class AutoTagSessionTests: XCTestCase {
         await fixture.session.startScan()
         fixture.session.approveAllSuggested()
         let deletedID = fixture.fileIDs[1]
-        _ = try await fixture.database.writer.write { database in try FileRecord.deleteOne(database, key: deletedID) }
+        // Deleted synchronously, so apply starts before the session's membership observation sees it.
+        let deleteFile = { () throws in
+            _ = try fixture.database.writer.write { database in try FileRecord.deleteOne(database, key: deletedID) }
+        }
+        try deleteFile()
         await fixture.session.applyConfirmed()
         let applied = await recorder.fileIDsByBatch
         XCTAssertEqual(applied, [[fixture.fileIDs[0], fixture.fileIDs[2]]])

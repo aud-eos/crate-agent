@@ -101,6 +101,9 @@ public actor OperationEngine {
         case superseded(Set<Int64>)
         case stale(Set<Int64>)
         case conflicted(Set<Int64>)
+        /// A file moved after the pass resolved its rows' paths, as by a rename
+        /// committed mid-pass; the rows still apply once resolved again (#260).
+        case moved
     }
 
     private enum DuplicateCleanupInterruption: Error {
@@ -2216,6 +2219,10 @@ public actor OperationEngine {
                 try await supersedeMissing(from: survivors, keeping: rows, reported: reported, run: &run)
             } catch let ExternalWriteInterruption.stale(stale) {
                 rows = holdingBack(stale, from: rows, run: &run)
+            } catch ExternalWriteInterruption.moved {
+                let resolved = try await eligibleWrites(rows)
+                try await supersedeMissing(from: rows, keeping: resolved, reported: reported, run: &run)
+                rows = resolved
             } catch let ExternalWriteInterruption.conflicted(conflicted) {
                 var survivors: [GuardedSeratoWrite] = []
                 for write in rows {
@@ -2591,6 +2598,9 @@ public actor OperationEngine {
             guard let file = try FileRecord.fetchOne(database, key: write.token.fileId) else {
                 superseded.insert(queueID)
                 continue
+            }
+            if SeratoWriteEligibility.resolved(write, file: file).write != write.write {
+                throw ExternalWriteInterruption.moved
             }
             do { try SeratoWriteEligibility.requirePhysicalTarget(write, file: file, in: database) }
             catch is FileProcessingEligibilityError { superseded.insert(queueID) }
