@@ -194,4 +194,4 @@ soulseek-mcp/      MCP server binary exposing soulseek-core to Claude
 
 ## License
 
-TBD. Intended for personal use by the author for now.
+Copyright (c) 2026 AUDEOS, LLC. All rights reserved. The source is public for reference only; see [LICENSE](./LICENSE).
