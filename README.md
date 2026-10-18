@@ -67,6 +67,13 @@ List mode). Playing, opening and revealing first check that the file at the row'
 path is still that row's recording; a missing or replaced file is refused with a
 dismissible message at the bottom of the window.
 
+Duplicates are checked in full before cleanup is offered: byte-level matches by
+hashing every byte, perceptual matches by decoding. Only files with identical
+contents or decoded audio are offered together. Files that share a fingerprint but differ in audio,
+such as Clean and Dirty edits, are listed as kept. Copies in another format or
+encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
+listen and check each one yourself.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing

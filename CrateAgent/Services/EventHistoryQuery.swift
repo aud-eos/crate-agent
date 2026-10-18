@@ -36,14 +36,75 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     public let canResync: Bool
     /// Queued Serato or audio-tag changes from this batch that were recorded
     /// as not applied (`serato_write_dispositions`).
-    public let notAppliedCount: Int
+    public let notApplied: NotAppliedSummary
 
     public var timestamp: Date {
         Date(timeIntervalSince1970: TimeInterval(firstTimestampMillis) / 1000)
     }
 }
 
+/// Why a batch's queued changes were not applied, for its History row.
+public struct NotAppliedSummary: Sendable, Equatable {
+    public static let none = NotAppliedSummary(changeCount: 0, fileCount: 0, reasons: [])
+
+    /// Distinct not-applied changes, each counted once.
+    public let changeCount: Int
+    /// Distinct files those changes touch.
+    public let fileCount: Int
+    /// One plain-language line per disposition, with its count.
+    public let reasons: [String]
+}
+
+/// One file whose queued changes in a batch were not applied.
+public struct NotAppliedFile: Sendable, Equatable, Identifiable {
+    public var id: String {
+        fileID.map { fileID in "file:\(fileID)" } ?? "event:\(firstEventID)"
+    }
+
+    /// Nil when the change's event names no file.
+    public let fileID: Int64?
+    let firstEventID: Int64
+    /// Nil when the file is no longer in the library.
+    public let path: String?
+    public let reasons: [String]
+    /// `true` when re-syncing this file through
+    /// `OperationEngine.resyncSeratoForBatch(_:fileID:)` can replay its
+    /// changes: the batch is re-syncable and the file's events project onto
+    /// Serato or audio-tag writes.
+    public let canResync: Bool
+}
+
 public enum EventHistoryQuery {
+    public static let notAppliedFilePageSize = 50
+
+    /// One page of the files `batch`'s not-applied changes touch, with each
+    /// file's reasons. Loaded only when the History row is expanded.
+    public static func loadNotAppliedFiles(for batch: BatchSummary, database: LibraryDatabase,
+                                           limit: Int = notAppliedFilePageSize, offset: Int = 0) async throws -> [NotAppliedFile]
+    {
+        precondition(limit > 0 && offset >= 0)
+        let batchID = batch.batchId
+        let records = try await database.writer.read { db in
+            try SeratoWriteDispositions.notAppliedFiles(batchID: batchID, limit: limit, offset: offset, in: db)
+        }
+        return records.map { record in
+            NotAppliedFile(fileID: record.fileID, firstEventID: record.firstEventID, path: record.path,
+                           reasons: reasons(record.byDisposition),
+                           canResync: batch.canResync && record.fileID != nil && record.path != nil && canResyncBatch(typeList: record.eventTypes))
+        }
+    }
+
+    static func notAppliedSummary(_ counts: NotAppliedBatchCounts?) -> NotAppliedSummary {
+        guard let counts else { return .none }
+        return NotAppliedSummary(changeCount: counts.changes, fileCount: counts.files, reasons: reasons(counts.byDisposition))
+    }
+
+    private static func reasons(_ counts: SeratoWriteDispositionCounts) -> [String] {
+        let known = SeratoWriteDisposition.allCases.filter { disposition in counts[disposition] > 0 }
+            .map { disposition in SeratoWriteDispositionMessages.summary(disposition, count: counts[disposition]) }
+        return known + (counts.unrecognized > 0 ? [SeratoWriteDispositionMessages.unrecognizedSummary(count: counts.unrecognized)] : [])
+    }
+
     static func loadFileHistory(fileID: Int64, in database: GRDB.Database, limit: Int = 200, offset: Int = 0) throws -> [EventRecord] {
         precondition(limit > 0 && offset >= 0)
         return try EventRecord.filter(Column("file_id") == fileID)
@@ -95,8 +156,9 @@ public enum EventHistoryQuery {
         LIMIT ?
         """
 
-        let (rows, notApplied): ([Row], [String: Int]) = try await database.writer.read { db in
-            try (Row.fetchAll(db, sql: sql, arguments: [limit]), SeratoWriteDispositions.notAppliedCounts(in: db))
+        let (rows, notApplied): ([Row], [String: NotAppliedBatchCounts]) = try await database.writer.read { db in
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [limit])
+            return try (rows, SeratoWriteDispositions.notAppliedByBatch(rows.map(\.batchId), in: db))
         }
 
         let allBatchIds = Set(rows.map(\.batchId))
@@ -112,7 +174,7 @@ public enum EventHistoryQuery {
                 isUndoBatch: row.batchId.hasPrefix("undo:"),
                 canResync: canResyncBatch(typeList: typeList)
                     && !batchHasBeenUndone(row.batchId, allBatchIds: allBatchIds),
-                notAppliedCount: notApplied[row.batchId] ?? 0
+                notApplied: notAppliedSummary(notApplied[row.batchId])
             )
         }
     }

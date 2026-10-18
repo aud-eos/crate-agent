@@ -66,7 +66,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         try await session.synchronize()
         fixture.lifecycle.running = true
         fixture.watchdog.refresh()
-        let group = DuplicateFinder.DuplicateGroup(groupKey: "unstarted", mode: .byteLevel, files: [keeper, target])
+        let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("unstarted", files: [keeper, target], in: fixture.database)
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.pendingCount, 1)
         try save(fixture, paths: [keeper.path])
@@ -91,7 +91,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         let broken = fixture.locator.smartCratesDirectoryUrl.appendingPathComponent("broken.scrate")
         try FileManager.default.createDirectory(at: broken, withIntermediateDirectories: false)
         let engine = cleanupEngine(fixture)
-        let group = DuplicateFinder.DuplicateGroup(groupKey: "failed-readdition", mode: .byteLevel, files: [keeper, target])
+        let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("failed-readdition", files: [keeper, target], in: fixture.database)
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.failureCount, 1)
         try FileManager.default.removeItem(at: broken)
@@ -233,7 +233,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         _ = try saveCrates(fixture, paths: [keeper.path, target.path])
         try FileManager.default.createDirectory(at: fixture.locator.smartCratesDirectoryUrl.appendingPathComponent("broken.scrate"), withIntermediateDirectories: false)
         let engine = cleanupEngine(fixture)
-        let group = DuplicateFinder.DuplicateGroup(groupKey: "partial-crates", mode: .byteLevel, files: [keeper, target])
+        let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("partial-crates", files: [keeper, target], in: fixture.database)
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.trashedCount, 0)
         XCTAssertEqual(outcome.failureCount, 1)
@@ -273,7 +273,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
                 }
             }
         }
-        let group = DuplicateFinder.DuplicateGroup(groupKey: "original", mode: .byteLevel, files: [keeper, target])
+        let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("original", files: [keeper, target], in: fixture.database)
         let pending = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(pending.pendingCount, 1)
         try await fixture.database.writer.write { $0.trace(nil) }
@@ -314,7 +314,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             try FileManager.default.moveItem(atPath: path, toPath: retained.path)
             try replacement.write(to: URL(fileURLWithPath: path))
         })
-        let group = DuplicateFinder.DuplicateGroup(groupKey: "final-delete", mode: .byteLevel, files: [keeper, target])
+        let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("final-delete", files: [keeper, target], in: fixture.database)
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.failureCount, 1)
         XCTAssertEqual(outcome.trashedCount, 0)
@@ -440,7 +440,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             let engine = cleanupEngine(fixture)
             let session = makeSession(fixture, engine: engine)
             try await session.synchronize()
-            let group = DuplicateFinder.DuplicateGroup(groupKey: "reviewed", mode: .byteLevel, files: [keeper, target])
+            let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("reviewed", files: [keeper, target], in: fixture.database)
             if change == "replaced target" {
                 try FileManager.default.removeItem(atPath: target.path)
                 try Self.wav(sample: 9).write(to: URL(fileURLWithPath: target.path))
