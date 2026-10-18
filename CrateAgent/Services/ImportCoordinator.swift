@@ -281,7 +281,8 @@ public actor ImportCoordinator {
             musicalKey: nil, // not in AudioTags; Serato analysis fills this
             comment: tags.comment,
             length: tags.durationSeconds.map(Self.formatDuration),
-            label: nil
+            label: nil,
+            year: tags.year.map(String.init)
         )
         return (metadata, tags.bitrateKbps.map(Int.init))
     }

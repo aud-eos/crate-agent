@@ -78,6 +78,8 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
     public var comment: String?
     public var length: String?
     public var label: String?
+    /// Serato's year text (`ttyr`), distinct from the audio tag year on `tracks`.
+    public var seratoYear: String?
 
     public init(
         id: Int64? = nil,
@@ -104,7 +106,8 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         musicalKey: String? = nil,
         comment: String? = nil,
         length: String? = nil,
-        label: String? = nil
+        label: String? = nil,
+        seratoYear: String? = nil
     ) {
         self.id = id
         self.path = path
@@ -131,6 +134,7 @@ public struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord,
         self.comment = comment
         self.length = length
         self.label = label
+        self.seratoYear = seratoYear
     }
 
     /// The file's indexed freshness identity.

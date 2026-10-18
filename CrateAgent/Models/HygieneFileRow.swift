@@ -36,12 +36,13 @@ public struct HygieneFileRow:
     public var comment: String?
     public var length: String?
     public var label: String?
+    public var seratoYear: String?
 
     /// Explicit projection SQL so we never accidentally pull BLOBs.
     /// The column list matches the property names (snake_case in SQL,
     /// camelCase in Swift via the decoding strategy above).
     public static let hygieneFetchSQL = """
-    SELECT id, membership_revision, path, artist, title, album, genre, bpm, musical_key, comment, length, label
+    SELECT id, membership_revision, path, artist, title, album, genre, bpm, musical_key, comment, length, label, serato_year
     FROM files
     WHERE \(FileProcessingEligibility.processableSQL)
     """
@@ -58,6 +59,7 @@ public struct HygieneFileRow:
         comment: String? = nil,
         length: String? = nil,
         label: String? = nil,
+        seratoYear: String? = nil,
         membershipRevision: Int64 = 0
     ) {
         self.id = id
@@ -72,5 +74,6 @@ public struct HygieneFileRow:
         self.comment = comment
         self.length = length
         self.label = label
+        self.seratoYear = seratoYear
     }
 }

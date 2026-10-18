@@ -126,6 +126,7 @@ public final class LibraryDatabase {
         AddFileTrashLocationsMigration.register(in: &migrator)
         AddFingerprintFailureReasonMigration.register(in: &migrator)
         AddSubsecondFileIdentityMigration.register(in: &migrator)
+        AddSeratoYearToFilesMigration.register(in: &migrator)
         AddSeratoRenameProgressMigration.register(in: &migrator)
         AddFileDigestsMigration.register(in: &migrator)
         AddSongFamiliesMigration.register(in: &migrator)

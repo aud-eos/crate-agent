@@ -1,7 +1,8 @@
 import Foundation
 
 struct SyncCheckpointHeader: Codable, Equatable, Sendable {
-    static let currentVersion = 1
+    /// 2 saves Serato's year (#95); a version 1 checkpoint forces one full sync.
+    static let currentVersion = 2
     var formatVersion = currentVersion
     let libraryID: String
     let source: SeratoSourceIdentity
@@ -23,15 +24,12 @@ struct SavedSeratoOccurrence: Codable, Equatable, Sendable {
 
     init(_ record: SeratoTrackRecord) {
         pathBytes = Data(record.path.utf8)
-        metadata = SeratoMetadata(artist: record.artist, title: record.title, album: record.album, genre: record.genre,
-                                  bpm: record.bpm, musicalKey: record.key, comment: record.comment, length: record.length, label: record.label)
+        metadata = SeratoMetadata(record)
     }
 
     func record() throws -> SeratoTrackRecord {
         guard let path = String(data: pathBytes, encoding: .utf8) else { throw SyncCheckpointError.malformed }
-        return SeratoTrackRecord(path: path, artist: metadata.artist, title: metadata.title, album: metadata.album,
-                                 genre: metadata.genre, bpm: metadata.bpm, key: metadata.musicalKey,
-                                 comment: metadata.comment, length: metadata.length, label: metadata.label)
+        return metadata.record(path: path)
     }
 }
 

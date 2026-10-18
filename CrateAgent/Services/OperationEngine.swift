@@ -879,15 +879,11 @@ public actor OperationEngine {
 
     /// `base` with the named fields copied from `source`, including absent values.
     static func merging(_ fields: Set<String>, from source: SeratoMetadata, into base: SeratoMetadata) -> SeratoMetadata {
-        SeratoMetadata(artist: fields.contains("artist") ? source.artist : base.artist,
-                       title: fields.contains("title") ? source.title : base.title,
-                       album: fields.contains("album") ? source.album : base.album,
-                       genre: fields.contains("genre") ? source.genre : base.genre,
-                       bpm: fields.contains("bpm") ? source.bpm : base.bpm,
-                       musicalKey: fields.contains("key") ? source.musicalKey : base.musicalKey,
-                       comment: fields.contains("comment") ? source.comment : base.comment,
-                       length: fields.contains("length") ? source.length : base.length,
-                       label: fields.contains("label") ? source.label : base.label)
+        var merged = base
+        for field in SeratoMetadata.fields where fields.contains(field.name) {
+            merged[keyPath: field.keyPath] = source[keyPath: field.keyPath]
+        }
+        return merged
     }
 
     private static func validateObservedIdentity(_ mutation: TrackMutation, in database: GRDB.Database) throws {
@@ -1336,51 +1332,15 @@ public actor OperationEngine {
     /// The non-nil fields of a `SeratoMetadata`, keyed by a stable field name.
     /// An empty-string value (a clear) is a real value and IS included.
     static func metadataFieldMap(_ metadata: SeratoMetadata) -> [String: String] {
-        var result: [String: String] = [:]
-        if let value = metadata.artist {
-            result["artist"] = value
+        SeratoMetadata.fields.reduce(into: [:]) { result, field in
+            result[field.name] = metadata[keyPath: field.keyPath]
         }
-        if let value = metadata.title {
-            result["title"] = value
-        }
-        if let value = metadata.album {
-            result["album"] = value
-        }
-        if let value = metadata.genre {
-            result["genre"] = value
-        }
-        if let value = metadata.bpm {
-            result["bpm"] = value
-        }
-        if let value = metadata.musicalKey {
-            result["key"] = value
-        }
-        if let value = metadata.comment {
-            result["comment"] = value
-        }
-        if let value = metadata.length {
-            result["length"] = value
-        }
-        if let value = metadata.label {
-            result["label"] = value
-        }
-        return result
     }
 
     /// A copy of `metadata` with only the fields in `keep`; every other field
     /// becomes nil (leave-unchanged for the writers).
     private static func reducedMetadata(_ metadata: SeratoMetadata, keeping keep: Set<String>) -> SeratoMetadata {
-        SeratoMetadata(
-            artist: keep.contains("artist") ? metadata.artist : nil,
-            title: keep.contains("title") ? metadata.title : nil,
-            album: keep.contains("album") ? metadata.album : nil,
-            genre: keep.contains("genre") ? metadata.genre : nil,
-            bpm: keep.contains("bpm") ? metadata.bpm : nil,
-            musicalKey: keep.contains("key") ? metadata.musicalKey : nil,
-            comment: keep.contains("comment") ? metadata.comment : nil,
-            length: keep.contains("length") ? metadata.length : nil,
-            label: keep.contains("label") ? metadata.label : nil
-        )
+        merging(keep, from: metadata, into: .empty)
     }
 
     /// Reduce one reconstructed write to only the fields this event still owns
@@ -1612,7 +1572,8 @@ public actor OperationEngine {
                 artist: payload.artist,
                 title: payload.title,
                 album: payload.album,
-                year: payload.year
+                year: payload.year,
+                seratoYear: payload.seratoYear
             )
         case .metadataCommittedToSerato:
             // Hygiene / importer path: re-emit the database-V2 metadata
@@ -1854,6 +1815,7 @@ public actor OperationEngine {
                         (applied.artist != nil && file.artist != applied.artist)
                             || (applied.title != nil && file.title != applied.title)
                             || (applied.album != nil && file.album != applied.album)
+                            || (applied.seratoYear != nil && file.seratoYear != applied.seratoYear)
                     if clobbersLaterEdit {
                         throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                     }
@@ -1878,6 +1840,7 @@ public actor OperationEngine {
                         (applied.artist != nil && file.artist != restored.artist)
                             || (applied.title != nil && file.title != restored.title)
                             || (applied.album != nil && file.album != restored.album)
+                            || (applied.seratoYear != nil && file.seratoYear != restored.year)
                     if clobbersLaterEdit {
                         throw OperationEngineError.undoSupersededByLaterMatch(fileId: fileId)
                     }
@@ -2835,10 +2798,9 @@ public actor OperationEngine {
             musicalKey: write.metadata.musicalKey,
             comment: write.metadata.comment,
             label: write.metadata.label,
-            // Year lives on the pending write, not on SeratoMetadata:
-            // Serato's database V2 has no year field, so the MusicBrainz
-            // match routes year to the file tags only. `writeFileTags`
-            // leaves it nil.
+            // The file tag's year comes from the pending write as a number;
+            // `SeratoMetadata.year` is Serato's `ttyr` text and only ever
+            // reaches database V2.
             year: year,
             clearYear: write.clearYear
         )
@@ -2911,17 +2873,7 @@ public actor OperationEngine {
         let additions = adds.map { entry in
             SeratoTrackAddition(
                 trackPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: entry.add.absolutePath),
-                metadata: SeratoMetadataUpdate(
-                    artist: entry.add.metadata.artist,
-                    title: entry.add.metadata.title,
-                    album: entry.add.metadata.album,
-                    genre: entry.add.metadata.genre,
-                    bpm: entry.add.metadata.bpm,
-                    key: entry.add.metadata.musicalKey,
-                    comment: entry.add.metadata.comment,
-                    length: entry.add.metadata.length,
-                    label: entry.add.metadata.label
-                )
+                metadata: entry.add.metadata.databaseUpdate
             )
         }
         let addWriter = seratoAddTrackBatchWriter
@@ -3197,17 +3149,7 @@ public actor OperationEngine {
                 trackPath: SeratoLibraryLocator.seratoRelativePath(
                     fromAbsolute: update.absolutePath
                 ),
-                update: SeratoMetadataUpdate(
-                    artist: update.metadata.artist,
-                    title: update.metadata.title,
-                    album: update.metadata.album,
-                    genre: update.metadata.genre,
-                    bpm: update.metadata.bpm,
-                    key: update.metadata.musicalKey,
-                    comment: update.metadata.comment,
-                    length: update.metadata.length,
-                    label: update.metadata.label
-                )
+                update: update.metadata.databaseUpdate
             )
         }
 
@@ -3463,17 +3405,7 @@ public actor OperationEngine {
             mtimeNanoseconds: fileRecord.mtimeNanoseconds,
             lightweightHash: fileRecord.lightweightHash,
             bitrateKbps: fileRecord.bitrateKbps,
-            metadata: SeratoMetadata(
-                artist: fileRecord.artist,
-                title: fileRecord.title,
-                album: fileRecord.album,
-                genre: fileRecord.genre,
-                bpm: fileRecord.bpm,
-                musicalKey: fileRecord.musicalKey,
-                comment: fileRecord.comment,
-                length: fileRecord.length,
-                label: fileRecord.label
-            )
+            metadata: SeratoMetadata(mirroredBy: fileRecord)
         )
 
         // Insert the event BEFORE deleting the file: at delete time,
@@ -3521,7 +3453,8 @@ public actor OperationEngine {
             musicalKey: payload.metadata.musicalKey,
             comment: payload.metadata.comment,
             length: payload.metadata.length,
-            label: payload.metadata.label
+            label: payload.metadata.label,
+            seratoYear: payload.metadata.year
         )
         try fileRecord.insert(db)
         guard let fileId = fileRecord.id else {
@@ -3549,27 +3482,8 @@ public actor OperationEngine {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
 
-        let originalMetadata = SeratoMetadata(
-            artist: fileRecord.artist,
-            title: fileRecord.title,
-            album: fileRecord.album,
-            genre: fileRecord.genre,
-            bpm: fileRecord.bpm,
-            musicalKey: fileRecord.musicalKey,
-            comment: fileRecord.comment,
-            length: fileRecord.length,
-            label: fileRecord.label
-        )
-
-        fileRecord.artist = payload.metadata.artist
-        fileRecord.title = payload.metadata.title
-        fileRecord.album = payload.metadata.album
-        fileRecord.genre = payload.metadata.genre
-        fileRecord.bpm = payload.metadata.bpm
-        fileRecord.musicalKey = payload.metadata.musicalKey
-        fileRecord.comment = payload.metadata.comment
-        fileRecord.length = payload.metadata.length
-        fileRecord.label = payload.metadata.label
+        let originalMetadata = SeratoMetadata(mirroredBy: fileRecord)
+        fileRecord.mirror(payload.metadata)
         try fileRecord.update(db)
 
         let forwardPayload = SetMetadataPayload(
@@ -3889,8 +3803,8 @@ public actor OperationEngine {
 
     /// The paired Serato-side writes a MusicBrainz match (or its
     /// revert) produces: a `database V2` metadata update and an audio
-    /// file-tag write. Year rides only on the file-tag write —
-    /// `SeratoMetadata`, and thus `database V2`, has no year field. This
+    /// file-tag write. The file tag takes the numeric `year`; `database V2`
+    /// takes `seratoYear`, its `ttyr` text. This
     /// is the shared mechanic both the forward apply and the inverse
     /// revert call with different values (applied vs. restored).
     private static func musicBrainzSeratoWrites(
@@ -3899,6 +3813,7 @@ public actor OperationEngine {
         title: String?,
         album: String?,
         year: Int?,
+        seratoYear: String?,
         clearFileYear: Bool = false
     ) -> [SeratoPendingWrite] {
         let metadata = SeratoMetadata(artist: artist, title: title, album: album)
@@ -3910,16 +3825,15 @@ public actor OperationEngine {
         // (tags.rs), so an empty patch still rewrites the file, bumps its
         // mtime, and can strip secondary ID3v1/APE tags. Emit each write only
         // when it actually carries a change.
-        let hasSeratoMetadataFields = artist != nil || title != nil || album != nil
-        let fileTagNeedsWrite = hasSeratoMetadataFields || year != nil || clearFileYear
+        let hasTextFields = artist != nil || title != nil || album != nil
+        let fileTagNeedsWrite = hasTextFields || year != nil || clearFileYear
 
         var writes: [SeratoPendingWrite] = []
-        if hasSeratoMetadataFields {
-            // Serato's database V2 has no year field, so `clearFileYear`
-            // is irrelevant to the metadata update — it only affects the
-            // file-tag write.
+        if hasTextFields || seratoYear != nil {
+            var databaseMetadata = metadata
+            databaseMetadata.year = seratoYear
             writes.append(.metadataUpdate(SeratoPendingMetadataUpdate(
-                absolutePath: absolutePath, metadata: metadata
+                absolutePath: absolutePath, metadata: databaseMetadata
             )))
         }
         if fileTagNeedsWrite {
@@ -3964,17 +3878,7 @@ public actor OperationEngine {
 
         // Snapshot the file's Serato metadata + track link before
         // mutating, so the inverse can restore them exactly.
-        let previousMetadata = SeratoMetadata(
-            artist: fileRecord.artist,
-            title: fileRecord.title,
-            album: fileRecord.album,
-            genre: fileRecord.genre,
-            bpm: fileRecord.bpm,
-            musicalKey: fileRecord.musicalKey,
-            comment: fileRecord.comment,
-            length: fileRecord.length,
-            label: fileRecord.label
-        )
+        let previousMetadata = SeratoMetadata(mirroredBy: fileRecord)
         let previousTrackID = fileRecord.trackId
 
         // Upsert the canonical track row keyed by fingerprint (invariant
@@ -4067,9 +3971,13 @@ public actor OperationEngine {
         if let album = payload.album {
             fileRecord.album = album
         }
+        var forwardPayload = payload
+        forwardPayload.wroteSeratoYear = payload.year != nil
+        if let seratoYear = forwardPayload.seratoYear {
+            fileRecord.seratoYear = seratoYear
+        }
         try fileRecord.update(db)
 
-        var forwardPayload = payload
         forwardPayload.previousTrackID = previousTrackID
         forwardPayload.previousMetadata = previousMetadata
         // D-D: undo rewrites the AUDIO FILE's tags back to what was actually
@@ -4105,7 +4013,8 @@ public actor OperationEngine {
             artist: payload.artist,
             title: payload.title,
             album: payload.album,
-            year: payload.year
+            year: payload.year,
+            seratoYear: forwardPayload.seratoYear
         )
         return (eventId, seratoWrites)
     }
@@ -4149,6 +4058,9 @@ public actor OperationEngine {
             }
             if applied.album != nil {
                 fileRecord.album = previousMetadata.album
+            }
+            if applied.seratoYear != nil {
+                fileRecord.seratoYear = previousMetadata.year
             }
         }
         try fileRecord.update(db)
@@ -4215,7 +4127,8 @@ public actor OperationEngine {
         let v2Metadata = SeratoMetadata(
             artist: applied.artist != nil ? (dbSnapshot.artist ?? "") : nil,
             title: applied.title != nil ? (dbSnapshot.title ?? "") : nil,
-            album: applied.album != nil ? (dbSnapshot.album ?? "") : nil
+            album: applied.album != nil ? (dbSnapshot.album ?? "") : nil,
+            year: applied.seratoYear != nil ? (dbSnapshot.year ?? "") : nil
         )
         // A field the match did not change has nothing to restore, and
         // rewriting it would clobber a later edit to it.
@@ -4233,7 +4146,7 @@ public actor OperationEngine {
         let clearFileYear = forwardWroteYear && applied.previousFileYear == nil
 
         var writes: [SeratoPendingWrite] = []
-        if v2Metadata.artist != nil || v2Metadata.title != nil || v2Metadata.album != nil {
+        if v2Metadata.artist != nil || v2Metadata.title != nil || v2Metadata.album != nil || v2Metadata.year != nil {
             writes.append(.metadataUpdate(SeratoPendingMetadataUpdate(
                 absolutePath: absolutePath, metadata: v2Metadata
             )))
@@ -4489,9 +4402,9 @@ public struct TrackIdentifiers: Codable, Sendable, Equatable {
 /// fields (`artist`, `title`, `album`, `year`) are cherry-picked — a
 /// `nil` field is not applied, leaving the prior value in place.
 ///
-/// `year` reaches ONLY the audio file's tags and `tracks.year`;
-/// `SeratoMetadata` (and therefore Serato's `database V2`) has no year
-/// field, so it is deliberately not threaded through the Serato write.
+/// `year` reaches the audio file's tags, `tracks.year`, and Serato's
+/// `ttyr` in `database V2` (`files.serato_year`), as `wroteSeratoYear`
+/// records.
 ///
 /// The `previous…` fields are populated by the engine at apply time to
 /// make the event fully undoable (invariant #2). Callers leave them at
@@ -4563,6 +4476,15 @@ public struct ApplyMusicBrainzMatchPayload: Codable, Sendable, Equatable {
     public var previousFileYear: Int?
     public var previousTrackIdentifiers: TrackIdentifiers?
     public var createdTrackRow: Bool
+    /// Whether this match wrote its year to Serato's `ttyr` (#95). Nil for a
+    /// match journaled before then, which wrote the year to file tags only,
+    /// so its resync and undo leave Serato's year alone.
+    public var wroteSeratoYear: Bool?
+
+    /// Serato's year text this match wrote, if any.
+    var seratoYear: String? {
+        wroteSeratoYear == true ? year.map(String.init) : nil
+    }
 
     public init(
         fileID: Int64,
@@ -4720,6 +4642,8 @@ public struct SeratoMetadata: Codable, Sendable, Equatable, Hashable {
     public var comment: String?
     public var length: String?
     public var label: String?
+    /// Serato's `ttyr` text, not the audio tag year (`tracks.year`).
+    public var year: String?
 
     public init(
         artist: String? = nil,
@@ -4730,7 +4654,8 @@ public struct SeratoMetadata: Codable, Sendable, Equatable, Hashable {
         musicalKey: String? = nil,
         comment: String? = nil,
         length: String? = nil,
-        label: String? = nil
+        label: String? = nil,
+        year: String? = nil
     ) {
         self.artist = artist
         self.title = title
@@ -4741,6 +4666,7 @@ public struct SeratoMetadata: Codable, Sendable, Equatable, Hashable {
         self.comment = comment
         self.length = length
         self.label = label
+        self.year = year
     }
 
     public static let empty = SeratoMetadata()
@@ -4892,10 +4818,9 @@ struct SeratoPendingTrash: Codable, Sendable, Equatable {
 struct SeratoPendingFileTagWrite: Codable, Sendable, Equatable {
     let absolutePath: String
     let metadata: SeratoMetadata
-    /// Year to write into the audio file's tags. Lives here rather than
-    /// on `SeratoMetadata` because Serato's `database V2` has no year
-    /// field — only the file-tag path carries it. `nil` for callers
-    /// that don't set a year (e.g. `writeFileTags`).
+    /// Year to write into the audio file's tags, as a number. Serato's
+    /// `ttyr` text on `SeratoMetadata.year` is not written to the file.
+    /// `nil` for callers that don't set a year (e.g. `writeFileTags`).
     let year: Int?
     /// Remove the file's year/date frame instead of writing a value.
     /// Used by MusicBrainz undo when the match added a year to a file

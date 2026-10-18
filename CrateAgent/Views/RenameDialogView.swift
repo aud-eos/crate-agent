@@ -164,17 +164,7 @@ public enum RenameDestinationPlanner {
         musicFolder: URL,
         template: String
     ) -> URL {
-        let metadata = SeratoMetadata(
-            artist: file.artist,
-            title: file.title,
-            album: file.album,
-            genre: file.genre,
-            bpm: file.bpm,
-            musicalKey: file.musicalKey,
-            comment: file.comment,
-            length: file.length,
-            label: file.label
-        )
+        let metadata = SeratoMetadata(mirroredBy: file)
         let fileExtension = (file.path as NSString).pathExtension
         let filename = FilenameTemplateEngine.render(
             template: template,

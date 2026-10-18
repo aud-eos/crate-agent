@@ -1172,6 +1172,37 @@ final class DurableSeratoQueueTests: XCTestCase {
         XCTAssertEqual(summary.notAppliedWrites.total, 1)
     }
 
+    func testAMatchedYearReachesSeratoAndUndoRestoresIt() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("dated.wav", bytes: FinalRemovalIntegrationTests.wav())
+        try save(fixture, paths: [file.path])
+        _ = try batchUpdateDatabaseRecords(databasePath: fixture.locator.databaseV2Url.path,
+                                           updates: [.init(trackPath: SeratoLibraryLocator.seratoRelativePath(fromAbsolute: file.path),
+                                                           update: .init(artist: nil, title: nil, album: nil, genre: nil, bpm: nil, key: nil, comment: nil, length: nil,
+                                                                         label: nil, year: "1990"))])
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        let fileID = try XCTUnwrap(file.id)
+        let fingerprint = try await makeMatchable(fixture, fileID: fileID)
+        let match = ApplyMusicBrainzMatchPayload(fileID: fileID, acoustID: "acoustid", recordingMBID: "recording", releaseMBID: nil, artistMBID: nil, isrc: nil,
+                                                 fingerprintHash: fingerprint, expectedFileSize: file.fileSize, expectedMtime: file.mtime,
+                                                 artist: nil, title: nil, album: nil, year: 1994)
+        func seratoYears() async throws -> [String?] {
+            let stored = try await fixture.database.writer.read { database in try XCTUnwrap(FileRecord.fetchOne(database, key: fileID)).seratoYear }
+            return try [readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path).first?.year, stored]
+        }
+        let synchronized = try await seratoYears()
+        XCTAssertEqual(synchronized, ["1990", "1990"])
+
+        try await fixture.engine.apply(.applyMusicBrainzMatch(match), batchId: "dated-match")
+        let matched = try await seratoYears()
+        XCTAssertEqual(matched, ["1994", "1994"])
+
+        _ = try await fixture.engine.undoBatch("dated-match")
+        let undone = try await seratoYears()
+        XCTAssertEqual(undone, ["1990", "1990"])
+    }
+
     /// Two tracks in database V2 and every crate, plus the free path the
     /// second one moves to before the first takes its place.
     private func chainFixture(_ fixture: SeratoRemovalFixture) async throws -> (FileRecord, FileRecord, String) {
