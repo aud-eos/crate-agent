@@ -4,13 +4,22 @@ import Security
 /// Errors surfaced by `AcoustIDKeyStore` for genuine Keychain failures —
 /// anything other than "no item found," which `load()` represents as `nil`
 /// rather than an error.
-public enum AcoustIDKeyStoreError: Error, Equatable {
+public enum AcoustIDKeyStoreError: LocalizedError, Equatable {
     /// A `SecItemAdd`/`SecItemCopyMatching`/`SecItemDelete` call returned a
     /// non-success, non-"not found" `OSStatus`. Carries the raw status so
     /// operators can look it up (e.g. `errSecMissingEntitlement`).
     case keychain(OSStatus)
     /// The item was found but its value could not be decoded as UTF-8.
     case invalidEncoding
+
+    public var errorDescription: String? {
+        switch self {
+        case let .keychain(status):
+            "The Keychain could not access the AcoustID key: \((SecCopyErrorMessageString(status, nil) as String?) ?? "status \(status)")."
+        case .invalidEncoding:
+            "The AcoustID key saved in the Keychain is not readable text. Enter the key again."
+        }
+    }
 }
 
 /// Stores the user's AcoustID API key in the macOS login Keychain as a

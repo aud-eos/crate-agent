@@ -58,7 +58,7 @@ final class SeratoRemovalFixture {
         let metadata = FileMetadataCollector.collect(at: path, includeLightweightHash: true)!
         let owner = try await reader.read().libraryID
         return try await database.writer.write { connection in
-            var file = FileRecord(path: path, volumeUuid: metadata.volumeUuid, inode: metadata.inode, fileSize: metadata.fileSize, mtime: metadata.mtime, lightweightHash: metadata.lightweightHash)
+            var file = FileRecord(path: path, volumeUuid: metadata.volumeUuid, inode: metadata.inode, fileSize: metadata.fileSize, mtime: metadata.mtime, mtimeNanoseconds: metadata.mtimeNanoseconds, lightweightHash: metadata.lightweightHash)
             file.libraryMembership = membership
             file.fileAvailability = .available
             file.seratoLibraryId = membership == .legacyUnverified ? nil : owner

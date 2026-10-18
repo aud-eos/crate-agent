@@ -451,7 +451,8 @@ final class AutoTagSession: ObservableObject {
                 }
                 let batchID = UUID().uuidString
                 do {
-                    try await applyBatch(freshPayloads.map { .applyMusicBrainzMatch($0) }, batchID, tokens)
+                    let freshIDs = Set(freshPayloads.map(\.fileID))
+                    try await applyBatch(freshPayloads.map { .applyMusicBrainzMatch($0) }, batchID, tokens.filter { entry in freshIDs.contains(entry.key) })
                     markApplied(freshPayloads)
                     lastResult = "Applied \(freshPayloads.count) file(s)." + skipNotice
                 } catch let OperationEngineError.externalSyncIncomplete(failedBatchID, underlying) {

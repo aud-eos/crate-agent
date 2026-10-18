@@ -54,6 +54,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         let resultAttachment = XCTAttachment(string: result)
         resultAttachment.lifetime = .keepAlways
         add(resultAttachment)
+        try await verifyUpgradeBackfill(fixture)
         try await verifyNavigationDuringSync(fixture)
         try await verifyWriterHoldWhilePublishingTheCheckpoint(fixture)
     }
@@ -83,6 +84,49 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         add(attachment)
     }
 
+    /// The first sync after migration 018 records 30,000 legacy rows' subsecond times from
+    /// stat evidence (#118): no audio reads, backfill writer waits inside #189's budget, slim events
+    /// even for fingerprinted rows, and the next restart back on the fast path.
+    private func verifyUpgradeBackfill(_ fixture: LibraryStartupPerformanceFixture) async throws {
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE files SET mtime_nanoseconds = NULL, chromaprint_fingerprint = ?, fingerprint_status = 'done'",
+                                 arguments: [Data(repeating: 7, count: 4096)])
+        }
+        let eventBytesBefore = try await eventBytes(fixture.database)
+        let counters = LibrarySyncMetrics()
+        let probe = WriterWaitProbe(database: fixture.database, during: .reconciling, of: counters)
+        let start = ContinuousClock.now
+        try await LibrarySyncMetrics.$current.withValue(counters) { try await fixture.makeSession(checkpointed: true).synchronize() }
+        let upgrade = start.duration(to: .now)
+        let (longestWriterWait, writerSamples) = await probe.stop()
+        let eventBytesAdded = try await eventBytes(fixture.database) - eventBytesBefore
+        let awaiting = try await fixture.database.writer.read { database in
+            try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM files WHERE mtime_nanoseconds IS NULL")
+        }
+        let restartStart = ContinuousClock.now
+        try await fixture.makeSession(checkpointed: true).synchronize()
+        let restart = restartStart.duration(to: .now)
+        XCTAssertEqual(awaiting, 0)
+        XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
+        XCTAssertEqual(counters.snapshot().audioTagReads, 0)
+        XCTAssertGreaterThan(writerSamples, 100)
+        XCTAssertLessThan(longestWriterWait, .milliseconds(500))
+        XCTAssertLessThan(eventBytesAdded / 30000, 512)
+        XCTAssertLessThan(upgrade, .seconds(60))
+        XCTAssertLessThan(restart, .seconds(2))
+        let result = "STARTUP_UPGRADE files=30000 fingerprinted=true upgrade=\(upgrade) backfill_writer_wait_max=\(longestWriterWait) writer_samples=\(writerSamples) event_bytes=\(eventBytesAdded) restart=\(restart) hash=\(counters.snapshot().lightweightHashReads) phases=\(counters.phaseDurations())"
+        print(result)
+        let attachment = XCTAttachment(string: result)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func eventBytes(_ database: LibraryDatabase) async throws -> Int {
+        try await database.writer.read { database in
+            try Int.fetchOne(database, sql: "SELECT COALESCE(SUM(LENGTH(payload_json) + LENGTH(inverse_payload_json)), 0) FROM events") ?? 0
+        }
+    }
+
     private func verifyNavigationDuringSync(_ fixture: LibraryStartupPerformanceFixture) async throws {
         let barrier = SessionBarrier()
         let reader = SeratoMembershipSnapshotReader(locator: fixture.locator, watchdog: fixture.watchdog, afterParsing: { await barrier.pauseFirst() })
@@ -95,6 +139,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         _ = try updateDatabaseRecord(databasePath: fixture.locator.databaseV2Url.path, trackPath: file.path,
                                      update: SeratoMetadataUpdate(artist: nil, title: "Changed during navigation", album: nil, genre: nil,
                                                                   bpm: nil, key: nil, comment: nil, length: nil, label: nil))
+        LibraryNavigationFixture.prepareWindowChrome()
         let model = try LibraryBrowserModel(database: fixture.database)
         await model.start()
         let selection = LibraryNavigationSelection()
@@ -135,16 +180,48 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         let navigationLatency = start.duration(to: .now)
         XCTAssertEqual(session.state, .reconciling)
         XCTAssertLessThan(navigationLatency, .milliseconds(500))
+        let resumed = ContinuousClock.now
         await barrier.release()
         try await syncing.value
+        let slowPath = resumed.duration(to: .now)
+        XCTAssertLessThan(slowPath, .seconds(30))
         XCTAssertEqual(counters.snapshot().snapshotParses, 1)
         XCTAssertEqual(counters.snapshot().audioTagReads, 0)
         XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
         XCTAssertEqual(counters.snapshot().rowWrites, 1)
-        let result = "STARTUP_NAVIGATION files=30000 mounted_production_sidebar=true mounted_production_library=true active_sync=held_after_parse content_render=\(renderLatency) navigation=\(navigationLatency) changed_rows=\(counters.snapshot().rowWrites)"
+        let result = "STARTUP_NAVIGATION files=30000 mounted_production_sidebar=true mounted_production_library=true active_sync=held_after_parse content_render=\(renderLatency) navigation=\(navigationLatency) slow_path_after_parse=\(slowPath) phases=\(counters.phaseDurations()) changed_rows=\(counters.snapshot().rowWrites)"
         print(result)
         let attachment = XCTAttachment(string: result)
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+}
+
+/// Issues an empty write every 5 ms, as #189 measured drains, and reports the longest
+/// time one waited for the writer while the sync stayed in one phase.
+private struct WriterWaitProbe {
+    private let task: Task<(longest: Duration, samples: Int), Never>
+
+    init(database: LibraryDatabase, during phase: SeratoLibrarySyncSession.SyncPhase, of metrics: LibrarySyncMetrics) {
+        task = Task.detached {
+            var longest = Duration.zero
+            var samples = 0
+            while !Task.isCancelled {
+                let start = ContinuousClock.now
+                let startedInPhase = metrics.currentPhase() == phase.rawValue
+                do { try await database.writer.write { _ in } } catch { break }
+                if startedInPhase, metrics.currentPhase() == phase.rawValue {
+                    longest = max(longest, start.duration(to: .now))
+                    samples += 1
+                }
+                do { try await Task.sleep(for: .milliseconds(5)) } catch { break }
+            }
+            return (longest, samples)
+        }
+    }
+
+    func stop() async -> (longest: Duration, samples: Int) {
+        task.cancel()
+        return await task.value
     }
 }

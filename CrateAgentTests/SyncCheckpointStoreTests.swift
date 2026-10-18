@@ -43,8 +43,8 @@ final class SyncCheckpointStoreTests: XCTestCase {
         XCTAssertEqual(durable, changed)
         let dirty = try await reopened.dirtyFiles()
         XCTAssertTrue(dirty.fileIDs.contains(fileID))
-        XCTAssertTrue(dirty.paths.contains(Data("/fixture/original.wav".utf8)))
-        XCTAssertFalse(dirty.paths.contains(Data("/fixture/rolled-back.wav".utf8)))
+        XCTAssertTrue(dirty.paths.contains(PathBytes("/fixture/original.wav")))
+        XCTAssertFalse(dirty.paths.contains(PathBytes("/fixture/rolled-back.wav")))
     }
 
     @MainActor
