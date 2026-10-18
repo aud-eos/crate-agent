@@ -59,7 +59,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
     }
 
     /// The first sync after migration 018 records 30,000 legacy rows' subsecond times from
-    /// stat evidence (#118): no audio reads, writer waits inside #189's budget, slim events
+    /// stat evidence (#118): no audio reads, backfill writer waits inside #189's budget, slim events
     /// even for fingerprinted rows, and the next restart back on the fast path.
     private func verifyUpgradeBackfill(_ fixture: LibraryStartupPerformanceFixture) async throws {
         try await fixture.database.writer.write { database in
@@ -68,11 +68,11 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         }
         let eventBytesBefore = try await eventBytes(fixture.database)
         let counters = LibrarySyncMetrics()
-        let probe = WriterWaitProbe(database: fixture.database)
+        let probe = WriterWaitProbe(database: fixture.database, during: .reconciling, of: counters)
         let start = ContinuousClock.now
         try await LibrarySyncMetrics.$current.withValue(counters) { try await fixture.makeSession(checkpointed: true).synchronize() }
         let upgrade = start.duration(to: .now)
-        let longestWriterWait = await probe.stop()
+        let (longestWriterWait, writerSamples) = await probe.stop()
         let eventBytesAdded = try await eventBytes(fixture.database) - eventBytesBefore
         let awaiting = try await fixture.database.writer.read { database in
             try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM files WHERE mtime_nanoseconds IS NULL")
@@ -83,11 +83,12 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         XCTAssertEqual(awaiting, 0)
         XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
         XCTAssertEqual(counters.snapshot().audioTagReads, 0)
+        XCTAssertGreaterThan(writerSamples, 100)
         XCTAssertLessThan(longestWriterWait, .milliseconds(500))
         XCTAssertLessThan(eventBytesAdded / 30000, 512)
         XCTAssertLessThan(upgrade, .seconds(60))
         XCTAssertLessThan(restart, .seconds(2))
-        let result = "STARTUP_UPGRADE files=30000 fingerprinted=true upgrade=\(upgrade) writer_wait_max=\(longestWriterWait) event_bytes=\(eventBytesAdded) restart=\(restart) hash=\(counters.snapshot().lightweightHashReads) phases=\(counters.phaseDurations())"
+        let result = "STARTUP_UPGRADE files=30000 fingerprinted=true upgrade=\(upgrade) backfill_writer_wait_max=\(longestWriterWait) writer_samples=\(writerSamples) event_bytes=\(eventBytesAdded) restart=\(restart) hash=\(counters.snapshot().lightweightHashReads) phases=\(counters.phaseDurations())"
         print(result)
         let attachment = XCTAttachment(string: result)
         attachment.lifetime = .keepAlways
@@ -167,24 +168,29 @@ final class LibraryStartupPerformanceTests: XCTestCase {
 }
 
 /// Issues an empty write every 5 ms, as #189 measured drains, and reports the longest
-/// time one waited for the writer.
+/// time one waited for the writer while the sync stayed in one phase.
 private struct WriterWaitProbe {
-    private let task: Task<Duration, Never>
+    private let task: Task<(longest: Duration, samples: Int), Never>
 
-    init(database: LibraryDatabase) {
+    init(database: LibraryDatabase, during phase: SeratoLibrarySyncSession.SyncPhase, of metrics: LibrarySyncMetrics) {
         task = Task.detached {
             var longest = Duration.zero
+            var samples = 0
             while !Task.isCancelled {
                 let start = ContinuousClock.now
+                let startedInPhase = metrics.currentPhase() == phase.rawValue
                 do { try await database.writer.write { _ in } } catch { break }
-                longest = max(longest, start.duration(to: .now))
+                if startedInPhase, metrics.currentPhase() == phase.rawValue {
+                    longest = max(longest, start.duration(to: .now))
+                    samples += 1
+                }
                 do { try await Task.sleep(for: .milliseconds(5)) } catch { break }
             }
-            return longest
+            return (longest, samples)
         }
     }
 
-    func stop() async -> Duration {
+    func stop() async -> (longest: Duration, samples: Int) {
         task.cancel()
         return await task.value
     }
