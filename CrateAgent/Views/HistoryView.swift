@@ -20,6 +20,7 @@ struct HistoryView: View {
     @State private var actionNotice: String?
     @State private var undoInFlightBatchId: String?
     @State private var resyncInFlightBatchId: String?
+    @State private var discardTarget: QueuedSeratoChange?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,6 +44,15 @@ struct HistoryView: View {
         }
         .frame(minWidth: 520, minHeight: 360)
         .task { await reload() }
+        .sheet(item: $discardTarget) { change in
+            DiscardQueuedChangeSheet(change: change) { message in
+                actionError = nil
+                actionNotice = message
+                await reload()
+            }
+            .environmentObject(services)
+            .environmentObject(services.seratoWatchdog)
+        }
     }
 
     @ViewBuilder
@@ -82,9 +92,14 @@ struct HistoryView: View {
                     ProgressView("Undoing batch…")
                 } else if resyncInFlightBatchId == batch.batchId {
                     ProgressView("Re-syncing batch…")
+                } else if batch.isDiscardBatch {
+                    StatusBadge(title: QueuedChangeDiscardMessages.discardedBatchBadge, systemImage: "xmark.circle")
                 } else {
                     StatusBadge(title: batch.isUndoBatch ? "Undo batch" : "Recorded changes",
                                 systemImage: batch.isUndoBatch ? "arrow.uturn.backward.circle" : "clock")
+                }
+                if !batch.stuckChanges.isEmpty {
+                    stuckChanges(batch.stuckChanges)
                 }
                 if batch.notApplied.hasRecordedChanges {
                     if batch.notApplied.changeCount > 0 {
@@ -134,6 +149,28 @@ struct HistoryView: View {
                 : "This batch contains operations that can't be undone yet (Serato-side imports/commits).")
         }
         .padding(.vertical, density.rowPadding)
+    }
+
+    /// Queued changes that cannot apply, each with its discard action.
+    private func stuckChanges(_ changes: [QueuedSeratoChange]) -> some View {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            StatusBadge(title: QueuedChangeDiscardMessages.historySummary(count: changes.count), systemImage: "exclamationmark.octagon", tint: .orange)
+            ForEach(changes) { change in
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text((change.path as NSString).lastPathComponent).font(.callout).textSelection(.enabled)
+                        Text(change.failure ?? QueuedChangeDiscardMessages.waitingBehindFailure)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Button(QueuedChangeDiscardMessages.discardAction) { discardTarget = change }
+                        .controlSize(.small)
+                        .disabled(undoInFlightBatchId != nil || resyncInFlightBatchId != nil)
+                        .seratoWriteGated(help: QueuedChangeDiscardMessages.confirmHelp, runningHelp: QueuedChangeDiscardMessages.runningHelp)
+                }
+            }
+        }
     }
 
     private func actionBanner(_ message: String, systemImage: String, tint: Color, dismiss: @escaping () -> Void) -> some View {
