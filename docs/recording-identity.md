@@ -12,7 +12,8 @@ through `OperationEngine` and undoable from History.
 
 ## The key
 
-`RecordingIdentity.key(of:in:)` is the single source of a file's key:
+`RecordingIdentity.key(of:in:)` is the single source of a file's key
+(`keys(ofFiles:in:)` applies the same rule to many files in one query):
 
 - The SHA-256 of its current 120 s fingerprint, by default.
 - The SHA-256 of that hash followed by a discriminator, while

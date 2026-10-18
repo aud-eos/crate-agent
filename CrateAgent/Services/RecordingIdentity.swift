@@ -35,16 +35,48 @@ enum RecordingIdentity {
     }
 
     static func key(fingerprintHash: Data, fileID: Int64, in database: Database) throws -> Data {
-        guard let stored = try discriminator(ofFile: fileID, in: database), stored.fingerprintHash == fingerprintHash else {
-            return fingerprintHash
+        try key(fingerprintHash: fingerprintHash, stored: discriminator(ofFile: fileID, in: database))
+    }
+
+    /// `key(of:in:)` for many files in one query, reading only the columns
+    /// the key needs. Files without a current fingerprint are left out.
+    static func keys(ofFiles fileIDs: [Int64], in database: Database) throws -> [Int64: Data] {
+        guard !fileIDs.isEmpty else { return [:] }
+        let rows = try Row.fetchCursor(database, sql: """
+        SELECT files.id, files.chromaprint_fingerprint, files.fingerprint_status, files.fingerprinted_size, files.fingerprinted_mtime,
+               files.file_size, files.mtime, \(discriminatorColumns(of: "separation"))
+        FROM files LEFT JOIN \(table) AS separation ON separation.file_id = files.id
+        WHERE files.id IN (SELECT value FROM json_each(?))
+        """, arguments: ["[" + fileIDs.map(String.init).joined(separator: ",") + "]"])
+        var keys: [Int64: Data] = [:]
+        while let row = try rows.next() {
+            let fileID: Int64 = row["id"]
+            guard let status = FingerprintStatus(rawValue: row["fingerprint_status"]),
+                  let hash = fingerprintHash(row["chromaprint_fingerprint"], status: status, fingerprintedSize: row["fingerprinted_size"],
+                                             fingerprintedMtime: row["fingerprinted_mtime"], fileSize: row["file_size"], mtime: row["mtime"])
+            else { continue }
+            let stored = try (row["source"] as String?) == nil ? nil : discriminator(of: row, fileID: fileID)
+            keys[fileID] = key(fingerprintHash: hash, stored: stored)
         }
+        return keys
+    }
+
+    private static func key(fingerprintHash: Data, stored: RecordingDiscriminator?) -> Data {
+        guard let stored, stored.fingerprintHash == fingerprintHash else { return fingerprintHash }
         return stored.key
     }
 
     static func discriminator(ofFile fileID: Int64, in database: Database) throws -> RecordingDiscriminator? {
-        guard let row = try Row.fetchOne(database, sql: "SELECT fingerprint_sha256, discriminator, source FROM \(table) WHERE file_id = ?",
-                                         arguments: [fileID])
-        else { return nil }
+        let statement = try database.cachedStatement(sql: "SELECT \(discriminatorColumns(of: table)) FROM \(table) WHERE file_id = ?")
+        guard let row = try Row.fetchOne(statement, arguments: [fileID]) else { return nil }
+        return try discriminator(of: row, fileID: fileID)
+    }
+
+    private static func discriminatorColumns(of alias: String) -> String {
+        "\(alias).fingerprint_sha256, \(alias).discriminator, \(alias).source"
+    }
+
+    private static func discriminator(of row: Row, fileID: Int64) throws -> RecordingDiscriminator {
         guard let source = RecordingSeparationSource(rawValue: row["source"]) else {
             throw RecordingIdentityError.unreadableDiscriminator(fileId: fileID)
         }

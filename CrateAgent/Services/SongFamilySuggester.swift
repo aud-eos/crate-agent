@@ -324,11 +324,7 @@ public struct SongFamilySuggester: Sendable {
     /// The current recording key of each unlinked candidate that has one,
     /// by the rule grouping links with. Reads fingerprints of candidates only.
     private static func fingerprintHashes(of fileIDs: [Int64], in database: GRDB.Database) throws -> [Int64: Data] {
-        try FileRecord.fetchAll(database, keys: fileIDs).reduce(into: [:]) { hashes, file in
-            if let fileID = file.id, let hash = try RecordingIdentity.key(of: file, in: database) {
-                hashes[fileID] = hash
-            }
-        }
+        try RecordingIdentity.keys(ofFiles: fileIDs, in: database)
     }
 
     private struct FingerprintTrack {
