@@ -42,6 +42,7 @@ extension SyncCheckpointStore {
             let cursor = try Row.fetchCursor(connection, sql: """
             SELECT files.id, files.path AS current_path, evidence.*
             FROM files LEFT JOIN sync_file_stats evidence ON evidence.file_id = files.id
+              AND evidence.generation = (SELECT generation FROM sync_checkpoint WHERE id = 1)
             """)
             while let row = try cursor.next() {
                 try Task.checkCancellation()
@@ -98,15 +99,15 @@ extension SyncCheckpointStore {
         }
     }
 
-    static func saveStatEvidence(_ file: SyncFileEvidence, in connection: Database) throws {
+    static func saveStatEvidence(_ file: SyncFileEvidence, generation: Int64, in connection: Database) throws {
         guard file.bitrateProbed, let stamp = file.readIdentity else { return }
         let entry = stamp.entry
         let link = entry == stamp.target ? nil : try JSONEncoder().encode(stamp)
         try connection.execute(sql: """
         INSERT INTO sync_file_stats
-        (file_id, path, volume_uuid, device, inode, size, modified_seconds, modified_nanoseconds, changed_seconds, changed_nanoseconds, link_evidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, arguments: [file.fileID, file.identity.path, file.identity.volumeUuid, entry.device, entry.inode, entry.size,
+        (generation, file_id, path, volume_uuid, device, inode, size, modified_seconds, modified_nanoseconds, changed_seconds, changed_nanoseconds, link_evidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, arguments: [generation, file.fileID, file.identity.path, file.identity.volumeUuid, entry.device, entry.inode, entry.size,
                          entry.modifiedSeconds, entry.modifiedNanoseconds, entry.changedSeconds, entry.changedNanoseconds, link])
     }
 }

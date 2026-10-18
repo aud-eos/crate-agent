@@ -132,6 +132,7 @@ public final class LibraryDatabase {
         AddSeratoWriteResolutionsMigration.register(in: &migrator)
         AddDuplicateLabelReviewsMigration.register(in: &migrator)
         AddSeratoPlayCountsMigration.register(in: &migrator)
+        AddSyncCheckpointGenerationsMigration.register(in: &migrator)
         return migrator
     }
 }
