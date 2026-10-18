@@ -313,8 +313,11 @@ WAL, and no owner audio, preferences, or live `AppServices` are accessed.
 
 The fixture mounts the production Library content and sidebar, repeatedly scrolls
 to distant rows and switches sidebar selection, and records main-actor scheduling
-gaps. Rendering, scroll completion, sidebar selection, and maximum main-actor gap
-must each stay below 500 ms while the backlog remains active. At least one batch
+gaps. As in the app, the window opens before the Library model loads, so rendering
+runs from the model's start until the first rows are visible in that window. The
+heartbeat also covers the window's own setup turn. Rendering, scroll completion,
+sidebar selection, and maximum main-actor gap must each stay below 500 ms while the
+backlog remains active. At least one batch
 must persist successful fingerprints, with no failed decodes. These measurements
 exercise scheduling and database/UI contention on warm, repeated PCM audio; they
 do not establish throughput for a diverse collection or cold external storage.

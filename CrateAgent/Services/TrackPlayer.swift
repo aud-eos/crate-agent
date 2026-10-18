@@ -27,21 +27,24 @@ extension PlayerTrack {
 
 enum TrackPlayerState: Equatable {
     case idle
+    /// Pressed, but its file is still being checked; shown as playing, so a
+    /// second press cancels it.
+    case verifying(PlayerTrack)
     case playing(PlayerTrack)
     case paused(PlayerTrack)
 
     var track: PlayerTrack? {
         switch self {
         case .idle: nil
-        case let .playing(track), let .paused(track): track
+        case let .verifying(track), let .playing(track), let .paused(track): track
         }
     }
 
     var isPlaying: Bool {
-        if case .playing = self {
-            return true
+        switch self {
+        case .verifying, .playing: true
+        case .idle, .paused: false
         }
-        return false
     }
 }
 
@@ -100,11 +103,13 @@ final class TrackPlayer: ObservableObject {
         stop()
         failure = nil
         let generation = playbackGeneration
+        state = .verifying(track)
         let record: FileRecord
         do {
             record = try await access.verifiedRecord(fileID: track.fileID)
         } catch {
             guard playbackGeneration == generation else { return }
+            state = .idle
             failure = (error as? LibraryFileAccessError).map { error in TrackPlayerMessages.cannotPlay(error.filename, detail: error.detail) }
                 ?? TrackPlayerMessages.cannotPlay(track.filename, detail: error.localizedDescription)
             return
@@ -137,6 +142,7 @@ final class TrackPlayer: ObservableObject {
     func togglePlayback() {
         switch state {
         case .idle: break
+        case .verifying: stop()
         case .playing: pause()
         case .paused: resume()
         }

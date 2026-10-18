@@ -179,7 +179,7 @@ struct HistoryView: View {
                 .foregroundStyle(tint)
                 .fixedSize(horizontal: false, vertical: true)
         } actions: {
-            Button("Dismiss", action: dismiss)
+            Button(CommonLabels.dismiss, action: dismiss)
                 .controlSize(density.controlSize)
         }
         .padding(.horizontal, density.pagePadding)

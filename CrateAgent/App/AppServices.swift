@@ -149,7 +149,9 @@ public final class AppServices: ObservableObject {
         try ApplicationRuntime.requireLiveResources()
         self.watchedMusicFolder = watchedMusicFolder
         self.database = database
-        let fileAccess = LibraryFileAccess(database: database)
+        let audioEvidence = DuplicateEvidenceVerifier(database: database)
+        duplicateEvidenceVerifier = audioEvidence
+        let fileAccess = LibraryFileAccess(database: database, audioEvidence: audioEvidence)
         trackPlayer = TrackPlayer(access: fileAccess)
         fileOpener = FileOpener(access: fileAccess)
         seratoWatchdog = SeratoWatchdog()
@@ -188,7 +190,6 @@ public final class AppServices: ObservableObject {
 
         let worker = FingerprintWorker(database: database, readiness: readiness)
         fingerprintWorker = worker
-        duplicateEvidenceVerifier = DuplicateEvidenceVerifier(database: database)
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and

@@ -439,6 +439,14 @@ format, plus the sample rate and channel count, and a marker with the packet
 timestamp for every packet the decoder skipped), its container/codec, its decoded
 duration and a hash of its full-length fingerprint.
 
+Play, Open and Reveal also cache a file's decoded-audio digest, in the background,
+once they have confirmed the file is still its row's recording. When a later
+access finds the file's bytes changed but the change not yet synced (Serato
+writing tags into it, for example), the file is used only when it decodes to
+exactly that cached PCM; with no cached digest, or different audio, it is refused
+as replaced until sync records it. This reads and fills the cache only; it records
+no identity, which sync still observes as usual.
+
 `DuplicateEvidenceVerifier` computes digests lazily off the main actor. A second
 caller joins the running pass instead of starting another, the pass is cancelled
 only when every caller has gone, and finished digests are saved before

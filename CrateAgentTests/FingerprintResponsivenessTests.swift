@@ -101,10 +101,18 @@ final class FingerprintResponsivenessTests: XCTestCase {
                 }
             }
             defer { heartbeat.cancel() }
-            let renderStart = ContinuousClock.now
-            await model.start()
+            // As in the app, the window is open before the library loads, so the render budget
+            // measures the library appearing in it. Building the window after the model had
+            // loaded fused split-view and toolbar setup with the table into one main-actor turn
+            // that the app never runs. Yielding starts the heartbeat first, so it still covers the
+            // window's own turn (#224).
+            await Task.yield()
             let host = NSHostingView(rootView: LibraryNavigationFixture(selection: selection, model: model, readiness: gate))
             window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            let renderStart = ContinuousClock.now
+            await model.start()
             host.layoutSubtreeIfNeeded()
             window.displayIfNeeded()
             await pagingEventually { model.results.totalCount == 30000 && model.results.row(at: 0) != nil }
