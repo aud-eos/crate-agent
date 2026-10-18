@@ -554,10 +554,15 @@ fn restore_otrks(
     for entry in removed {
         let mut parsed = TlvRecord::parse_all(&entry.record)?;
         match (parsed.pop(), parsed.is_empty()) {
-            (Some(record), true) if &record.tag == TAG_OTRK => decoded.push((entry.index, record)),
+            (Some(record), true)
+                if &record.tag == TAG_OTRK
+                    && otrk_has_path_in(&record.payload, path_tag, &target) =>
+            {
+                decoded.push((entry.index, record))
+            }
             _ => {
                 return Err(SeratoError::InvalidFile(
-                    "removed record is not a single otrk".into(),
+                    "removed record is not a single otrk holding the restored path".into(),
                 ))
             }
         }
@@ -2080,7 +2085,7 @@ mod tests {
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
         let removed = database
-            .remove_track_capturing(("Users/x/Music/A/remove.mp3"))
+            .remove_track_capturing("Users/x/Music/A/remove.mp3")
             .unwrap()
             .len();
         assert_eq!(removed, 1);
@@ -2101,7 +2106,7 @@ mod tests {
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
         let removed = database
-            .remove_track_capturing(("Users/x/Music/A/nonexistent.mp3"))
+            .remove_track_capturing("Users/x/Music/A/nonexistent.mp3")
             .unwrap()
             .len();
         assert_eq!(removed, 0);
@@ -2118,7 +2123,7 @@ mod tests {
         );
         let mut crate_file = CrateFile::from_bytes(&bytes).unwrap();
         let removed = crate_file
-            .remove_track_capturing(("Users/x/Music/A/remove.mp3"))
+            .remove_track_capturing("Users/x/Music/A/remove.mp3")
             .unwrap()
             .len();
         assert_eq!(removed, 1);
@@ -2246,10 +2251,10 @@ mod tests {
                 tag: *b"vrsn",
                 payload: encode_utf16be("1.0/Serato ScratchLive Crate"),
             },
+            otrk_with_metadata(TAG_PTRK, "Music/B/dup.mp3", "One"),
             synthetic_otrk(TAG_PTRK, "Music/A/a.mp3"),
-            synthetic_otrk(TAG_PTRK, "Music/B/dup.mp3"),
+            otrk_with_metadata(TAG_PTRK, "Music/B/dup.mp3", "Two"),
             synthetic_otrk(TAG_PTRK, "Music/C/c.mp3"),
-            synthetic_otrk(TAG_PTRK, "Music/B/dup.mp3"),
         ]);
         let mut crate_file = CrateFile::from_bytes(&original).unwrap();
         let mut removed = crate_file
@@ -2260,7 +2265,7 @@ mod tests {
                 .iter()
                 .map(|record| record.index)
                 .collect::<Vec<_>>(),
-            vec![2, 4]
+            vec![1, 3]
         );
         removed.reverse();
 
@@ -2427,10 +2432,7 @@ mod tests {
             );
 
             let mut removed = original.clone();
-            assert_eq!(
-                removed.remove_track_capturing((requested)).unwrap().len(),
-                1
-            );
+            assert_eq!(removed.remove_track_capturing(requested).unwrap().len(), 1);
             assert_eq!(
                 removed.records,
                 vec![original.records[0].clone(), unrelated.clone()]
@@ -2457,10 +2459,7 @@ mod tests {
             );
 
             let mut removed = original.clone();
-            assert_eq!(
-                removed.remove_track_capturing((requested)).unwrap().len(),
-                1
-            );
+            assert_eq!(removed.remove_track_capturing(requested).unwrap().len(), 1);
             assert_eq!(removed.track_paths(), vec![UNRELATED_PATH]);
         }
     }
@@ -2570,7 +2569,7 @@ mod tests {
                 let mut database = DatabaseV2 { records };
                 (
                     database
-                        .remove_track_capturing((PREFILTER_TARGET))
+                        .remove_track_capturing(PREFILTER_TARGET)
                         .unwrap()
                         .len(),
                     database.records,
@@ -2579,7 +2578,7 @@ mod tests {
                 let mut crate_file = CrateFile { records };
                 (
                     crate_file
-                        .remove_track_capturing((PREFILTER_TARGET))
+                        .remove_track_capturing(PREFILTER_TARGET)
                         .unwrap()
                         .len(),
                     crate_file.records,
@@ -2653,7 +2652,7 @@ mod tests {
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
         let removed = database
-            .remove_track_capturing(("Users/x/Music/A/only.mp3"))
+            .remove_track_capturing("Users/x/Music/A/only.mp3")
             .unwrap()
             .len();
         assert_eq!(removed, 1);

@@ -330,31 +330,37 @@ pub fn remove_path_from_crate_capturing(
 }
 
 /// Reinserts records captured by the `*_capturing` removals. The path tag
-/// follows the file's extension: `.crate` and `.scrate` hold `ptrk`, anything
-/// else is a database V2 holding `pfil`.
+/// follows the file: `.crate` and `.scrate` hold `ptrk`, the extensionless
+/// `database V2` holds `pfil`, and any other file is rejected.
 pub fn restore_removed_records(
     file_path: String,
     track_path: String,
     records: Vec<SeratoRemovedRecord>,
 ) -> Result<u32, CoreError> {
     let path = PathBuf::from(file_path);
-    let is_crate_shaped = path
-        .extension()
-        .is_some_and(|extension| extension == "crate" || extension == "scrate");
-    let restored = if is_crate_shaped {
-        let mut crate_file = serato::CrateFile::read_from_path(&path)?;
-        let restored = crate_file.restore_removed_records(&track_path, &records)?;
-        if restored > 0 {
-            crate_file.write_to_path(&path)?;
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let restored = match extension {
+        Some("crate" | "scrate") => {
+            let mut crate_file = serato::CrateFile::read_from_path(&path)?;
+            let restored = crate_file.restore_removed_records(&track_path, &records)?;
+            if restored > 0 {
+                crate_file.write_to_path(&path)?;
+            }
+            restored
         }
-        restored
-    } else {
-        let mut database = serato::DatabaseV2::read_from_path(&path)?;
-        let restored = database.restore_removed_records(&track_path, &records)?;
-        if restored > 0 {
-            database.write_to_path(&path)?;
+        None => {
+            let mut database = serato::DatabaseV2::read_from_path(&path)?;
+            let restored = database.restore_removed_records(&track_path, &records)?;
+            if restored > 0 {
+                database.write_to_path(&path)?;
+            }
+            restored
         }
-        restored
+        Some(other) => {
+            return Err(CoreError::InvalidInput {
+                reason: format!("cannot restore records into a `.{other}` file"),
+            })
+        }
     };
     Ok(u32::try_from(restored).expect("restore count exceeded u32"))
 }
