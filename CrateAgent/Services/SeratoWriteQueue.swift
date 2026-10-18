@@ -477,6 +477,7 @@ enum DuplicateCleanupStore {
         let target: FileActionAuthority
         let keeper: FileActionAuthority
         let batchID: String
+        let evidenceRequirement: DuplicateEvidenceRequirement?
     }
 
     static func fetch(targetFileID: Int64, in database: Database) throws -> PendingDuplicateCleanup? {
@@ -492,7 +493,8 @@ enum DuplicateCleanupStore {
     }
 
     static func save(_ intent: PendingDuplicateCleanup, in database: Database) throws {
-        let authority = try JSONEncoder().encode(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID))
+        let authority = try JSONEncoder().encode(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID,
+                                                           evidenceRequirement: intent.evidenceRequirement))
         try database.execute(sql: """
         INSERT OR REPLACE INTO duplicate_cleanup_intents (target_file_id, payload, step, waiting_event_id, removed_v2, failure)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -530,7 +532,8 @@ enum DuplicateCleanupStore {
     private static func decode(_ row: Row) throws -> PendingDuplicateCleanup {
         let bytes: Data = row["payload"]
         let authority = try SyncCheckpointStore.decodeCanonical(Authority.self, from: bytes)
-        var intent = PendingDuplicateCleanup(target: authority.target, keeper: authority.keeper, batchID: authority.batchID)
+        var intent = PendingDuplicateCleanup(target: authority.target, keeper: authority.keeper, batchID: authority.batchID,
+                                             evidenceRequirement: authority.evidenceRequirement)
         intent.step = row["step"]
         intent.waitingEventID = row["waiting_event_id"]
         intent.removedV2 = row["removed_v2"]
