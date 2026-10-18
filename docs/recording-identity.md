@@ -27,7 +27,7 @@ still send the 120 s fingerprint, as fpcalc does.
 
 Every path that finds "the recording this file's audio identifies" uses the
 key: Auto-Tag's lookup baseline (and therefore the #182 collision preflight),
-grouping's link rule, and Serato conflict targets.
+grouping's link rule, Find Versions' placement, and Serato conflict targets.
 
 ## Full-length fingerprint, only on collision
 

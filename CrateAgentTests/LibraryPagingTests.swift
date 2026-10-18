@@ -135,6 +135,78 @@ final class LibraryPagingTests: XCTestCase {
         add(attachment)
     }
 
+    /// Invariant 8 evidence for Find Versions: 6,000 of the 30,000 files form 2,000 three-version
+    /// suggestions; the other 23,999 matching files await fingerprints. The scan reads the
+    /// whole library off the main actor; one apply groups the most families a batch may hold.
+    @MainActor
+    func testFindVersionsScanAndApplyStayWithinBudgetsAtThirtyThousandFiles() async throws {
+        let fixture = try fixture
+        let labels = ["Clean", "Dirty", "Instrumental"]
+        try await fixture.pool.write { connection in
+            for family in 0 ..< 2000 {
+                for (member, label) in labels.enumerated() {
+                    let fileID = family * 10 + member + 1
+                    try connection.execute(sql: "UPDATE files SET title = ?, chromaprint_fingerprint = ?, fingerprint_status = 'done' WHERE id = ?",
+                                           arguments: ["Song \(family) (\(label))", Data("fingerprint-\(fileID)".utf8), fileID])
+                }
+            }
+        }
+        defer {
+            do {
+                try fixture.pool.write { connection in
+                    for family in 0 ..< 2000 {
+                        for member in 0 ..< labels.count {
+                            var file = PagedLibraryFixture.file(family * 10 + member + 1)
+                            try file.save(connection)
+                        }
+                    }
+                }
+            } catch { XCTFail("Fixture restore: \(error)") }
+        }
+        let engine = OperationEngine(database: fixture.database, seratoWatchdog: SeratoWatchdog(runningBundleIdentifiersProvider: { [] }),
+                                     seratoLocator: SeratoLibraryLocator(seratoDirectory: URL(fileURLWithPath: "/dev/null")),
+                                     fileTagWriter: { _, _ in XCTFail("Grouping wrote audio tags") }, fileTagReader: { _ in AudioTags.none })
+        let suggester = SongFamilySuggester(database: fixture.database, families: SongFamilyService(engine: engine, database: fixture.database))
+        var maximumDelay = Duration.zero
+        let heartbeat = Task { @MainActor in
+            var previous = ContinuousClock.now
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(5)) } catch { return }
+                maximumDelay = max(maximumDelay, ContinuousClock.now - previous - .milliseconds(5))
+                previous = .now
+            }
+        }
+        let scanStart = ContinuousClock.now
+        let found = try await suggester.suggestions()
+        let scan = ContinuousClock.now - scanStart
+        heartbeat.cancel()
+        XCTAssertEqual(found.suggestions.count, 2000)
+        XCTAssertTrue(found.suggestions.allSatisfy { suggestion in suggestion.confidence == .high })
+        XCTAssertEqual(found.awaitingFingerprint, 23999)
+        XCTAssertLessThan(scan, .seconds(2))
+        XCTAssertLessThan(maximumDelay, .milliseconds(100))
+
+        let probe = WriterHoldProbe()
+        probe.start(fixture.database) { nil }
+        let applyStart = ContinuousClock.now
+        let choices = found.suggestions.prefix(SongFamilySuggester.maximumFamiliesPerApply).map { suggestion in
+            SongFamilySuggestionChoice(suggestion: suggestion, recordingIds: Set(suggestion.recordings.map(\.id)))
+        }
+        _ = try await suggester.apply(choices)
+        let apply = ContinuousClock.now - applyStart
+        let waits = await probe.stop()
+        let grouped = try await fixture.pool.read { connection in try SongFamilyRecord.fetchCount(connection) }
+        XCTAssertEqual(grouped, SongFamilySuggester.maximumFamiliesPerApply)
+        let longestWait = try XCTUnwrap(waits.first).duration
+        XCTAssertLessThan(longestWait, .milliseconds(500))
+        let metrics = "FIND_VERSIONS_METRICS files=30000 suggestions=\(found.suggestions.count) scan_ms=\(scan.milliseconds) "
+            + "scan_main_delay_ms=\(maximumDelay.milliseconds) applied=\(choices.count) apply_ms=\(apply.milliseconds) apply_longest_writer_wait_ms=\(longestWait.milliseconds)"
+        print(metrics)
+        let attachment = XCTAttachment(string: metrics)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testCapturedSelectionExcludesNewMatchesAndReconcilesChangedIdentities() async throws {
         let fixture = try fixture
         let store = try LibrarySelectionStore(database: fixture.database)

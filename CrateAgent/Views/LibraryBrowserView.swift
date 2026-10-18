@@ -19,6 +19,7 @@ struct LibraryBrowserView: View {
     @State private var isDropTargeted: Bool = false
     @State private var lastImportSummary: String?
     @State private var renameTarget: FileRecord?
+    @State private var showsFindVersions = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -107,6 +108,9 @@ struct LibraryBrowserView: View {
             RenameDialogView(file: fileToRename)
                 .environmentObject(services)
         }
+        .sheet(isPresented: $showsFindVersions) {
+            FindVersionsSheet().environmentObject(services)
+        }
     }
 
     private var dropOverlay: some View {
@@ -160,6 +164,9 @@ struct LibraryBrowserView: View {
             }
 
             Spacer()
+
+            Button(FindVersionsMessages.command) { showsFindVersions = true }
+                .help(FindVersionsMessages.commandHelp)
 
             Button {
                 services.open(.workers)
