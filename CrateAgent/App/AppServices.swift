@@ -280,7 +280,7 @@ public final class AppServices: ObservableObject {
             guard let self else { return }
             logActivity(scanMilestones.entries(for: progress), category: .scan)
         }
-        // A finished sync (at startup, and after Serato quits) means History is settled.
+        // A finished sync means Serato is closed; the service re-reads History only if it or the library's paths changed.
         playCountSubscription = session.$state.sink { [weak self] state in
             guard case .ready = state, let service = self?.playCountService else { return }
             Task { await service.refresh() }
