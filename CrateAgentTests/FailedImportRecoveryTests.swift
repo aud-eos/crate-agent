@@ -50,6 +50,26 @@ final class FailedImportRecoveryTests: XCTestCase {
         XCTAssertEqual(remaining, 0)
     }
 
+    func testAFailedSeratoAddReportsTheCoreMessageNotAnEnumDump() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let pending = try await fixture.add("pending.wav", membership: .pendingImport)
+        try Data("invalid V2".utf8).write(to: fixture.locator.databaseV2Url)
+        try gate.markReady(gate.prepareDrain())
+        let databasePath = fixture.locator.databaseV2Url.path
+        var coreMessage = ""
+        do { _ = try readDatabaseRecordsStrict(databasePath: databasePath) }
+        catch let CoreError.SeratoFormat(message) { coreMessage = message }
+
+        do {
+            try await fixture.engine.apply(.addTrackToSerato(.init(fileId: XCTUnwrap(pending.id), metadata: .empty)), batchId: "import")
+            XCTFail("An add against an invalid database V2 must not complete")
+        } catch let OperationEngineError.externalSyncIncomplete(_, underlying) {
+            XCTAssertEqual(underlying, OperationEngineError.seratoRewriteFailed(path: databasePath, underlying: coreMessage).localizedDescription)
+        }
+    }
+
     func testImportIntoProtectedPathIsReportedBeforeAllocatingAnIndexedRow() async throws {
         let gate = LibrarySyncReadiness()
         let fixture = try SeratoRemovalFixture(readiness: gate)

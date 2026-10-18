@@ -379,7 +379,7 @@ public actor OperationEngine {
     }
 
     private static func duplicateCleanupFailureMessage(_ intent: PendingDuplicateCleanup, error: Error) -> String {
-        "Cleanup stopped at step \(intent.step + 1) for \((intent.target.identity.path as NSString).lastPathComponent): \(error.localizedDescription). Fix the cause, then choose Retry Sync."
+        "Cleanup stopped at step \(intent.step + 1) for \((intent.target.identity.path as NSString).lastPathComponent): \(UserFacingErrorMessage.message(for: error)). Fix the cause, then choose Retry Sync."
     }
 
     func pendingCleanupOwnsRemoval(of file: FileRecord) async throws -> Bool {
@@ -2424,7 +2424,7 @@ public actor OperationEngine {
     /// that reached I/O threw from it. Only a mark this attempt set is
     /// cleared; any other may be an earlier process's that is not folded yet.
     private func recordFailure(_ writes: [GuardedSeratoWrite], error: Error) async throws {
-        let message = error.localizedDescription
+        let message = UserFacingErrorMessage.message(for: error)
         let unwritten = writes.compactMap(\.queueID).filter { queueID in attemptIO[queueID] == .marked }
         try await database.writer.write { database in
             try SeratoWriteQueue.recordFailure(writes, message: message, in: database)
@@ -2720,7 +2720,7 @@ public actor OperationEngine {
             do {
                 try trasher(trash.absolutePath)
             } catch {
-                throw OperationEngineError.trashFailed(path: trash.absolutePath, underlying: String(describing: error))
+                throw OperationEngineError.trashFailed(path: trash.absolutePath, underlying: UserFacingErrorMessage.message(for: error))
             }
             io.recordReturned()
             guard let targetFileID = guardedWrites.first?.cleanupTargetFileID else { return }
@@ -2759,7 +2759,7 @@ public actor OperationEngine {
         } catch {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
-                underlying: String(describing: error)
+                underlying: UserFacingErrorMessage.message(for: error)
             )
         }
     }
@@ -2779,7 +2779,7 @@ public actor OperationEngine {
             await note("Failed to enumerate Subcrates directory while removing \(displayFilename): \(error.localizedDescription)")
             throw OperationEngineError.seratoEnumerationFailed(
                 directory: seratoLocator.subcratesDirectoryUrl.path,
-                underlying: String(describing: error)
+                underlying: UserFacingErrorMessage.message(for: error)
             )
         }
         // Per-crate fault tolerance: one bad crate file can't
@@ -2798,7 +2798,7 @@ public actor OperationEngine {
             } catch {
                 perCrateFailures.append((crateFile, error))
                 let crateName = crateFile.lastPathComponent
-                await note("Skipped crate \(crateName) while removing \(displayFilename): \(error.localizedDescription)")
+                await note("Skipped crate \(crateName) while removing \(displayFilename): \(UserFacingErrorMessage.message(for: error))")
             }
         }
         // Cleanup cannot advance to Trash until every reference store completes.
@@ -2858,7 +2858,7 @@ public actor OperationEngine {
         } catch {
             throw OperationEngineError.fileTagWriteFailed(
                 path: write.absolutePath,
-                underlying: String(describing: error)
+                underlying: UserFacingErrorMessage.message(for: error)
             )
         }
     }
@@ -2926,7 +2926,7 @@ public actor OperationEngine {
                 io.recordReturned()
                 throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: message)
             } catch {
-                throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: String(describing: error))
+                throw OperationEngineError.seratoRewriteFailed(path: databaseV2Path, underlying: UserFacingErrorMessage.message(for: error))
             }
             io.recordReturned()
             try scopeAuthorization?.check()
@@ -2979,7 +2979,7 @@ public actor OperationEngine {
             throw error
         } catch {
             databaseV2Error = error
-            await note("Failed to update database V2 for \(renames.count) renames: \(error.localizedDescription)")
+            await note("Failed to update database V2 for \(renames.count) renames: \(UserFacingErrorMessage.message(for: error))")
         }
 
         let crateFiles: [URL]
@@ -2989,7 +2989,7 @@ public actor OperationEngine {
             await note("Failed to enumerate Subcrates directory: \(error.localizedDescription)")
             throw OperationEngineError.seratoEnumerationFailed(
                 directory: seratoLocator.subcratesDirectoryUrl.path,
-                underlying: String(describing: error)
+                underlying: UserFacingErrorMessage.message(for: error)
             )
         }
 
@@ -3003,7 +3003,7 @@ public actor OperationEngine {
                 throw error
             } catch {
                 perCrateFailures.append((crateFile, error))
-                await note("Skipped crate \(crateFile.lastPathComponent) during batch rename: \(error.localizedDescription)")
+                await note("Skipped crate \(crateFile.lastPathComponent) during batch rename: \(UserFacingErrorMessage.message(for: error))")
             }
         }
 
@@ -3098,7 +3098,7 @@ public actor OperationEngine {
     private func requireSuccessfulSeratoRenames(databaseError: Error?, crateFailures: [(URL, Error)]) throws {
         let firstFailure = databaseError.map { error in (seratoLocator.databaseV2Url, error) } ?? crateFailures.first
         if let (url, error) = firstFailure {
-            throw OperationEngineError.seratoRewriteFailed(path: url.path, underlying: String(describing: error))
+            throw OperationEngineError.seratoRewriteFailed(path: url.path, underlying: UserFacingErrorMessage.message(for: error))
         }
     }
 
@@ -3226,7 +3226,7 @@ public actor OperationEngine {
         } catch {
             throw OperationEngineError.seratoRewriteFailed(
                 path: databaseV2Path,
-                underlying: String(describing: error)
+                underlying: UserFacingErrorMessage.message(for: error)
             )
         }
     }
