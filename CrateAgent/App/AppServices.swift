@@ -33,7 +33,8 @@ public final class AppServices: ObservableObject {
     public let fingerprintWorker: FingerprintWorker
     public let duplicateEvidenceVerifier: DuplicateEvidenceVerifier
     public let activityLog: ActivityLog
-    let trackPlayer = TrackPlayer()
+    let trackPlayer: TrackPlayer
+    let fileOpener: FileOpener
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
@@ -47,8 +48,8 @@ public final class AppServices: ObservableObject {
         guard NSPasteboard.general.setString(text, forType: .string) else {
             throw SeratoConflictActionError(message: "Could not copy the conflict details to the clipboard.")
         }
-    }, revealFile: { path in
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }, revealFile: { [fileOpener] path in
+        fileOpener.reveal(verifiedPath: path)
     }, openSerato: {
         let identifiers = ["com.serato.dj", "com.serato.djpro", "com.serato.djlite"]
         guard let application = identifiers.lazy.compactMap({ identifier in NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) }).first else {
@@ -148,6 +149,9 @@ public final class AppServices: ObservableObject {
         try ApplicationRuntime.requireLiveResources()
         self.watchedMusicFolder = watchedMusicFolder
         self.database = database
+        let fileAccess = LibraryFileAccess(database: database)
+        trackPlayer = TrackPlayer(access: fileAccess)
+        fileOpener = FileOpener(access: fileAccess)
         seratoWatchdog = SeratoWatchdog()
         seratoLocator = try SeratoLibraryLocator.defaultLocation()
         activityLog = ActivityLog()

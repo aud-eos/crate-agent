@@ -15,7 +15,9 @@ longer in Serato.
 
 The reconciler reads identity projections in pages of 256, without fingerprint
 blobs, and checks only indexed locations and paths in the saved snapshot. It does
-not enumerate a music folder or Trash. Ownership mismatches and offline volumes
+not enumerate a music folder. It lists a volume's Trash at most once per pass, and
+only for a row whose indexed path is gone with no verifiable recorded Trash item
+(see below). Ownership mismatches and offline volumes
 cannot retire a row. File availability is recorded independently of membership.
 Retirement retains file ID, recording association, fingerprint, and History.
 
@@ -197,7 +199,17 @@ different file requests reconciliation; a missing or trashed row keeps its state
 until then, and an available row becomes `unknown`. A removal
 event at that Trash path, or any reconciliation that finds the indexed path
 missing, keeps the row trashed only while that exact item still verifies;
-otherwise it becomes missing. A trashed row
+otherwise it becomes missing. Events are not the only evidence of a Trash move. A
+volume attached with `-nobrowse` (or any volume without an FSEvents store) keeps no
+event history, so a move made while crate-agent was not running is never replayed.
+A trashed folder reports only a directory rename, which requests reconciliation.
+So when reconciliation finds an indexed path gone and no recorded item verifies,
+`NativeTrashIndex` lists that volume's Trash recursively, once per pass. An item
+with the row's inode that `FileTrashLocation.capture` verifies marks the row trashed
+(#234). A Trash that cannot be fully listed, for example without Full Disk Access,
+leaves the row missing but counts it in `trashUncheckedFileIDs`: the sync banner
+reports it with a warning, and the row stays out of the checkpoint so a later sync
+searches again. A trashed row
 without a persisted item (recorded before this table existed) cannot be verified
 and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
@@ -687,6 +699,23 @@ the start of each sync: a replayable event is rebuilt into queue rows from its
 journal, a destructive one is recorded as `legacyUnrecoverable`, and the fence is
 deleted in the same transaction. The checkpoint is derived evidence; queued intent
 lives in the queue.
+
+Publication is staged so that no writer transaction grows with the library
+(#238). Every row of `sync_saved_occurrences`, `sync_file_evidence` and
+`sync_file_stats` carries a `generation`, and only the generation the
+`sync_checkpoint` header names is current; every reader filters on it.
+`SyncCheckpointStore.publish` checks publishability in a read, removes rows
+outside the current generation, and writes the next generation in transactions of
+1,000 rows (`defaultChunkSize`). A final short transaction re-checks the
+revision, effect fences and queue, verifies that the current generation is still
+the one staging started from and that every staged row is present, then points
+the header at the new generation and clears `sync_dirty_files`. Readiness opens
+only after that commit. The superseded generation is deleted afterwards, in
+chunks. Until the flip, readers and the fast path see the previous checkpoint
+whole. A crash or cancellation mid-staging leaves it current, with the same
+meaning as a crash before publishing, and the next publish deletes the orphaned
+rows first. A library change during staging moves the revision, so the flip
+fails with `changed` and the sync re-runs. One store publishes at a time.
 Any code that performs a physical or Serato-side effect records its fence with
 `SyncCheckpointStore.beginEffect` in a transaction that commits before the effect
 starts. It clears the fence only after the effect completes or is explicitly

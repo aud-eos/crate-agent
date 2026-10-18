@@ -73,14 +73,16 @@ final class TrackPlayer: ObservableObject {
     let position = TrackPlayerPosition()
 
     private let output: TrackPlayerOutput
+    private let access: LibraryFileAccess
     private var playbackGeneration = 0
 
-    init(output: TrackPlayerOutput) {
+    init(output: TrackPlayerOutput, access: LibraryFileAccess) {
         self.output = output
+        self.access = access
     }
 
-    convenience init() {
-        self.init(output: AVTrackPlayerOutput())
+    convenience init(access: LibraryFileAccess) {
+        self.init(output: AVTrackPlayerOutput(), access: access)
     }
 
     var track: PlayerTrack? {
@@ -91,17 +93,25 @@ final class TrackPlayer: ObservableObject {
         state.isPlaying && track?.fileID == fileID
     }
 
-    /// Stops the current track and plays `track` from `startFraction` of its length.
-    func play(_ track: PlayerTrack, from startFraction: Double) {
+    /// Stops the current track and plays `track` from `startFraction` of its
+    /// length, once its row is confirmed available and its file is still
+    /// that row's recording.
+    func play(_ track: PlayerTrack, from startFraction: Double) async {
         stop()
-        guard FileManager.default.isReadableFile(atPath: track.path) else {
-            failure = TrackPlayerMessages.unreadable(track.filename)
+        failure = nil
+        let generation = playbackGeneration
+        let record: FileRecord
+        do {
+            record = try await access.verifiedRecord(fileID: track.fileID)
+        } catch {
+            guard playbackGeneration == generation else { return }
+            failure = (error as? LibraryFileAccessError).map { error in TrackPlayerMessages.cannotPlay(error.filename, detail: error.detail) }
+                ?? TrackPlayerMessages.cannotPlay(track.filename, detail: error.localizedDescription)
             return
         }
-        failure = nil
+        guard playbackGeneration == generation else { return }
         state = .playing(track)
-        let generation = playbackGeneration
-        output.play(URL(fileURLWithPath: track.path), from: startFraction, onProgress: { [weak self] elapsed, duration in
+        output.play(URL(fileURLWithPath: record.path), from: startFraction, onProgress: { [weak self] elapsed, duration in
             guard let self, playbackGeneration == generation else { return }
             position.elapsed = elapsed
             position.duration = duration
@@ -116,11 +126,11 @@ final class TrackPlayer: ObservableObject {
 
     /// A row button press: pauses or resumes `track` in place when it is
     /// current; otherwise plays it as a preview.
-    func toggle(_ track: PlayerTrack) {
+    func toggle(_ track: PlayerTrack) async {
         if self.track?.fileID == track.fileID {
             togglePlayback()
         } else {
-            play(track, from: Self.previewStartFraction)
+            await play(track, from: Self.previewStartFraction)
         }
     }
 
@@ -152,6 +162,10 @@ final class TrackPlayer: ObservableObject {
         seek(toSeconds: position.elapsed + seconds)
     }
 
+    func dismissFailure() {
+        failure = nil
+    }
+
     func stop() {
         playbackGeneration += 1
         output.stop()
@@ -170,7 +184,7 @@ final class TrackPlayer: ObservableObject {
 
 /// The audio device boundary. `onProgress` reports elapsed and total
 /// seconds; `onEnd` receives nil when playback reaches the end, or a reason
-/// when it fails. A callback already queued when `stop()` runs can still
+/// when it fails, including a stall that outlasts `stallTimeout`. A callback already queued when `stop()` runs can still
 /// arrive, so the player ignores stale ones.
 @MainActor
 protocol TrackPlayerOutput: AnyObject {
@@ -187,11 +201,14 @@ protocol TrackPlayerOutput: AnyObject {
 final class AVTrackPlayerOutput: TrackPlayerOutput {
     private static let progressInterval = CMTime(value: 1, timescale: 4)
     private static let timescale: CMTimeScale = 600
+    /// How long playback may wait for data, e.g. after its volume is ejected, before it fails visibly.
+    static let stallTimeout: Duration = .seconds(5)
 
     private let player = AVPlayer()
     private var subscriptions: Set<AnyCancellable> = []
     private var timeObserver: Any?
     private var isPaused = false
+    private var stallTimer: Task<Void, Never>?
 
     func play(_ url: URL, from startFraction: Double,
               onProgress: @escaping @MainActor (TimeInterval, TimeInterval) -> Void,
@@ -204,14 +221,20 @@ final class AVTrackPlayerOutput: TrackPlayerOutput {
         center.publisher(for: AVPlayerItem.didPlayToEndTimeNotification, object: item)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.finish(onEnd, reason: nil)
+                self?.finish(item, onEnd, reason: nil)
             }
             .store(in: &subscriptions)
         center.publisher(for: AVPlayerItem.failedToPlayToEndTimeNotification, object: item)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
                 let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-                self?.finish(onEnd, reason: error?.localizedDescription ?? TrackPlayerMessages.unknownFailure)
+                self?.finish(item, onEnd, reason: error?.localizedDescription ?? TrackPlayerMessages.unknownFailure)
+            }
+            .store(in: &subscriptions)
+        player.publisher(for: \.timeControlStatus)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                self?.watchForStall(item, status: status, onEnd: onEnd)
             }
             .store(in: &subscriptions)
         item.publisher(for: \.status)
@@ -220,7 +243,7 @@ final class AVTrackPlayerOutput: TrackPlayerOutput {
                 guard let self, let item else { return }
                 switch status {
                 case .failed:
-                    finish(onEnd, reason: item.error?.localizedDescription ?? TrackPlayerMessages.unknownFailure)
+                    finish(item, onEnd, reason: item.error?.localizedDescription ?? TrackPlayerMessages.unknownFailure)
                 case .readyToPlay:
                     start(item, from: startFraction)
                 default:
@@ -252,6 +275,8 @@ final class AVTrackPlayerOutput: TrackPlayerOutput {
     }
 
     func stop() {
+        stallTimer?.cancel()
+        stallTimer = nil
         subscriptions.removeAll()
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
@@ -286,7 +311,19 @@ final class AVTrackPlayerOutput: TrackPlayerOutput {
         player.play()
     }
 
-    private func finish(_ onEnd: @MainActor (String?) -> Void, reason: String?) {
+    /// Waiting for data, not paused by the user, starts the stall clock; any other state stops it.
+    private func watchForStall(_ item: AVPlayerItem, status: AVPlayer.TimeControlStatus, onEnd: @escaping @MainActor (String?) -> Void) {
+        stallTimer?.cancel()
+        stallTimer = nil
+        guard status == .waitingToPlayAtSpecifiedRate, player.currentItem === item, item.status == .readyToPlay else { return }
+        stallTimer = Task { [weak self] in
+            guard await (try? Task.sleep(for: Self.stallTimeout)) != nil else { return }
+            self?.finish(item, onEnd, reason: TrackPlayerMessages.stalled)
+        }
+    }
+
+    private func finish(_ item: AVPlayerItem, _ onEnd: @MainActor (String?) -> Void, reason: String?) {
+        guard player.currentItem === item else { return }
         stop()
         onEnd(reason)
     }

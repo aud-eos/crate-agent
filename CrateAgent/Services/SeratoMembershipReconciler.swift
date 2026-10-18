@@ -13,6 +13,13 @@ struct ReconciliationSummary: Sendable, Equatable {
     /// Rows whose Trash item changed before their state was saved. They keep their old
     /// state and are left out of the checkpoint, so the next sync checks them again.
     var trashChangedFileIDs: Set<Int64> = []
+    /// Missing rows whose volume's Trash could not be listed, so they may really be trashed.
+    /// Left out of the checkpoint like `trashChangedFileIDs`, so a later sync searches again.
+    var trashUncheckedFileIDs: Set<Int64> = []
+
+    var needsAttention: Bool {
+        pathConflictCount > 0 || notAppliedWrites.total > 0 || !trashUncheckedFileIDs.isEmpty
+    }
 }
 
 enum SeratoReconciliationError: LocalizedError {
@@ -98,6 +105,7 @@ actor SeratoMembershipReconciler {
         var summary = ReconciliationSummary()
         summary.pathConflictCount = analysis.conflicts.count
         let batchID = UUID().uuidString
+        var trashIndex = NativeTrashIndex()
         for file in eligibleFiles {
             if let plan, let identifier = file.id, !plan.reconcileFileIDs.contains(identifier) {
                 continue
@@ -123,6 +131,17 @@ actor SeratoMembershipReconciler {
                 let location = try await database.writer.read { connection in try FileTrashLocation.load(fileID: fileID, in: connection) }
                 observed = try FileTrashLocation.availability(of: location, resolver: availability)
                 verifiedTrashLocation = observed == .trashed ? location : nil
+                if observed == .missing, observedIdentity == nil {
+                    switch try trashIndex.locate(file) {
+                    case let .found(discovered):
+                        observed = .trashed
+                        verifiedTrashLocation = discovered
+                    case .unchecked:
+                        summary.trashUncheckedFileIDs.insert(fileID)
+                    case .notFound:
+                        break
+                    }
+                }
             }
             let saved = savedPaths.contains(SeratoPath.normalized(path))
             let ownedRemoval = try await operationEngine.pendingCleanupOwnsRemoval(of: file)

@@ -88,7 +88,8 @@ jobs:
         run: |
           hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE "$RUNNER_TEMP/task6.sparseimage"
           mkdir -p "$TASK6_MOUNT"
-          hdiutil attach "$RUNNER_TEMP/task6.sparseimage" -mountpoint "$TASK6_MOUNT" -nobrowse
+          # Not -nobrowse: a nobrowse volume keeps no FSEvents history, so replay tests would race (#234).
+          hdiutil attach "$RUNNER_TEMP/task6.sparseimage" -mountpoint "$TASK6_MOUNT"
           touch "$TASK6_MOUNT/.task6-test-volume"
           # Foundation's trash-directory lookup cannot create a fresh volume's .Trashes; a native trash can.
           touch "$TASK6_MOUNT/.trash-seed"

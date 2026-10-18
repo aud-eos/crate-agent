@@ -1,10 +1,11 @@
 import AppKit
 import SwiftUI
 
-enum LibraryBrowserAction: String, CaseIterable {
-    case rename = "Rename…"
-    case history = "Show History"
-    case finder = "Show in Finder"
+enum LibraryBrowserAction: Equatable {
+    case rename
+    case history
+    case open(OpenTarget)
+    case reveal
 }
 
 /// Song-family changes offered from a Library row's context menu.
@@ -14,6 +15,7 @@ struct LibraryPagedContent: View {
     let showsFilenames: Bool
     var readiness: LibrarySyncReadiness?
     var player: TrackPlayer?
+    var opener: FileOpener?
     let onAction: (Int64, LibraryBrowserAction) -> Void
     var onFamilyAction: (BrowserRow, LibraryFamilyAction) -> Void = { _, _ in }
 
@@ -102,7 +104,8 @@ struct LibraryPagedContent: View {
                    contentRevision: (readiness?.scopeRevision ?? 0) &+ model.familyRevision,
                    onFocus: { identifier, index in model.focus(id: identifier, index: index) },
                    onDisclose: { identifier, expanded in model.disclose(expanded, row: identifier) },
-                   onSpace: player.map { player in { row in player.toggle(PlayerTrack(row)) } })
+                   onSpace: player.map { player in { row in Task { await player.toggle(PlayerTrack(row)) } } },
+                   onOpen: opener.map { _ in { row in onAction(row.id, .open(.defaultApplication)) } })
     }
 
     private var familyControls: LibraryFamilyControls {
@@ -116,15 +119,31 @@ struct LibraryPagedContent: View {
         guard !model.isRefreshing else { return nil }
         let menu = NSMenu()
         menu.autoenablesItems = false
-        for action in LibraryBrowserAction.allCases {
-            let item = LibraryActionMenuItem(title: action.rawValue) { onAction(identifier, action) }
-            if action == .rename {
-                item.isEnabled = model.results.cachedRows.first { row in row.id == identifier }?.applyingConflictScope(readiness).canProcess == true
-                item.toolTip = model.results.cachedRows.first { row in row.id == identifier }?.applyingConflictScope(readiness).processingBlockReason
+        let row = model.results.cachedRows.first { row in row.id == identifier }
+        let rename = LibraryActionMenuItem(title: "Rename…") { onAction(identifier, .rename) }
+        rename.isEnabled = row?.applyingConflictScope(readiness).canProcess == true
+        rename.toolTip = row?.applyingConflictScope(readiness).processingBlockReason
+        menu.addItem(rename)
+        menu.addItem(LibraryActionMenuItem(title: "Show History") { onAction(identifier, .history) })
+        if let opener, let path = row?.path {
+            menu.addItem(.separator())
+            let defaultApplication = opener.defaultApplication(for: path)
+            let open = LibraryActionMenuItem(title: FileOpenerMessages.open(in: defaultApplication?.name ?? FileOpenerMessages.defaultApplication)) {
+                onAction(identifier, .open(.defaultApplication))
             }
-            menu.addItem(item)
+            open.keyEquivalent = "o"
+            open.keyEquivalentModifierMask = .command
+            open.isEnabled = defaultApplication != nil
+            menu.addItem(open)
+            menu.addItem(.sectionHeader(title: FileOpenerMessages.openWith))
+            for application in opener.otherApplications(for: path) {
+                menu.addItem(LibraryActionMenuItem(title: application.name) { onAction(identifier, .open(.application(application))) })
+            }
+            menu.addItem(LibraryActionMenuItem(title: FileOpenerMessages.otherApplication) { onAction(identifier, .open(.chooseApplication)) })
         }
-        guard let row = model.results.cachedRows.first(where: { row in row.id == identifier }) else { return menu }
+        menu.addItem(.separator())
+        menu.addItem(LibraryActionMenuItem(title: FileOpenerMessages.reveal) { onAction(identifier, .reveal) })
+        guard let row else { return menu }
         let targetCount = model.familyTargetCount(for: row)
         let familyActions = LibraryFamilyAction.allCases.filter { action in action.applies(to: row, targetCount: targetCount) }
         if !familyActions.isEmpty {

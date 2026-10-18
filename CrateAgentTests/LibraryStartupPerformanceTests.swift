@@ -56,6 +56,32 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         add(resultAttachment)
         try await verifyUpgradeBackfill(fixture)
         try await verifyNavigationDuringSync(fixture)
+        try await verifyWriterHoldWhilePublishingTheCheckpoint(fixture)
+    }
+
+    /// A changed saved title leaves the fast path, so the sync republishes the
+    /// whole 30,000-file checkpoint. No writer transaction may hold other
+    /// writes off for 500 ms or more (#238).
+    private func verifyWriterHoldWhilePublishingTheCheckpoint(_ fixture: LibraryStartupPerformanceFixture) async throws {
+        let session = fixture.makeSession(checkpointed: true)
+        let files = try await fixture.scanner.identityProjectionsForConflictAnalysis()
+        let file = try XCTUnwrap(files.last)
+        _ = try updateDatabaseRecord(databasePath: fixture.locator.databaseV2Url.path, trackPath: file.path,
+                                     update: SeratoMetadataUpdate(artist: nil, title: "Changed before republishing", album: nil, genre: nil,
+                                                                  bpm: nil, key: nil, comment: nil, length: nil, label: nil))
+        let probe = WriterHoldProbe()
+        probe.start(fixture.database) { session.phase?.rawValue }
+        try await session.synchronize()
+        let waits = await probe.stop()
+        guard case .ready = session.state else { return XCTFail("Republishing sync failed: \(session.state)") }
+        let longest = try XCTUnwrap(waits.first)
+        let publishing = waits.first { wait in wait.phase == SeratoLibrarySyncSession.SyncPhase.draining.rawValue }
+        XCTAssertLessThan(longest.duration, .milliseconds(500), "Longest writer wait was in \(longest.phase ?? "no phase")")
+        let result = "STARTUP_WRITER_HOLD files=30000 probe_interval=5ms probes=\(waits.count) longest=\(longest.duration) longest_phase=\(longest.phase ?? "none") applying_queued_changes_longest=\(publishing?.duration.description ?? "none")"
+        print(result)
+        let attachment = XCTAttachment(string: result)
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     /// The first sync after migration 018 records 30,000 legacy rows' subsecond times from
