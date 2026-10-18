@@ -141,6 +141,7 @@ public final class LibraryDatabase {
         AddSyncCheckpointGenerationsMigration.register(in: &migrator)
         AddRecordingDiscriminatorsMigration.register(in: &migrator)
         AddMusicBrainzWorkMigration.register(in: &migrator)
+        AddFilesProcessableIndexMigration.register(in: &migrator)
         return migrator
     }
 }

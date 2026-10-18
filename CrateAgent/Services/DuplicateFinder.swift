@@ -154,18 +154,18 @@ public enum DuplicateFinder {
     /// that aren't processable library members. Groups are ordered
     /// biggest first, then by key.
     public static func findDuplicates(in database: Database, mode: Mode) throws -> [DuplicateGroup<DuplicateFileRow>] {
-        var membersByKey: [String: [DuplicateConfirmation.Member]] = [:]
+        var membersByCluster: [Cluster: [DuplicateConfirmation.Member]] = [:]
         let playCounts = try SeratoPlayCounts.all(in: database)
         let rows = try Row.fetchCursor(database, sql: memberSQL(for: mode))
         while let row = try rows.next() {
             let file = try DuplicateFileRow(row: row, playCounts: playCounts)
             let evidence = try DuplicateDigestStore.evidence(from: row, kind: mode.digestKind)
-            membersByKey[groupKey(mode: mode, fileSize: file.fileSize, keyBytes: row["group_blob"]), default: []]
+            membersByCluster[Cluster(mode: mode, fileSize: file.fileSize, keyBytes: row["group_blob"]), default: []]
                 .append(.init(file: file, evidence: evidence))
         }
         let keptSignatures = try DuplicateLabelReview.keptSignatures(in: database)
-        return membersByKey
-            .flatMap { key, members in DuplicateConfirmation.groups(clusterKey: key, mode: mode, members: members) }
+        return membersByCluster
+            .flatMap { cluster, members in DuplicateConfirmation.groups(clusterKey: cluster.groupKey, mode: mode, members: members) }
             .map { group in group.withLabelReview(keptSignatures: keptSignatures) }
             .sorted { lhs, rhs in
                 if lhs.size != rhs.size {
@@ -179,11 +179,11 @@ public enum DuplicateFinder {
     /// UI's "X of Y fingerprinted" badge: a low perceptual count may
     /// mean fingerprinting is still in progress, not zero duplicates.
     public static func fingerprintCoverage(in database: Database) throws -> (done: Int, total: Int) {
+        let processable = FileProcessingEligibility.processableSQL
         let row = try Row.fetchOne(database, sql: """
-        SELECT COUNT(*) AS total,
-               COALESCE(SUM(files.fingerprint_status = ? AND files.chromaprint_fingerprint IS NOT NULL), 0) AS done
-        FROM files WHERE \(FileProcessingEligibility.processableSQL)
-        """, arguments: [FingerprintStatus.done.rawValue])
+        SELECT (SELECT COUNT(*) FROM files WHERE \(processable)) AS total,
+               (SELECT COUNT(*) FROM files WHERE \(processable) AND \(fingerprintedSQL)) AS done
+        """)
         return (done: row?["done"] ?? 0, total: row?["total"] ?? 0)
     }
 
@@ -203,6 +203,9 @@ public enum DuplicateFinder {
         DigestCandidate(fileID: row["id"], path: row["path"], fileSize: row["file_size"], mtime: row["mtime"], inode: row["inode"])
     }
 
+    private static let fingerprintColumn = "files.chromaprint_fingerprint"
+    private static let fingerprintedSQL = "files.fingerprint_status = '\(FingerprintStatus.done.rawValue)' AND \(fingerprintColumn) IS NOT NULL"
+
     private static func memberSQL(for mode: Mode, digestFilter: String = "") -> String {
         """
         SELECT \(DuplicateFileRow.columnsSQL), \(keyBlobColumn(mode)) AS group_blob, \(DuplicateDigestStore.columnsSQL(mode.digestKind))
@@ -216,45 +219,56 @@ public enum DuplicateFinder {
     private static func keyBlobColumn(_ mode: Mode) -> String {
         switch mode {
         case .byteLevel: "files.lightweight_hash"
-        case .perceptual: "files.chromaprint_fingerprint"
+        case .perceptual: fingerprintColumn
         }
     }
 
     /// Selects processable files whose candidate key another processable
-    /// file shares. For `.perceptual`, these are the files whose 120 s
-    /// fingerprint collides, the only files that need a full-length one.
+    /// file shares.
     static func clusterMemberSQL(_ mode: Mode) -> String {
         let keyBlob = keyBlobColumn(mode)
-        let keyColumns: String
-        let keyCondition: String
+        let eligibleSQL: String
+        let clusteredIDsSQL: String
         switch mode {
         case .byteLevel:
-            keyColumns = "files.file_size, \(keyBlob)"
-            keyCondition = "\(keyBlob) IS NOT NULL"
+            eligibleSQL = "\(FileProcessingEligibility.processableSQL) AND \(keyBlob) IS NOT NULL"
+            clusteredIDsSQL = idsSharingSQL(key: "files.file_size, \(keyBlob)", among: eligibleSQL)
         case .perceptual:
-            keyColumns = keyBlob
-            keyCondition = "files.fingerprint_status = '\(FingerprintStatus.done.rawValue)' AND \(keyBlob) IS NOT NULL"
+            eligibleSQL = "\(FileProcessingEligibility.processableSQL) AND \(fingerprintedSQL)"
+            // Partitioning every multi-kilobyte fingerprint is the scan's
+            // largest cost, so only files that share a fingerprint's length
+            // and final frames are compared by the whole fingerprint.
+            let candidateIDsSQL = idsSharingSQL(key: "length(\(keyBlob)), substr(\(keyBlob), -32)", among: eligibleSQL)
+            clusteredIDsSQL = idsSharingSQL(key: keyBlob, among: "files.id IN (\(candidateIDsSQL))")
         }
-        let eligibleSQL = "\(FileProcessingEligibility.processableSQL) AND \(keyCondition)"
-        return """
-        \(eligibleSQL)
-          AND (\(keyColumns)) IN (
-            SELECT \(keyColumns) FROM files WHERE \(eligibleSQL)
-            GROUP BY \(keyColumns) HAVING COUNT(*) > 1
-          )
-        """
+        return "\(eligibleSQL) AND files.id IN (\(clusteredIDsSQL))"
     }
 
-    /// Byte-level keys keep the size alongside the 32-byte hash, as a
-    /// guard against a cross-size hash collision. Perceptual keys
-    /// digest the multi-kilobyte fingerprint so group identifiers stay
-    /// short and stable while fingerprints land.
-    private static func groupKey(mode: Mode, fileSize: Int64, keyBytes: Data) -> String {
-        switch mode {
-        case .byteLevel:
-            "\(fileSize):\(keyBytes.base64EncodedString())"
-        case .perceptual:
-            SHA256.hash(data: keyBytes).lowercaseHex
+    /// Ids of the `filter` rows whose `key` at least one other such row shares.
+    private static func idsSharingSQL(key: String, among filter: String) -> String {
+        "SELECT id FROM (SELECT files.id, COUNT(*) OVER (PARTITION BY \(key)) AS copies FROM files WHERE \(filter)) WHERE copies > 1"
+    }
+
+    /// What a cluster's files share. Byte-level clusters keep the size
+    /// alongside the 32-byte hash, as a guard against a cross-size hash
+    /// collision.
+    private struct Cluster: Hashable {
+        let fileSize: Int64?
+        let keyBytes: Data
+
+        init(mode: Mode, fileSize: Int64, keyBytes: Data) {
+            self.fileSize = mode == .byteLevel ? fileSize : nil
+            self.keyBytes = keyBytes
+        }
+
+        /// Perceptual keys digest the multi-kilobyte fingerprint so group
+        /// identifiers stay short and stable while fingerprints land.
+        var groupKey: String {
+            if let fileSize {
+                "\(fileSize):\(keyBytes.base64EncodedString())"
+            } else {
+                SHA256.hash(data: keyBytes).lowercaseHex
+            }
         }
     }
 }
