@@ -1107,7 +1107,10 @@ public actor OperationEngine {
         case .trackRemovedFromSerato: .removeFromDatabase
         case .fileRemovedFromCrates: .removeFromCrates
         case .fileTrashed: .trashFile
-        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested: nil
+        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked: nil
         }
     }
 
@@ -1528,7 +1531,10 @@ public actor OperationEngine {
             true
         case .trackImported, .fileRemoved, .metadataSet,
              .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato,
-             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             false
         }
     }
@@ -1623,7 +1629,10 @@ public actor OperationEngine {
                   let absolutePath = pathByFileId[fileId] else { return [] }
             return musicBrainzRevertSeratoWrites(applied: payload.applied, absolutePath: absolutePath)
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested:
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileImportRequested,
+             .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
             return []
         }
     }
@@ -1671,7 +1680,10 @@ public actor OperationEngine {
                 }
                 try MatchUndoTagGuard.requireUnchanged(read)
             }
-            for event in events {
+            // Undoing a grouping link checks that grouping still owns the link
+            // and keeps it otherwise, so a retired file never blocks the undo
+            // (docs/song-families.md). Its redo takes the general guard.
+            for event in events where event.eventType != .songFamilyRecordingLinked {
                 guard let fileID = event.fileId else { continue }
                 guard let file = try FileRecord.fetchOne(database, key: fileID),
                       file.libraryMembership != .retired,
@@ -1901,6 +1913,13 @@ public actor OperationEngine {
                 ApplyMusicBrainzMatchPayload.self, from: inverseJsonData
             )
             return .applyMusicBrainzMatch(payload)
+        case .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
+             .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored:
+            return try .songFamily(.restore(decoder.decode(RestoreSongFamiliesPayload.self, from: inverseJsonData)))
+        case .songFamilyRecordingLinked:
+            return try .songFamily(.unlinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
+        case .songFamilyRecordingUnlinked:
+            return try .songFamily(.relinkRecording(decoder.decode(SongFamilyRecordingLink.self, from: inverseJsonData)))
         }
     }
 
@@ -3262,6 +3281,9 @@ public actor OperationEngine {
                 payload, batchId: batchId, timestamp: timestampMillis, in: db
             )
             return ExecutionResult(eventId: eventId, seratoWrites: seratoWrites)
+        case let .songFamily(operation):
+            let eventId = try SongFamilyMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         }
     }
 
@@ -3837,10 +3859,12 @@ public actor OperationEngine {
             guard let existingId = existingTrack.id else {
                 throw OperationEngineError.insertDidNotReturnRowId
             }
-            // Undo retains an empty fingerprint row for FK stability. Reusing
-            // that unreferenced row must seed kept fields just like creation.
-            let isEmptyOrphan = try existingTrack == TrackRecord(id: existingId, fingerprintHash: payload.fingerprintHash)
-                && FileRecord.filter(Column("track_id") == existingId).fetchCount(db) == 0
+            // Undo retains an empty fingerprint row for FK stability, and song
+            // grouping links a file to one. Reusing a bare row no other library
+            // file depends on must seed kept fields just like creation; a
+            // retired file keeps its link but no longer names the recording.
+            let isEmptyOrphan = try existingTrack.isBare
+                && FileRecord.otherActiveFileReferencingTrack(existingId, excluding: payload.fileID, in: db) == nil
             existingTrack.acoustidId = payload.acoustID
             existingTrack.musicbrainzRecordingId = payload.recordingMBID
             existingTrack.musicbrainzReleaseId = payload.releaseMBID
@@ -4216,6 +4240,7 @@ public enum TrackMutation: Sendable {
     /// `decodeInverseMutation` during undo. Never constructed by
     /// feature code directly.
     case revertMusicBrainzMatch(RevertMusicBrainzMatchPayload)
+    case songFamily(SongFamilyOperation)
 }
 
 /// Move the file at `fileId` to the user's Trash via

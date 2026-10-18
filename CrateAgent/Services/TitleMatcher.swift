@@ -61,6 +61,15 @@ public enum TitleMatcher {
         "short edit", "quick hit", "album version",
     ]
 
+    /// True when `annotation` names one of the DJ version flags as a whole
+    /// word, other than the `excluded` terms.
+    static func containsVersionTerm(_ annotation: String, excluding excluded: Set<String> = []) -> Bool {
+        let normalizedAnnotation = normalize(annotation)
+        return djVersionVocabulary.contains { term in
+            !excluded.contains(term) && containsWholeWord(term, in: normalizedAnnotation)
+        }
+    }
+
     public static func decide(current: String, proposed: String) -> TitleDecision {
         let normalizedCurrent = normalize(current)
         let normalizedProposed = normalize(proposed)
