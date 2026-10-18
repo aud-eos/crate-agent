@@ -6,7 +6,7 @@ import GRDB
 /// generation 0, which the existing header already names.
 enum AddSyncCheckpointGenerationsMigration {
     static func register(in migrator: inout DatabaseMigrator) {
-        migrator.registerMigration("024_add_sync_checkpoint_generations") { database in
+        migrator.registerMigration("025_add_sync_checkpoint_generations") { database in
             try database.execute(sql: """
             ALTER TABLE sync_checkpoint ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
 

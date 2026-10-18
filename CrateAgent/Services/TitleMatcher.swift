@@ -50,16 +50,11 @@ public struct TitleDecision: Equatable {
 /// user ultimately picks (the default, or an override) into the title
 /// string to write.
 public enum TitleMatcher {
-    /// DJ version-flag vocabulary confirmed against a 32k-track library
-    /// scan. Used only as a fallback when a title carries one of these
-    /// tokens bare (no surrounding `()`/`[]`/`- ` delimiter) that MB's
-    /// proposal doesn't preserve. Matched whole-word, case-insensitive.
-    private static let djVersionVocabulary: [String] = [
-        "clean", "dirty", "explicit", "radio edit", "radio version", "intro", "outro",
-        "acapella", "instrumental", "extended", "extended mix", "club mix", "original mix",
-        "main", "edit", "flip", "bootleg", "redrum", "transition", "remix", "dub",
-        "short edit", "quick hit", "album version",
-    ]
+    /// DJ version-flag vocabulary (`VersionLabel`). Used only as a fallback
+    /// when a title carries one of these tokens bare (no surrounding
+    /// `()`/`[]`/`- ` delimiter) that MB's proposal doesn't preserve.
+    /// Matched whole-word, case-insensitive.
+    private static let djVersionVocabulary = VersionLabel.annotationTerms
 
     /// True when `annotation` names one of the DJ version flags as a whole
     /// word, other than the `excluded` terms.

@@ -130,6 +130,7 @@ public final class LibraryDatabase {
         AddFileDigestsMigration.register(in: &migrator)
         AddSongFamiliesMigration.register(in: &migrator)
         AddSeratoWriteResolutionsMigration.register(in: &migrator)
+        AddDuplicateLabelReviewsMigration.register(in: &migrator)
         AddSyncCheckpointGenerationsMigration.register(in: &migrator)
         return migrator
     }
