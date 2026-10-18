@@ -32,7 +32,7 @@
 //   https://github.com/flatmax/XwaxSeratoScanner   (SeratoData.py / Entry.py — `database V2` tag derivation rules)
 //   https://github.com/Holzhaus/serato-tags   (per-track GEOB tags inside audio files — relevant to Pillar F)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -54,6 +54,10 @@ pub enum SeratoError {
     InvalidUtf16 { tag: String },
     #[error("invalid Serato file: {0}")]
     InvalidFile(String),
+    /// Two requested paths are one file by NFC form but carry different
+    /// updates, so no single update can be applied to its record.
+    #[error("{first} and {second} name the same file but request different metadata")]
+    ConflictingPathRequests { first: String, second: String },
     /// The new bytes replaced the file, but its directory could not be
     /// flushed, so the rename may not survive a power loss. The write landed.
     #[error("{path} was replaced but may not be durable: {source}")]
@@ -200,7 +204,7 @@ impl TlvRecord {
     }
 }
 
-fn decode_utf16be(bytes: &[u8]) -> Option<String> {
+pub(crate) fn decode_utf16be(bytes: &[u8]) -> Option<String> {
     let (code_unit_pairs, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
         return None;
@@ -348,8 +352,14 @@ struct PathKeys {
 
 impl PathKeys {
     fn new<'path>(paths: impl IntoIterator<Item = &'path str>) -> Self {
-        let keys: HashSet<String> = paths.into_iter().map(path_key).collect();
-        let encoded_keys = keys.iter().map(|key| encode_utf16be(key)).collect();
+        let requested: Vec<&str> = paths.into_iter().collect();
+        let keys: HashSet<String> = requested.iter().map(|path| path_key(path)).collect();
+        let encoded_keys = keys
+            .iter()
+            .map(String::as_str)
+            .chain(requested.iter().copied())
+            .map(encode_utf16be)
+            .collect();
         Self { keys, encoded_keys }
     }
 
@@ -376,6 +386,17 @@ fn otrk_has_path_in(otrk_payload: &[u8], path_tag: &[u8; 4], paths: &PathKeys) -
     let mut found = false;
     walk_nested_fields(otrk_payload, |tag, payload| {
         if tag == path_tag && paths.matches_field(payload) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether some `path_tag` field of an `otrk` payload holds exactly `encoded`.
+fn otrk_has_exact_path(otrk_payload: &[u8], path_tag: &[u8; 4], encoded: &[u8]) -> bool {
+    let mut found = false;
+    walk_nested_fields(otrk_payload, |tag, payload| {
+        if tag == path_tag && payload == encoded {
             found = true;
         }
     });
@@ -483,7 +504,7 @@ fn rewrite_path_in_otrks(
     path_tag: &[u8; 4],
     old_path: &str,
     new_path: &str,
-) -> usize {
+) -> Vec<RewrittenOtrk> {
     let mut renames = HashMap::with_capacity(1);
     renames.insert(old_path.to_string(), new_path.to_string());
     rewrite_paths_in_otrks(records, path_tag, &renames)
@@ -502,23 +523,33 @@ fn rewrite_paths_in_otrks(
     records: &mut [TlvRecord],
     path_tag: &[u8; 4],
     renames: &HashMap<String, String>,
-) -> usize {
+) -> Vec<RewrittenOtrk> {
     if renames.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let sources = PathKeys::new(renames.keys().map(String::as_str));
-    let renames_by_key: HashMap<String, &String> = renames
-        .iter()
-        .map(|(old_path, new_path)| (path_key(old_path), new_path))
-        .collect();
-    let mut count: usize = 0;
-    for record in records.iter_mut() {
+    // Equivalent sources bound for different destinations match only by
+    // their exact spellings: no NFC fallback can choose between them.
+    let mut renames_by_key: HashMap<String, Option<&String>> = HashMap::new();
+    for (old_path, new_path) in renames {
+        renames_by_key
+            .entry(path_key(old_path))
+            .and_modify(|destination| {
+                if *destination != Some(new_path) {
+                    *destination = None;
+                }
+            })
+            .or_insert(Some(new_path));
+    }
+    let mut rewritten = Vec::new();
+    for (index, record) in records.iter_mut().enumerate() {
         if &record.tag != TAG_OTRK || !otrk_has_path_in(&record.payload, path_tag, &sources) {
             continue;
         }
         let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
             continue;
         };
+        let original = first_path_bytes(&record.payload, path_tag).unwrap_or_default();
         let mut changed = false;
         for nested_record in nested.iter_mut() {
             if nested_record.tag != *path_tag {
@@ -529,7 +560,7 @@ fn rewrite_paths_in_otrks(
             };
             let destination = renames
                 .get(&current)
-                .or_else(|| renames_by_key.get(&path_key(&current)).copied());
+                .or_else(|| renames_by_key.get(&path_key(&current)).copied().flatten());
             if let Some(new_path) = destination {
                 nested_record.payload = encode_utf16be(new_path);
                 changed = true;
@@ -539,10 +570,54 @@ fn rewrite_paths_in_otrks(
             let mut rebuilt = Vec::with_capacity(record.payload.len());
             TlvRecord::write_all(&nested, &mut rebuilt).expect("writing to Vec<u8> cannot fail");
             record.payload = rebuilt;
-            count += 1;
+            rewritten.push(RewrittenOtrk { index, original });
         }
     }
-    count
+    rewritten
+}
+
+/// The bytes of an `otrk` payload's first `path_tag` field.
+fn first_path_bytes(otrk_payload: &[u8], path_tag: &[u8; 4]) -> Option<Vec<u8>> {
+    let mut path = None;
+    walk_nested_fields(otrk_payload, |tag, payload| {
+        if tag == path_tag && path.is_none() {
+            path = Some(payload.to_vec());
+        }
+    });
+    path
+}
+
+/// After a rename, drops the entries that held another spelling of the
+/// same file than the first entry now at that path, so a crate holding
+/// both spellings keeps one entry. Entries that already repeated one
+/// spelling are left as they were.
+fn dedupe_renamed_spellings(
+    records: &mut Vec<TlvRecord>,
+    path_tag: &[u8; 4],
+    rewritten: &[RewrittenOtrk],
+) {
+    let mut first_spelling: HashMap<Vec<u8>, &[u8]> = HashMap::new();
+    let mut duplicates: HashSet<usize> = HashSet::new();
+    for entry in rewritten {
+        let Some(destination) = first_path_bytes(&records[entry.index].payload, path_tag) else {
+            continue;
+        };
+        let spelling = first_spelling.entry(destination).or_insert(&entry.original);
+        if *spelling != entry.original.as_slice() {
+            duplicates.insert(entry.index);
+        }
+    }
+    let mut position = 0;
+    records.retain(|_| {
+        let keep = !duplicates.contains(&position);
+        position += 1;
+        keep
+    });
+}
+
+struct RewrittenOtrk {
+    index: usize,
+    original: Vec<u8>,
 }
 
 /// A parsed Serato `.crate` file. Records are kept in original order;
@@ -589,7 +664,9 @@ impl CrateFile {
     }
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
-        rewrite_path_in_otrks(&mut self.records, TAG_PTRK, old_path, new_path)
+        let rewritten = rewrite_path_in_otrks(&mut self.records, TAG_PTRK, old_path, new_path);
+        dedupe_renamed_spellings(&mut self.records, TAG_PTRK, &rewritten);
+        rewritten.len()
     }
 
     /// Which of `paths` this crate holds a track at.
@@ -604,7 +681,9 @@ impl CrateFile {
     /// Caller layer pairs this with one read + one write of the
     /// crate file regardless of how many renames are batched.
     pub fn rewrite_paths(&mut self, renames: &HashMap<String, String>) -> usize {
-        rewrite_paths_in_otrks(&mut self.records, TAG_PTRK, renames)
+        let rewritten = rewrite_paths_in_otrks(&mut self.records, TAG_PTRK, renames);
+        dedupe_renamed_spellings(&mut self.records, TAG_PTRK, &rewritten);
+        rewritten.len()
     }
 
     /// Drop every otrk in this crate whose `ptrk` points at
@@ -742,7 +821,7 @@ impl DatabaseV2 {
     }
 
     pub fn rewrite_path(&mut self, old_path: &str, new_path: &str) -> usize {
-        rewrite_path_in_otrks(&mut self.records, TAG_PFIL, old_path, new_path)
+        rewrite_path_in_otrks(&mut self.records, TAG_PFIL, old_path, new_path).len()
     }
 
     /// Multi-rename variant: rewrite every matching `pfil` in one pass.
@@ -750,7 +829,7 @@ impl DatabaseV2 {
     /// (typically multi-MB) `database V2` file regardless of how many
     /// renames are in the batch.
     pub fn rewrite_paths(&mut self, renames: &HashMap<String, String>) -> usize {
-        rewrite_paths_in_otrks(&mut self.records, TAG_PFIL, renames)
+        rewrite_paths_in_otrks(&mut self.records, TAG_PFIL, renames).len()
     }
 
     /// Drop every otrk whose `pfil` points at `target_path`. Used
@@ -863,20 +942,27 @@ impl DatabaseV2 {
         update: &SeratoMetadataUpdate,
     ) -> usize {
         let target = PathKeys::new([track_path]);
-        for record in self.records.iter_mut() {
-            if &record.tag != TAG_OTRK {
+        let exact = encode_utf16be(track_path);
+        let mut equivalent = None;
+        let mut chosen = None;
+        for (index, record) in self.records.iter().enumerate() {
+            if &record.tag != TAG_OTRK
+                || !otrk_has_path_in(&record.payload, TAG_PFIL, &target)
+                || TlvRecord::parse_all(&record.payload).is_err()
+            {
                 continue;
             }
-            let Ok(mut nested) = TlvRecord::parse_all(&record.payload) else {
-                continue;
-            };
-            let path_matches = nested
-                .iter()
-                .any(|field| &field.tag == TAG_PFIL && target.matches_field(&field.payload));
-            if !path_matches {
-                continue;
+            if otrk_has_exact_path(&record.payload, TAG_PFIL, &exact) {
+                chosen = Some(index);
+                break;
             }
-
+            equivalent.get_or_insert(index);
+        }
+        // A record stored in the requested spelling wins over an equivalent one.
+        if let Some(index) = chosen.or(equivalent) {
+            let record = &mut self.records[index];
+            let mut nested =
+                TlvRecord::parse_all(&record.payload).expect("the chosen otrk parsed above");
             let changed = apply_metadata_update_to_nested(&mut nested, update);
             if !changed {
                 // Path matched but every supplied field already held
@@ -910,13 +996,29 @@ impl DatabaseV2 {
     pub fn batch_update_track_metadata(
         &mut self,
         updates: &HashMap<String, SeratoMetadataUpdate>,
-    ) -> usize {
+    ) -> Result<usize, SeratoError> {
         if updates.is_empty() {
-            return 0;
+            return Ok(0);
         }
-        let updates_by_key: HashMap<String, &SeratoMetadataUpdate> = updates
-            .iter()
-            .map(|(track_path, update)| (path_key(track_path), update))
+        let mut requests_by_key: HashMap<String, (&String, &SeratoMetadataUpdate)> =
+            HashMap::with_capacity(updates.len());
+        for (track_path, update) in updates {
+            match requests_by_key.entry(path_key(track_path)) {
+                Entry::Occupied(existing) if existing.get().1 != update => {
+                    let mut names = [existing.get().0.clone(), track_path.clone()];
+                    names.sort();
+                    let [first, second] = names;
+                    return Err(SeratoError::ConflictingPathRequests { first, second });
+                }
+                Entry::Occupied(_) => {}
+                Entry::Vacant(slot) => {
+                    slot.insert((track_path, update));
+                }
+            }
+        }
+        let updates_by_key: HashMap<String, &SeratoMetadataUpdate> = requests_by_key
+            .into_iter()
+            .map(|(key, (_, update))| (key, update))
             .collect();
         let mut changed_tracks = 0;
         for record in self.records.iter_mut() {
@@ -940,7 +1042,7 @@ impl DatabaseV2 {
             record.payload = rebuilt;
             changed_tracks += 1;
         }
-        changed_tracks
+        Ok(changed_tracks)
     }
 }
 
@@ -1926,6 +2028,81 @@ mod tests {
         )
     }
 
+    fn both_spellings(path_tag: &[u8; 4]) -> Vec<u8> {
+        synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            path_tag,
+            &[COMPOSED_PATH, DECOMPOSED_PATH, UNRELATED_PATH],
+        )
+    }
+
+    #[test]
+    fn metadata_update_prefers_the_record_stored_in_the_requested_spelling() {
+        for (requested, index) in [(COMPOSED_PATH, 0), (DECOMPOSED_PATH, 1)] {
+            let mut database = DatabaseV2::from_bytes(&both_spellings(TAG_PFIL)).unwrap();
+            assert_eq!(
+                database.update_track_metadata(requested, &title("Exact")),
+                1
+            );
+            let titles: Vec<Option<String>> = database
+                .track_records()
+                .into_iter()
+                .map(|record| record.title)
+                .collect();
+            let mut expected = vec![None, None, None];
+            expected[index] = Some("Exact".to_owned());
+            assert_eq!(titles, expected);
+        }
+    }
+
+    #[test]
+    fn batch_metadata_refuses_equivalent_paths_with_different_updates() {
+        let mut database = DatabaseV2::from_bytes(&both_spellings(TAG_PFIL)).unwrap();
+        let original = database.clone();
+        let result = database.batch_update_track_metadata(&HashMap::from([
+            (COMPOSED_PATH.to_owned(), title("Composed")),
+            (DECOMPOSED_PATH.to_owned(), title("Decomposed")),
+        ]));
+        assert!(matches!(
+            result,
+            Err(SeratoError::ConflictingPathRequests { .. })
+        ));
+        assert_eq!(database, original);
+    }
+
+    #[test]
+    fn renaming_a_crate_that_holds_both_spellings_leaves_one_entry() {
+        let mut crate_file = CrateFile::from_bytes(&both_spellings(TAG_PTRK)).unwrap();
+        crate_file.rewrite_path(COMPOSED_PATH, PREFILTER_RENAMED);
+        assert_eq!(
+            crate_file.track_paths(),
+            vec![PREFILTER_RENAMED, UNRELATED_PATH]
+        );
+    }
+
+    #[test]
+    fn equivalent_rename_sources_with_different_destinations_match_only_exactly() {
+        let mixed = "Music/Cafe\u{301} Cr\u{e8}me.mp3";
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PTRK,
+            &[mixed, UNRELATED_PATH],
+        );
+        let mut crate_file = CrateFile::from_bytes(&bytes).unwrap();
+        let renames = HashMap::from([
+            (
+                "Music/Caf\u{e9} Cr\u{e8}me.mp3".to_owned(),
+                "Music/One.mp3".to_owned(),
+            ),
+            (
+                "Music/Cafe\u{301} Cre\u{300}me.mp3".to_owned(),
+                "Music/Two.mp3".to_owned(),
+            ),
+        ]);
+        assert_eq!(crate_file.rewrite_paths(&renames), 0);
+        assert_eq!(crate_file.track_paths(), vec![mixed, UNRELATED_PATH]);
+    }
+
     /// Swift compares paths by NFC form (`SeratoPath.normalized`), so a request in either
     /// normalization reaches a record stored in the other, and the stored bytes of a path
     /// the write does not rename stay as Serato wrote them.
@@ -1945,10 +2122,12 @@ mod tests {
             );
             assert_eq!(database.update_track_metadata(requested, &title("One")), 1);
             assert_eq!(
-                database.batch_update_track_metadata(&HashMap::from([(
-                    requested.to_owned(),
-                    title("Two")
-                )])),
+                database
+                    .batch_update_track_metadata(&HashMap::from([(
+                        requested.to_owned(),
+                        title("Two")
+                    )]))
+                    .unwrap(),
                 1
             );
             assert_eq!(
@@ -2281,7 +2460,7 @@ mod tests {
             },
         );
 
-        let changed = database.batch_update_track_metadata(&updates);
+        let changed = database.batch_update_track_metadata(&updates).unwrap();
         // Two of the three otrks matched an update entry; the middle
         // one was left alone.
         assert_eq!(changed, 2);
@@ -2302,7 +2481,9 @@ mod tests {
             &["Users/x/Music/A/one.mp3"],
         );
         let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
-        let changed = database.batch_update_track_metadata(&HashMap::new());
+        let changed = database
+            .batch_update_track_metadata(&HashMap::new())
+            .unwrap();
         assert_eq!(changed, 0);
         assert_eq!(database.to_bytes().unwrap(), bytes);
     }

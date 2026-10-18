@@ -199,6 +199,8 @@ final class FinalRemovalIntegrationTests: XCTestCase {
                 current.fingerprintStatus = .done
                 current.fingerprintedSize = current.fileSize
                 current.fingerprintedMtime = current.mtime
+                current.fingerprintedMtimeNanoseconds = current.mtimeNanoseconds
+                current.fingerprintedInode = current.inode
                 try current.update(database)
             }
             return try XCTUnwrap(track.id)
@@ -213,8 +215,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         XCTAssertEqual(current.trackId, trackID)
         XCTAssertEqual(current.membershipRevision, file.membershipRevision)
         XCTAssertEqual(current.chromaprintFingerprint, Data([5, 6, 7, 8]))
-        XCTAssertEqual(current.fingerprintedSize, current.fileSize)
-        XCTAssertEqual(current.fingerprintedMtime, current.mtime)
+        XCTAssertEqual(current.fingerprintBasis, current.freshness)
         XCTAssertEqual(siblingAfter, siblingBefore)
         XCTAssertEqual(scannedTrack, matchedTrack)
         XCTAssertEqual(try readAudioTags(filePath: file.path).title, "Matched recording title")
@@ -522,6 +523,8 @@ final class FinalRemovalIntegrationTests: XCTestCase {
             current.fingerprintStatus = .done
             current.fingerprintedSize = current.fileSize
             current.fingerprintedMtime = current.mtime
+            current.fingerprintedMtimeNanoseconds = current.mtimeNanoseconds
+            current.fingerprintedInode = current.inode
             try current.update(database)
             return current
         }
@@ -532,8 +535,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         XCTAssertEqual(current.chromaprintFingerprint, before.chromaprintFingerprint)
         XCTAssertEqual(current.membershipRevision, before.membershipRevision)
         XCTAssertNil(current.lastProjectionInvalidationRevision)
-        XCTAssertEqual(current.fingerprintedSize, current.fileSize)
-        XCTAssertEqual(current.fingerprintedMtime, current.mtime)
+        XCTAssertEqual(current.fingerprintBasis, current.freshness)
         let replay = try await fixture.engine.resyncSeratoForBatch("owned-tags")
         XCTAssertEqual(replay.supersededCount, 0)
         XCTAssertEqual(replay.appliedCount, 1)

@@ -41,7 +41,7 @@ struct SeratoConflictReviewView: View {
                                         .textSelection(.enabled)
                                         .fixedSize(horizontal: false, vertical: true)
                                     if case .existing = occurrence.observation {
-                                        Button("Show in Finder") { Task { await model.reveal(occurrence) } }
+                                        Button(FileOpenerMessages.reveal) { Task { await model.reveal(occurrence) } }
                                             .accessibilityLabel("Show saved entry \(occurrence.id + 1) in Finder")
                                     }
                                 }

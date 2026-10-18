@@ -51,7 +51,7 @@ enum SeratoPath {
         else { return false }
         let current = try FileMetadataCollector.collectVerified(at: file.path)
         return current.volumeUuid == identity.volumeUuid && current.inode == identity.inode
-            && current.fileSize == identity.fileSize && current.mtime == identity.mtime
+            && current.fileSize == identity.fileSize && current.hasSameModificationTime(as: identity)
             && current.lightweightHash == identity.lightweightHash
     }
 }
@@ -151,16 +151,21 @@ actor SeratoMembershipReconciler {
             if let observedIdentity {
                 mutations.append(.observeFileIdentity(.init(fileId: fileID, expectedRevision: revision, previousIdentity: file.identity, identity: observedIdentity)))
             } else if observed == .available {
+                let evidence = try AudioFileReadIdentity.read(at: path)
                 let identity = try FileMetadataCollector.collectVerified(at: path)
                 if identity != file.identity {
+                    let replacement = FileIdentityObservationMutation.isReplacement(file, identity: identity)
                     if saved {
                         mutations.append(.observeFileIdentity(.init(fileId: fileID, expectedRevision: revision, previousIdentity: file.identity, identity: identity)))
-                        if FileIdentityObservationMutation.isReplacement(file, identity: identity) {
+                        if replacement {
                             revision += 1
                         }
-                    } else if FileIdentityObservationMutation.isReplacement(file, identity: identity) {
+                    } else if replacement {
                         observed = .unknown
                     }
+                } else if file.mtimeNanoseconds == nil, Self.describes(evidence, identity) {
+                    let time = SubsecondModificationTimePayload(fileId: fileID, membershipRevision: revision, mtimeNanoseconds: identity.mtimeNanoseconds)
+                    mutations.append(.recordSubsecondModificationTime(.init(time: time, identity: file.identity, evidence: evidence)))
                 }
             }
             var membership = file.libraryMembership
@@ -200,8 +205,39 @@ actor SeratoMembershipReconciler {
                 summary.unavailable += 1
             }
         }
+        if let plan {
+            try await recordSubsecondTimes(plan, snapshot: snapshot)
+        }
         try await reader.validate(snapshot)
         return summary
+    }
+
+    /// Records the subsecond time of unchanged rows indexed before it was kept, from the
+    /// stat evidence the plan verified, so no audio is re-read. Every chunk joins one
+    /// History batch, and is capped like a queued drain segment (#189) because each row
+    /// rechecks its file inside the writer transaction. A row whose file changed meanwhile
+    /// is skipped and left for the next sync, which plans it again.
+    private func recordSubsecondTimes(_ plan: LibraryRefreshPlan, snapshot: SeratoMembershipSnapshot) async throws {
+        let files = Dictionary(uniqueKeysWithValues: plan.indexedFiles.compactMap { file in file.id.map { fileID in (fileID, file) } })
+        let mutations = plan.subsecondTimes.sorted { left, right in left.key < right.key }.compactMap { fileID, nanoseconds -> TrackMutation? in
+            guard let file = files[fileID], let evidence = plan.evidence[fileID]?.readIdentity else { return nil }
+            let time = SubsecondModificationTimePayload(fileId: fileID, membershipRevision: file.membershipRevision, mtimeNanoseconds: nanoseconds)
+            return .recordSubsecondModificationTime(.init(time: time, identity: file.identity, evidence: evidence))
+        }
+        let batchID = UUID().uuidString
+        for start in stride(from: 0, to: mutations.count, by: Self.subsecondBatchSize) {
+            try Task.checkCancellation()
+            let chunk = Array(mutations[start ..< min(start + Self.subsecondBatchSize, mutations.count)])
+            _ = try await operationEngine.applyObservedBatch(chunk, authorization: reader.authorization(for: snapshot), batchId: batchID)
+        }
+    }
+
+    private static let subsecondBatchSize = 200
+
+    private static func describes(_ evidence: AudioFileReadIdentity, _ identity: FileMetadata) -> Bool {
+        let target = evidence.target
+        return target.size == identity.fileSize && Int64(bitPattern: target.inode) == identity.inode
+            && Int64(target.modifiedSeconds) == identity.mtime && Int64(target.modifiedNanoseconds) == identity.mtimeNanoseconds
     }
 
     private func repairedLegacyVolume(_ file: FileRecord) throws -> FileMetadata? {
@@ -275,7 +311,7 @@ actor SeratoMembershipReconciler {
     private static func matchesKnownFile(_ file: FileRecord, identity: FileMetadata) -> Bool {
         SeratoPath.normalized(file.path) == SeratoPath.normalized(identity.path)
             && file.inode == identity.inode && file.volumeUuid == identity.volumeUuid
-            && file.fileSize == identity.fileSize && file.mtime == identity.mtime
+            && file.fileSize == identity.fileSize && file.hasSameModificationTime(as: identity)
             && (file.lightweightHash == nil || file.lightweightHash == identity.lightweightHash)
     }
 

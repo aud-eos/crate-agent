@@ -785,19 +785,10 @@ public actor LibraryHygieneRunner {
         return effectiveBatchId
     }
 
-    /// Shared mutation triple: setMetadata (crate-agent DB) +
-    /// commitMetadataToSerato (Serato's database V2) + writeFileTags
-    /// (the audio file's embedded ID3v2.4 / Vorbis / iTunes tags).
-    /// All three under the same batch_id so a single Undo from
-    /// History reverts the file tags, the Serato snapshot, and the
-    /// DB row in lockstep.
-    ///
-    /// All three carry the pre-fix `previousMetadata` so each is
-    /// individually invertible — see the matching engine extensions.
-    ///
-    /// `merged` was derived from the scan-time snapshot, so the engine
-    /// rejects the write if the live row has diverged from it. Returns
-    /// false for that file instead of overwriting the newer values.
+    /// Applies `merged` through `OperationEngine.applyMetadataEdit`. `merged`
+    /// was derived from the scan-time snapshot, so the engine rejects the
+    /// write if the live row has diverged from it. Returns false for that
+    /// file instead of overwriting the newer values.
     private func applyMergedMetadata(
         fileId: Int64,
         file: some HygieneFileSource,
@@ -815,31 +806,9 @@ public actor LibraryHygieneRunner {
             length: file.length,
             label: file.label
         )
-        // One transaction for all three mutations: setMetadata writes
-        // the DB row, commitMetadataToSerato queues/applies the
-        // Serato library snapshot, writeFileTags writes the audio
-        // file tags. Bundling avoids three separate writer
-        // transactions per file — the hot path during hygiene runs
-        // over thousands of files.
         do {
-            try await operationEngine.applyBatch(
-                [
-                    .setMetadata(SetMetadataPayload(fileId: fileId, metadata: merged, isSeratoAuthoritative: false)),
-                    .commitMetadataToSerato(CommitMetadataToSeratoPayload(
-                        fileId: fileId,
-                        metadata: merged,
-                        previousMetadata: previousSnapshot
-                    )),
-                    .writeFileTags(WriteFileTagsPayload(
-                        fileId: fileId,
-                        metadata: merged,
-                        previousMetadata: previousSnapshot
-                    )),
-                ],
-                batchId: batchId,
-                expectedMembershipTokens: [fileId: FileMembershipToken(fileId: fileId, revision: file.membershipRevision)],
-                expectedMetadata: [fileId: previousSnapshot]
-            )
+            try await operationEngine.applyMetadataEdit(fileId: fileId, membershipRevision: file.membershipRevision,
+                                                        previous: previousSnapshot, edited: merged, batchId: batchId)
         } catch OperationEngineError.metadataChanged {
             return false
         }

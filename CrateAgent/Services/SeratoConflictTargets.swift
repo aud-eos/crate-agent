@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import GRDB
 
@@ -26,6 +27,9 @@ enum SeratoConflictTargets {
         case let .observeFileMetadata(payload):
             fileID = payload.observation.fileId
             include(payload.observation.identity, in: &target)
+        case let .recordSubsecondModificationTime(payload):
+            fileID = payload.time.fileId
+            include(payload.identity, in: &target)
         case let .observeFileIdentity(payload):
             fileID = payload.fileId
             include(payload.previousIdentity, in: &target)
@@ -48,6 +52,14 @@ enum SeratoConflictTargets {
         case let .revertMusicBrainzMatch(payload):
             fileID = payload.applied.fileID
             try includeSharedTrack(payload.applied.fingerprintHash, in: &target, database: database)
+        case let .songFamily(operation):
+            fileID = try includeRecordingLink(operation, in: &target, database: database)
+        case let .duplicateLabelReview(.keepBoth(payload)), let .duplicateLabelReview(.reopen(payload)):
+            fileID = nil
+            target.fileIDs.formUnion(payload.fileIds)
+            for file in try FileRecord.fetchAll(database, keys: payload.fileIds) {
+                target.include(file)
+            }
         }
         if let fileID {
             target.fileIDs.insert(fileID)
@@ -87,6 +99,27 @@ enum SeratoConflictTargets {
         target.paths.append(identity.path)
         if identity.volumeUuid != LegacyFileIdentity.unknownVolume {
             target.physicalIdentities.insert(.init(volumeID: identity.volumeUuid, inode: UInt64(bitPattern: identity.inode)))
+        }
+    }
+
+    /// Linking, unlinking or relinking sets a file's `track_id`, so it targets
+    /// that file and the recording it joins or leaves. Every other family
+    /// change writes only `works` and `tracks.work_id`, which no Serato file
+    /// or path mirrors.
+    private static func includeRecordingLink(_ operation: SongFamilyOperation, in target: inout SeratoConflictTarget,
+                                             database: GRDB.Database) throws -> Int64?
+    {
+        switch operation {
+        case let .linkRecording(fileID):
+            if let file = try FileRecord.fetchOne(database, key: fileID), let fingerprint = file.chromaprintFingerprint {
+                try includeSharedTrack(Data(SHA256.hash(data: fingerprint)), in: &target, database: database)
+            }
+            return fileID
+        case let .unlinkRecording(link), let .relinkRecording(link):
+            target.sharedTrackIDs.insert(link.trackId)
+            return link.fileId
+        case .create, .attach, .detach, .merge, .split, .setRepresentative, .restore:
+            return nil
         }
     }
 

@@ -27,7 +27,7 @@ import GRDB
 /// digest still pending is shown as checking and offers nothing. Only files
 /// with a finished fingerprint are clustered perceptually.
 public enum DuplicateFinder {
-    public enum Mode: String, Sendable, Equatable, CaseIterable {
+    public enum Mode: String, Codable, Sendable, Equatable, CaseIterable {
         case byteLevel
         case perceptual
 
@@ -58,6 +58,14 @@ public enum DuplicateFinder {
         case unreadable(String)
     }
 
+    /// A confirmed group whose copies name different version labels
+    /// (`DuplicateLabelReview`). `keptBoth` records that the user chose to
+    /// keep every copy; it lasts while `signature` still matches.
+    public struct LabelReview: Sendable, Equatable {
+        public let signature: String
+        public let keptBoth: Bool
+    }
+
     public struct KeptFile<File: DuplicateFileSource>: Sendable, Equatable {
         public let file: File
         public let reason: KeptReason
@@ -75,10 +83,12 @@ public enum DuplicateFinder {
         public let keptFiles: [KeptFile<File>]
         /// Digest evidence per file id.
         public let evidence: [Int64: DuplicateEvidence]
+        /// Set when the copies' version labels disagree.
+        public let labelReview: LabelReview?
 
         /// A group is unconfirmed until its files' digests are checked.
         public init(groupKey: String, mode: Mode, files: [File], check: Check = .checking, keptFiles: [KeptFile<File>] = [],
-                    evidence: [Int64: DuplicateEvidence] = [:])
+                    evidence: [Int64: DuplicateEvidence] = [:], labelReview: LabelReview? = nil)
         {
             self.groupKey = groupKey
             self.mode = mode
@@ -86,16 +96,32 @@ public enum DuplicateFinder {
             self.check = check
             self.keptFiles = keptFiles
             self.evidence = evidence
+            self.labelReview = labelReview
         }
 
-        /// Whether any file here may be moved to Trash at all.
+        /// Whether any file here may be moved to Trash at all. Copies the
+        /// user chose to keep are not offered again.
         public var offersCleanup: Bool {
-            files.count > 1 && (check == .confirmed || check == .needsListening)
+            files.count > 1 && (check == .confirmed || check == .needsListening) && labelReview?.keptBoth != true
         }
 
-        /// Whether every non-keeper is selected for Trash by default.
+        /// Whether every non-keeper is selected for Trash by default, and a
+        /// keeper chosen for the user. Never when labels disagree.
         public var preselectsCleanup: Bool {
-            files.count > 1 && check == .confirmed
+            files.count > 1 && check == .confirmed && labelReview == nil
+        }
+
+        /// Whether the copies' labels disagree and the user hasn't kept them all.
+        public var labelsDisagree: Bool {
+            labelReview?.keptBoth == false
+        }
+
+        func withLabelReview(keptSignatures: Set<String>) -> Self {
+            guard check == .confirmed, files.count > 1, DuplicateLabelReview.labelsDisagree(files),
+                  let signature = DuplicateLabelReview.signature(of: self)
+            else { return self }
+            return Self(groupKey: groupKey, mode: mode, files: files, check: check, keptFiles: keptFiles, evidence: evidence,
+                        labelReview: LabelReview(signature: signature, keptBoth: keptSignatures.contains(signature)))
         }
 
         /// Files whose digest is still being computed.
@@ -129,15 +155,18 @@ public enum DuplicateFinder {
     /// biggest first, then by key.
     public static func findDuplicates(in database: Database, mode: Mode) throws -> [DuplicateGroup<DuplicateFileRow>] {
         var membersByKey: [String: [DuplicateConfirmation.Member]] = [:]
+        let playCounts = try SeratoPlayCounts.all(in: database)
         let rows = try Row.fetchCursor(database, sql: memberSQL(for: mode))
         while let row = try rows.next() {
-            let file = try DuplicateFileRow(row: row)
+            let file = try DuplicateFileRow(row: row, playCounts: playCounts)
             let evidence = try DuplicateDigestStore.evidence(from: row, kind: mode.digestKind)
             membersByKey[groupKey(mode: mode, fileSize: file.fileSize, keyBytes: row["group_blob"]), default: []]
                 .append(.init(file: file, evidence: evidence))
         }
+        let keptSignatures = try DuplicateLabelReview.keptSignatures(in: database)
         return membersByKey
             .flatMap { key, members in DuplicateConfirmation.groups(clusterKey: key, mode: mode, members: members) }
+            .map { group in group.withLabelReview(keptSignatures: keptSignatures) }
             .sorted { lhs, rhs in
                 if lhs.size != rhs.size {
                     return lhs.size > rhs.size
@@ -211,7 +240,7 @@ public enum DuplicateFinder {
         case .byteLevel:
             "\(fileSize):\(keyBytes.base64EncodedString())"
         case .perceptual:
-            SHA256.hash(data: keyBytes).map { byte in String(format: "%02x", byte) }.joined()
+            SHA256.hash(data: keyBytes).lowercaseHex
         }
     }
 }

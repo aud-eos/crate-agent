@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 /// Background jobs and the library coverage they produce. Job state comes from the services
@@ -23,6 +22,7 @@ struct WorkersView: View {
                     fileInfoJob
                     fingerprintJob
                     deferredWrites
+                    PlayCountCard(service: services.playCountService)
                     coverage
                     drillDown
                 }
@@ -150,7 +150,8 @@ struct WorkersView: View {
                     Text("Showing the first \(WorkerCoverageQuery.drillDownLimit) files.").font(.caption).foregroundStyle(.secondary)
                 }
                 List(model.rows, selection: $model.selectedFileIDs) { row in
-                    WorkerFileRowView(row: row, showInLibrary: { services.showInLibrary(path: row.path) })
+                    WorkerFileRowView(row: row, showInLibrary: { services.showInLibrary(path: row.path) },
+                                      reveal: { Task { await services.fileOpener.reveal(fileID: row.id) } })
                 }
                 .frame(minHeight: 260)
             }
@@ -213,6 +214,32 @@ private struct WorkerCard<Content: View>: View {
     }
 }
 
+private struct PlayCountCard: View {
+    @ObservedObject var service: SeratoPlayCountService
+
+    var body: some View {
+        WorkerCard(title: SeratoPlayCountMessages.title) {
+            switch service.status {
+            case .notRefreshed:
+                Text(SeratoPlayCountMessages.notRefreshed).font(.callout)
+            case .refreshing:
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(SeratoPlayCountMessages.refreshing).font(.callout)
+                }
+            case let .refreshed(summary):
+                Text(SeratoPlayCountMessages.refreshed(summary)).font(.callout.monospacedDigit())
+                Text(SeratoPlayCountMessages.skipped(summary)).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+            case .skippedWhileSeratoRunning:
+                Text(SeratoPlayCountMessages.skippedWhileSeratoRunning).font(.callout)
+            case let .failed(reason):
+                Text(SeratoPlayCountMessages.failed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            Text(SeratoPlayCountMessages.explanation).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
 private struct CoverageLine: View {
     let items: [(String, Int)]
 
@@ -226,6 +253,7 @@ private struct CoverageLine: View {
 private struct WorkerFileRowView: View {
     let row: WorkerFileRow
     let showInLibrary: () -> Void
+    let reveal: () -> Void
 
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
@@ -237,11 +265,9 @@ private struct WorkerFileRowView: View {
             }
             Spacer()
             Button("Show in Library", action: showInLibrary).controlSize(.small)
-            Button("Show in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: row.path)])
-            }
-            .controlSize(.small)
-            .disabled(row.availability != .available)
+            Button(FileOpenerMessages.reveal, action: reveal)
+                .controlSize(.small)
+                .disabled(row.availability != .available)
         }
         .tag(row.id)
     }

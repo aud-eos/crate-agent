@@ -261,9 +261,13 @@ final class SeratoLibrarySyncSession: ObservableObject {
                     cachedSource = nil
                 }
                 let pendingWork = try await operationEngine.hasPendingSynchronizationWork
+                var awaitingSubsecondTime = false
+                if let checkpointStore, let header {
+                    awaitingSubsecondTime = try await checkpointStore.hasRowsAwaitingSubsecondTime(libraryID: header.libraryID)
+                }
                 if let checkpointStore, let header, let baseRevision, let cachedSource,
                    header.complete, !header.hadConflicts, header.localRevision == baseRevision,
-                   stats?.changedFileIDs.isEmpty == true, !pendingWork, !filesystemRetryActive,
+                   stats?.changedFileIDs.isEmpty == true, !pendingWork, !awaitingSubsecondTime, !filesystemRetryActive,
                    startupReplay?.observations.isEmpty != false
                 {
                     try readiness.install(.init(), for: authorization)

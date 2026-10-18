@@ -27,7 +27,7 @@ struct TrackPlayButton: View {
         let isCurrent = player.track?.fileID == track.fileID
         let isPlaying = player.isPlaying(fileID: track.fileID)
         Button {
-            player.toggle(track)
+            Task { await player.toggle(track) }
         } label: {
             Image(systemName: TrackPlayerSymbol.name(isPlaying: isPlaying))
         }
@@ -49,7 +49,11 @@ struct NowPlayingBar: View {
         if player.track != nil || player.failure != nil {
             VStack(alignment: .leading, spacing: density.detailSpacing) {
                 if let failure = player.failure {
-                    ActionErrorMessage(message: failure)
+                    HStack(spacing: density.spacing) {
+                        ActionErrorMessage(message: failure)
+                        Spacer(minLength: density.spacing)
+                        Button(TrackPlayerMessages.dismiss, action: player.dismissFailure)
+                    }
                 }
                 if let track = player.track {
                     HStack(spacing: density.spacing) {
@@ -72,7 +76,7 @@ struct NowPlayingBar: View {
                         .frame(minWidth: 120, maxWidth: 260, alignment: .leading)
                         .help(track.path)
                         .accessibilityElement(children: .combine)
-                        .accessibilityLabel("\(TrackPlayerMessages.nowPlaying): \([track.displayTitle, track.artist].compactMap { $0 }.joined(separator: ", "))")
+                        .accessibilityLabel(TrackPlayerMessages.nowPlayingLabel(title: track.displayTitle, artist: track.artist))
                         TrackPlayerScrubber(position: player.position, seek: player.seek(toFraction:))
                         Button(TrackPlayerMessages.stop, systemImage: "stop.fill", action: player.stop)
                     }
@@ -176,6 +180,6 @@ final class TrackPlayCell: NSTableCellView {
 
     @objc private func toggle() {
         guard let row, let player else { return }
-        player.toggle(row.track)
+        Task { await player.toggle(row.track) }
     }
 }

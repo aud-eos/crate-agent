@@ -338,13 +338,34 @@ struct StatusBadge: View {
 }
 
 struct ActionErrorMessage: View {
-    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     let message: String
 
     var body: some View {
+        ActionMessageRow(message: message, systemImage: "exclamationmark.triangle.fill", tint: .orange, accessibilityPrefix: "Error")
+    }
+}
+
+/// Information about an action that needs no fixing, such as files another
+/// drop is already importing.
+struct ActionNoticeMessage: View {
+    let message: String
+
+    var body: some View {
+        ActionMessageRow(message: message, systemImage: "info.circle", tint: .secondary, accessibilityPrefix: "Notice")
+    }
+}
+
+private struct ActionMessageRow: View {
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    let message: String
+    let systemImage: String
+    let tint: Color
+    let accessibilityPrefix: String
+
+    var body: some View {
         HStack(alignment: .top, spacing: density.spacing) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+            Image(systemName: systemImage)
+                .foregroundStyle(tint)
                 .accessibilityHidden(true)
             Text(message)
                 .foregroundStyle(.primary)
@@ -354,7 +375,7 @@ struct ActionErrorMessage: View {
         }
         .font(.callout)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Error: \(message)")
+        .accessibilityLabel("\(accessibilityPrefix): \(message)")
         .help(message)
     }
 }
