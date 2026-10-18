@@ -418,6 +418,28 @@ pub fn fingerprint_audio_file(file_path: String) -> Result<Vec<u32>, CoreError> 
     Ok(fingerprint::fingerprint_file(&path)?)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAudioDigest {
+    pub pcm_sha256: Vec<u8>,
+    pub format: String,
+    pub sample_rate: u32,
+    pub channel_count: u32,
+    pub frame_count: u64,
+    pub full_fingerprint_sha256: Vec<u8>,
+}
+
+pub fn decoded_audio_digest(file_path: String) -> Result<DecodedAudioDigest, CoreError> {
+    let digest = fingerprint::decoded_audio_digest(PathBuf::from(file_path))?;
+    Ok(DecodedAudioDigest {
+        pcm_sha256: digest.pcm_sha256.to_vec(),
+        format: digest.format,
+        sample_rate: digest.sample_rate,
+        channel_count: digest.channel_count,
+        frame_count: digest.frame_count,
+        full_fingerprint_sha256: digest.full_fingerprint_sha256.to_vec(),
+    })
+}
+
 /// Encode a raw Chromaprint fingerprint into the compressed, base64url
 /// string AcoustID's lookup API expects. Consumes the `Vec<u32>`
 /// `fingerprint_audio_file` produces; the two are always used together
