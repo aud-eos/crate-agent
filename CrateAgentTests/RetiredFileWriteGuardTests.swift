@@ -245,17 +245,31 @@ final class RetiredFileWriteGuardTests: XCTestCase {
             state.running = false
             watchdog.refresh()
         }
+
+        /// Takes the file out of the crate as a landed removal does, recording what it took.
+        func recordCrateRemoval() async throws -> Int64 {
+            let trackPath = SeratoLibraryLocator.seratoRelativePath(fromAbsolute: audio.path)
+            let removed = try removePathFromCrateCapturing(cratePath: crate.path, trackPath: trackPath)
+            return try await database.writer.write { [fileID, crate] database in
+                let eventID = try OperationEngine.insertEvent(batchId: "removal", timestamp: 0, fileId: fileID, eventType: .fileRemovedFromCrates,
+                                                              forwardPayload: RemoveFileFromCratesPayload(fileId: fileID), inversePayload: [String: String](), in: database)
+                try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: crate.path, trackPath: trackPath, records: removed,
+                                                   earlierAttemptMayHaveLanded: false, in: database)
+                return eventID
+            }
+        }
     }
 
     @MainActor
     func testEveryQueuedVariantIsFencedAcrossRetirementAndReadd() async throws {
-        for variant in ["add", "rename", "remove", "crates", "trash"] {
+        for variant in ["add", "rename", "remove", "crates", "trash", "restore"] {
             let fixture = try await Fixture.make(membership: variant == "add" ? .pendingImport : .active)
             defer { try? FileManager.default.removeItem(at: fixture.root) }
             let v2URL = fixture.library.appendingPathComponent("database V2")
             if variant == "add" {
                 try OperationEngineTests.synthesizeDatabaseV2BytesForTest(withTrackPaths: []).write(to: v2URL)
             }
+            let removalEventID = variant == "restore" ? try await fixture.recordCrateRemoval() : 0
             let v2Before = try Data(contentsOf: v2URL)
             let crateBefore = try Data(contentsOf: fixture.crate)
             let mutation: TrackMutation = switch variant {
@@ -263,6 +277,7 @@ final class RetiredFileWriteGuardTests: XCTestCase {
             case "rename": .renameFile(RenameFilePayload(fileId: fixture.fileID, newPath: fixture.root.appendingPathComponent("renamed.mp3").path))
             case "remove": .removeTrackFromSerato(RemoveTrackFromSeratoPayload(fileId: fixture.fileID))
             case "crates": .removeFileFromCrates(RemoveFileFromCratesPayload(fileId: fixture.fileID))
+            case "restore": .restoreSeratoRecords(RestoreSeratoRecordsPayload(removalEventID: removalEventID, trackPath: fixture.audio.path))
             default: .trashFile(TrashFilePayload(fileId: fixture.fileID))
             }
             try await fixture.engine.apply(mutation, batchId: variant)

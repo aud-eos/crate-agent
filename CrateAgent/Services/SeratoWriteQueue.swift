@@ -9,13 +9,14 @@ enum SeratoWriteKind: String, Codable, Sendable {
     case removeFromDatabase
     case removeFromCrates
     case trashFile
+    case restoreRecords
 
     /// Writes to Serato's library files (database V2, crates, smart crates),
     /// which all wait together while `database V2` is missing (#192). Audio
     /// tags and Trash are not Serato library files.
     var writesSeratoLibrary: Bool {
         switch self {
-        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates: true
+        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates, .restoreRecords: true
         case .fileTagWrite, .trashFile: false
         }
     }
@@ -36,6 +37,7 @@ extension SeratoPendingWrite: Codable {
         case .removeFromDatabase: .removeFromDatabase
         case .removeFromCrates: .removeFromCrates
         case .trashFile: .trashFile
+        case .restoreRecords: .restoreRecords
         }
     }
 
@@ -49,6 +51,7 @@ extension SeratoPendingWrite: Codable {
         case .removeFromDatabase: self = try .removeFromDatabase(container.decode(SeratoPendingRemoval.self, forKey: .value))
         case .removeFromCrates: self = try .removeFromCrates(container.decode(SeratoPendingRemoval.self, forKey: .value))
         case .trashFile: self = try .trashFile(container.decode(SeratoPendingTrash.self, forKey: .value))
+        case .restoreRecords: self = try .restoreRecords(container.decode(SeratoPendingRestore.self, forKey: .value))
         }
     }
 
@@ -62,6 +65,7 @@ extension SeratoPendingWrite: Codable {
         case let .fileTagWrite(value): try container.encode(value, forKey: .value)
         case let .removeFromDatabase(value), let .removeFromCrates(value): try container.encode(value, forKey: .value)
         case let .trashFile(value): try container.encode(value, forKey: .value)
+        case let .restoreRecords(value): try container.encode(value, forKey: .value)
         }
     }
 }
@@ -242,7 +246,7 @@ enum SeratoWriteQueue {
             case let .rename(later): later.oldAbsolutePath
             case let .metadataUpdate(update): update.absolutePath
             case let .removeFromDatabase(removal), let .removeFromCrates(removal): removal.absolutePath
-            case .addTrack, .fileTagWrite, .trashFile: nil
+            case .addTrack, .fileTagWrite, .trashFile, .restoreRecords: nil
             }
             guard let referencePath, SeratoPath.normalized(referencePath) == newPath else { continue }
             stranded.append(SeratoStrandedWrite(write: write, detail: SeratoWriteDispositionMessages.unarrivedRename(at: rename.newAbsolutePath),
@@ -475,6 +479,8 @@ enum SeratoWriteDisposition: String, Sendable, CaseIterable {
     case legacyUnrecoverable
     case malformed
     case noSeratoRecord
+    /// A restore's crate was deleted after the removal it undoes.
+    case storeMissing
     /// Dropped by the user, who reverted the change in the same batch (#163).
     case discarded
 }

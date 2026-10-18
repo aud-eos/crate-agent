@@ -11,6 +11,11 @@ enum SeratoRemovalCaptureStore {
         let storePath: String
         let trackPath: String
         let records: [SeratoRemovedRecord]
+
+        /// The store's records may have been removed by an attempt whose capture rolled back.
+        var isUnrecorded: Bool {
+            records.isEmpty
+        }
     }
 
     /// The generated `SeratoRemovedRecord` cannot synthesize Codable outside its own file.
@@ -19,8 +24,16 @@ enum SeratoRemovalCaptureStore {
         let record: Data
     }
 
-    static func save(eventID: Int64, storePath: String, trackPath: String, records: [SeratoRemovedRecord], in database: Database) throws {
-        guard !records.isEmpty else { return }
+    /// A retry that finds nothing left to remove after an earlier attempt's I/O may
+    /// have landed saves an unrecorded capture, unless that attempt's capture committed.
+    static func save(eventID: Int64, storePath: String, trackPath: String, records: [SeratoRemovedRecord],
+                     earlierAttemptMayHaveLanded: Bool, in database: Database) throws
+    {
+        if records.isEmpty {
+            let captured = try Bool.fetchOne(database, sql: "SELECT EXISTS(SELECT 1 FROM serato_removal_captures WHERE event_id = ? AND store_path = ?)",
+                                             arguments: [eventID, storePath]) ?? false
+            guard earlierAttemptMayHaveLanded, !captured else { return }
+        }
         let stored = records.map { removed in StoredRecord(index: removed.index, record: removed.record) }
         try database.execute(sql: """
         INSERT INTO serato_removal_captures (event_id, store_path, track_path, records, captured_at) VALUES (?, ?, ?, ?, ?)

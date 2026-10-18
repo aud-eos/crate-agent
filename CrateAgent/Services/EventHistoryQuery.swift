@@ -310,6 +310,10 @@ public enum EventHistoryQuery {
             return "Removed \(count) track\(pluralS) from Serato's database"
         case .fileRemovedFromCrates:
             return "Removed \(count) file\(pluralS) from Serato crates"
+        case .fileRestoredFromTrash:
+            return RemovalUndoMessages.restoredFromTrashPhrase(count: count)
+        case .seratoRecordsRestored:
+            return RemovalUndoMessages.recordsRestoredPhrase(count: count)
         case .trackAddedToSerato:
             return "Added \(count) track\(pluralS) to Serato"
         case .musicBrainzMatchApplied:

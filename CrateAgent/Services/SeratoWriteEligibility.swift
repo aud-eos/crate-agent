@@ -66,7 +66,7 @@ enum SeratoWriteEligibility {
             result.write = .removeFromDatabase(.init(absolutePath: referencePath(write.absolutePath, file: file)))
         case let .removeFromCrates(write):
             result.write = .removeFromCrates(.init(absolutePath: referencePath(write.absolutePath, file: file)))
-        case .rename: break
+        case .rename, .restoreRecords: break
         }
         return result
     }
@@ -100,6 +100,7 @@ enum SeratoWriteEligibility {
         switch guarded.write {
         case let .fileTagWrite(write): try requirePath(write.absolutePath, file: file)
         case let .trashFile(write): try requirePath(write.absolutePath, file: file)
+        case let .restoreRecords(write): try requirePath(write.absolutePath, file: file)
         case let .addTrack(write): try requirePath(write.absolutePath, file: file)
         case let .metadataUpdate(write): try requireReference(write.absolutePath, file: file)
         case let .removeFromDatabase(write): try requireReference(write.absolutePath, file: file)
@@ -166,6 +167,9 @@ enum SeratoWriteEligibility {
     static func permits(_ write: SeratoPendingWrite, file: FileRecord) -> Bool {
         if case .addTrack = write {
             return file.libraryMembership == .pendingImport && file.fileAvailability == .available
+        }
+        if case let .restoreRecords(restore) = write, restore.absolutePath != file.path {
+            return false
         }
         return file.libraryMembership == .active && file.fileAvailability == .available
     }

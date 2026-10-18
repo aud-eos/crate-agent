@@ -46,6 +46,16 @@ enum SeratoConflictTargets {
         case let .trashFile(payload): fileID = payload.fileId
         case let .removeTrackFromSerato(payload): fileID = payload.fileId
         case let .removeFileFromCrates(payload): fileID = payload.fileId
+        case let .restoreFromTrash(payload):
+            fileID = try FileRecord.filter(Column("path") == payload.originalPath).fetchOne(database)?.id
+            target.paths.append(payload.originalPath)
+            include(payload.identity, in: &target)
+            if let trashItem = try SeratoRemovalCaptureStore.trashDestination(eventID: payload.removalEventID, in: database)?.identity {
+                include(trashItem, in: &target)
+            }
+        case let .restoreSeratoRecords(payload):
+            fileID = try FileRecord.filter(Column("path") == payload.trackPath).fetchOne(database)?.id
+            target.paths.append(payload.trackPath)
         case let .applyMusicBrainzMatch(payload):
             fileID = payload.fileID
             try includeSharedTrack(payload.fingerprintHash, in: &target, database: database)
@@ -160,6 +170,7 @@ extension SeratoPendingWrite {
         case let .fileTagWrite(payload): [payload.absolutePath]
         case let .removeFromDatabase(payload), let .removeFromCrates(payload): [payload.absolutePath]
         case let .trashFile(payload): [payload.absolutePath]
+        case let .restoreRecords(payload): [payload.absolutePath]
         }
     }
 }
