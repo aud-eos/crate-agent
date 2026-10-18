@@ -341,6 +341,12 @@ public enum EventHistoryQuery {
             return "Reopened label review for \(count) duplicate group\(pluralS)"
         case .queuedSeratoChangeDiscarded:
             return QueuedChangeDiscardMessages.batchPhrase(count: count)
+        case .recordingSeparated:
+            return "Gave \(count) file\(pluralS) a recording of \(count == 1 ? "its" : "their") own"
+        case .recordingSeparatedForGrouping:
+            return "Gave \(count) file\(pluralS) a recording of \(count == 1 ? "its" : "their") own for grouping"
+        case .recordingRejoined:
+            return "Returned \(count) file\(pluralS) to \(count == 1 ? "its" : "their") shared recording"
         case .musicBrainzWorkRecorded:
             return MusicBrainzWorkMessages.recordedPhrase(count: count)
         case .musicBrainzWorkCleared:

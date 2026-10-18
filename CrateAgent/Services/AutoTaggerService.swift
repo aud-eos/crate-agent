@@ -428,7 +428,10 @@ final class AutoTaggerService: ObservableObject {
             selected = alternatives.entries.first
         }
         recordingAlternatives[fileID] = alternatives
-        let baseline = LookupBaseline(fileID: fileID, membershipToken: membershipToken, fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)),
+        let recordingKey = try await database.writer.read { database in
+            try RecordingIdentity.key(fingerprintHash: Data(SHA256.hash(data: fingerprintBytes)), fileID: fileID, in: database)
+        }
+        let baseline = LookupBaseline(fileID: fileID, membershipToken: membershipToken, fingerprintHash: recordingKey,
                                       freshness: lookupFreshness, tags: tags)
         lookupBaselines[fileID] = baseline
         guard let selected else { return .noMatch }

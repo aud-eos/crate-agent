@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import GRDB
 
@@ -171,9 +170,9 @@ public enum SongFamilyError: LocalizedError, Equatable {
         case let .recordingHasNoFiles(recording):
             "“\(recording)” has no file in the library, so it can't be grouped."
         case let .fingerprintCollision(file, otherFile?):
-            "“\(file)” and “\(otherFile)” share an audio fingerprint, so crate-agent treats them as one recording and can't group them as separate versions."
+            "“\(file)” and “\(otherFile)” share an audio fingerprint, so crate-agent treats them as one recording. Group them as different recordings to keep them as separate versions."
         case let .fingerprintCollision(file, nil):
-            "“\(file)” has the same audio fingerprint as a recording crate-agent already identified, so it treats them as one recording and can't group them as separate versions."
+            "“\(file)” has the same audio fingerprint as a recording crate-agent already identified, so it treats them as one recording. Group them as different recordings to keep them as separate versions."
         case let .linkChanged(file):
             "“\(file)” was linked to a different recording since this was recorded."
         case let .changedSinceShown(file):
@@ -333,8 +332,9 @@ enum SongFamilyMutation {
                 }
                 trackID = id
             case let .file(fileID):
-                let file = try activeFile(fileID, in: database)
-                guard let linked = file.trackId else { throw SongFamilyError.recordingUnidentified(file: file.displayName) }
+                guard let linked = try activeFileLink(fileID, in: database).trackID else {
+                    throw try SongFamilyError.recordingUnidentified(file: fileRecord(fileID, in: database).displayName)
+                }
                 trackID = linked
             }
             if !trackIDs.contains(trackID) {
@@ -342,6 +342,15 @@ enum SongFamilyMutation {
             }
         }
         return trackIDs
+    }
+
+    /// What resolving and linking read of a file still in the library,
+    /// without decoding its record; a batch reads it for every member.
+    private static func activeFileLink(_ fileID: Int64, in database: GRDB.Database) throws -> (trackID: Int64?, membershipRevision: Int64) {
+        let statement = try database.cachedStatement(sql: "SELECT library_membership, track_id, membership_revision FROM files WHERE id = ?")
+        guard let row = try Row.fetchOne(statement, arguments: [fileID]) else { throw OperationEngineError.fileNotFound(fileId: fileID) }
+        guard row[0] as LibraryMembership != .retired else { throw try SongFamilyError.fileRetired(file: fileRecord(fileID, in: database).displayName) }
+        return (row[1], row[2])
     }
 
     private static func activeFile(_ fileID: Int64, in database: GRDB.Database) throws -> FileRecord {
@@ -377,11 +386,15 @@ enum SongFamilyMutation {
     }
 
     private static func link(_ fileID: Int64, in database: GRDB.Database) throws -> SongFamilyRecordingLink? {
-        let file = try activeFile(fileID, in: database)
-        guard file.trackId == nil else { return nil }
-        guard let hash = currentFingerprintHash(of: file) else { throw SongFamilyError.recordingUnidentified(file: file.displayName) }
+        let file = try activeFileLink(fileID, in: database)
+        guard file.trackID == nil else { return nil }
+        guard let hash = try RecordingIdentity.keys(ofFiles: [fileID], in: database)[fileID] else {
+            throw try SongFamilyError.recordingUnidentified(file: fileRecord(fileID, in: database).displayName)
+        }
         let trackID: Int64
-        if let existing = try TrackRecord.filter(Column("fingerprint_hash") == hash).fetchOne(database), let existingID = existing.id {
+        if let existing = try TrackRecord.fetchOne(database.cachedStatement(sql: "SELECT * FROM tracks WHERE fingerprint_hash = ?"), arguments: [hash]),
+           let existingID = existing.id
+        {
             try requireUnclaimed(existing, by: fileID, in: database)
             trackID = existingID
         } else {
@@ -399,22 +412,13 @@ enum SongFamilyMutation {
         guard try fileRecord(recorded.fileId, in: database).trackId != recorded.trackId else { return nil }
         let file = try activeFile(recorded.fileId, in: database)
         guard file.trackId == nil, let track = try TrackRecord.fetchOne(database, key: recorded.trackId),
-              currentFingerprintHash(of: file) == track.fingerprintHash
+              try RecordingIdentity.key(of: file, in: database) == track.fingerprintHash
         else {
             throw SongFamilyError.linkChanged(file: file.displayName)
         }
         try requireUnclaimed(track, by: recorded.fileId, in: database)
         return try setLink(SongFamilyRecordingLink(fileId: recorded.fileId, trackId: recorded.trackId, membershipRevision: file.membershipRevision),
                            in: database)
-    }
-
-    static func currentFingerprintHash(of file: FileRecord) -> Data? {
-        guard file.fingerprintStatus == .done, let fingerprint = file.chromaprintFingerprint,
-              (file.fingerprintedSize ?? file.fileSize) == file.fileSize, (file.fingerprintedMtime ?? file.mtime) == file.mtime
-        else {
-            return nil
-        }
-        return Data(SHA256.hash(data: fingerprint))
     }
 
     /// A link a later identity change claimed stays; that change owns it now.
@@ -427,12 +431,12 @@ enum SongFamilyMutation {
         else {
             return nil
         }
-        try database.execute(sql: "UPDATE files SET track_id = NULL WHERE id = ?", arguments: [recorded.fileId])
+        try database.cachedStatement(sql: "UPDATE files SET track_id = NULL WHERE id = ?").execute(arguments: [recorded.fileId])
         return SongFamilyRecordingLink(fileId: recorded.fileId, trackId: recorded.trackId, membershipRevision: file.membershipRevision)
     }
 
     private static func setLink(_ link: SongFamilyRecordingLink, in database: GRDB.Database) throws -> SongFamilyRecordingLink {
-        try database.execute(sql: "UPDATE files SET track_id = ? WHERE id = ?", arguments: [link.trackId, link.fileId])
+        try database.cachedStatement(sql: "UPDATE files SET track_id = ? WHERE id = ?").execute(arguments: [link.trackId, link.fileId])
         return link
     }
 
@@ -581,7 +585,7 @@ enum SongFamilyMutation {
             try record.save(database)
         }
         for assignment in target.assignments {
-            try database.execute(sql: "UPDATE tracks SET work_id = ? WHERE id = ?", arguments: [assignment.familyId, assignment.trackId])
+            try database.cachedStatement(sql: "UPDATE tracks SET work_id = ? WHERE id = ?").execute(arguments: [assignment.familyId, assignment.trackId])
         }
         for family in target.families where !family.exists {
             try SongFamilyRecord.deleteOne(database, key: family.familyId)

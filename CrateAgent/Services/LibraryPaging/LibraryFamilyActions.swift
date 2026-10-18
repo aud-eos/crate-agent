@@ -16,6 +16,16 @@ enum LibraryFamilyAction: CaseIterable, Sendable {
         }
     }
 
+    /// The command offered when this action is refused because its files
+    /// share a recording (#205), or nil when it has none.
+    var differentRecordingsTitle: String? {
+        switch self {
+        case .groupSelected: LibraryFamilyMessages.groupAsDifferentRecordings
+        case .addSelected: LibraryFamilyMessages.addAsDifferentRecordings
+        case .mergeSelected, .splitSelected, .setMain, .automaticMain, .remove: nil
+        }
+    }
+
     /// Whether the action applies to the clicked `row` when `targetCount` files are targeted.
     func applies(to row: BrowserRow, targetCount: Int) -> Bool {
         let inFamily = row.familyId != nil && row.recordingId != nil
@@ -27,6 +37,13 @@ enum LibraryFamilyAction: CaseIterable, Sendable {
         case .remove: inFamily
         }
     }
+}
+
+struct LibraryDifferentRecordingsOffer {
+    let action: LibraryFamilyAction
+    let row: BrowserRow
+    let actions: LibraryFamilyActions
+    let message: String
 }
 
 /// What a family command acts on: the clicked row, and the files it targets.
@@ -55,10 +72,14 @@ enum LibraryFamilyActionError: LocalizedError, Equatable {
 struct LibraryFamilyActions: Sendable {
     let families: SongFamilyService
 
+    /// `asDifferentRecordings` groups or adds the files as different
+    /// recordings, for an action with a `differentRecordingsTitle`.
     @discardableResult
-    func perform(_ action: LibraryFamilyAction, on target: LibraryFamilyActionTarget) async throws -> SongFamilyResult {
+    func perform(_ action: LibraryFamilyAction, on target: LibraryFamilyActionTarget, asDifferentRecordings: Bool = false) async throws -> SongFamilyResult {
         let authority = target.files.map { identity in FileMembershipToken(fileId: identity.id, revision: identity.revision) }
         switch action {
+        case .groupSelected where asDifferentRecordings:
+            return try await families.createAsDifferentRecordings(target.files.map(\.id), authority: authority)
         case .groupSelected:
             return try await families.create(target.files.map { identity in .file(identity.id) }, authority: authority)
         case .setMain, .automaticMain:
@@ -69,6 +90,9 @@ struct LibraryFamilyActions: Sendable {
             let (familyID, memberships) = try await memberships(of: target)
             let outside = memberships.filter { membership in membership.familyId != familyID }
             guard !outside.isEmpty else { throw LibraryFamilyActionError.nothingToChange }
+            if asDifferentRecordings {
+                return try await families.attachAsDifferentRecordings(outside.map(\.fileId), to: familyID, authority: authority)
+            }
             return try await families.attach(outside.map { membership in .file(membership.fileId) }, to: familyID, authority: authority)
         case .mergeSelected:
             let (familyID, memberships) = try await memberships(of: target)

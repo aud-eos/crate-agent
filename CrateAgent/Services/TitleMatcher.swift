@@ -111,6 +111,7 @@ public enum TitleMatcher {
     /// stripped). Order: parenthesized groups, then bracketed groups, then
     /// the trailing dash suffix, each in left-to-right order of appearance.
     public static func annotationSegments(in title: String) -> [String] {
+        guard hasAnnotationDelimiter(title) else { return [] }
         var segments = regexCaptures(parenthesizedSegment, in: title)
         segments.append(contentsOf: regexCaptures(bracketedSegment, in: title))
         if let dashSegment = trailingDashSegment(in: title) {
@@ -122,6 +123,7 @@ public enum TitleMatcher {
     /// `title` without each annotation, as `annotationSegments` reads them,
     /// whose inner content `shouldRemove` accepts.
     static func removingAnnotations(from title: String, where shouldRemove: (String) -> Bool) -> String {
+        guard hasAnnotationDelimiter(title) else { return title }
         let remaining = NSMutableString(string: title)
         if let dashSegment = trailingDashSegment(in: title), shouldRemove(dashSegment),
            let match = trailingDashSegmentPattern?.firstMatch(in: title, range: NSRange(title.startIndex..., in: title))
@@ -205,6 +207,15 @@ public enum TitleMatcher {
             return nil
         }
         return String(title[capturedRange])
+    }
+
+    /// Every annotation pattern below needs one of these. Most titles have
+    /// none, and one scan spares them the patterns: Find Versions and
+    /// Library rank every title.
+    private static let annotationDelimiters = CharacterSet(charactersIn: "([-–")
+
+    private static func hasAnnotationDelimiter(_ title: String) -> Bool {
+        title.rangeOfCharacter(from: annotationDelimiters) != nil
     }
 
     /// Compiled once: Library ranks family titles through these on every page query.
