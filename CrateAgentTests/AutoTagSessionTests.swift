@@ -136,7 +136,7 @@ final class AutoTagSessionTests: XCTestCase {
         await fixture.session.startScan()
         await fixture.session.loadBrowsePage(1)
         let mounted = expectation(description: "Review mounted")
-        let hosting = NSHostingView(rootView: AutoTaggerView(session: fixture.session, player: TrackPlayer(output: FakeTrackPlayerOutput(), access: LibraryFileAccess(database: fixture.database)), opener: FileOpener(workspace: FakeFileOpeningWorkspace(), access: LibraryFileAccess(database: fixture.database)))
+        let hosting = NSHostingView(rootView: fixture.reviewView()
             .environmentObject(SeratoWatchdog(runningBundleIdentifiersProvider: { [] }))
             .onAppear { mounted.fulfill() })
         hosting.frame = NSRect(x: 0, y: 0, width: 1000, height: 760)
@@ -254,7 +254,7 @@ final class AutoTagSessionTests: XCTestCase {
         let watchdog = SeratoWatchdog(runningBundleIdentifiersProvider: { [] })
         let appeared = expectation(description: "Auto-Tag mounted")
         let disappeared = expectation(description: "Auto-Tag removed")
-        let hosting = NSHostingView(rootView: AnyView(AutoTaggerView(session: fixture.session, player: TrackPlayer(output: FakeTrackPlayerOutput(), access: LibraryFileAccess(database: fixture.database)), opener: FileOpener(workspace: FakeFileOpeningWorkspace(), access: LibraryFileAccess(database: fixture.database)))
+        let hosting = NSHostingView(rootView: AnyView(fixture.reviewView()
                 .environmentObject(watchdog).onAppear { appeared.fulfill() }.onDisappear { disappeared.fulfill() }))
         hosting.frame = NSRect(x: 0, y: 0, width: 1000, height: 760)
         hosting.layoutSubtreeIfNeeded()
@@ -273,7 +273,7 @@ final class AutoTagSessionTests: XCTestCase {
         await release.open()
         await scan.value
         let remounted = expectation(description: "Auto-Tag recreated")
-        hosting.rootView = AnyView(AutoTaggerView(session: fixture.session, player: TrackPlayer(output: FakeTrackPlayerOutput(), access: LibraryFileAccess(database: fixture.database)), opener: FileOpener(workspace: FakeFileOpeningWorkspace(), access: LibraryFileAccess(database: fixture.database))).environmentObject(watchdog).onAppear { remounted.fulfill() })
+        hosting.rootView = AnyView(fixture.reviewView().environmentObject(watchdog).onAppear { remounted.fulfill() })
         hosting.layoutSubtreeIfNeeded()
         await fulfillment(of: [remounted], timeout: 3)
         XCTAssertEqual(fixture.session.rowModels.count, 2)
@@ -623,6 +623,12 @@ private struct SessionFixture {
     let loader: SessionLookupLoader
     let service: AutoTaggerService
     let session: AutoTagSession
+
+    func reviewView() -> AutoTaggerView {
+        let access = LibraryFileAccess(database: database, audioEvidence: DuplicateEvidenceVerifier(database: database))
+        return AutoTaggerView(session: session, player: TrackPlayer(output: FakeTrackPlayerOutput(), access: access),
+                              opener: FileOpener(workspace: FakeFileOpeningWorkspace(), access: access))
+    }
 
     init(fileCount: Int, alternatives: Bool = false, firstLookupHasNoMatch: Bool = false, lowScoreAlternative: Bool = false, onlyMetadataMatches: Bool = false,
          blockedRecordingID: String? = nil,

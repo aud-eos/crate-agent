@@ -1,17 +1,25 @@
 import Foundation
 import GRDB
+import os.log
 
 /// Resolves a library row afresh and checks that the file at its path is
 /// still that row's recording before it is played, opened or revealed. A
 /// path alone is only a label (invariant 4): a Missing row's path can later
 /// hold a different file.
 struct LibraryFileAccess {
-    private let database: LibraryDatabase
+    private static let logger = Logger(subsystem: "com.crateagent.app", category: "LibraryFileAccess")
 
-    init(database: LibraryDatabase) {
+    private let database: LibraryDatabase
+    private let audioEvidence: DuplicateEvidenceVerifier
+
+    init(database: LibraryDatabase, audioEvidence: DuplicateEvidenceVerifier) {
         self.database = database
+        self.audioEvidence = audioEvidence
     }
 
+    /// A file whose bytes changed since its row was indexed is still handed
+    /// over when it decodes to the same PCM as before, as after Serato writes
+    /// tags into it; anything else is refused as replaced until sync records it.
     func verifiedRecord(fileID: Int64) async throws -> FileRecord {
         guard let record = try await database.writer.read({ connection in try FileRecord.fetchOne(connection, key: fileID) }) else {
             throw LibraryFileAccessError.notInLibrary(fileID: fileID)
@@ -20,11 +28,26 @@ struct LibraryFileAccess {
         guard record.fileAvailability == .available else {
             throw LibraryFileAccessError.unavailable(filename: filename, availability: record.fileAvailability)
         }
-        try await Task.detached { try Self.verifyOnDisk(record, filename: filename) }.value
+        if try await Task.detached(operation: { try Self.matchesIndexedContent(record, filename: filename) }).value {
+            recordIndexedAudio(of: record, fileID: fileID)
+        } else if try await !audioEvidence.decodesToIndexedAudio(record) {
+            throw LibraryFileAccessError.replaced(filename: filename)
+        }
         return record
     }
 
-    private static func verifyOnDisk(_ record: FileRecord, filename: String) throws {
+    private func recordIndexedAudio(of record: FileRecord, fileID: Int64) {
+        let audioEvidence = audioEvidence
+        Task.detached(priority: .background) {
+            do {
+                try await audioEvidence.recordIndexedAudio(of: record)
+            } catch {
+                Self.logger.error("Couldn't record the decoded audio of file \(fileID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    private static func matchesIndexedContent(_ record: FileRecord, filename: String) throws -> Bool {
         guard FileManager.default.fileExists(atPath: record.path) else {
             throw LibraryFileAccessError.unavailable(filename: filename, availability: .missing)
         }
@@ -34,9 +57,7 @@ struct LibraryFileAccess {
         } catch {
             throw LibraryFileAccessError.unreadable(filename: filename, reason: error.localizedDescription)
         }
-        guard FileIdentityObservationMutation.matchesContent(record, identity: current) else {
-            throw LibraryFileAccessError.replaced(filename: filename)
-        }
+        return FileIdentityObservationMutation.matchesContent(record, identity: current)
     }
 }
 

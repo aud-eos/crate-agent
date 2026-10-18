@@ -170,12 +170,10 @@ public actor DuplicateEvidenceVerifier {
             case .content:
                 evidence = try .content(contentDigest(candidate.path))
             case .audio:
-                let digest = try audioDigest(candidate.path)
-                guard digest.sampleRate > 0 else {
+                guard let audio = try DuplicateEvidence.DecodedAudio(audioDigest(candidate.path)) else {
                     return result(.unreadable(reason: "The decoder reported no sample rate.", retryable: false), live: live)
                 }
-                evidence = .decoded(.init(format: digest.format, pcmDigest: digest.pcmSha256, fullFingerprintDigest: digest.fullFingerprintSha256,
-                                          durationSeconds: Double(digest.frameCount) / Double(digest.sampleRate)))
+                evidence = .decoded(audio)
             }
         } catch let CoreError.Fingerprint(message) {
             return result(.unreadable(reason: "Couldn't decode the audio: \(message)", retryable: false), live: live)
@@ -188,5 +186,51 @@ public actor DuplicateEvidenceVerifier {
             return result(.unreadable(reason: "The file changed on disk while it was being checked.", retryable: true), live: live)
         }
         return result(evidence, live: live)
+    }
+}
+
+extension DuplicateEvidenceVerifier {
+    /// Caches the decoded-audio digest of a file just confirmed to be its
+    /// row's recording, so a later tag-only edit can be told apart from a
+    /// replacement (`decodesToIndexedAudio`).
+    func recordIndexedAudio(of record: FileRecord) async throws {
+        guard let fileID = record.id else { return }
+        switch try await indexedAudio(of: record) {
+        case .decoded, .unreadable(_, retryable: false): return
+        case .pending, .unreadable, .content: break
+        }
+        try await verify([DigestCandidate(fileID: fileID, path: record.path, fileSize: record.fileSize, mtime: record.mtime, inode: record.inode)],
+                         kind: .audio)
+    }
+
+    /// Whether the file now at `record.path` decodes to exactly the PCM
+    /// cached for the row's indexed identity. A tag edit rewrites bytes, not
+    /// audio; only identical PCM proves the recording is unchanged, so a
+    /// file with no cached digest, or one that fails to decode, is not.
+    func decodesToIndexedAudio(_ record: FileRecord) async throws -> Bool {
+        let indexed = try await indexedAudio(of: record)
+        guard case .decoded = indexed else { return false }
+        let audioDigest = audioDigest
+        let path = record.path
+        let live = await Task.detached { () -> DuplicateEvidence? in
+            guard let before = try? AudioFileReadIdentity.read(at: path),
+                  let audio = try? DuplicateEvidence.DecodedAudio(audioDigest(path)),
+                  (try? before.requireUnchanged(at: path)) != nil
+            else { return nil }
+            return .decoded(audio)
+        }.value
+        guard let live else { return false }
+        return DuplicateEvidence.relation(indexed, live) == .identical
+    }
+
+    private func indexedAudio(of record: FileRecord) async throws -> DuplicateEvidence {
+        guard let fileID = record.id else { return .pending }
+        return try await database.writer.read { connection in
+            guard let row = try Row.fetchOne(connection, sql: """
+            SELECT \(DuplicateDigestStore.columnsSQL(.audio)) FROM files \(DuplicateDigestStore.freshJoinSQL(.audio))
+            WHERE files.id = ? AND files.file_size = ? AND files.mtime = ? AND files.inode = ?
+            """, arguments: [fileID, record.fileSize, record.mtime, record.inode]) else { return .pending }
+            return try DuplicateDigestStore.evidence(from: row, kind: .audio)
+        }
     }
 }

@@ -27,8 +27,8 @@ struct DuplicatesPanel: View {
     /// (DuplicateKeeperPicker.chooseDefaultKeeper). Per-group radio
     /// taps write into this dictionary.
     @State private var keeperOverrides: [String: Int64] = [:]
-    /// The last file clicked; Command-O opens it.
-    @State private var focusedFileID: Int64?
+    /// The file row with keyboard focus; Command-O opens it.
+    @FocusState private var focusedFileID: Int64?
     /// Per group needing listening, the files the user explicitly checked
     /// for Trash. Such groups never pre-select anything.
     @State private var listeningSelections: [String: Set<Int64>] = [:]
@@ -594,9 +594,7 @@ struct DuplicatesPanel: View {
             .help("Show this file in Finder so you can review or delete it manually.")
         }
         .padding(.vertical, density.rowPadding)
-        .background(file.id == focusedFileID ? Color.accentColor.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
-        .contentShape(Rectangle())
-        .simultaneousGesture(TapGesture().onEnded { focusedFileID = file.id })
+        .fileOpenTarget(file.id, focus: $focusedFileID, opener: services.fileOpener)
         .contextMenu {
             if let identifier = file.id {
                 FileOpenMenuItems(opener: services.fileOpener, fileID: identifier, path: file.path)

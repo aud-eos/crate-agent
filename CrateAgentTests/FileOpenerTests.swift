@@ -81,6 +81,30 @@ final class FileOpenerTests: XCTestCase {
         XCTAssertEqual(player.failure, TrackPlayerMessages.cannotPlay("track.mp3", detail: LibraryFileAccessMessages.replaced))
     }
 
+    func testATagEditThatKeepsTheAudioIsStillOpenedButNewAudioAtThePathIsNot() async throws {
+        let workspace = FakeFileOpeningWorkspace()
+        workspace.defaultApplication = URL(fileURLWithPath: "/Applications/Music.app")
+        let opener = FileOpener(workspace: workspace, access: fixture.access)
+        let path = try await fixture.addFile("track.wav", id: 1, bytes: TestAudio.wav(frequency: 440, title: "Before"))
+        await opener.reveal(fileID: 1)
+        let database = fixture.database
+        await pagingEventually {
+            await (try? database.writer.read { connection in
+                try Bool.fetchOne(connection, sql: "SELECT EXISTS(SELECT 1 FROM file_audio_digests WHERE file_id = 1 AND pcm_sha256 IS NOT NULL)")
+            }) == true
+        }
+
+        _ = try fixture.writeAudio("track.wav", bytes: TestAudio.wav(frequency: 440, title: "Retagged by Serato"))
+        await opener.open(fileID: 1)
+        XCTAssertNil(opener.failure, "Serato writing tags into the file leaves its audio, so it is still the row's recording")
+        XCTAssertEqual(workspace.opened.map(\.file.path), [path])
+
+        _ = try fixture.writeAudio("track.wav", bytes: TestAudio.wav(frequency: 660, title: "Before"))
+        await opener.open(fileID: 1)
+        XCTAssertEqual(opener.failure, FileOpenerMessages.cannot(FileOpenerMessages.openVerb, "track.wav", LibraryFileAccessMessages.replaced))
+        XCTAssertEqual(workspace.opened.count, 1, "Different audio at the path is never handed over")
+    }
+
     func testCommandOOpensTheFocusedLibraryRowInItsDefaultApplication() async throws {
         for (index, name) in ["one.mp3", "two.mp3"].enumerated() {
             try await fixture.addFile(name, id: Int64(index + 1), title: "Track \(index + 1)")

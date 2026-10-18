@@ -17,6 +17,20 @@ public enum DuplicateEvidence: Hashable, Sendable {
         public let pcmDigest: Data
         public let fullFingerprintDigest: Data
         public let durationSeconds: Double
+
+        init(format: String, pcmDigest: Data, fullFingerprintDigest: Data, durationSeconds: Double) {
+            self.format = format
+            self.pcmDigest = pcmDigest
+            self.fullFingerprintDigest = fullFingerprintDigest
+            self.durationSeconds = durationSeconds
+        }
+
+        /// Nil when the decoder reported no sample rate, so no duration.
+        init?(_ digest: DecodedAudioDigest) {
+            guard digest.sampleRate > 0 else { return nil }
+            self.init(format: digest.format, pcmDigest: digest.pcmSha256, fullFingerprintDigest: digest.fullFingerprintSha256,
+                      durationSeconds: Double(digest.frameCount) / Double(digest.sampleRate))
+        }
     }
 
     public enum Relation: Sendable, Equatable {
