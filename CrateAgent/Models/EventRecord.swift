@@ -93,6 +93,11 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case songFamilyRestored = "song_family_restored"
     case songFamilyRecordingLinked = "song_family_recording_linked"
     case songFamilyRecordingUnlinked = "song_family_recording_unlinked"
+    case duplicateLabelsKeptBoth = "duplicate_labels_kept_both"
+    case duplicateLabelsReopened = "duplicate_labels_reopened"
+    case queuedSeratoChangeDiscarded = "queued_serato_change_discarded"
+    case musicBrainzWorkRecorded = "music_brainz_work_recorded"
+    case musicBrainzWorkCleared = "music_brainz_work_cleared"
 
     /// Whether this event type projects onto Serato/audio-file writes that
     /// `OperationEngine.resyncSeratoForBatch` can idempotently replay from the
@@ -117,7 +122,9 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
              .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
-             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked:
+             .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
+             .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             false
         }
     }

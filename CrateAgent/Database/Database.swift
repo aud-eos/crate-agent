@@ -52,7 +52,9 @@ public final class LibraryDatabase {
     }
 
     static func openWAL(at url: URL) throws -> LibraryDatabase {
-        let pool = try DatabasePool(path: url.path, configuration: makeConfiguration())
+        let checkpointer = WALCheckpointer()
+        let pool = try DatabasePool(path: url.path, configuration: makeConfiguration(checkpointer: checkpointer))
+        try checkpointer.attach(path: url.path)
         return try LibraryDatabase(writer: pool)
     }
 
@@ -67,9 +69,12 @@ public final class LibraryDatabase {
     /// GRDB's default. The rest exist because SQLite's stock
     /// settings are conservatively tuned for embedded devices, not
     /// for a desktop app holding tens of thousands of rows hot.
-    private static func makeConfiguration() -> Configuration {
+    private static func makeConfiguration(checkpointer: WALCheckpointer? = nil) -> Configuration {
         var configuration = Configuration()
         configuration.prepareDatabase { database in
+            if !database.configuration.readonly {
+                checkpointer?.install(on: database)
+            }
             ListSearch.register(in: database)
             SongFamilyRepresentative.register(in: database)
             // NORMAL is the WAL-mode recommended setting: durable
@@ -126,10 +131,15 @@ public final class LibraryDatabase {
         AddFileTrashLocationsMigration.register(in: &migrator)
         AddFingerprintFailureReasonMigration.register(in: &migrator)
         AddSubsecondFileIdentityMigration.register(in: &migrator)
+        AddSeratoYearToFilesMigration.register(in: &migrator)
         AddSeratoRenameProgressMigration.register(in: &migrator)
         AddFileDigestsMigration.register(in: &migrator)
         AddSongFamiliesMigration.register(in: &migrator)
         AddSeratoWriteResolutionsMigration.register(in: &migrator)
+        AddDuplicateLabelReviewsMigration.register(in: &migrator)
+        AddSeratoPlayCountsMigration.register(in: &migrator)
+        AddSyncCheckpointGenerationsMigration.register(in: &migrator)
+        AddMusicBrainzWorkMigration.register(in: &migrator)
         return migrator
     }
 }

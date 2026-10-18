@@ -15,10 +15,12 @@ import Foundation
 ///    `<Bucket>` matches the artist's normalized bucket name (per
 ///    Invariant 5) is preferred over copies that drifted out of the
 ///    canonical location.
-/// 3. **Oldest mtime** — interpreting "the original copy" as the
+/// 3. **Most plays** — the copy Serato History shows was played most
+///    is the one the DJ actually uses (`SeratoPlayCountService`).
+/// 4. **Oldest mtime** — interpreting "the original copy" as the
 ///    one that's been on disk the longest. If you'd rather prefer
 ///    the most-recently-edited copy, flip the comparator.
-/// 4. **Lexicographic path** — deterministic last-resort tiebreaker.
+/// 5. **Lexicographic path** — deterministic last-resort tiebreaker.
 public enum DuplicateKeeperPicker {
     /// Pick a default keeper from the group's files. Returns the
     /// file's id; the UI uses this to seed its radio selection and
@@ -41,13 +43,14 @@ public enum DuplicateKeeperPicker {
 
     /// Total ordering on duplicate candidates. `lhs < rhs` means "rhs is the
     /// stronger keeper candidate." Implemented as a lexicographic
-    /// tuple comparison so all four tiers participate; later tiers
+    /// tuple comparison so all five tiers participate; later tiers
     /// only matter when earlier tiers tie.
     static func rank(_ file: some DuplicateFileSource, musicFolder: URL) -> RankKey {
         RankKey(
             qualityTier: qualityTier(for: file),
             bitrate: file.bitrateKbps ?? 0,
             bucketMatches: pathMatchesArtistBucket(file: file, musicFolder: musicFolder),
+            playCount: file.seratoPlayCount,
             // Older mtime → higher rank → comes "last" in
             // `.max(by:)` semantics. Negate to invert.
             mtimeRank: -file.mtime,
@@ -102,12 +105,13 @@ public enum DuplicateKeeperPicker {
 
 /// Comparable tuple used by `DuplicateKeeperPicker.rank`. Conforming
 /// to `Comparable` lets `.max(by:)` callers use a single `<`
-/// comparison; lexicographic ordering composes the four tiers in
+/// comparison; lexicographic ordering composes the five tiers in
 /// priority order.
 struct RankKey: Comparable {
     let qualityTier: Int
     let bitrate: Int
     let bucketMatches: Bool
+    let playCount: Int
     let mtimeRank: Int64
     let invertedPath: String
 
@@ -124,6 +128,9 @@ struct RankKey: Comparable {
         if lhs.bucketMatches != rhs.bucketMatches {
             // false < true, so "matches" sorts higher (better).
             return !lhs.bucketMatches && rhs.bucketMatches
+        }
+        if lhs.playCount != rhs.playCount {
+            return lhs.playCount < rhs.playCount
         }
         if lhs.mtimeRank != rhs.mtimeRank {
             return lhs.mtimeRank < rhs.mtimeRank

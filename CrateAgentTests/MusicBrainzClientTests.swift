@@ -92,14 +92,39 @@ final class MusicBrainzClientTests: XCTestCase {
         XCTAssertEqual(loader.requests.count, 4)
     }
 
-    func testLegacyPartialCacheIsNotReused() async throws {
-        let cache = LookupCache.memory()
-        try cache.store(jsonData(["id": "old-id", "title": "Stale", "releases": []]), forKey: "mb:old-id")
-        let loader = try MusicBrainzSequenceLoader(bodies: [jsonData(["id": "canonical", "title": "Fresh", "releases": []])])
-        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache)
-        let recording = try await client.recording(mbid: "old-id")
-        XCTAssertEqual(recording.title, "Fresh")
+    /// Partial responses (`mb:`) and complete ones without work relations
+    /// (`mb:complete-v2:`) must both be fetched again.
+    func testLegacyCacheEntriesAreNotReused() async throws {
+        for legacyKey in ["mb:old-id", "mb:complete-v2:old-id"] {
+            let cache = LookupCache.memory()
+            try cache.store(jsonData(["id": "old-id", "title": "Stale", "releases": []]), forKey: legacyKey)
+            let loader = try MusicBrainzSequenceLoader(bodies: [jsonData(["id": "canonical", "title": "Fresh", "releases": []])])
+            let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: cache)
+            let recording = try await client.recording(mbid: "old-id")
+            XCTAssertEqual(recording.title, "Fresh", legacyKey)
+            XCTAssertEqual(loader.requests.count, 1, legacyKey)
+        }
+    }
+
+    func testRecordingRequestsWorkRelationsAndKeepsOnePerformedWork() async throws {
+        let relations: [[String: Any]] = [
+            ["type": "performance", "attributes": ["medley"], "work": ["id": "0-medley-part"]],
+            ["type": "performance", "attributes": [], "work": ["id": "work-b"]],
+            ["type": "performance", "attributes": ["live"], "work": ["id": "work-a"]],
+            ["type": "based on", "work": ["id": "0-source-work"]],
+        ]
+        let loader = try MusicBrainzSequenceLoader(bodies: [jsonData(["id": "recording", "title": "Song", "releases": [], "relations": relations])])
+        let client = MusicBrainzClient(loader: loader, limiter: .noop, cache: .memory())
+
+        let fetched = try await client.recording(mbid: "recording")
+        let cached = try await client.recording(mbid: "recording")
+
+        XCTAssertEqual(fetched.workMBID, "work-a")
+        XCTAssertEqual(cached.workMBID, "work-a")
         XCTAssertEqual(loader.requests.count, 1)
+        let request = try XCTUnwrap(loader.requests.first?.url)
+        let include = URLComponents(url: request, resolvingAgainstBaseURL: false)?.queryItems?.first { item in item.name == "inc" }?.value
+        XCTAssertEqual(include?.split(separator: "+").contains("work-rels"), true)
     }
 
     func testMissingCanonicalIDFailsInsteadOfCachingUnverifiableIdentity() async throws {

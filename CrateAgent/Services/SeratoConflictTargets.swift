@@ -54,6 +54,23 @@ enum SeratoConflictTargets {
             try includeSharedTrack(payload.applied.fingerprintHash, in: &target, database: database)
         case let .songFamily(operation):
             fileID = try includeRecordingLink(operation, in: &target, database: database)
+        case let .discardQueuedSeratoChange(payload):
+            fileID = payload.fileId
+            for discarded in payload.writes {
+                include(discarded.queued.originalIdentity, in: &target)
+                target.paths += discarded.queued.originalReferencePaths + discarded.queued.write.referencePaths
+            }
+        case let .recordMusicBrainzWork(payload):
+            // Writes only `tracks.musicbrainz_work_id`; no file, path or
+            // Serato field mirrors it, so it targets the recording alone.
+            fileID = nil
+            target.sharedTrackIDs.insert(payload.trackId)
+        case let .duplicateLabelReview(.keepBoth(payload)), let .duplicateLabelReview(.reopen(payload)):
+            fileID = nil
+            target.fileIDs.formUnion(payload.fileIds)
+            for file in try FileRecord.fetchAll(database, keys: payload.fileIds) {
+                target.include(file)
+            }
         }
         if let fileID {
             target.fileIDs.insert(fileID)

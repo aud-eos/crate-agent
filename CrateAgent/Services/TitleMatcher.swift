@@ -50,16 +50,11 @@ public struct TitleDecision: Equatable {
 /// user ultimately picks (the default, or an override) into the title
 /// string to write.
 public enum TitleMatcher {
-    /// DJ version-flag vocabulary confirmed against a 32k-track library
-    /// scan. Used only as a fallback when a title carries one of these
-    /// tokens bare (no surrounding `()`/`[]`/`- ` delimiter) that MB's
-    /// proposal doesn't preserve. Matched whole-word, case-insensitive.
-    private static let djVersionVocabulary: [String] = [
-        "clean", "dirty", "explicit", "radio edit", "radio version", "intro", "outro",
-        "acapella", "instrumental", "extended", "extended mix", "club mix", "original mix",
-        "main", "edit", "flip", "bootleg", "redrum", "transition", "remix", "dub",
-        "short edit", "quick hit", "album version",
-    ]
+    /// DJ version-flag vocabulary (`VersionLabel`). Used only as a fallback
+    /// when a title carries one of these tokens bare (no surrounding
+    /// `()`/`[]`/`- ` delimiter) that MB's proposal doesn't preserve.
+    /// Matched whole-word, case-insensitive.
+    private static let djVersionVocabulary = VersionLabel.annotationTerms
 
     /// True when `annotation` names one of the DJ version flags as a whole
     /// word, other than the `excluded` terms.
@@ -122,6 +117,26 @@ public enum TitleMatcher {
             segments.append(dashSegment)
         }
         return segments
+    }
+
+    /// `title` without each annotation, as `annotationSegments` reads them,
+    /// whose inner content `shouldRemove` accepts.
+    static func removingAnnotations(from title: String, where shouldRemove: (String) -> Bool) -> String {
+        let remaining = NSMutableString(string: title)
+        if let dashSegment = trailingDashSegment(in: title), shouldRemove(dashSegment),
+           let match = trailingDashSegmentPattern?.firstMatch(in: title, range: NSRange(title.startIndex..., in: title))
+        {
+            remaining.replaceCharacters(in: match.range, with: " ")
+        }
+        for regex in [parenthesizedSegment, bracketedSegment].compactMap(\.self) {
+            let text = remaining as String
+            for match in regex.matches(in: text, range: NSRange(location: 0, length: remaining.length)).reversed()
+                where match.numberOfRanges > 1 && shouldRemove(remaining.substring(with: match.range(at: 1)))
+            {
+                remaining.replaceCharacters(in: match.range, with: " ")
+            }
+        }
+        return remaining as String
     }
 
     /// True when the current title carries an annotation MB's proposal

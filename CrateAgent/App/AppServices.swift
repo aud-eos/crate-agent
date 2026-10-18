@@ -27,16 +27,20 @@ public final class AppServices: ObservableObject {
     public let seratoLocator: SeratoLibraryLocator
     public let operationEngine: OperationEngine
     let songFamilies: SongFamilyService
+    let songFamilySuggester: SongFamilySuggester
     public let filesystemSyncCoordinator: FilesystemSyncCoordinator
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
     public let duplicateEvidenceVerifier: DuplicateEvidenceVerifier
     public let activityLog: ActivityLog
-    let trackPlayer = TrackPlayer()
+    let trackPlayer: TrackPlayer
+    let fileOpener: FileOpener
     let autoTaggerService: AutoTaggerService
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
+    let playCountService: SeratoPlayCountService
+    let musicBrainzWorkBackfill: MusicBrainzWorkBackfill
     @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
     @Published private(set) var syncPhase: SeratoLibrarySyncSession.SyncPhase?
     @Published private(set) var syncFileInfoFailures: [String] = []
@@ -46,8 +50,8 @@ public final class AppServices: ObservableObject {
         guard NSPasteboard.general.setString(text, forType: .string) else {
             throw SeratoConflictActionError(message: "Could not copy the conflict details to the clipboard.")
         }
-    }, revealFile: { path in
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }, revealFile: { [fileOpener] path in
+        fileOpener.reveal(verifiedPath: path)
     }, openSerato: {
         let identifiers = ["com.serato.dj", "com.serato.djpro", "com.serato.djlite"]
         guard let application = identifiers.lazy.compactMap({ identifier in NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) }).first else {
@@ -121,6 +125,7 @@ public final class AppServices: ObservableObject {
     private var fingerprintMilestones = FingerprintActivityMilestones()
     private var scanMilestones = ScanActivityMilestones()
     private var scanActivitySubscription: AnyCancellable?
+    private var playCountSubscription: AnyCancellable?
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -146,6 +151,11 @@ public final class AppServices: ObservableObject {
         try ApplicationRuntime.requireLiveResources()
         self.watchedMusicFolder = watchedMusicFolder
         self.database = database
+        let audioEvidence = DuplicateEvidenceVerifier(database: database)
+        duplicateEvidenceVerifier = audioEvidence
+        let fileAccess = LibraryFileAccess(database: database, audioEvidence: audioEvidence)
+        trackPlayer = TrackPlayer(access: fileAccess)
+        fileOpener = FileOpener(access: fileAccess)
         seratoWatchdog = SeratoWatchdog()
         seratoLocator = try SeratoLibraryLocator.defaultLocation()
         activityLog = ActivityLog()
@@ -161,6 +171,7 @@ public final class AppServices: ObservableObject {
         )
         operationEngine = engine
         songFamilies = SongFamilyService(engine: engine, database: database)
+        songFamilySuggester = SongFamilySuggester(database: database, families: songFamilies)
 
         let filesystemCoordinator = FilesystemSyncCoordinator(
             operationEngine: engine,
@@ -182,7 +193,6 @@ public final class AppServices: ObservableObject {
 
         let worker = FingerprintWorker(database: database, readiness: readiness)
         fingerprintWorker = worker
-        duplicateEvidenceVerifier = DuplicateEvidenceVerifier(database: database)
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and
@@ -197,12 +207,14 @@ public final class AppServices: ObservableObject {
         let lookupCache = LookupCache(
             directory: applicationSupportUrl.appendingPathComponent("crate-agent/lookup-cache", isDirectory: true)
         )
+        let musicBrainzClient = MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache)
         let taggingService = AutoTaggerService(
             database: database,
             acoustIDClient: AcoustIDClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
-            musicBrainzClient: MusicBrainzClient(loader: URLSession.shared, limiter: lookupRateLimiter, cache: lookupCache),
+            musicBrainzClient: musicBrainzClient,
             readiness: readiness
         )
+        musicBrainzWorkBackfill = MusicBrainzWorkBackfill(database: database, engine: engine, client: musicBrainzClient)
         autoTaggerService = taggingService
         autoTagSession = AutoTagSession(
             database: database, lookupService: autoTaggerService,
@@ -218,6 +230,7 @@ public final class AppServices: ObservableObject {
                                                stopProcessing: { taggingService.cancel() },
                                                checkpointStore: SyncCheckpointStore(database: database), watchRoots: watchConfiguration.watchedPaths)
         syncSession = session
+        playCountService = SeratoPlayCountService(database: database, seratoLocator: seratoLocator, watchdog: seratoWatchdog)
         let resumeFromEventId = watchConfiguration.resumeEventID {
             UserPreferences.lastFSEventId(forWatchedPath: $0)
         }
@@ -278,6 +291,11 @@ public final class AppServices: ObservableObject {
         scanActivitySubscription = session.$scanProgress.sink { [weak self] progress in
             guard let self else { return }
             logActivity(scanMilestones.entries(for: progress), category: .scan)
+        }
+        // A finished sync means Serato is closed; the service re-reads History only if it or the library's paths changed.
+        playCountSubscription = session.$state.sink { [weak self] state in
+            guard case .ready = state, let service = self?.playCountService else { return }
+            Task { await service.refresh() }
         }
         session.$phase.assign(to: &$syncPhase)
         session.$fileInfoFailures.assign(to: &$syncFileInfoFailures)

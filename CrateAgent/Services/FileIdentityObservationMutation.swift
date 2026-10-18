@@ -50,12 +50,11 @@ public struct ObserveFileMetadataPayload: Codable, Sendable {
 
 extension FileRecord {
     var seratoMetadata: SeratoMetadata {
-        SeratoMetadata(artist: artist, title: title, album: album, genre: genre, bpm: bpm,
-                       musicalKey: musicalKey, comment: comment, length: length, label: label)
+        SeratoMetadata(mirroredBy: self)
     }
 
     static func loadIdentityProjections(database: LibraryDatabase) async throws -> [FileRecord] {
-        let columns = "id, track_id, path, volume_uuid, inode, file_size, mtime, mtime_nanoseconds, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision, artist, title, album, genre, bpm, musical_key, comment, length, label, bitrate_kbps"
+        let columns = "id, track_id, path, volume_uuid, inode, file_size, mtime, mtime_nanoseconds, lightweight_hash, fingerprint_status, library_membership, file_availability, serato_library_id, retired_at, membership_revision, last_projection_invalidation_revision, artist, title, album, genre, bpm, musical_key, comment, length, label, serato_year, bitrate_kbps"
         var result: [FileRecord] = []
         var cursor: Int64 = 0
         while true {
@@ -201,14 +200,6 @@ enum FileIdentityObservationMutation {
     }
 
     private static func applyMetadata(_ metadata: SeratoMetadata, to file: inout FileRecord) {
-        file.artist = metadata.artist
-        file.title = metadata.title
-        file.album = metadata.album
-        file.genre = metadata.genre
-        file.bpm = metadata.bpm
-        file.musicalKey = metadata.musicalKey
-        file.comment = metadata.comment
-        file.length = metadata.length
-        file.label = metadata.label
+        file.mirror(metadata)
     }
 }

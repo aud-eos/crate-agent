@@ -17,6 +17,20 @@ public enum DuplicateEvidence: Hashable, Sendable {
         public let pcmDigest: Data
         public let fullFingerprintDigest: Data
         public let durationSeconds: Double
+
+        init(format: String, pcmDigest: Data, fullFingerprintDigest: Data, durationSeconds: Double) {
+            self.format = format
+            self.pcmDigest = pcmDigest
+            self.fullFingerprintDigest = fullFingerprintDigest
+            self.durationSeconds = durationSeconds
+        }
+
+        /// Nil when the decoder reported no sample rate, so no duration.
+        init?(_ digest: DecodedAudioDigest) {
+            guard digest.sampleRate > 0 else { return nil }
+            self.init(format: digest.format, pcmDigest: digest.pcmSha256, fullFingerprintDigest: digest.fullFingerprintSha256,
+                      durationSeconds: Double(digest.frameCount) / Double(digest.sampleRate))
+        }
     }
 
     public enum Relation: Sendable, Equatable {
@@ -166,11 +180,19 @@ enum DuplicateDigestStore {
     /// Joins each file to its digest row while the indexed size, mtime and
     /// inode match; the nanosecond mtime and ctime are compared with the
     /// live file by `DuplicateEvidenceVerifier` and the cleanup boundary.
-    static func freshJoinSQL(_ kind: DigestKind) -> String {
+    static func freshJoinSQL(_ kind: DigestKind, as alias: String = "digest") -> String {
         """
-        LEFT JOIN \(kind.table) AS digest ON digest.file_id = files.id
-          AND digest.file_size = files.file_size AND digest.mtime = files.mtime AND digest.inode = files.inode
+        LEFT JOIN \(kind.table) AS \(alias) ON \(alias).file_id = files.id
+          AND \(alias).file_size = files.file_size AND \(alias).mtime = files.mtime AND \(alias).inode = files.inode
         """
+    }
+
+    /// The digest column that proves two files `.identical` under `kind`.
+    static func confirmingDigestColumn(_ kind: DigestKind, of alias: String) -> String {
+        switch kind {
+        case .content: "\(alias).content_sha256"
+        case .audio: "\(alias).pcm_sha256"
+        }
     }
 
     static func columnsSQL(_ kind: DigestKind) -> String {

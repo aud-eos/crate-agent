@@ -69,11 +69,11 @@ extension SeratoPendingWrite: Codable {
 extension SeratoMetadata {
     /// The fields this update sets, over `original` for the rest.
     func overlaid(on original: SeratoMetadata) -> SeratoMetadata {
-        SeratoMetadata(artist: artist ?? original.artist, title: title ?? original.title,
-                       album: album ?? original.album, genre: genre ?? original.genre,
-                       bpm: bpm ?? original.bpm, musicalKey: musicalKey ?? original.musicalKey,
-                       comment: comment ?? original.comment, length: length ?? original.length,
-                       label: label ?? original.label)
+        SeratoMetadata.fields.reduce(into: original) { overlaid, field in
+            if let value = self[keyPath: field.keyPath] {
+                overlaid[keyPath: field.keyPath] = value
+            }
+        }
     }
 }
 
@@ -108,6 +108,13 @@ struct SeratoStrandedWrite: Sendable {
     let detail: String?
     /// Whether Serato may still hold a record at this rename's new path.
     let newPathHeld: Bool
+}
+
+/// A queued row's place in FIFO order, read without decoding its payload.
+struct SeratoQueuedRowReference: Sendable {
+    let queueID: Int64
+    let eventID: Int64
+    let cleanupTargetFileID: Int64?
 }
 
 /// The durable queue of Serato-side effects. A row is inserted in the same
@@ -177,8 +184,20 @@ enum SeratoWriteQueue {
         try Row.fetchAll(database, sql: "SELECT \(columns) FROM serato_write_queue ORDER BY queue_id").map(decode)
     }
 
+    static func fetchOrderedReferences(in database: Database) throws -> [SeratoQueuedRowReference] {
+        try Row.fetchAll(database, sql: "SELECT queue_id, event_id, cleanup_target_file_id FROM serato_write_queue ORDER BY queue_id").map { row in
+            SeratoQueuedRowReference(queueID: row["queue_id"], eventID: row["event_id"], cleanupTargetFileID: row["cleanup_target_file_id"])
+        }
+    }
+
     static func fetch(fileID: Int64, in database: Database) throws -> [GuardedSeratoWrite] {
         try Row.fetchAll(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE file_id = ? ORDER BY queue_id", arguments: [fileID]).map(decode)
+    }
+
+    static func fetch(eventIDs: [Int64], in database: Database) throws -> [GuardedSeratoWrite] {
+        guard !eventIDs.isEmpty else { return [] }
+        return try Row.fetchAll(database, sql: "SELECT \(columns) FROM serato_write_queue WHERE event_id IN (\(databaseQuestionMarks(count: eventIDs.count))) ORDER BY queue_id",
+                                arguments: StatementArguments(eventIDs)).map(decode)
     }
 
     static func fetch(queueID: Int64, in database: Database) throws -> GuardedSeratoWrite? {
@@ -198,23 +217,26 @@ enum SeratoWriteQueue {
     static func writesStranded(by dropped: GuardedSeratoWrite, in database: Database) throws -> [SeratoStrandedWrite] {
         guard case let .rename(rename) = dropped.write, let queueID = dropped.queueID else { return [] }
         let oldPath = SeratoPath.normalized(rename.oldAbsolutePath)
-        let newPath = SeratoPath.normalized(rename.newAbsolutePath)
         var stranded: [SeratoStrandedWrite] = []
         if try !renameNeverArrived(fileID: dropped.token.fileId, at: oldPath, before: dropped.eventId, in: database) {
-            // Rows queued before the key column carry none and are matched by decoding.
             let arrivals = try Row.fetchAll(database.cachedStatement(sql: """
-            SELECT \(columns) FROM serato_write_queue
+            SELECT \(columns), rename_new_path_key FROM serato_write_queue
             WHERE (rename_new_path_key = ? OR rename_new_path_key IS NULL) AND queue_id > ? AND kind = ?
             ORDER BY queue_id
-            """), arguments: [oldPath, queueID, SeratoWriteKind.rename.rawValue]).map(decode)
-            for arrival in arrivals {
-                guard case let .rename(arriving) = arrival.write, SeratoPath.normalized(arriving.newAbsolutePath) == oldPath else { continue }
+            """), arguments: [oldPath, queueID, SeratoWriteKind.rename.rawValue])
+            for row in arrivals {
+                let arrival = try decode(row)
+                guard case let .rename(arriving) = arrival.write else { continue }
+                // Rows queued before the key column carry none and are matched by decoding.
+                let arrivalKey: String? = row["rename_new_path_key"]
+                guard (arrivalKey ?? SeratoPath.normalized(arriving.newAbsolutePath)) == oldPath else { continue }
                 stranded.append(SeratoStrandedWrite(write: arrival, detail: SeratoWriteDispositionMessages.unmovedOccupant(at: rename.oldAbsolutePath),
                                                     newPathHeld: true))
             }
         }
         let later = try Row.fetchAll(database.cachedStatement(sql: "SELECT \(columns) FROM serato_write_queue WHERE file_id = ? AND queue_id > ? ORDER BY queue_id"),
                                      arguments: [dropped.token.fileId, queueID]).map(decode)
+        lazy var newPath = SeratoPath.normalized(rename.newAbsolutePath)
         for write in later where stranded.allSatisfy({ entry in entry.write.queueID != write.queueID }) {
             let referencePath: String? = switch write.write {
             case let .rename(later): later.oldAbsolutePath
@@ -394,11 +416,13 @@ enum SeratoWriteQueue {
         Int64(Date().timeIntervalSince1970 * 1000)
     }
 
+    static func payload(of write: GuardedSeratoWrite) -> SeratoQueuedWritePayload {
+        SeratoQueuedWritePayload(write: write.write, originalIdentity: write.originalIdentity, originalReferencePaths: write.originalReferencePaths,
+                                 externalBaseline: write.externalBaseline, baselineKnownFields: write.baselineKnownFields.map { fields in fields.sorted() })
+    }
+
     private static func encode(_ write: GuardedSeratoWrite) throws -> Data {
-        try JSONEncoder().encode(SeratoQueuedWritePayload(write: write.write, originalIdentity: write.originalIdentity,
-                                                          originalReferencePaths: write.originalReferencePaths,
-                                                          externalBaseline: write.externalBaseline,
-                                                          baselineKnownFields: write.baselineKnownFields.map { fields in fields.sorted() }))
+        try SyncCheckpointStore.encodeCanonical(payload(of: write))
     }
 
     private static func decode(_ row: Row) throws -> GuardedSeratoWrite {
@@ -440,7 +464,7 @@ enum SeratoExternalBaselines {
 
     static func save(_ metadata: SeratoMetadata, token: FileMembershipToken, in database: Database) throws {
         try database.execute(sql: "INSERT OR REPLACE INTO serato_external_baselines (file_id, membership_revision, metadata) VALUES (?, ?, ?)",
-                             arguments: [token.fileId, token.revision, JSONEncoder().encode(metadata)])
+                             arguments: [token.fileId, token.revision, SyncCheckpointStore.encodeCanonical(metadata)])
     }
 }
 
@@ -451,6 +475,8 @@ enum SeratoWriteDisposition: String, Sendable, CaseIterable {
     case legacyUnrecoverable
     case malformed
     case noSeratoRecord
+    /// Dropped by the user, who reverted the change in the same batch (#163).
+    case discarded
 }
 
 /// Not-applied queued changes by disposition, each counted once per event.
@@ -510,6 +536,12 @@ enum SeratoWriteDispositions {
         SELECT event_id, kind, MAX(id), ? FROM serato_write_dispositions WHERE event_id = ? AND kind = ? GROUP BY event_id, kind
         ON CONFLICT(event_id, kind) DO UPDATE SET disposition_id = excluded.disposition_id, resolved_at = excluded.resolved_at
         """, arguments: [SeratoWriteQueue.now(), eventID, kind.rawValue])
+    }
+
+    /// The open dispositions of `eventID`'s writes, by kind, each the latest recorded.
+    static func openDispositions(eventID: Int64, in database: Database) throws -> [String: String] {
+        try Row.fetchAll(database, sql: "SELECT kind, disposition FROM serato_write_dispositions d WHERE event_id = ? AND \(isOpen) ORDER BY id",
+                         arguments: [eventID]).reduce(into: [:]) { dispositions, row in dispositions[row["kind"]] = row["disposition"] }
     }
 
     /// A disposition `d` no later write for the same event and kind resolved.
@@ -656,8 +688,8 @@ enum DuplicateCleanupStore {
     }
 
     static func save(_ intent: PendingDuplicateCleanup, in database: Database) throws {
-        let authority = try JSONEncoder().encode(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID,
-                                                           evidenceRequirement: intent.evidenceRequirement))
+        let authority = try SyncCheckpointStore.encodeCanonical(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID,
+                                                                          evidenceRequirement: intent.evidenceRequirement))
         try database.execute(sql: """
         INSERT OR REPLACE INTO duplicate_cleanup_intents (target_file_id, payload, step, waiting_event_id, removed_v2, failure)
         VALUES (?, ?, ?, ?, ?, ?)

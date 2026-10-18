@@ -15,7 +15,9 @@ longer in Serato.
 
 The reconciler reads identity projections in pages of 256, without fingerprint
 blobs, and checks only indexed locations and paths in the saved snapshot. It does
-not enumerate a music folder or Trash. Ownership mismatches and offline volumes
+not enumerate a music folder. It lists a volume's Trash at most once per pass, and
+only for a row whose indexed path is gone with no verifiable recorded Trash item
+(see below). Ownership mismatches and offline volumes
 cannot retire a row. File availability is recorded independently of membership.
 Retirement retains file ID, recording association, fingerprint, and History.
 
@@ -197,7 +199,17 @@ different file requests reconciliation; a missing or trashed row keeps its state
 until then, and an available row becomes `unknown`. A removal
 event at that Trash path, or any reconciliation that finds the indexed path
 missing, keeps the row trashed only while that exact item still verifies;
-otherwise it becomes missing. A trashed row
+otherwise it becomes missing. Events are not the only evidence of a Trash move. A
+volume attached with `-nobrowse` (or any volume without an FSEvents store) keeps no
+event history, so a move made while crate-agent was not running is never replayed.
+A trashed folder reports only a directory rename, which requests reconciliation.
+So when reconciliation finds an indexed path gone and no recorded item verifies,
+`NativeTrashIndex` lists that volume's Trash recursively, once per pass. An item
+with the row's inode that `FileTrashLocation.capture` verifies marks the row trashed
+(#234). A Trash that cannot be fully listed, for example without Full Disk Access,
+leaves the row missing but counts it in `trashUncheckedFileIDs`: the sync banner
+reports it with a warning, and the row stays out of the checkpoint so a later sync
+searches again. A trashed row
 without a persisted item (recorded before this table existed) cannot be verified
 and also becomes missing. An unrelated Trash item's removal never matches the row. Root derivation and stream creation/start failures fail startup
 visibly. The checkpoint key includes the complete watched-path set. Until the
@@ -304,6 +316,69 @@ establish new intent under the existing membership-revision rules; the older row
 it supersedes no longer blocks the new import. This work does not change shared
 recording ownership rules (#113).
 
+### Serato History play counts
+
+`serato_play_counts` is derived external evidence, like the fingerprint and
+audio-digest caches. It is not a mutation and does not bypass invariant 1: there
+is no user intent to journal and nothing to undo. `SeratoPlayCountService` only
+reads `_Serato_/History`, and never writes `files`, tags or any Serato file.
+
+- **When it refreshes:** each sync reaching `.ready` (at startup, after Serato
+  quits, and after filesystem-driven reconciliations) asks for a refresh, but
+  History is parsed again only when its inputs changed since the last read: the
+  `Sessions` files' names, sizes and modification times, or the library's path
+  history (file count, highest file id, and highest path-change event id). A
+  failed read records its inputs too, so a corrupt session is not re-parsed on
+  every sync; it is retried once History or the library changes. While Serato
+  runs, the refresh is skipped and the last table kept. A read during which the
+  watchdog's lifecycle revision changed is discarded, so a session Serato may be
+  appending to is never trusted.
+- **How it parses:** the Rust parser (`read_serato_history`) reads
+  `History/Sessions/*.session` strictly. The parse needs the `vrsn` header, then
+  only `oent` records with one `adat` each. Each `adat` needs a played flag
+  (field 50), and played entries also need a UTF-16 path (field 2) and a start
+  time (field 28).
+  - Loaded-but-unplayed entries are counted and skipped.
+  - Entries whose path is not absolute, such as streaming tracks
+    (`_783160.beatsource`), are skipped by that rule and counted as non-file.
+  - AppleDouble sidecars (`._*.session`) hold Finder metadata, not sessions,
+    and are skipped by name.
+  - A session file over 64 MiB fails the read before it is loaded.
+  - Any other structure fails the whole read, naming the session file. Workers
+    shows the error, Duplicates notes that play counts may be out of date with
+    the same reason, and the previous table is kept.
+- **How plays are attributed:** a play counts for the file that was at its path
+  when it started. Each file's past paths come from its `file_renamed`,
+  `file_location_observed` and `file_identity_observed` events, chained in
+  journal (`event_id`) order. Each event's old path covers the time since the
+  previous change, and the current path covers the time since the last one.
+  - Event times are when crate-agent applied or noticed a change, not when the
+    file moved on disk: a move made while crate-agent was not running is dated
+    at the next scan, so plays between the move and that scan count at the old
+    path.
+  - A file's first-seen path covers all earlier time, so plays from before the
+    file was indexed count for it if it was at that path then.
+  - Paths are compared by `SeratoPath.normalized`, so History's absolute paths
+    match V2's root-relative ones, and NFD matches NFC. Comparison is
+    case-sensitive, like the rest of the app's path matching: on a
+    case-insensitive APFS volume, a play Serato logged under different letter
+    case than the file's path is unattributed (a known undercount).
+  - A play at a path no file held then, or that two files claimed at that
+    moment, is unattributed. It is counted in the Workers summary and the log,
+    and never guessed.
+- **How it is stored:** parsing runs off the database, and attribution (the
+  event fetch, decode and per-play lookup) runs in a read transaction. The write
+  transaction only re-checks the library path signature and applies the
+  difference: rows for files whose count changed, and deletions for files that
+  no longer have plays. When the counts equal the stored ones, nothing is
+  written, so open views observing the table, such as Duplicates, do not
+  rescan. If the library's paths changed between attribution and the write,
+  the write is skipped and the refresh runs again. On 30,000 files with 65,000
+  path-change events, no writer wait exceeds the 500 ms budget
+  (`SeratoPlayCountPerformanceTests`).
+- **How it is used:** `DuplicateKeeperPicker` ranks most plays between the
+  bucket match and the oldest mtime. Duplicates rows show "N plays".
+
 ## Physical effects and duplicate cleanup
 
 Queued effects retain their original file identity and membership revision. The
@@ -364,6 +439,14 @@ format, plus the sample rate and channel count, and a marker with the packet
 timestamp for every packet the decoder skipped), its container/codec, its decoded
 duration and a hash of its full-length fingerprint.
 
+Play, Open and Reveal also cache a file's decoded-audio digest, in the background,
+once they have confirmed the file is still its row's recording. When a later
+access finds the file's bytes changed but the change not yet synced (Serato
+writing tags into it, for example), the file is used only when it decodes to
+exactly that cached PCM; with no cached digest, or different audio, it is refused
+as replaced until sync records it. This reads and fills the cache only; it records
+no identity, which sync still observes as usual.
+
 `DuplicateEvidenceVerifier` computes digests lazily off the main actor. A second
 caller joins the running pass instead of starting another, the pass is cancelled
 only when every caller has gone, and finished digests are saved before
@@ -385,6 +468,17 @@ live file inside its writer transaction, for the exact identities it was
 authorized with: identical contents or PCM, or a fingerprint match only for a file
 the user selected. If that transaction rolls back on a conflict, the recheck runs
 again when the step resumes.
+
+A confirmed group whose titles name different `VersionLabel`s (the one version
+vocabulary, shared with `TitleMatcher` and song-family suggestions) is a label
+review. It is never pre-selected, and the panel chooses no keeper for it. Giving
+the keeper another copy's title is `OperationEngine.applyMetadataEdit`, the
+same row, V2 and tag batch as Cleanup's fixes. Keeping every copy is the
+`duplicateLabelReview` mutation. It records the group's signature (a digest of the
+member file ids and their content or PCM digests) in `duplicate_label_reviews`,
+after rechecking in the transaction that those files are still identical and still
+disagree. Its inverse deletes the row. Any changed, removed or added copy changes
+the signature, so the review is shown again.
 
 Only a registered sequence with a confirmed own V2 removal may retain an absent
 member during reconciliation. An unstarted queued removal has no exemption.
@@ -467,7 +561,10 @@ pre-upgrade fence that no longer decodes is removed with a `malformed`
 disposition; the rest of the queue still applies. Only one pass runs at a time:
 a scoped pass leaves a row that depends on an unfinished earlier row for the
 next drain, and with Serato closed that drain waits for the next sync, so a rename
-made during another pass on the same file waits for that pass instead.
+made during another pass on the same file waits for that pass instead. Its database
+transaction can still commit, moving the file, after the pass resolved a row's
+path and before that row's I/O. The pass then resolves and retries those rows
+at the file's current path instead of dropping them as superseded (#260).
 
 The pass groups eligible rows into segments in queue order. Every V2 metadata
 edit joins one rewrite unless a rename, add, or V2 removal queued since that
@@ -539,7 +636,8 @@ records one `seratoDatabaseMissing` error naming the path and how many changes
 the pass held, and the drain or Re-sync fails with it, so the sync status shows
 it and **Retry Sync** applies the rows once the file is back. On a Mac where
 Serato has never run, sync itself reports `sourceMissing`: open Serato once to
-create its library. Discarding queued changes instead is #163.
+create its library. A queued change that cannot apply can instead be discarded
+from History, as described below.
 
 The ready summary reports each dropped change by disposition (superseded,
 uncertain, interrupted, malformed, legacy unrecoverable, or no Serato entry) once, and turns to a
@@ -554,6 +652,26 @@ completes, the queue records it in `serato_write_resolutions`, which History rea
 show that change as applied by a later re-sync rather than deleting its record.
 The file list pages by `(path, entry)` keyset, so a change recorded between page
 loads cannot skip or repeat a file.
+
+A queued change that cannot apply, because one of its writes failed or it waits
+behind one that did, is listed on its History batch, one entry per file, with
+**Discard this change…** (#163). The confirmation names the file and the values
+the discard puts back. Confirming runs `OperationEngine.discardQueuedChange(batchID:fileID:)`,
+which in one `discard:` batch drops the change's queued rows with a `discarded`
+disposition through the `discardQueuedSeratoChange` mutation and applies the
+inverses of the change's events, as undo would, with undo's guards. A write that
+never reached its I/O is not written back, since Serato or the file still holds
+the old value. A write that completed, or whose row may have landed
+(`io_started` or `may_have_landed`), is written back with the old value through
+the queue, and the confirmation says so. A write recorded as not applied is left
+alone, except an interrupted one, which may have landed. Undoing the discard
+batch applies the reverted events' inverses, which queue the change again.
+The discard is refused while a drain holds the change's rows, and while a later
+queued change waits behind it (any row the drain would hold behind it, not only
+the same file), which the confirmation lists; discard those first. The rows,
+their attempts and landed marks, the file's membership revision, and the later
+changes are checked again inside the transaction. Changes without an inverse,
+such as imports, removals, Trash and cleanup steps, cannot be discarded.
 After repair, normal membership revision, physical identity, and external metadata
 baseline rules determine which retained intent is still applicable. Unrelated V2,
 Subcrates, and SmartCrates rewrites preserve duplicate records and opaque TLVs.
@@ -613,6 +731,26 @@ the start of each sync: a replayable event is rebuilt into queue rows from its
 journal, a destructive one is recorded as `legacyUnrecoverable`, and the fence is
 deleted in the same transaction. The checkpoint is derived evidence; queued intent
 lives in the queue.
+
+Publication is staged so that no writer transaction grows with the library
+(#238). WAL checkpoints run on a connection of their own (`WALCheckpointer`),
+never inside a writer commit: while an open Library page's snapshot holds the
+WAL, frames accumulate, and SQLite's automatic checkpoint would copy and sync
+the whole backlog inside the next commit after it closes (#259). Every row of `sync_saved_occurrences`, `sync_file_evidence` and
+`sync_file_stats` carries a `generation`, and only the generation the
+`sync_checkpoint` header names is current; every reader filters on it.
+`SyncCheckpointStore.publish` checks publishability in a read, removes rows
+outside the current generation, and writes the next generation in transactions of
+1,000 rows (`defaultChunkSize`). A final short transaction re-checks the
+revision, effect fences and queue, verifies that the current generation is still
+the one staging started from and that every staged row is present, then points
+the header at the new generation and clears `sync_dirty_files`. Readiness opens
+only after that commit. The superseded generation is deleted afterwards, in
+chunks. Until the flip, readers and the fast path see the previous checkpoint
+whole. A crash or cancellation mid-staging leaves it current, with the same
+meaning as a crash before publishing, and the next publish deletes the orphaned
+rows first. A library change during staging moves the revision, so the flip
+fails with `changed` and the sync re-runs. One store publishes at a time.
 Any code that performs a physical or Serato-side effect records its fence with
 `SyncCheckpointStore.beginEffect` in a transaction that commits before the effect
 starts. It clears the fence only after the effect completes or is explicitly

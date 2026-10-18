@@ -14,7 +14,8 @@ the app.
 
 In **Library**, alternate versions of a song (Instrumental, Acapella, Clean)
 can be grouped into a song family that shows one main row with a version count;
-expand it to see the alternates. See [song families](docs/song-families.md).
+expand it to see the alternates. **Find Versions…** suggests families across the
+library for you to confirm. See [song families](docs/song-families.md).
 
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the
@@ -27,11 +28,13 @@ file stats. In **Workers**, **Re-scan File Info** forces a complete refresh and 
 be stopped while it is running. Fingerprinting waits for validated readiness, then
 continues as independent background work. Workers also shows library-wide
 fingerprint and file coverage, failed or invalid results with their reasons, and
-retries them ([Workers](docs/workers.md)). Removing a track from Serato
+retries them; **Record Works** fills in the MusicBrainz works of tracks matched
+before matches recorded them ([Workers](docs/workers.md)). Removing a track from Serato
 retires its crate-agent entry while preserving the audio, recording identity, and
 History. Missing audio that Serato still references remains a member but cannot
 be processed. The main window and menu bar show waiting, sync results, or an error
-with **Retry Sync**. A missing or unreadable Serato database stops synchronization;
+with **Retry Sync**; a queued change that keeps failing can be discarded and
+reverted from History. A missing or unreadable Serato database stops synchronization;
 it never means that every track was removed. See the
 [reconciliation contract](docs/serato-membership-reconciliation.md).
 
@@ -56,10 +59,24 @@ still operate on the clicked file.
 The play button at the start of each Library row, beside each file in
 **Cleanup → Duplicates**, and beside each **Auto-Tag** review plays the track from
 about 30% in, past DJ intros, and keeps playing to the end. Press it again to pause
-and resume; in Library, Space does the same for the focused row. The now-playing
-bar at the bottom of the window shows the title and artist, elapsed and total time,
-a scrub bar, play/pause, ±10 s skip and stop. One track plays at a time, app-wide,
-across screens. Playback only reads the file.
+and resume; in Library, Space does the same for the focused row, and Shift-Space
+selects or deselects it. The now-playing bar at the bottom of the window shows the
+title and artist, elapsed and total time, a scrub bar, play/pause, ±10 s skip and
+stop. One track plays at a time, app-wide, across screens. Playback only reads the
+file, and stops with a visible error if the file stops delivering audio, for
+example when its drive is ejected.
+
+Right-click a track in Library, Duplicates or Auto-Tag for **Open in** its default
+app, an **Open With** list of other apps that can open it plus **Other…** to pick
+any app, and **Reveal in Finder**. Command-O opens the focused Library row, the
+Duplicates file or Auto-Tag List mode review with keyboard focus (click or Tab to
+it; not while typing in search), or the Auto-Tag review in Focus mode. Playing,
+opening and revealing first check that the file at the row's path is still that
+row's recording; a missing or replaced file is refused with a dismissible message
+at the bottom of the window. A file whose tags changed outside crate-agent, as when
+Serato writes its analysis into it, is still used when it decodes to the same audio
+as when crate-agent last used or duplicate-checked it. A second press of a play
+button while its file is still being checked cancels it.
 
 Duplicates are checked in full before cleanup is offered: byte-level matches by
 hashing every byte, perceptual matches by decoding. Only files with identical
@@ -67,6 +84,18 @@ contents or decoded audio are offered together. Files that share a fingerprint b
 such as Clean and Dirty edits, are listed as kept. Copies in another format or
 encoding (FLAC and MP3, or MP3 320 and 128) are shown but never pre-selected;
 listen and check each one yourself.
+
+Identical copies whose titles name different versions, such as "(Clean)" and
+"(Dirty)", or "(Instrumental)" and nothing, are marked **labels disagree**: at
+least one label is wrong. They are never pre-selected and no keeper is chosen
+for you. Pick the keeper, optionally give it another copy's title, or keep every
+copy; both are undoable from History. Choose **Labels disagree** in the **Show** menu to review them together.
+
+**Cleanup → Duplicates** suggests a keeper for each group: the better quality, then
+the copy in its artist's folder, then the one Serato played most, then the oldest.
+Play counts come from Serato History, which is read only while Serato is closed and
+never written; each row shows its plays, and **Workers** shows how many plays were
+matched to library files, including plays at an earlier path of a renamed file.
 
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;

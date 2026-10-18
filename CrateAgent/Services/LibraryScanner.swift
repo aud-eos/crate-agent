@@ -127,8 +127,8 @@ public actor LibraryScanner {
                     bitrateBackfills.append((fileId: fileId, bitrate: bitrate))
                 }
 
-                let seratoMetadata = makeSeratoMetadata(fromRecord: record)
-                let storedMetadata = makeSeratoMetadata(fromFileRecord: existingFile)
+                let seratoMetadata = SeratoMetadata(record)
+                let storedMetadata = SeratoMetadata(mirroredBy: existingFile)
                 if seratoMetadata == storedMetadata {
                     continue
                 }
@@ -175,7 +175,7 @@ public actor LibraryScanner {
                     mtimeNanoseconds: metadata.mtimeNanoseconds,
                     lightweightHash: metadata.lightweightHash,
                     bitrateKbps: bitrate,
-                    metadata: makeSeratoMetadata(fromRecord: record)
+                    metadata: SeratoMetadata(record)
                 )))
                 filesIndexed += 1
                 lastChangedPath = absolutePath
@@ -314,7 +314,7 @@ public actor LibraryScanner {
                 let authorization = try await reader.authorization(for: snapshot)
                 let events = try await operationEngine.observeSnapshotMetadata(.init(fileId: identifier, expectedRevision: existing.membershipRevision,
                                                                                      previousIdentity: existing.identity, identity: existing.identity,
-                                                                                     metadata: makeSeratoMetadata(fromRecord: record), bitrateKbps: existing.bitrateKbps,
+                                                                                     metadata: SeratoMetadata(record), bitrateKbps: existing.bitrateKbps,
                                                                                      expectedState: existing.libraryState), authorization: authorization,
                                                                                metadataEvidence: stamp, expectedMetadata: existing.seratoMetadata)
                 if !events.isEmpty {
@@ -365,7 +365,7 @@ public actor LibraryScanner {
                 fileInfoFailures.append(bitrateError!)
             }
             try stamp.requireUnchanged(at: path)
-            let metadata = makeSeratoMetadata(fromRecord: record)
+            let metadata = SeratoMetadata(record)
             let authorization = try await reader.authorization(for: snapshot)
             if let existing, let fileID = existing.id {
                 // Identity refresh belongs to reconciliation, which supersedes stale work.
@@ -432,7 +432,7 @@ public actor LibraryScanner {
         let authorization = try await reader.authorization(for: snapshot)
         let events = try await operationEngine.observeSnapshotMetadata(.init(fileId: fileID, expectedRevision: file.membershipRevision,
                                                                              previousIdentity: file.identity, identity: file.identity,
-                                                                             metadata: makeSeratoMetadata(fromRecord: record), bitrateKbps: file.bitrateKbps,
+                                                                             metadata: SeratoMetadata(record), bitrateKbps: file.bitrateKbps,
                                                                              expectedState: file.libraryState), authorization: authorization)
         return !events.isEmpty
     }
@@ -484,34 +484,6 @@ public actor LibraryScanner {
             byPath[file.path] = file
         }
         return (byPath, duplicatePathCount)
-    }
-
-    private func makeSeratoMetadata(fromRecord record: SeratoTrackRecord) -> SeratoMetadata {
-        SeratoMetadata(
-            artist: record.artist,
-            title: record.title,
-            album: record.album,
-            genre: record.genre,
-            bpm: record.bpm,
-            musicalKey: record.key,
-            comment: record.comment,
-            length: record.length,
-            label: record.label
-        )
-    }
-
-    private func makeSeratoMetadata(fromFileRecord file: FileRecord) -> SeratoMetadata {
-        SeratoMetadata(
-            artist: file.artist,
-            title: file.title,
-            album: file.album,
-            genre: file.genre,
-            bpm: file.bpm,
-            musicalKey: file.musicalKey,
-            comment: file.comment,
-            length: file.length,
-            label: file.label
-        )
     }
 
     /// Probe a file's audio bitrate via the existing `readAudioTags`

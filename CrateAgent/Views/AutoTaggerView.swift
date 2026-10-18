@@ -3,12 +3,15 @@ import SwiftUI
 struct AutoTaggerView: View {
     @ObservedObject var session: AutoTagSession
     let player: TrackPlayer
+    let opener: FileOpener
     var readiness: LibrarySyncReadiness?
     var conflictRevision: UInt64 = 0
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
     @State private var showResetConfirmation = false
     @State private var reviewQuery = ""
     @State private var chooserFile: ChooserFile?
+    /// The List mode review with keyboard focus; Command-O opens it.
+    @FocusState private var listFocusedFileID: Int64?
 
     private struct ChooserFile: Identifiable { let id: Int64 }
 
@@ -25,6 +28,7 @@ struct AutoTaggerView: View {
                 reviewStage
             }
         }
+        .fileOpenShortcut(opener, fileID: session.scannedFileIDs.isEmpty ? nil : session.reviewMode == .focus ? session.focusedFileID : listFocusedFileID)
         .navigationTitle("Auto-Tag")
         .frame(minWidth: 680, minHeight: 480)
         .appPresentation()
@@ -224,7 +228,14 @@ struct AutoTaggerView: View {
                 TrackPlayButton(player: player, track: PlayerTrack(file), isAvailable: file.fileAvailability == .available)
             }
             reviewDetails(fileID, file: file, path: path, isFocused: isFocused)
-        }.padding(.vertical, density.rowPadding)
+        }
+        .padding(.vertical, density.rowPadding)
+        .fileOpenTarget(isFocused ? nil : fileID, focus: $listFocusedFileID, opener: opener)
+        .contextMenu {
+            if let file {
+                FileOpenMenuItems(opener: opener, fileID: fileID, path: file.path)
+            }
+        }
     }
 
     private func reviewDetails(_ fileID: Int64, file: BrowserRow?, path: String, isFocused: Bool) -> some View {

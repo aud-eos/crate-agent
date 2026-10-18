@@ -8,11 +8,14 @@ struct DuplicatesPanel: View {
     @EnvironmentObject private var services: AppServices
 
     @State private var mode: DuplicateFinder.Mode = .byteLevel
+    /// Every group the last scan found; `groups` shows those `labelFilter` includes.
+    @State private var scannedGroups: [ScannedGroup] = []
+    @State private var labelFilter: LabelFilter = .duplicates
     @State private var results = ListResultSelection<ScannedGroup>()
     private var groups: [ScannedGroup] {
         get { results.rows }
         nonmutating set {
-            results.replace(newValue, context: mode.rawValue, searchText: { group in
+            results.replace(newValue, context: "\(mode.rawValue):\(labelFilter.rawValue)", searchText: { group in
                 group.files.map { ListSearch.text(artist: $0.artist, title: $0.title, album: $0.album, path: $0.path) }.joined(separator: "\n")
             })
             refreshConflictSelection()
@@ -24,6 +27,8 @@ struct DuplicatesPanel: View {
     /// (DuplicateKeeperPicker.chooseDefaultKeeper). Per-group radio
     /// taps write into this dictionary.
     @State private var keeperOverrides: [String: Int64] = [:]
+    /// The file row with keyboard focus; Command-O opens it.
+    @FocusState private var focusedFileID: Int64?
     /// Per group needing listening, the files the user explicitly checked
     /// for Trash. Such groups never pre-select anything.
     @State private var listeningSelections: [String: Set<Int64>] = [:]
@@ -55,6 +60,22 @@ struct DuplicatesPanel: View {
     /// Coalesces bursts of fingerprint writes into one rescan.
     private static let liveRescanInterval: Duration = .milliseconds(1500)
 
+    /// Which groups the list shows. Groups whose copies the user kept leave
+    /// the default list.
+    private enum LabelFilter: String, CaseIterable {
+        case duplicates
+        case labelsDisagree
+        case kept
+
+        func includes(_ group: ScannedGroup) -> Bool {
+            switch self {
+            case .duplicates: group.labelReview?.keptBoth != true
+            case .labelsDisagree: group.labelsDisagree
+            case .kept: group.labelReview?.keptBoth == true
+            }
+        }
+    }
+
     private struct BatchProgress: Equatable {
         var trashed: Int
         var total: Int
@@ -77,6 +98,7 @@ struct DuplicatesPanel: View {
             PageHeading("Duplicate tracks", subtitle: "Choose one keeper per group. Review the other copies before moving them to Trash.")
                 .padding(density.pagePadding)
             SeratoRunningBanner(message: SeratoGateMessages.quitBefore("resolving duplicates"))
+            PlayCountStalenessNote(service: services.playCountService)
             modeBar.disabled(isScanning || isResolving)
             Divider()
             ResultListHeader(results: $results, enabled: !isScanning && !isResolving)
@@ -88,6 +110,7 @@ struct DuplicatesPanel: View {
                 batchActionBar
             }
         }
+        .fileOpenShortcut(services.fileOpener, fileID: focusedFileID)
         .task { await rescan() }
         .task { await rescanAsLibraryChanges() }
         .onDisappear {
@@ -184,6 +207,18 @@ struct DuplicatesPanel: View {
             .onChange(of: mode) { _, _ in
                 Task { await rescan() }
             }
+            let disagreeing = scannedGroups.count(where: LabelFilter.labelsDisagree.includes)
+            let kept = scannedGroups.count(where: LabelFilter.kept.includes)
+            if disagreeing > 0 || kept > 0 || labelFilter != .duplicates {
+                Picker("Show", selection: $labelFilter) {
+                    Text("Duplicates").tag(LabelFilter.duplicates)
+                    Text("Labels disagree (\(disagreeing))").tag(LabelFilter.labelsDisagree)
+                    Text("Kept copies (\(kept))").tag(LabelFilter.kept)
+                }
+                .fixedSize()
+                .help("Copies with identical audio whose titles name different versions, such as Clean and Dirty, need you to choose the keeper.")
+                .onChange(of: labelFilter) { _, _ in showFilteredGroups() }
+            }
             Spacer()
             if uncheckedFileCount > 0 {
                 Text("Checking \(uncheckedFileCount) file\(uncheckedFileCount == 1 ? "" : "s")")
@@ -211,6 +246,15 @@ struct DuplicatesPanel: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let actionError, groups.isEmpty {
             ActionErrorMessage(message: actionError)
+        } else if groups.isEmpty, labelFilter != .duplicates {
+            hygienePlaceholder(
+                icon: "checkmark.seal",
+                color: .green,
+                headline: labelFilter == .labelsDisagree ? "No labels disagree" : "No kept copies",
+                detail: labelFilter == .labelsDisagree
+                    ? "Every group of identical copies names the same versions."
+                    : "Copies you keep from a group whose labels disagree appear here."
+            )
         } else if groups.isEmpty {
             hygienePlaceholder(
                 icon: "checkmark.seal",
@@ -261,7 +305,7 @@ struct DuplicatesPanel: View {
     }
 
     private var uncheckedFileCount: Int {
-        groups.reduce(0) { total, group in total + group.uncheckedFileCount }
+        scannedGroups.reduce(0) { total, group in total + group.uncheckedFileCount }
     }
 
     private func groupCard(_ group: ScannedGroup) -> some View {
@@ -285,7 +329,7 @@ struct DuplicatesPanel: View {
                             .labelStyle(.titleAndIcon)
                     }
                     .controlSize(density.controlSize)
-                    .disabled(isResolving || conflictReason(group) != nil || trashCount(for: group) == 0)
+                    .disabled(isResolving || conflictReason(group) != nil || trashCount(for: group) == 0 || effectiveKeeperId(for: group) == nil)
                     .seratoWriteGated(help: "Move non-keepers in this group to Trash and remove their Serato references in one batch.",
                                       runningHelp: SeratoGateMessages.duplicateResolveBlocked)
                 }
@@ -297,6 +341,13 @@ struct DuplicatesPanel: View {
                 Text("These files sound alike but their audio isn't identical. Listen before removing. Nothing here is selected for Trash until you check it.")
                     .font(.callout)
                     .foregroundStyle(.orange)
+            }
+            if group.labelsDisagree {
+                labelReviewSection(group)
+            } else if group.labelReview?.keptBoth == true {
+                Text("You kept every copy because their labels disagree. Undo it from History to review them again.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
             if group.check == .checking {
                 HStack(spacing: density.spacing) {
@@ -340,6 +391,73 @@ struct DuplicatesPanel: View {
         }
     }
 
+    /// Copies with identical audio whose titles name different versions.
+    /// Nothing is chosen for the user: they pick the keeper, may give it
+    /// another copy's title, or keep every copy.
+    private func labelReviewSection(_ group: ScannedGroup) -> some View {
+        let keeper = group.files.first { file in file.id == effectiveKeeperId(for: group) }
+        let otherTitles = keeper.map { keeper in
+            group.files.filter { file in file.title != nil && file.title != keeper.title }
+                .reduce(into: [DuplicateFileRow]()) { distinct, file in
+                    if !distinct.contains(where: { existing in existing.title == file.title }) {
+                        distinct.append(file)
+                    }
+                }
+        } ?? []
+        return VStack(alignment: .leading, spacing: density.detailSpacing) {
+            Text(keeper == nil
+                ? "Labels disagree, but the audio is identical, so at least one label is wrong. Choose the copy to keep, or keep every copy."
+                : "Labels disagree, but the audio is identical, so at least one label is wrong. You can give the keeper another copy's title.")
+                .font(.callout)
+                .foregroundStyle(.orange)
+            HStack(spacing: density.spacing) {
+                if let keeper {
+                    ForEach(otherTitles, id: \.id) { source in
+                        Button("Use \u{201C}\(source.title ?? "")\u{201D} as the kept file's title") {
+                            Task { await useTitle(of: source, forKeeper: keeper, in: group) }
+                        }
+                        .controlSize(density.controlSize)
+                        .disabled(isResolving)
+                        .seratoWriteGated(help: "Write this title to the kept file's tags and Serato's library. You can undo it from History.",
+                                          runningHelp: SeratoGateMessages.cleanupApplyBlocked)
+                    }
+                }
+                Button(group.size == 2 ? "Keep both" : "Keep all \(group.size) copies") {
+                    Task { await keepAll(group) }
+                }
+                .controlSize(density.controlSize)
+                .disabled(isResolving)
+                .help("Keep every copy and stop offering this group for cleanup until one of them changes. You can undo it from History.")
+            }
+        }
+    }
+
+    private func useTitle(of source: DuplicateFileRow, forKeeper keeper: DuplicateFileRow, in group: ScannedGroup) async {
+        await runLabelReview(success: "Gave the kept file the title \u{201C}\(source.title ?? "")\u{201D}") { reviewer in
+            try await reviewer.useTitle(of: source, forKeeper: keeper, in: group)
+        }
+    }
+
+    private func keepAll(_ group: ScannedGroup) async {
+        await runLabelReview(success: "Kept all \(group.size) copies") { reviewer in
+            try await reviewer.keepAll(group)
+        }
+    }
+
+    private func runLabelReview(success: String, _ action: (DuplicateLabelReviewer) async throws -> Void) async {
+        isResolving = true
+        defer { isResolving = false }
+        actionError = nil
+        lastResolution = nil
+        do {
+            try await action(DuplicateLabelReviewer(operationEngine: services.operationEngine, database: services.database))
+            lastResolution = success
+        } catch {
+            actionError = error.localizedDescription
+        }
+        await rescan(showingProgress: false)
+    }
+
     private func groupHeader(for group: ScannedGroup) -> String {
         let match = group.mode == .byteLevel
             ? "byte-level, \(group.files.first.map { file in Self.byteCountFormatter.string(fromByteCount: file.fileSize) } ?? "") each"
@@ -348,7 +466,8 @@ struct DuplicatesPanel: View {
         case .checking:
             return "\(group.size) files · \(match) · checking \(group.mode == .byteLevel ? "contents" : "audio")"
         case .confirmed:
-            return "\(group.size) copies · \(match) · identical \(group.mode == .byteLevel ? "contents" : "audio")"
+            let labels = group.labelReview == nil ? "" : group.labelsDisagree ? " · labels disagree" : " · kept"
+            return "\(group.size) copies · \(match) · identical \(group.mode == .byteLevel ? "contents" : "audio")\(labels)"
         case .needsListening:
             return "\(group.size) files · \(match) · listen before removing"
         case .differs:
@@ -432,6 +551,11 @@ struct DuplicatesPanel: View {
                     .lineLimit(density == .comfortable ? 2 : 1)
                     .truncationMode(.middle)
                     .help(file.path)
+                if group.labelReview != nil {
+                    Text("Labels: \(VersionLabel.describe(VersionLabel.labels(in: file.title ?? "")))")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 if isKeeper {
                     StatusBadge(title: "Keeper", systemImage: "checkmark.circle", tint: .accentColor)
                 } else if group.check == .needsListening, let identifier = file.id {
@@ -446,6 +570,11 @@ struct DuplicatesPanel: View {
                         Text("\(bitrate) kbps")
                             .foregroundStyle(.secondary)
                     }
+                    if file.seratoPlayCount > 0 {
+                        Text(SeratoPlayCountMessages.plays(file.seratoPlayCount))
+                            .foregroundStyle(.secondary)
+                            .help(SeratoPlayCountMessages.explanation)
+                    }
                     if group.mode == .perceptual {
                         statusBadge(file.fingerprintStatus)
                     }
@@ -454,9 +583,9 @@ struct DuplicatesPanel: View {
             }
             Spacer()
             Button {
-                NSWorkspace.shared.activateFileViewerSelecting(
-                    [URL(fileURLWithPath: file.path)]
-                )
+                if let identifier = file.id {
+                    Task { await services.fileOpener.reveal(fileID: identifier) }
+                }
             } label: {
                 Label("Reveal", systemImage: "magnifyingglass")
                     .labelStyle(.iconOnly)
@@ -465,6 +594,12 @@ struct DuplicatesPanel: View {
             .help("Show this file in Finder so you can review or delete it manually.")
         }
         .padding(.vertical, density.rowPadding)
+        .fileOpenTarget(file.id, focus: $focusedFileID, opener: services.fileOpener)
+        .contextMenu {
+            if let identifier = file.id {
+                FileOpenMenuItems(opener: services.fileOpener, fileID: identifier, path: file.path)
+            }
+        }
     }
 
     @ViewBuilder
@@ -611,21 +746,27 @@ struct DuplicatesPanel: View {
                 try (groups: DuplicateFinder.findDuplicates(in: database, mode: mode), coverage: DuplicateFinder.fingerprintCoverage(in: database))
             }
             guard generation == scanGeneration else { return }
-            if scan.groups != groups {
-                groups = scan.groups
-            }
+            scannedGroups = scan.groups
+            showFilteredGroups()
             fingerprintCoverage = scan.coverage
             // Drop overrides for groups that no longer exist after
             // the rescan — preserves the user's per-group picks for
             // surviving groups while pruning stale ones.
-            let currentIds = Set(groups.map(\.id))
+            let currentIds = Set(scannedGroups.map(\.id))
             keeperOverrides = keeperOverrides.filter { entry in currentIds.contains(entry.key) }
             listeningSelections = listeningSelections.filter { entry in currentIds.contains(entry.key) }
-            if showingProgress || groups.contains(where: { group in group.check == .checking }) {
+            if showingProgress || scannedGroups.contains(where: { group in group.check == .checking }) {
                 startCheck(mode: mode)
             }
         } catch {
             actionError = "Couldn't scan library: \(error.localizedDescription)"
+        }
+    }
+
+    private func showFilteredGroups() {
+        let filtered = scannedGroups.filter(labelFilter.includes)
+        if filtered != groups {
+            groups = filtered
         }
     }
 
@@ -678,6 +819,11 @@ struct DuplicatesPanel: View {
         for group in groups {
             if let override = keeperOverrides[group.id], group.files.contains(where: { $0.id == override }) {
                 refreshed[group.id] = override
+                continue
+            }
+            // At least one disagreeing label is wrong, so only the user can
+            // say which copy to keep.
+            if group.labelsDisagree {
                 continue
             }
             if let keeperId = DuplicateKeeperPicker.chooseDefaultKeeper(
@@ -800,6 +946,24 @@ struct DuplicatesPanel: View {
             }
         } catch {
             services.syncSession.reportFailure(error.localizedDescription)
+        }
+    }
+}
+
+/// Keeper suggestions rank by plays, so a failed History read is shown
+/// where those suggestions are made, not only in Workers.
+private struct PlayCountStalenessNote: View {
+    @ObservedObject var service: SeratoPlayCountService
+
+    var body: some View {
+        if case let .failed(reason) = service.status {
+            Label(SeratoPlayCountMessages.stale(reason), systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
         }
     }
 }

@@ -43,6 +43,7 @@ use unicode_normalization::UnicodeNormalization;
 const TAG_OTRK: &[u8; 4] = b"otrk";
 const TAG_PTRK: &[u8; 4] = b"ptrk";
 const TAG_PFIL: &[u8; 4] = b"pfil";
+const TAG_TTYR: &[u8; 4] = b"ttyr";
 
 #[derive(Debug, Error)]
 pub enum SeratoError {
@@ -204,7 +205,7 @@ impl TlvRecord {
     }
 }
 
-fn decode_utf16be(bytes: &[u8]) -> Option<String> {
+pub(crate) fn decode_utf16be(bytes: &[u8]) -> Option<String> {
     let (code_unit_pairs, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
         return None;
@@ -277,6 +278,7 @@ fn decode_track_fields(nested: &[TlvRecord], path: String) -> SeratoTrackRecord 
         comment: None,
         length: None,
         label: None,
+        year: None,
     };
 
     for field in nested {
@@ -290,6 +292,7 @@ fn decode_track_fields(nested: &[TlvRecord], path: String) -> SeratoTrackRecord 
             b"tcom" => track.comment = decode_utf16be(&field.payload),
             b"tlen" => track.length = decode_utf16be(&field.payload),
             b"tlbl" => track.label = decode_utf16be(&field.payload),
+            TAG_TTYR => track.year = decode_utf16be(&field.payload),
             _ => {}
         }
     }
@@ -319,6 +322,7 @@ pub struct SeratoTrackRecord {
     pub comment: Option<String>,
     pub length: Option<String>,
     pub label: Option<String>,
+    pub year: Option<String>,
 }
 
 /// Return every track path stored in `otrk` containers of the given
@@ -744,7 +748,7 @@ impl DatabaseV2 {
     /// Full metadata records for every track entry. Where
     /// `track_paths()` returns only the `pfil` path, this also
     /// extracts the well-known `t*` text fields (artist, title,
-    /// album, genre, BPM, key, comment, length, label) from each
+    /// album, genre, BPM, key, comment, length, label, year) from each
     /// `otrk` container.
     ///
     /// Records without a `pfil` are skipped — an `otrk` entry that
@@ -808,6 +812,7 @@ impl DatabaseV2 {
                         | b"tcom"
                         | b"tlen"
                         | b"tlbl"
+                        | TAG_TTYR
                 ) && decode_utf16be(&field.payload).is_none()
                 {
                     return Err(SeratoError::InvalidUtf16 {
@@ -1060,6 +1065,7 @@ pub struct SeratoMetadataUpdate {
     pub comment: Option<String>,
     pub length: Option<String>,
     pub label: Option<String>,
+    pub year: Option<String>,
 }
 
 /// Returns true if any field was actually changed. False means the
@@ -1096,6 +1102,9 @@ fn apply_metadata_update_to_nested(
     }
     if let Some(value) = &update.label {
         changed |= set_or_insert_text_field(nested, b"tlbl", value);
+    }
+    if let Some(value) = &update.year {
+        changed |= set_or_insert_text_field(nested, TAG_TTYR, value);
     }
     changed
 }
@@ -1801,6 +1810,29 @@ mod tests {
         let records = database.track_records();
         assert_eq!(records[0].artist.as_deref(), Some("New Artist"));
         assert_eq!(records[0].bpm.as_deref(), Some("128.000"));
+    }
+
+    #[test]
+    fn year_written_by_a_batch_update_reads_back() {
+        let bytes = synthetic_library(
+            "2.0/Serato Scratch LIVE Database",
+            TAG_PFIL,
+            &["Users/x/Music/A/Track.mp3"],
+        );
+        let mut database = DatabaseV2::from_bytes(&bytes).unwrap();
+        let updates = HashMap::from([(
+            "Users/x/Music/A/Track.mp3".to_string(),
+            SeratoMetadataUpdate {
+                year: Some("1994".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        assert_eq!(database.batch_update_track_metadata(&updates).unwrap(), 1);
+
+        let reread = DatabaseV2::from_bytes(&database.to_bytes().unwrap()).unwrap();
+        let records = reread.strict_track_records().unwrap();
+        assert_eq!(records[0].year.as_deref(), Some("1994"));
     }
 
     #[test]

@@ -67,12 +67,15 @@ volume is mounted at `/private/tmp/crate-agent-task6-volume` with a
 ```sh
 hdiutil create -size 200m -fs APFS -volname CrateTask6 -type SPARSE /path/to/task6.sparseimage
 mkdir -p /private/tmp/crate-agent-task6-volume
-hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume -nobrowse
+hdiutil attach /path/to/task6.sparseimage -mountpoint /private/tmp/crate-agent-task6-volume
 touch /private/tmp/crate-agent-task6-volume/.task6-test-volume
 touch /private/tmp/crate-agent-task6-volume/.trash-seed
 swift -e 'import Foundation; try FileManager.default.trashItem(at: URL(fileURLWithPath: CommandLine.arguments[1]), resultingItemURL: nil)' \
   /private/tmp/crate-agent-task6-volume/.trash-seed
 ```
+
+Don't attach it with `-nobrowse`: FSEvents keeps no event history for a nobrowse
+volume, so the cursor-replay test would pass or fail on timing alone (#234).
 
 The last step creates the volume's `.Trashes/<uid>`. On a fresh volume,
 `FileManager.url(for: .trashDirectory, …, create: true)` fails with "feature not
@@ -275,6 +278,31 @@ Total drain time is unchanged, at 1.4 to 2.1 s per 1,000 rows. A 26.7 MB `databa
 rewrite costs 40 to 60 ms, whatever the row count. The cap therefore costs about one
 extra library rewrite per 200 rows.
 
+## Checkpoint publish writer hold
+
+A sync that leaves the fast path republishes the whole checkpoint: one saved
+occurrence per V2 record, plus evidence and a stat row per file. It used to write
+all of them in one writer transaction. Publication now stages a new generation in
+1,000-row transactions and makes it current in one short transaction (#238; see
+the incremental checkpoint section of `serato-membership-reconciliation.md`).
+
+`LibraryStartupPerformanceTests` asserts the budget. After its navigation step,
+it changes one saved title and runs a sync while `WriterHoldProbe` issues an empty
+write every 5 ms. It records the longest wait and the sync phase it ended in, and
+requires every wait to stay under 500 ms. `STARTUP_WRITER_HOLD` reports the
+result.
+
+Reference run on 2026-10-18, on the 30,000-file fixture, with the optimized
+**Test** settings above. Both runs use identical test code; the baseline is
+`4ed1fcc` with the probe step added uncommitted.
+
+| Longest writer wait | Baseline (`4ed1fcc`) | Generation staging |
+| --- | ---: | ---: |
+| Applying queued changes (checkpoint publish) | 941 ms | 38 ms |
+| Any phase | 941 ms | 243 ms (Refreshing file info) |
+
+The probe made about 3,400 writes in each run.
+
 ## Fingerprint backlog responsiveness
 
 `FingerprintResponsivenessTests` exercises a 30,000-row pending library while the
@@ -285,8 +313,11 @@ WAL, and no owner audio, preferences, or live `AppServices` are accessed.
 
 The fixture mounts the production Library content and sidebar, repeatedly scrolls
 to distant rows and switches sidebar selection, and records main-actor scheduling
-gaps. Rendering, scroll completion, sidebar selection, and maximum main-actor gap
-must each stay below 500 ms while the backlog remains active. At least one batch
+gaps. As in the app, the window opens before the Library model loads, so rendering
+runs from the model's start until the first rows are visible in that window. The
+heartbeat also covers the window's own setup turn. Rendering, scroll completion,
+sidebar selection, and maximum main-actor gap must each stay below 500 ms while the
+backlog remains active. At least one batch
 must persist successful fingerprints, with no failed decodes. These measurements
 exercise scheduling and database/UI contention on warm, repeated PCM audio; they
 do not establish throughput for a diverse collection or cold external storage.

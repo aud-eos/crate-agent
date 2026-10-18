@@ -8,6 +8,7 @@ use crate::tags;
 use fingerprint_core as fingerprint;
 
 pub use crate::serato::{SeratoMetadataUpdate, SeratoTrackRecord};
+pub use crate::serato_history::{SeratoHistoryPlay, SeratoHistoryScan};
 pub use crate::tags::{AudioTagUpdate, AudioTags};
 
 /// One rename pair in a `batch_rewrite_*` call. UniFFI doesn't take
@@ -331,6 +332,12 @@ pub fn read_database_records_strict(
     Ok(database.strict_track_records()?)
 }
 
+pub fn read_serato_history(history_directory: String) -> Result<SeratoHistoryScan, CoreError> {
+    Ok(crate::serato_history::read_history(&PathBuf::from(
+        history_directory,
+    ))?)
+}
+
 pub fn update_database_record(
     database_path: String,
     track_path: String,
@@ -569,6 +576,7 @@ mod conflict_round_trip_tests {
             comment: None,
             length: None,
             label: None,
+            year: None,
         }
     }
 

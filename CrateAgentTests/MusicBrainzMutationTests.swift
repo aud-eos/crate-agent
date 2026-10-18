@@ -307,6 +307,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         currentFileAlbum: String? = nil,
         recordingMBID: String = "rec",
         releaseMBID: String = "rel",
+        workMBID: String? = "work",
         // Match `makeEngineWithFile`'s indexed identity so the D-A staleness
         // check passes by default; a stale-candidate test overrides these.
         expectedFileSize: Int64 = 1,
@@ -319,6 +320,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             releaseMBID: releaseMBID,
             artistMBID: "art",
             isrc: "ISRC123",
+            workMBID: workMBID,
             fingerprintHash: fingerprintHash,
             expectedFileSize: expectedFileSize,
             expectedMtime: expectedMtime,
@@ -356,6 +358,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             XCTAssertEqual(track.musicbrainzReleaseId, "rel")
             XCTAssertEqual(track.musicbrainzArtistId, "art")
             XCTAssertEqual(track.isrc, "ISRC123")
+            XCTAssertEqual(track.musicbrainzWorkId, "work")
             XCTAssertEqual(track.year, 1994)
             XCTAssertEqual(track.artist, "Nas")
             XCTAssertEqual(track.title, "N.Y. State of Mind")
@@ -417,6 +420,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             XCTAssertNotNil(track, "created row is kept (orphaned), not deleted")
             XCTAssertNil(track?.musicbrainzRecordingId)
             XCTAssertNil(track?.isrc)
+            XCTAssertNil(track?.musicbrainzWorkId)
             XCTAssertNil(track?.year)
             XCTAssertNil(track?.artist)
         }
@@ -540,6 +544,7 @@ final class MusicBrainzMutationTests: XCTestCase {
                 musicbrainzReleaseId: "orig-rel",
                 musicbrainzArtistId: "orig-art",
                 isrc: "orig-isrc",
+                musicbrainzWorkId: "orig-work",
                 artist: "OrigArtist",
                 title: "OrigTitle",
                 album: "OrigAlbum",
@@ -562,6 +567,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             let track = try TrackRecord.fetchOne(db, key: seededTrackId)!
             XCTAssertEqual(track.musicbrainzRecordingId, "rec", "apply overwrote identity on existing row")
             XCTAssertEqual(track.isrc, "ISRC123")
+            XCTAssertEqual(track.musicbrainzWorkId, "work")
         }
 
         try await engine.undoBatch("rt-pre")
@@ -575,6 +581,7 @@ final class MusicBrainzMutationTests: XCTestCase {
             XCTAssertEqual(track.musicbrainzReleaseId, "orig-rel")
             XCTAssertEqual(track.musicbrainzArtistId, "orig-art")
             XCTAssertEqual(track.isrc, "orig-isrc")
+            XCTAssertEqual(track.musicbrainzWorkId, "orig-work")
             XCTAssertEqual(track.year, 2000)
             XCTAssertEqual(track.artist, "OrigArtist")
 

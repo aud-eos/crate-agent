@@ -54,6 +54,28 @@ public struct SongFamilyResult: Equatable, Sendable {
     public let familyId: Int64?
 }
 
+/// One membership change in a multi-family batch (`SongFamilyService.apply(_:authority:)`).
+public enum SongFamilyChangeRequest: Sendable, Equatable {
+    case create([SongFamilyMember])
+    case attach([SongFamilyMember], to: Int64)
+    case merge([Int64], into: Int64)
+
+    var operation: SongFamilyOperation {
+        switch self {
+        case let .create(members): .create(members: members, representative: nil)
+        case let .attach(members, familyID): .attach(familyId: familyID, members: members)
+        case let .merge(familyIDs, familyID): .merge(familyId: familyID, mergedFamilyIds: familyIDs)
+        }
+    }
+
+    var members: [SongFamilyMember] {
+        switch self {
+        case let .create(members), let .attach(members, _): members
+        case .merge: []
+        }
+    }
+}
+
 /// The API every song-family client uses. Changes go through
 /// `OperationEngine` as `.songFamily` mutations; undo is History's
 /// `undoBatch(batchId)`. Grouping never writes tags, Serato files, or
@@ -133,30 +155,43 @@ public struct SongFamilyService: Sendable {
         }
     }
 
-    /// Runs the file links and the membership change as one batch, so one
-    /// undo reverses both and a refused change leaves no link behind. Every
-    /// `authority` token must still be current inside that transaction; a
-    /// stale one is refused by the file's name.
+    /// Applies every change as one History batch: one undo reverses them all,
+    /// and a refused change refuses the batch, naming the file or recording.
+    /// Returns the batch id.
+    public func apply(_ requests: [SongFamilyChangeRequest], authority: [FileMembershipToken] = []) async throws -> String {
+        try await run(requests.map(\.operation), linking: requests.flatMap(\.members), authority: authority)
+    }
+
     private func apply(_ operation: SongFamilyOperation, linking members: [SongFamilyMember] = [], familyId: Int64?,
                        authority: [FileMembershipToken]) async throws -> SongFamilyResult
     {
-        let batchID = UUID().uuidString
-        let links = members.compactMap { member -> TrackMutation? in
-            guard case let .file(fileID) = member else { return nil }
-            return .songFamily(.linkRecording(fileId: fileID))
-        }
-        do {
-            _ = try await engine.applyBatch(links + [.songFamily(operation)], batchId: batchID, authorizingMembershipTokens: authority)
-        } catch let FileProcessingEligibilityError.superseded(fileID) where authority.contains(where: { token in token.fileId == fileID }) {
-            let name = try await database.writer.read { database in try FileRecord.fetchOne(database, key: fileID)?.displayName }
-            guard let name else { throw FileProcessingEligibilityError.superseded(fileId: fileID) }
-            throw SongFamilyError.changedSinceShown(file: name)
-        }
+        let batchID = try await run([operation], linking: members, authority: authority)
         let change = try await database.writer.read { database in
             try EventRecord.filter(Column("batch_id") == batchID && Column("event_type") == operation.eventType.rawValue).fetchOne(database)
                 .map { event in try JSONDecoder().decode(SongFamilyChange.self, from: Data(event.payloadJson.utf8)) }
         }
         return SongFamilyResult(batchId: batchID, familyId: change.map(\.familyId) ?? familyId)
+    }
+
+    /// Runs the file links and the membership changes as one batch, so one
+    /// undo reverses both and a refused change leaves no link behind. Every
+    /// `authority` token must still be current inside that transaction; a
+    /// stale one is refused by the file's name.
+    private func run(_ operations: [SongFamilyOperation], linking members: [SongFamilyMember], authority: [FileMembershipToken]) async throws -> String {
+        let batchID = UUID().uuidString
+        var linked = Set<Int64>()
+        let links = members.compactMap { member -> TrackMutation? in
+            guard case let .file(fileID) = member, linked.insert(fileID).inserted else { return nil }
+            return .songFamily(.linkRecording(fileId: fileID))
+        }
+        do {
+            _ = try await engine.applyBatch(links + operations.map(TrackMutation.songFamily), batchId: batchID, authorizingMembershipTokens: authority)
+        } catch let FileProcessingEligibilityError.superseded(fileID) where authority.contains(where: { token in token.fileId == fileID }) {
+            let name = try await database.writer.read { database in try FileRecord.fetchOne(database, key: fileID)?.displayName }
+            guard let name else { throw FileProcessingEligibilityError.superseded(fileId: fileID) }
+            throw SongFamilyError.changedSinceShown(file: name)
+        }
+        return batchID
     }
 
     static func fetchFamily(id: Int64, in database: GRDB.Database) throws -> SongFamily? {
