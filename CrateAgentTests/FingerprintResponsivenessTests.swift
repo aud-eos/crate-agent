@@ -38,7 +38,8 @@ final class FingerprintResponsivenessTests: XCTestCase {
             return [42, 43]
         }, pollIntervalSeconds: 0.01, batchCooldownMillis: 0)
         await worker.start()
-        await fulfillment(of: [entered], timeout: 5)
+        // Liveness bounds, not latency budgets: the decoder runs at background QoS (#224).
+        await fulfillment(of: [entered], timeout: 120)
         await worker.stop()
         await worker.start { progress in
             if progress.totalDone >= 4, state.withLock({ state in
@@ -50,7 +51,7 @@ final class FingerprintResponsivenessTests: XCTestCase {
         }
         await fulfillment(of: [overlap], timeout: 0.15)
         release.signal()
-        await fulfillment(of: [resumed], timeout: 5)
+        await fulfillment(of: [resumed], timeout: 120)
         await worker.stop()
         await worker.waitUntilStopped()
         XCTAssertEqual(state.withLock { state in state.peak }, 1)
