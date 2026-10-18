@@ -127,7 +127,7 @@ final class DurableSeratoQueueTests: XCTestCase {
                 }
             }
         }
-        let group = DuplicateFinder.DuplicateGroup(groupKey: "restart", mode: .byteLevel, files: [keeper, target])
+        let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("restart", files: [keeper, target], in: fixture.database)
         let outcome = try await DuplicateResolver(operationEngine: first, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "restart-cleanup")
         try await fixture.database.writer.write { database in database.trace(nil) }
         XCTAssertTrue(fixture.lifecycle.running, "The real mutation boundary must restart Serato")
@@ -412,7 +412,7 @@ final class DurableSeratoQueueTests: XCTestCase {
                     """)
                 }
             }
-            let group = DuplicateFinder.DuplicateGroup(groupKey: "interrupted", mode: .byteLevel, files: [keeper, target])
+            let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("interrupted", files: [keeper, target], in: fixture.database)
             _ = try await DuplicateResolver(operationEngine: first, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id), batchId: "interrupted-trash")
             if trashSucceeded {
                 // A throw after the Trash, inside its transaction, does not prove the audio stayed put.
