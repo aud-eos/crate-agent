@@ -6,6 +6,27 @@ extension ApplyMusicBrainzMatchPayload {
     var fileTagRestoreSnapshot: SeratoMetadata {
         previousFileTags ?? previousMetadata ?? .empty
     }
+
+    /// Applied file-tag fields whose matched value equals the file's captured
+    /// pre-match value. Undo has nothing to restore there, so it leaves them
+    /// alone, and a later edit to one survives. Absent and empty text are the
+    /// same tag value.
+    var fileTagFieldsUnchangedByMatch: Set<MatchFileTagField> {
+        let restored = fileTagRestoreSnapshot
+        let textFields: [(field: MatchFileTagField, applied: String?, restored: String?)] = [
+            (.artist, artist, restored.artist), (.title, title, restored.title), (.album, album, restored.album),
+        ]
+        var fields = Set(textFields.filter { field in field.applied.map { value in value == (field.restored ?? "") } ?? false }.map(\.field))
+        if let year, year == previousFileYear {
+            fields.insert(.year)
+        }
+        return fields
+    }
+}
+
+/// An audio-tag field a MusicBrainz match can apply.
+enum MatchFileTagField: String, Sendable, CaseIterable {
+    case artist, title, album, year
 }
 
 /// The audio-tag side of undoing or redoing a MusicBrainz match (#111).
@@ -132,10 +153,10 @@ enum MatchUndoTagGuard {
     /// of the match's change. Absent and empty text are the same tag value.
     static func conflictingFields(live: AudioTags, applied: ApplyMusicBrainzMatchPayload, direction: MatchHistoryDirection) -> [String] {
         let restored = applied.fileTagRestoreSnapshot
-        // Undo does not rewrite a field the match left untouched on disk, so a
-        // later edit to it is safe. Redo re-applies the match, which may write
-        // that field again, so a later edit to it conflicts like any other.
-        let untouched = direction == .undo ? applied.fileTagFieldsAlreadyOnDisk ?? [] : []
+        // Undo does not rewrite a field the match did not change, so a later
+        // edit to it is safe. Redo re-applies the match, which may write that
+        // field again, so a later edit to it conflicts like any other.
+        let untouched = direction == .undo ? applied.fileTagFieldsUnchangedByMatch : []
         let textFields: [(field: MatchFileTagField, written: String?, restored: String?, live: String?)] = [
             (.artist, applied.artist, restored.artist, live.artist),
             (.title, applied.title, restored.title, live.title),

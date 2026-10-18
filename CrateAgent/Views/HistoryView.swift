@@ -22,6 +22,7 @@ struct HistoryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            SeratoRunningBanner(message: SeratoGateMessages.quitBefore("re-syncing"))
             PageHeading("History", subtitle: "Review recorded changes, undo a batch, or retry its external writes.")
                 .padding(density.pagePadding)
             Divider()
@@ -82,10 +83,22 @@ struct HistoryView: View {
                     StatusBadge(title: batch.isUndoBatch ? "Undo batch" : "Recorded changes",
                                 systemImage: batch.isUndoBatch ? "arrow.uturn.backward.circle" : "clock")
                 }
-                if batch.notAppliedCount > 0 {
-                    StatusBadge(title: SeratoWriteDispositionMessages.historyBadge(count: batch.notAppliedCount),
+                if batch.notApplied.changeCount > 0 {
+                    StatusBadge(title: SeratoWriteDispositionMessages.historyBadge(count: batch.notApplied.changeCount),
                                 systemImage: "exclamationmark.triangle", tint: .orange)
                         .help(SeratoWriteDispositionMessages.historyHelp)
+                    ForEach(batch.notApplied.reasons, id: \.self) { reason in
+                        Text(reason)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    NotAppliedFilesList(batch: batch, database: services.database,
+                                        actionsDisabled: resyncInFlightBatchId != nil || undoInFlightBatchId != nil)
+                    { file in
+                        guard let fileID = file.fileID else { return }
+                        await resync(batch: batch, fileID: fileID)
+                    }
                 }
             }
         } actions: {
@@ -153,11 +166,11 @@ struct HistoryView: View {
         await reload()
     }
 
-    private func resync(batch: BatchSummary) async {
+    private func resync(batch: BatchSummary, fileID: Int64? = nil) async {
         resyncInFlightBatchId = batch.batchId
         defer { resyncInFlightBatchId = nil }
         do {
-            let outcome = try await services.operationEngine.resyncSeratoForBatch(batch.batchId)
+            let outcome = try await services.operationEngine.resyncSeratoForBatch(batch.batchId, fileID: fileID)
             actionError = nil
             // If the resync ended with queued-only writes, surface
             // it on the inline banner too — the activity strip
@@ -170,6 +183,87 @@ struct HistoryView: View {
             actionError = "Re-sync failed: \(error.localizedDescription)"
         }
         await reload()
+    }
+}
+
+/// The files a batch's not-applied changes touch, loaded a page at a time
+/// only once the reader asks for them.
+private struct NotAppliedFilesList: View {
+    let batch: BatchSummary
+    let database: LibraryDatabase
+    let actionsDisabled: Bool
+    let resync: (NotAppliedFile) async -> Void
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+    @State private var isExpanded = false
+    @State private var files: [NotAppliedFile] = []
+    @State private var isLoading = false
+    @State private var loadError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            Button(isExpanded ? SeratoWriteDispositionMessages.hideFiles : SeratoWriteDispositionMessages.showFiles(count: batch.notApplied.fileCount)) {
+                isExpanded.toggle()
+                if isExpanded, files.isEmpty {
+                    Task { await loadPage() }
+                }
+            }
+            .buttonStyle(.link)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            if isExpanded {
+                ForEach(files) { file in
+                    fileRow(file)
+                }
+                if let loadError {
+                    ActionErrorMessage(message: loadError)
+                } else if isLoading {
+                    ProgressView().controlSize(.small)
+                } else if files.count < batch.notApplied.fileCount {
+                    Button(SeratoWriteDispositionMessages.showMoreFiles(remaining: batch.notApplied.fileCount - files.count)) {
+                        Task { await loadPage() }
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+        }
+    }
+
+    private func fileRow(_ file: NotAppliedFile) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(file.path ?? (file.fileID == nil ? SeratoWriteDispositionMessages.changeWithoutFile : SeratoWriteDispositionMessages.fileNoLongerInLibrary))
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(file.reasons, id: \.self) { reason in
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if file.canResync {
+                Button("Re-sync") {
+                    Task {
+                        await resync(file)
+                        files = []
+                        await loadPage()
+                    }
+                }
+                .controlSize(.small)
+                .disabled(actionsDisabled)
+                .seratoWriteGated(help: SeratoWriteDispositionMessages.fileResyncHelp, runningHelp: SeratoGateMessages.quitBefore("re-syncing"))
+            }
+        }
+    }
+
+    private func loadPage() async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            files += try await EventHistoryQuery.loadNotAppliedFiles(for: batch, database: database, offset: files.count)
+            loadError = nil
+        } catch {
+            loadError = "Could not load the affected files: \(error.localizedDescription)"
+        }
     }
 }
 
