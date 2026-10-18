@@ -1784,6 +1784,34 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(recorder.calls.last?.update, tagUpdate(artist: "Disk Artist"))
     }
 
+    func testUndoOfAMatchRecordedWithoutFileTagsChecksEveryAppliedField() async throws {
+        let recorder = FileTagWriterRecorder()
+        let (engine, database, fileId) = try await MainActor.run {
+            try makeEngineWithFile(artist: "old", title: "Same Title", album: "old", recorder: recorder)
+        }
+        recorder.disk = AudioTags.none.applying([tagUpdate(title: "Disk Title")])
+        try await engine.apply(
+            .applyMusicBrainzMatch(fullPayload(
+                fileID: fileId, fingerprintHash: sha256(sampleFingerprintBytes),
+                artist: nil, title: "Same Title", album: nil, year: nil, currentFileTitle: "Disk Title"
+            )),
+            batchId: "legacy-match"
+        )
+        // Events from before the pre-match file tags were captured carry only the row snapshot.
+        try await database.writer.write { db in
+            try db.execute(sql: "UPDATE events SET payload_json = json_remove(payload_json, '$.previousFileTags', '$.previousFileYear') WHERE batch_id = ?",
+                           arguments: ["legacy-match"])
+        }
+        try await engine.apply(.writeFileTags(.init(fileId: fileId, metadata: .init(title: "Later Edit"))), batchId: "edit")
+
+        do {
+            try await engine.undoBatch("legacy-match")
+            XCTFail("expected the undo to be refused")
+        } catch let error as OperationEngineError {
+            XCTAssertEqual(error, .undoWouldOverwriteFileTags(fileId: fileId, fields: ["title"], direction: .undo))
+        }
+    }
+
     func testQueuedTagEditKeepsAMatchFieldThatEqualsTheCapturedValue() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, _, fileId) = try await MainActor.run {
@@ -1820,7 +1848,7 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertTrue(recorder.calls.isEmpty)
     }
 
-    func testTagsChangedBeforeAQueuedConfirmRunsGetTheMatchBack() async throws {
+    func testTagsChangedInPlaceBeforeAQueuedConfirmRunsGetTheMatchBack() async throws {
         let recorder = FileTagWriterRecorder()
         let (engine, _, fileId) = try await MainActor.run {
             try makeEngineWithFile(artist: "old", title: "old", album: "old", recorder: recorder, seratoIsRunning: true)
@@ -1834,7 +1862,8 @@ final class MusicBrainzMutationTests: XCTestCase {
             )),
             batchId: "exact-confirm-while-running"
         )
-        // Serato rewrites the tags from its cached copy before it quits.
+        // The tags change in place, keeping the file's size and mtime, so the
+        // physical-target check still authorizes the queued write.
         recorder.disk = AudioTags.none.applying([tagUpdate(artist: "Nas", title: "Serato Title", album: "Illmatic", year: 1990)])
 
         await runningState?.stop()

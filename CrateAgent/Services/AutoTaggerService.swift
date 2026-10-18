@@ -196,10 +196,7 @@ final class AutoTaggerService: ObservableObject {
         if case LookupError.unauthorized = error {
             return musicBrainzUnauthorizedMessage
         }
-        if let lookupError = error as? LookupError {
-            return describe(lookupError)
-        }
-        return String(describing: error)
+        return UserFacingErrorMessage.message(for: error)
     }
 
     /// Cancels the in-flight pass, if any. Already-resolved rows in `rows`
@@ -290,7 +287,7 @@ final class AutoTaggerService: ObservableObject {
                 // only the bare reason, since the view already prefixes it
                 // with "Stopped — ".
                 guard generation == runGeneration else { return }
-                let reason = Self.describe(lookupError)
+                let reason = lookupError.localizedDescription
                 haltReason = "Auto-tag pass stopped: \(reason)"
                 stopUnresolvedRows(among: fileIDs, message: reason, generation: generation)
                 return
@@ -310,7 +307,7 @@ final class AutoTaggerService: ObservableObject {
                 return
             } catch {
                 guard generation == runGeneration else { return }
-                rows[fileID] = .failed(String(describing: error))
+                rows[fileID] = .failed(UserFacingErrorMessage.message(for: error))
                 continue
             }
             // The lookup completed; only publish if a newer scan hasn't taken
@@ -359,7 +356,7 @@ final class AutoTaggerService: ObservableObject {
                 // failing (and re-hammering) each file individually.
                 throw lookupError
             case .rateLimited, .transport:
-                return .failed(Self.describe(lookupError))
+                return .failed(lookupError.localizedDescription)
             }
         }
     }
@@ -504,21 +501,6 @@ final class AutoTaggerService: ObservableObject {
     /// A MusicBrainz partial date's leading year (`"1988-05-09"` → `1988`).
     private static func year(fromMusicBrainzDate dateString: String) -> Int? {
         Int(dateString.prefix(4))
-    }
-
-    private static func describe(_ error: LookupError) -> String {
-        switch error {
-        case .unauthorized:
-            "the AcoustID API key was rejected (401 Unauthorized)"
-        case .rateLimited:
-            "the lookup was rate-limited and retries were exhausted"
-        case .server:
-            "the lookup server returned repeated errors"
-        case let .offline(message):
-            "the network is unavailable (\(message))"
-        case let .transport(message):
-            message
-        }
     }
 
     // MARK: - Fingerprint on demand
@@ -799,12 +781,12 @@ final class AutoTaggerService: ObservableObject {
 
 /// A resolution failure local to one file (not found, no fingerprint, no
 /// releases, etc.) — distinct from `LookupError`, which is reserved for the
-/// remote lookup clients. Its `description` is what callers show for that
+/// remote lookup clients. Its description is what callers show for that
 /// row's `.failed` reason.
-private struct AutoTaggerRowFailure: Error, CustomStringConvertible {
-    let description: String
+private struct AutoTaggerRowFailure: LocalizedError {
+    let errorDescription: String?
     init(_ description: String) {
-        self.description = description
+        errorDescription = description
     }
 }
 

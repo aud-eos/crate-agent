@@ -7,6 +7,7 @@ struct LibraryBrowserView: View {
 
     @State private var statusFilter: LibraryStatusFilter = .active
     @State private var loadError: String?
+    @State private var importNotice: String?
     @State private var historyTarget: BrowserRow?
     @State private var model: LibraryBrowserModel?
     @State private var searchText: String = ""
@@ -28,6 +29,9 @@ struct LibraryBrowserView: View {
             LibraryStatusFilterBar(selection: $statusFilter)
             if let loadError {
                 ActionErrorMessage(message: loadError).padding(density.pagePadding)
+            }
+            if let importNotice {
+                ActionNoticeMessage(message: importNotice).padding(density.pagePadding)
             }
             ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
             if let model {
@@ -78,8 +82,9 @@ struct LibraryBrowserView: View {
             let coordinator = services.importCoordinator
             Task { @MainActor in
                 let result = await coordinator.importDroppedItems(droppedUrls)
-                let notices = result.blockedFiles + result.filesNotAdded + result.filesAlreadyImporting
-                loadError = notices.isEmpty ? nil : notices.joined(separator: "\n")
+                let problems = result.blockedFiles + result.filesNotAdded
+                loadError = problems.isEmpty ? nil : problems.joined(separator: "\n")
+                importNotice = result.filesAlreadyImporting.isEmpty ? nil : result.filesAlreadyImporting.joined(separator: "\n")
                 if result.filesPendingSync > 0 {
                     lastImportSummary = "\(result.filesImported) imported; \(result.filesPendingSync) pending sync; \(result.filesSkipped) skipped"
                     services.syncSession.reportFailure(
