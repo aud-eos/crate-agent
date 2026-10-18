@@ -289,7 +289,11 @@ this way: a retired or removed row still refuses a replacement at its path. When
 readiness is closed, that observation is refused and the file is reported with
 the readiness reason. A file listed twice in one drop, such as a folder and a
 file inside it, is imported once, and a file a still-running drop is importing
-is reported as already being imported by an overlapping drop. The Library drop
+is reported as already being imported by an overlapping drop, as a notice
+rather than an error. A file whose import mutations fail is never counted as
+skipped: one that changed between its stat and its import is reported as not
+added, and any other failure, such as an ambiguous legacy identity, is listed
+with its reason (#229). The Library drop
 flow publishes a failed add through the shared sync status and Retry Sync action. Retry performs
 the external add and normal confirmation without repeating import intent or
 changing the original event payloads/inverses. Failed or unattempted adds are
