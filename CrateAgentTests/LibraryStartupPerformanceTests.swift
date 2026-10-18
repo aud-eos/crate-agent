@@ -110,13 +110,16 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         let navigationLatency = start.duration(to: .now)
         XCTAssertEqual(session.state, .reconciling)
         XCTAssertLessThan(navigationLatency, .milliseconds(500))
+        let resumed = ContinuousClock.now
         await barrier.release()
         try await syncing.value
+        let slowPath = resumed.duration(to: .now)
+        XCTAssertLessThan(slowPath, .seconds(30))
         XCTAssertEqual(counters.snapshot().snapshotParses, 1)
         XCTAssertEqual(counters.snapshot().audioTagReads, 0)
         XCTAssertEqual(counters.snapshot().lightweightHashReads, 0)
         XCTAssertEqual(counters.snapshot().rowWrites, 1)
-        let result = "STARTUP_NAVIGATION files=30000 mounted_production_sidebar=true mounted_production_library=true active_sync=held_after_parse content_render=\(renderLatency) navigation=\(navigationLatency) changed_rows=\(counters.snapshot().rowWrites)"
+        let result = "STARTUP_NAVIGATION files=30000 mounted_production_sidebar=true mounted_production_library=true active_sync=held_after_parse content_render=\(renderLatency) navigation=\(navigationLatency) slow_path_after_parse=\(slowPath) phases=\(counters.phaseDurations()) changed_rows=\(counters.snapshot().rowWrites)"
         print(result)
         let attachment = XCTAttachment(string: result)
         attachment.lifetime = .keepAlways

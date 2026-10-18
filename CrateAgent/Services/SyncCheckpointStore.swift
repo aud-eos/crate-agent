@@ -19,7 +19,7 @@ actor SyncCheckpointStore {
     func dirtyFiles() async throws -> SyncDirtyFiles {
         try await database.writer.read { connection in
             let rows = try Row.fetchAll(connection, sql: "SELECT file_id, path FROM sync_dirty_files")
-            return SyncDirtyFiles(fileIDs: Set(rows.map { row in row["file_id"] }), paths: Set(rows.map { row in row["path"] }))
+            return SyncDirtyFiles(fileIDs: Set(rows.map { row in row["file_id"] }), paths: Set(rows.map { row in PathBytes(bytes: row["path"]) }))
         }
     }
 

@@ -215,7 +215,10 @@ only lower the priority of the matching Test-host executable when needed.
 `STARTUP_FULL`, `STARTUP_RESTART`, and `STARTUP_NAVIGATION` appear in the log and
 XCTest attachments. Hard assertions require ready within two seconds, content
 rendering/navigation within 500 ms, zero unchanged parser/tag/bitrate/hash reads,
-and one changed row after a single parse. Phase timings contain no paths or metadata.
+and one changed row after a single parse. The slow-path sync after that parse
+(`slow_path_after_parse`) must finish within 30 s; it measured 34.8 s before path keys
+hashed their full bytes (#218) and 12.6 s after, in the optimized settings above.
+Phase timings contain no paths or metadata.
 The file cache is warm after setup; tiny WAVs, one temporary directory, and a
 controlled replay boundary do not predict cold-disk or external-drive latency.
 
