@@ -569,6 +569,7 @@ mod conflict_round_trip_tests {
             comment: None,
             length: None,
             label: None,
+            year: None,
         }
     }
 

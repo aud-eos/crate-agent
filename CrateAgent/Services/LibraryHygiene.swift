@@ -22,6 +22,7 @@ public protocol HygieneFileSource {
     var comment: String? { get }
     var length: String? { get }
     var label: String? { get }
+    var seratoYear: String? { get }
 }
 
 extension FileRecord: HygieneFileSource {}
@@ -169,33 +170,11 @@ public enum LibraryHygiene {
         forFile file: some HygieneFileSource,
         matches: [FindAndReplaceMatch]
     ) -> SeratoMetadata {
-        var artist = file.artist
-        var title = file.title
-        var album = file.album
-        var genre = file.genre
-        var bpm = file.bpm
-        var musicalKey = file.musicalKey
-        var comment = file.comment
-        var length = file.length
-        var label = file.label
+        var merged = SeratoMetadata(mirroredBy: file)
         for match in matches where match.fileId == file.id {
-            switch match.field {
-            case .artist: artist = match.newValue
-            case .title: title = match.newValue
-            case .album: album = match.newValue
-            case .genre: genre = match.newValue
-            case .bpm: bpm = match.newValue
-            case .musicalKey: musicalKey = match.newValue
-            case .comment: comment = match.newValue
-            case .length: length = match.newValue
-            case .label: label = match.newValue
-            }
+            merged[keyPath: match.field.metadataKeyPath] = match.newValue
         }
-        return SeratoMetadata(
-            artist: artist, title: title, album: album, genre: genre,
-            bpm: bpm, musicalKey: musicalKey, comment: comment,
-            length: length, label: label
-        )
+        return merged
     }
 
     /// Internal: case-aware substring replace. Foundation's
@@ -422,31 +401,9 @@ public enum LibraryHygiene {
         field: SeratoMetadataField,
         value: String
     ) -> SeratoMetadata {
-        var artist = file.artist
-        var title = file.title
-        var album = file.album
-        var genre = file.genre
-        var bpm = file.bpm
-        var musicalKey = file.musicalKey
-        var comment = file.comment
-        var length = file.length
-        var label = file.label
-        switch field {
-        case .artist: artist = value
-        case .title: title = value
-        case .album: album = value
-        case .genre: genre = value
-        case .bpm: bpm = value
-        case .musicalKey: musicalKey = value
-        case .comment: comment = value
-        case .length: length = value
-        case .label: label = value
-        }
-        return SeratoMetadata(
-            artist: artist, title: title, album: album, genre: genre,
-            bpm: bpm, musicalKey: musicalKey, comment: comment,
-            length: length, label: label
-        )
+        var merged = SeratoMetadata(mirroredBy: file)
+        merged[keyPath: field.metadataKeyPath] = value
+        return merged
     }
 
     /// Compose the SeratoMetadata snapshot for one file given the
@@ -456,33 +413,11 @@ public enum LibraryHygiene {
         forFile file: some HygieneFileSource,
         fixes: [CaseFix]
     ) -> SeratoMetadata {
-        var artist = file.artist
-        var title = file.title
-        var album = file.album
-        var genre = file.genre
-        var bpm = file.bpm
-        var musicalKey = file.musicalKey
-        var comment = file.comment
-        var length = file.length
-        var label = file.label
+        var merged = SeratoMetadata(mirroredBy: file)
         for fix in fixes where fix.fileId == file.id {
-            switch fix.field {
-            case .artist: artist = fix.newValue
-            case .title: title = fix.newValue
-            case .album: album = fix.newValue
-            case .genre: genre = fix.newValue
-            case .bpm: bpm = fix.newValue
-            case .musicalKey: musicalKey = fix.newValue
-            case .comment: comment = fix.newValue
-            case .length: length = fix.newValue
-            case .label: label = fix.newValue
-            }
+            merged[keyPath: fix.field.metadataKeyPath] = fix.newValue
         }
-        return SeratoMetadata(
-            artist: artist, title: title, album: album, genre: genre,
-            bpm: bpm, musicalKey: musicalKey, comment: comment,
-            length: length, label: label
-        )
+        return merged
     }
 
     /// Build the trimmed SeratoMetadata snapshot for a single file
@@ -493,39 +428,11 @@ public enum LibraryHygiene {
         forFile file: some HygieneFileSource,
         issues: [WhitespaceIssue]
     ) -> SeratoMetadata {
-        var artist = file.artist
-        var title = file.title
-        var album = file.album
-        var genre = file.genre
-        var bpm = file.bpm
-        var musicalKey = file.musicalKey
-        var comment = file.comment
-        var length = file.length
-        var label = file.label
+        var merged = SeratoMetadata(mirroredBy: file)
         for issue in issues where issue.fileId == file.id {
-            switch issue.field {
-            case .artist: artist = issue.newValue
-            case .title: title = issue.newValue
-            case .album: album = issue.newValue
-            case .genre: genre = issue.newValue
-            case .bpm: bpm = issue.newValue
-            case .musicalKey: musicalKey = issue.newValue
-            case .comment: comment = issue.newValue
-            case .length: length = issue.newValue
-            case .label: label = issue.newValue
-            }
+            merged[keyPath: issue.field.metadataKeyPath] = issue.newValue
         }
-        return SeratoMetadata(
-            artist: artist,
-            title: title,
-            album: album,
-            genre: genre,
-            bpm: bpm,
-            musicalKey: musicalKey,
-            comment: comment,
-            length: length,
-            label: label
-        )
+        return merged
     }
 }
 
@@ -554,6 +461,20 @@ public enum SeratoMetadataField: String, CaseIterable, Sendable {
         case .comment: file.comment
         case .length: file.length
         case .label: file.label
+        }
+    }
+
+    var metadataKeyPath: WritableKeyPath<SeratoMetadata, String?> {
+        switch self {
+        case .artist: \.artist
+        case .title: \.title
+        case .album: \.album
+        case .genre: \.genre
+        case .bpm: \.bpm
+        case .musicalKey: \.musicalKey
+        case .comment: \.comment
+        case .length: \.length
+        case .label: \.label
         }
     }
 
@@ -804,17 +725,7 @@ public actor LibraryHygieneRunner {
         merged: SeratoMetadata,
         batchId: String
     ) async throws -> Bool {
-        let previousSnapshot = SeratoMetadata(
-            artist: file.artist,
-            title: file.title,
-            album: file.album,
-            genre: file.genre,
-            bpm: file.bpm,
-            musicalKey: file.musicalKey,
-            comment: file.comment,
-            length: file.length,
-            label: file.label
-        )
+        let previousSnapshot = SeratoMetadata(mirroredBy: file)
         // One transaction for all three mutations: setMetadata writes
         // the DB row, commitMetadataToSerato queues/applies the
         // Serato library snapshot, writeFileTags writes the audio

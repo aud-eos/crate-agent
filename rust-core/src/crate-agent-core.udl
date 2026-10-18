@@ -247,6 +247,7 @@ dictionary SeratoTrackRecord {
   string? comment;
   string? length;
   string? label;
+  string? year = null;
 };
 
 // Field-by-field update payload for `update_database_record`. Each
@@ -265,6 +266,7 @@ dictionary SeratoMetadataUpdate {
   string? comment;
   string? length;
   string? label;
+  string? year = null;
 };
 
 // Patch applied to an audio file's primary tag by

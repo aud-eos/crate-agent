@@ -3786,6 +3786,23 @@ final class LibraryHygieneMissingFieldsRunnerTests: XCTestCase {
         XCTAssertNil(genre, "whitespace-only fill value must be rejected")
     }
 
+    func testWhitespaceCleanupKeepsSeratosYear() async throws {
+        let (engine, database) = try await MainActor.run { try makeEngine() }
+        try await engine.apply(.indexNewFile(IndexNewFilePayload(
+            path: "/Music/A/track.mp3",
+            volumeUuid: "v1", inode: 1, fileSize: 1, mtime: 1,
+            metadata: SeratoMetadata(artist: " Artist ", year: "1990")
+        )))
+        try await seedProcessableHygieneFiles(database)
+        let files = try await database.writer.read { db in try HygieneFileRow.fetchAll(db, sql: HygieneFileRow.hygieneFetchSQL) }
+
+        _ = try await LibraryHygieneRunner(operationEngine: engine).applyWhitespaceFixes(LibraryHygiene.findWhitespaceIssues(in: files), files: files)
+
+        let stored = try await database.writer.read { db in try XCTUnwrap(FileRecord.fetchOne(db)) }
+        XCTAssertEqual(stored.artist, "Artist")
+        XCTAssertEqual(stored.seratoYear, "1990")
+    }
+
     func testFillBatchIsFullyUndoable() async throws {
         let (engine, database) = try await MainActor.run { try makeEngine() }
         try await engine.apply(.indexNewFile(IndexNewFilePayload(

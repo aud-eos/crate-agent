@@ -69,11 +69,11 @@ extension SeratoPendingWrite: Codable {
 extension SeratoMetadata {
     /// The fields this update sets, over `original` for the rest.
     func overlaid(on original: SeratoMetadata) -> SeratoMetadata {
-        SeratoMetadata(artist: artist ?? original.artist, title: title ?? original.title,
-                       album: album ?? original.album, genre: genre ?? original.genre,
-                       bpm: bpm ?? original.bpm, musicalKey: musicalKey ?? original.musicalKey,
-                       comment: comment ?? original.comment, length: length ?? original.length,
-                       label: label ?? original.label)
+        SeratoMetadata.fields.reduce(into: original) { overlaid, field in
+            if let value = self[keyPath: field.keyPath] {
+                overlaid[keyPath: field.keyPath] = value
+            }
+        }
     }
 }
 
