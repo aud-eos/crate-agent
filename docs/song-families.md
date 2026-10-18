@@ -173,8 +173,10 @@ replaced, and returns when it is available again.
 
 The projection runs in SQL (`LibraryBrowseQuery`). Family files are ranked in
 small CTEs using the same `SongFamilyRepresentative` ordering as the service,
-and the outer pass over `files` joins only their results. Each snapshot reads a
-family's members at most once.
+and the outer pass over `files` joins only their results. A snapshot runs the
+projection once when it opens, for every counted file's placement, and takes
+its counts, select-all scope, selection summary and families' members from that
+read; only a page of rows runs it again (#258).
 
 `LibraryPagingTests` holds the 30,000-file paging fixture, with 6,000 files in
 2,000 families, to the 500 ms interaction budget and attaches the timings. Each

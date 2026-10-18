@@ -948,48 +948,57 @@ final class DurableSeratoQueueTests: XCTestCase {
     /// #117: a rename lands while a drain, or the immediate pass of another
     /// edit, still owes an earlier write to the same file. The rename waits
     /// for that write instead of overtaking it, and must still reach Serato
-    /// once the earlier pass finishes.
+    /// once the earlier pass finishes. The rename starts at several points in
+    /// the pass, so it also commits after the pass resolved the tag write's
+    /// path and before that write's I/O (#260).
     func testRenameDuringAnotherPassOnTheSameFileStillReachesSerato() async throws {
         for draining in [false, true] {
-            let label = draining ? "during a drain" : "during an immediate pass"
-            let fixture = try SeratoRemovalFixture()
-            defer { fixture.cleanup() }
-            let file = try await fixture.add("before.wav", bytes: FinalRemovalIntegrationTests.wav())
-            let fileID = try XCTUnwrap(file.id)
-            try save(fixture, paths: [file.path])
-            let crates = try saveCrates(fixture, paths: [file.path])
-            try await makeSession(fixture, engine: fixture.engine).synchronize()
-            let renamed = fixture.directory.appendingPathComponent("after.wav").path
-            let concurrentRename = ConcurrentRename()
-            let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
-                                         seratoMetadataBatchWriter: { databasePath, updates in
-                                             let result = try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
-                                             concurrentRename.startOnce()
-                                             return result
-                                         })
-            concurrentRename.prepare {
-                try await engine.apply(.renameFile(.init(fileId: fileID, newPath: renamed, previousPath: file.path, physicalMove: true)), batchId: "concurrent-rename")
+            for renameDelay in [0, 250, 500, 1000, 2000].map(Duration.microseconds) {
+                try await assertRenameDuringAnotherPassReachesSerato(draining: draining, renameDelay: renameDelay)
             }
-            setRunning(fixture, draining)
-            let current = try await fixture.row(file)
-            try await LibraryHygieneRunner(operationEngine: engine)
-                .applyMissingFieldFill(field: .title, value: "Filled title", fileIds: [fileID], files: [current], batchId: "hygiene-pass")
-            if draining {
-                setRunning(fixture, false)
-                _ = try await engine.drainPendingSeratoUpdates()
-            }
-            try await concurrentRename.finished()
-
-            XCTAssertEqual(try readAudioTags(filePath: renamed).title, "Filled title", label)
-            let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
-            XCTAssertEqual(records.map { record in SeratoPath.normalized(record.path) }, [renamed], label)
-            XCTAssertEqual(records.first?.title, "Filled title", label)
-            for (url, _) in crates {
-                XCTAssertEqual(try readCratePaths(cratePath: url.path).map(SeratoPath.normalized), [renamed], label)
-            }
-            let remaining = try await engine.pendingSeratoWriteCount
-            XCTAssertEqual(remaining, 0, "\(label): the rename was left queued with Serato closed")
         }
+    }
+
+    private func assertRenameDuringAnotherPassReachesSerato(draining: Bool, renameDelay: Duration) async throws {
+        let label = (draining ? "during a drain" : "during an immediate pass") + ", rename after \(renameDelay)"
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let file = try await fixture.add("before.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let fileID = try XCTUnwrap(file.id)
+        try save(fixture, paths: [file.path])
+        let crates = try saveCrates(fixture, paths: [file.path])
+        try await makeSession(fixture, engine: fixture.engine).synchronize()
+        let renamed = fixture.directory.appendingPathComponent("after.wav").path
+        let concurrentRename = ConcurrentRename()
+        let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
+                                     seratoMetadataBatchWriter: { databasePath, updates in
+                                         let result = try batchUpdateDatabaseRecords(databasePath: databasePath, updates: updates)
+                                         concurrentRename.startOnce()
+                                         return result
+                                     })
+        concurrentRename.prepare {
+            try await Task.sleep(for: renameDelay)
+            try await engine.apply(.renameFile(.init(fileId: fileID, newPath: renamed, previousPath: file.path, physicalMove: true)), batchId: "concurrent-rename")
+        }
+        setRunning(fixture, draining)
+        let current = try await fixture.row(file)
+        try await LibraryHygieneRunner(operationEngine: engine)
+            .applyMissingFieldFill(field: .title, value: "Filled title", fileIds: [fileID], files: [current], batchId: "hygiene-pass")
+        if draining {
+            setRunning(fixture, false)
+            _ = try await engine.drainPendingSeratoUpdates()
+        }
+        try await concurrentRename.finished()
+
+        XCTAssertEqual(try readAudioTags(filePath: renamed).title, "Filled title", label)
+        let records = try readDatabaseRecordsStrict(databasePath: fixture.locator.databaseV2Url.path)
+        XCTAssertEqual(records.map { record in SeratoPath.normalized(record.path) }, [renamed], label)
+        XCTAssertEqual(records.first?.title, "Filled title", label)
+        for (url, _) in crates {
+            XCTAssertEqual(try readCratePaths(cratePath: url.path).map(SeratoPath.normalized), [renamed], label)
+        }
+        let remaining = try await engine.pendingSeratoWriteCount
+        XCTAssertEqual(remaining, 0, "\(label): the rename was left queued with Serato closed")
     }
 
     func testSeratoSessionEditsWinAcrossRestartAndFastStartup() async throws {
