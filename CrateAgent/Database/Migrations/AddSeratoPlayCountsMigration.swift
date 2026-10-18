@@ -4,7 +4,7 @@ import GRDB
 /// `SeratoPlayCountService`; never written through `applyMutation`.
 enum AddSeratoPlayCountsMigration {
     static func register(in migrator: inout DatabaseMigrator) {
-        migrator.registerMigration("017_add_serato_play_counts") { database in
+        migrator.registerMigration("022_add_serato_play_counts") { database in
             try database.execute(sql: """
             CREATE TABLE serato_play_counts (
                 file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
