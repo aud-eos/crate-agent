@@ -42,6 +42,32 @@ final class MusicBrainzMutationTests: XCTestCase {
         XCTAssertEqual(events, 0)
     }
 
+    @MainActor
+    func testGroupingCannotLinkAConflictedFileToItsRecording() async throws {
+        let gate = LibrarySyncReadiness()
+        let fixture = try SeratoRemovalFixture(readiness: gate)
+        defer { fixture.cleanup() }
+        let protected = try await fixture.add("Café.mp3")
+        let protectedID = try XCTUnwrap(protected.id)
+        let fingerprintBytes = sampleFingerprintBytes
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE files SET fingerprint_status = 'done', chromaprint_fingerprint = ? WHERE id = ?",
+                                 arguments: [fingerprintBytes, protectedID])
+        }
+        let fingerprinted = try await fixture.row(protected)
+        try fixture.save(paths: [protected.path, protected.path.decomposedStringWithCanonicalMapping])
+        let analysis = try await SeratoConflictAnalyzer().analyze(snapshot: fixture.reader.read(), files: [fingerprinted])
+        let authorization = gate.prepareDrain()
+        try gate.install(analysis.scope, for: authorization)
+        try gate.markReady(authorization)
+        do {
+            try await fixture.engine.apply(.songFamily(.linkRecording(fileId: protectedID)))
+            XCTFail("The conflicted file was linked to a recording")
+        } catch is SeratoPathConflictError {}
+        let after = try await fixture.row(protected)
+        XCTAssertNil(after.trackId)
+    }
+
     private let audioFixture = OwnedProcessingAudioFixture()
 
     override func tearDownWithError() throws {
