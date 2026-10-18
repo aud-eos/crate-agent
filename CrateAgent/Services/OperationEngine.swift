@@ -2945,8 +2945,9 @@ public actor OperationEngine {
 
     /// Runs one store's removal I/O after a write-ahead in-progress mark that
     /// its own transaction replaces with what it removed. The mark is
-    /// withdrawn when the I/O cannot have landed, so a retry reads a store left
-    /// in progress as one whose capture may have been lost.
+    /// withdrawn only when this attempt's I/O never returned, so a retry reads
+    /// a store left in progress as one whose capture may have been lost, even
+    /// when a later step of the same transaction threw.
     private func removeCapturing(eventID: Int64, storePath: String, trackPath: String, guardedWrites: [GuardedSeratoWrite], completing: Bool,
                                  remove: @escaping @Sendable () throws -> [SeratoRemovedRecord],
                                  afterward: @escaping @Sendable (GRDB.Database) throws -> Void = { _ in }) async throws
@@ -2954,35 +2955,31 @@ public actor OperationEngine {
         let earlier = try await database.writer.write { database in
             try SeratoRemovalCaptureStore.beginRemoval(eventID: eventID, storePath: storePath, trackPath: trackPath, in: database)
         }
+        let removal = ExternalIOProgress()
         do {
             try await performExternalWrite(guardedWrites, completing: completing) { database, io in
-                let removed = try remove()
+                let removed: [SeratoRemovedRecord]
+                do { removed = try remove() }
+                catch {
+                    if case CoreError.LandedNotDurable = error {
+                        removal.recordReturned()
+                    }
+                    throw error
+                }
+                removal.recordReturned()
                 io.recordReturned()
                 try SeratoRemovalCaptureStore.save(eventID: eventID, storePath: storePath, trackPath: trackPath, records: removed,
                                                    earlierOutcome: earlier, in: database)
                 try afterward(database)
             }
         } catch {
-            if Self.ioCannotHaveLanded(error) {
+            if !removal.returned {
                 try await database.writer.write { database in
                     try SeratoRemovalCaptureStore.abandonRemoval(eventID: eventID, storePath: storePath, earlierOutcome: earlier, in: database)
                 }
             }
             throw error
         }
-    }
-
-    /// An interruption stops before any I/O, and the core reports a write
-    /// that replaced its file but could not flush it as `LandedNotDurable`.
-    private static func ioCannotHaveLanded(_ error: Error) -> Bool {
-        if error is ExternalWriteInterruption {
-            return true
-        }
-        guard let coreError = error as? CoreError else { return false }
-        if case .LandedNotDurable = coreError {
-            return false
-        }
-        return true
     }
 
     /// Without a database V2 no crate is rewritten either, so a removal

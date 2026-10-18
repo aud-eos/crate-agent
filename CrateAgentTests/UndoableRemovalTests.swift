@@ -151,6 +151,27 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
+    func testUndoRefusesAV2RemovalWhoseCaptureWasLostAfterItsWriteLanded() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let unverifiable = SeratoTestEncoding.record("otrk", SeratoTestEncoding.record("tsng", "No path".data(using: .utf16BigEndian)!))
+        let cleaned = try await cleanDuplicate(fixture, engine: engine, extraDatabaseRecords: unverifiable, completes: false)
+        let databaseV2 = fixture.locator.databaseV2Url
+        let landed = try Data(contentsOf: databaseV2)
+        try landed.prefix(landed.count - unverifiable.count).write(to: databaseV2)
+        try await engine.drainPendingSeratoUpdates(retryingFailedCleanup: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cleaned.target.path), "The retried cleanup finishes")
+
+        do {
+            try await engine.undoBatch(cleaned.batchID)
+            XCTFail("Undo must not report success without the V2 records")
+        } catch let OperationEngineError.restoreBlocked(_, reason) {
+            guard case let .recordsNotRecorded(store) = reason else { return XCTFail("Unexpected reason \(reason)") }
+            XCTAssertEqual(Self.resolved(store), Self.resolved(databaseV2.path))
+        }
+    }
+
     private struct CleanedDuplicate {
         let target: FileRecord
         let batchID: String
@@ -159,13 +180,16 @@ final class UndoableRemovalTests: XCTestCase {
     }
 
     /// Cleans `target.wav`, a duplicate of `keeper.wav` held in database V2 and both crate kinds.
-    /// `otherCrates`, by name, are saved as well, and `completes: false` lets a cleanup step fail.
+    /// `otherCrates`, by name, are saved as well, `extraDatabaseRecords` are appended to V2, and `completes: false` lets a cleanup step fail.
     private func cleanDuplicate(_ fixture: SeratoRemovalFixture, engine: OperationEngine, otherCrates: [String: Data] = [:],
-                                completes: Bool = true) async throws -> CleanedDuplicate
+                                extraDatabaseRecords: Data = Data(), completes: Bool = true) async throws -> CleanedDuplicate
     {
         let keeper = try await fixture.add("keeper.wav", bytes: FinalRemovalIntegrationTests.wav())
         let target = try await fixture.add("target.wav", bytes: FinalRemovalIntegrationTests.wav())
         try fixture.save(paths: [keeper.path, target.path].map(SeratoLibraryLocator.seratoRelativePath))
+        if !extraDatabaseRecords.isEmpty {
+            try (Data(contentsOf: fixture.locator.databaseV2Url) + extraDatabaseRecords).write(to: fixture.locator.databaseV2Url)
+        }
         let crates = try saveCrates(fixture, paths: [keeper.path, target.path])
         for (name, bytes) in otherCrates {
             try bytes.write(to: fixture.locator.subcratesDirectoryUrl.appendingPathComponent(name))
