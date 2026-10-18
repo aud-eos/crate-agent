@@ -333,6 +333,11 @@ struct DuplicatesPanel: View {
                         Text("\(bitrate) kbps")
                             .foregroundStyle(.secondary)
                     }
+                    if file.seratoPlayCount > 0 {
+                        Text(SeratoPlayCountMessages.plays(file.seratoPlayCount))
+                            .foregroundStyle(.secondary)
+                            .help(SeratoPlayCountMessages.explanation)
+                    }
                     if group.mode == .perceptual {
                         statusBadge(file.fingerprintStatus)
                     }

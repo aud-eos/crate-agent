@@ -54,6 +54,12 @@ The play button at the start of each Library row, and beside each file in
 starting another, pressing stop, or leaving the screen ends it. Previewing only
 reads the file.
 
+**Cleanup → Duplicates** suggests a keeper for each group: the better quality, then
+the copy in its artist's folder, then the one Serato played most, then the oldest.
+Play counts come from Serato History, which is read only while Serato is closed and
+never written; each row shows its plays, and **Workers** shows how many plays were
+matched to library files, including plays at an earlier path of a renamed file.
+
 In **Library**, use **Active**, **Removed from Serato**, or **Missing** to inspect
 current membership and availability. Right-click a file for **Show History**;
 retired entries keep their last normal path and cannot be processed. Missing

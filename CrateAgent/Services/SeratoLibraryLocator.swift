@@ -45,6 +45,11 @@ public struct SeratoLibraryLocator: Sendable, Equatable {
         return "\(volumeID):\(directory.path.precomposedStringWithCanonicalMapping)"
     }
 
+    /// Serato's play log, read-only: `History/Sessions/*.session`.
+    public var historyDirectoryUrl: URL {
+        seratoDirectory.appendingPathComponent("History", isDirectory: true)
+    }
+
     public var subcratesDirectoryUrl: URL {
         seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
     }

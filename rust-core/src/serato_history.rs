@@ -71,7 +71,12 @@ pub fn read_history(history_directory: &Path) -> Result<SeratoHistoryScan, Serat
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let bytes = std::fs::read(&session_path)?;
+        let bytes = std::fs::read(&session_path).map_err(|error| {
+            SeratoError::Io(std::io::Error::new(
+                error.kind(),
+                format!("History session {name}: {error}"),
+            ))
+        })?;
         read_session(&bytes, &mut scan).map_err(|error| {
             SeratoError::InvalidFile(format!("History session {name}: {error}"))
         })?;

@@ -288,6 +288,42 @@ establish new intent under the existing membership-revision rules; the older row
 it supersedes no longer blocks the new import. This work does not change shared
 recording ownership rules (#113).
 
+### Serato History play counts
+
+`serato_play_counts` is derived external evidence, like the fingerprint and
+audio-digest caches. It is not a mutation and does not bypass invariant 1: there
+is no user intent to journal and nothing to undo. `SeratoPlayCountService` only
+reads `_Serato_/History`, and never writes `files`, tags or any Serato file.
+
+- **When it refreshes:** after each sync reaches `.ready`, at startup and after
+  Serato quits. While Serato runs, it skips the refresh and keeps the last table.
+  A read during which the watchdog's lifecycle revision changed is discarded, so
+  a session Serato may be appending to is never trusted.
+- **How it parses:** the Rust parser (`read_serato_history`) reads
+  `History/Sessions/*.session` strictly. The parse needs the `vrsn` header, then
+  only `oent` records with one `adat` each. Each `adat` needs a played flag
+  (field 50), and played entries also need a UTF-16 path (field 2) and a start
+  time (field 28).
+  - Loaded-but-unplayed entries are counted and skipped.
+  - Entries whose path is not absolute, such as streaming tracks
+    (`_783160.beatsource`), are skipped by that rule and counted as non-file.
+  - Any other structure fails the whole read, naming the session file. Workers
+    shows the error, and the previous table is kept.
+- **How plays are attributed:** a play counts for the file that was at its path
+  when it started. Each file's past paths come from its `file_renamed`,
+  `file_location_observed` and `file_identity_observed` events. Each event's old
+  path covers the time since the previous change, and the current path covers
+  the time since the last one.
+  - Paths are compared by `SeratoPath.normalized`, so History's absolute paths
+    match V2's root-relative ones, and NFD matches NFC.
+  - A play at a path no file held then, or that two files claimed at that
+    moment, is unattributed. It is counted in the Workers summary and the log,
+    and never guessed.
+- **How it is stored:** the rebuild deletes and reinserts the whole table in one
+  write transaction, which also reads `files` and `events`.
+- **How it is used:** `DuplicateKeeperPicker` ranks most plays between the
+  bucket match and the oldest mtime. Duplicates rows show "N plays".
+
 ## Physical effects and duplicate cleanup
 
 Queued effects retain their original file identity and membership revision. The

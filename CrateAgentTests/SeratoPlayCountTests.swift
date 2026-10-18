@@ -28,7 +28,7 @@ final class SeratoPlayCountTests: XCTestCase {
         service = SeratoPlayCountService(database: database, seratoLocator: locator, watchdog: watchdog)
     }
 
-    private func insertFile(_ path: String, mtime: Int64 = 1, in connection: Database) throws -> Int64 {
+    private nonisolated func insertFile(_ path: String, mtime: Int64 = 1, in connection: Database) throws -> Int64 {
         var file = try FileRecord(path: path, volumeUuid: "play-count-fixture", inode: Int64(FileRecord.fetchCount(connection)) + 1,
                                   fileSize: 4096, mtime: mtime, lightweightHash: sharedHash, bitrateKbps: 320)
         file.libraryMembership = .active
@@ -41,7 +41,7 @@ final class SeratoPlayCountTests: XCTestCase {
         SyntheticSeratoHistory.Entry(path: path, startedAt: base + offset, played: played)
     }
 
-    private func milliseconds(_ offset: UInt32) -> Int64 {
+    private nonisolated func milliseconds(_ offset: UInt32) -> Int64 {
         Int64(base + offset) * 1000
     }
 
@@ -65,9 +65,10 @@ final class SeratoPlayCountTests: XCTestCase {
 
         await service.refresh()
 
-        let group = try await XCTUnwrap(database.writer.read { connection in
-            try DuplicateFinder.findDuplicates(in: connection, mode: .byteLevel).first
-        })
+        let groups = try await database.writer.read { connection in
+            try DuplicateFinder.findDuplicates(in: connection, mode: .byteLevel)
+        }
+        let group = try XCTUnwrap(groups.first)
         XCTAssertEqual(DuplicateKeeperPicker.chooseDefaultKeeper(for: group, musicFolder: URL(fileURLWithPath: "/Music")), newer,
                        "Plays outrank the older-mtime tiebreak")
         let counts = try await playCounts()
@@ -83,19 +84,19 @@ final class SeratoPlayCountTests: XCTestCase {
             let departed = try self.insertFile("/Music/D/d.mp3", in: connection)
             let composed = try self.insertFile("/Music/E/Café.mp3", in: connection)
             _ = try OperationEngine.insertEvent(batchId: "rename", timestamp: self.milliseconds(100), fileId: renamed, eventType: .fileRenamed,
-                                            forwardPayload: RenameFilePayload(fileId: renamed, newPath: "/Music/A/new.mp3", previousPath: "/Music/A/old.mp3"),
-                                            inversePayload: RenameFilePayload(fileId: renamed, newPath: "/Music/A/old.mp3", previousPath: "/Music/A/new.mp3"),
-                                            in: connection)
+                                                forwardPayload: RenameFilePayload(fileId: renamed, newPath: "/Music/A/new.mp3", previousPath: "/Music/A/old.mp3"),
+                                                inversePayload: RenameFilePayload(fileId: renamed, newPath: "/Music/A/old.mp3", previousPath: "/Music/A/new.mp3"),
+                                                in: connection)
             _ = try OperationEngine.insertEvent(batchId: "observe", timestamp: self.milliseconds(200), fileId: movedIn, eventType: .fileLocationObserved,
-                                            forwardPayload: ObserveFileLocationPayload(fileId: movedIn, expectedRevision: 0, path: "/Music/A/old.mp3",
-                                                                                       volumeUuid: "play-count-fixture", inode: 2),
-                                            inversePayload: ObserveFileLocationPayload(fileId: movedIn, expectedRevision: 1, path: "/Music/Elsewhere/b.mp3",
-                                                                                       volumeUuid: "play-count-fixture", inode: 2),
-                                            in: connection)
+                                                forwardPayload: ObserveFileLocationPayload(fileId: movedIn, expectedRevision: 0, path: "/Music/A/old.mp3",
+                                                                                           volumeUuid: "play-count-fixture", inode: 2),
+                                                inversePayload: ObserveFileLocationPayload(fileId: movedIn, expectedRevision: 1, path: "/Music/Elsewhere/b.mp3",
+                                                                                           volumeUuid: "play-count-fixture", inode: 2),
+                                                in: connection)
             _ = try OperationEngine.insertEvent(batchId: "depart", timestamp: self.milliseconds(300), fileId: departed, eventType: .fileRenamed,
-                                            forwardPayload: RenameFilePayload(fileId: departed, newPath: "/Music/D/d.mp3", previousPath: "/Music/C/c.mp3"),
-                                            inversePayload: RenameFilePayload(fileId: departed, newPath: "/Music/C/c.mp3", previousPath: "/Music/D/d.mp3"),
-                                            in: connection)
+                                                forwardPayload: RenameFilePayload(fileId: departed, newPath: "/Music/D/d.mp3", previousPath: "/Music/C/c.mp3"),
+                                                inversePayload: RenameFilePayload(fileId: departed, newPath: "/Music/C/c.mp3", previousPath: "/Music/D/d.mp3"),
+                                                in: connection)
             return (renamed: renamed, movedIn: movedIn, resident: resident, departed: departed, composed: composed)
         }
         try SyntheticSeratoHistory.write([

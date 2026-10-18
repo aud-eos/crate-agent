@@ -141,12 +141,7 @@ enum WorkerCoverageQuery {
 
     static func failureReason(for error: Error) -> String {
         guard let coreError = error as? CoreError else { return error.localizedDescription }
-        switch coreError {
-        case .NotImplemented: return "Fingerprinting is not implemented for this file."
-        case let .InvalidInput(reason): return reason
-        case let .IoError(message), let .SeratoFormat(message), let .Fingerprint(message), let .Tag(message), let .LandedNotDurable(message):
-            return message
-        }
+        return coreError.message ?? "Fingerprinting is not implemented for this file."
     }
 }
 

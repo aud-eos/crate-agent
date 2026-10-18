@@ -14,9 +14,17 @@ public protocol DuplicateFileSource: SeratoConflictTargetFile, Hashable, Sendabl
     var bitrateKbps: Int? { get }
     var fingerprintStatus: FingerprintStatus { get }
     var identity: FileMetadata { get }
+    /// Plays Serato History attributes to this file; a keeper tiebreak.
+    var seratoPlayCount: Int { get }
 }
 
-extension FileRecord: DuplicateFileSource {}
+extension FileRecord: DuplicateFileSource {
+    /// `files` rows do not carry the derived History cache; only
+    /// `DuplicateFileRow`, which the Duplicates scan fetches, joins it.
+    public var seratoPlayCount: Int {
+        0
+    }
+}
 
 /// One member of a duplicate group, fetched by
 /// `DuplicateFinder.findDuplicates(in:mode:)`. Carries the reviewed
@@ -37,10 +45,12 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
     public let title: String?
     public let album: String?
     public let fingerprintStatus: FingerprintStatus
+    public let seratoPlayCount: Int
 
     static let columnsSQL = """
     files.id, files.membership_revision, files.path, files.volume_uuid, files.inode, files.file_size, files.mtime,
-    files.lightweight_hash, files.bitrate_kbps, files.artist, files.title, files.album, files.fingerprint_status
+    files.lightweight_hash, files.bitrate_kbps, files.artist, files.title, files.album, files.fingerprint_status,
+    (SELECT play_count FROM serato_play_counts WHERE serato_play_counts.file_id = files.id) AS serato_play_count
     """
 
     public var identity: FileMetadata {
@@ -65,6 +75,7 @@ public struct DuplicateFileRow: DuplicateFileSource, Identifiable {
             throw DuplicateScanError.unknownFingerprintStatus(status)
         }
         self.fingerprintStatus = fingerprintStatus
+        seratoPlayCount = row["serato_play_count"] ?? 0
     }
 }
 
