@@ -119,10 +119,24 @@ actor SyncCheckpointStore {
         return header
     }
 
+    /// Sorted keys make equal values encode to equal bytes, which
+    /// `decodeCanonical` checks before any structural comparison.
+    static func encodeCanonical(_ value: some Encodable) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(value)
+    }
+
     static func decodeCanonical<Value: Codable>(_ type: Value.Type, from bytes: Data) throws -> Value {
         let value = try JSONDecoder().decode(type, from: bytes)
+        let reencoded = try encodeCanonical(value)
+        // Parsing both sides costs more than the decode. Bytes written by
+        // `encodeCanonical` match exactly; only other encodings need it.
+        if reencoded == bytes, bytes.first == UInt8(ascii: "{") {
+            return value
+        }
         let original = try JSONSerialization.jsonObject(with: bytes) as? NSDictionary
-        let canonical = try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? NSDictionary
+        let canonical = try JSONSerialization.jsonObject(with: reencoded) as? NSDictionary
         guard let original, let canonical, original.isEqual(canonical) else {
             throw SyncCheckpointError.malformed
         }
@@ -161,10 +175,9 @@ actor SyncCheckpointStore {
         defer { isPublishing = false }
         guard checkpoint.header.formatVersion == SyncCheckpointHeader.currentVersion,
               checkpoint.header.complete else { throw SyncCheckpointError.malformed }
-        let encoder = JSONEncoder()
-        let headerBytes = try encoder.encode(checkpoint.header)
-        let records = try checkpoint.records.map { record in try (record.pathBytes, encoder.encode(record.metadata)) }
-        let files = try checkpoint.files.map { file in try (file, encoder.encode(file)) }
+        let headerBytes = try Self.encodeCanonical(checkpoint.header)
+        let records = try checkpoint.records.map { record in try (record.pathBytes, Self.encodeCanonical(record.metadata)) }
+        let files = try checkpoint.files.map { file in try (file, Self.encodeCanonical(file)) }
         let previous = try await database.writer.read { connection in
             try Self.requirePublishable(checkpoint, expectedRevision: expectedRevision, source: sourceAuthorization, in: connection)
             return try Self.currentGeneration(in: connection)
