@@ -144,19 +144,38 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         return page
     }
 
-    /// Visible rows, the rows Select all would select, and whether any family is shown, in one pass.
+    /// Visible rows, the rows Select all would select, and whether any family is shown.
     func counts(in database: GRDB.Database) throws -> (visible: Int, selectAll: Int, hasFamilies: Bool) {
-        let alternates = includeAlternates ? "placed.available" : "0"
-        guard let row = try GRDB.Row.fetchOne(database, sql: """
-        \(placedSQL)
-        SELECT COUNT(*) FILTER (WHERE \(visibleSQL)) AS visible,
-               COUNT(*) FILTER (WHERE placed.in_scope AND (placed.family_role != \(LibraryFamilyRole.alternate.rawValue) OR \(alternates))) AS select_all,
-               COUNT(*) FILTER (WHERE placed.in_scope AND placed.family_role = \(LibraryFamilyRole.main.rawValue)) > 0 AS has_families
-        FROM placed
-        """, arguments: arguments) else {
-            throw PagingError.incompletePage
+        try counts(of: placements(in: database))
+    }
+
+    /// The same counts from placements already read, so a snapshot runs the projection once for them all.
+    func counts(of placements: [LibraryFamilyPlacement]) -> (visible: Int, selectAll: Int, hasFamilies: Bool) {
+        var visible = 0
+        var selectAll = 0
+        var hasFamilies = false
+        for placement in placements where !placement.isHiddenBySearch {
+            if isVisible(placement) {
+                visible += 1
+            }
+            if isSelectedByAll(placement) {
+                selectAll += 1
+            }
+            hasFamilies = hasFamilies || placement.role == .main
         }
-        return (row["visible"], row["select_all"], row["has_families"])
+        return (visible, selectAll, hasFamilies)
+    }
+
+    /// A counted file shows as a row unless it is the alternate of a family that is neither expanded nor searched,
+    /// as `visibleSQL` pages them.
+    func isVisible(_ placement: LibraryFamilyPlacement) -> Bool {
+        !placement.isHiddenBySearch
+            && (placement.role != .alternate || isSearching || placement.familyId.map(expandedFamilies.contains) == true)
+    }
+
+    /// Select all takes main and standalone rows, plus eligible alternates when the query includes them.
+    func isSelectedByAll(_ placement: LibraryFamilyPlacement) -> Bool {
+        !placement.isHiddenBySearch && (placement.role != .alternate || (includeAlternates && placement.isEligible))
     }
 
     func rows(in database: GRDB.Database, range: Range<Int>) throws -> [BrowserRow] {
@@ -176,38 +195,22 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         """, arguments: lookup)
     }
 
-    /// Counted members of the given families, read from the family CTEs alone.
-    func familyPlacements(_ familyIds: Set<Int64>, in database: GRDB.Database) throws -> [LibraryFamilyPlacement] {
-        var lookup = arguments
-        lookup += ["families": "[" + familyIds.sorted().map(String.init).joined(separator: ",") + "]"]
-        return try GRDB.Row.fetchAll(database, sql: """
-        \(placedSQL)
-        SELECT family_files.id, family_files.membership_revision, family_files.family_id, family_files.available,
-               family_files.id = heads.head_id AS is_head, family_files.matches
-        FROM family_files JOIN heads ON heads.family_id = family_files.family_id JOIN families ON families.family_id = family_files.family_id
-        WHERE family_files.family_id IN (SELECT value FROM json_each(:families))
-          AND families.matched
-        ORDER BY family_files.id
-        """, arguments: lookup).map { row in
-            LibraryFamilyPlacement(identity: .init(id: row["id"], revision: row["membership_revision"]), familyId: row["family_id"],
-                                   role: row["is_head"] ? .main : .alternate, isEligible: row["available"],
-                                   isHiddenBySearch: !(row["is_head"] as Bool) && !(row["matches"] as Bool))
-        }
-    }
-
     /// Every counted file's family placement, in id order, with the members
     /// of shown families that the search hides, so a selection of them stays
     /// in scope for family commands.
+    /// Read through a cursor by column position: every snapshot opens with this read, over every file.
     func placements(in database: GRDB.Database) throws -> [LibraryFamilyPlacement] {
-        try GRDB.Row.fetchAll(database, sql: """
+        let rows = try GRDB.Row.fetchCursor(database, sql: """
         \(placedSQL)
         SELECT id, membership_revision, family_id, family_role, available, NOT in_scope AS hidden_by_search FROM placed
         WHERE in_scope OR (family_role = \(LibraryFamilyRole.alternate.rawValue) AND family_matched) ORDER BY id
-        """, arguments: arguments).map { row in
-            try LibraryFamilyPlacement(identity: .init(id: row["id"], revision: row["membership_revision"]), familyId: row["family_id"],
-                                       role: LibraryFamilyRole.decode(row["family_role"]), isEligible: row["available"],
-                                       isHiddenBySearch: row["hidden_by_search"])
+        """, arguments: arguments)
+        var placements: [LibraryFamilyPlacement] = []
+        while let row = try rows.next() {
+            try placements.append(LibraryFamilyPlacement(identity: .init(id: row[0], revision: row[1]), familyId: row[2],
+                                                         role: LibraryFamilyRole.decode(row[3]), isEligible: row[4], isHiddenBySearch: row[5]))
         }
+        return placements
     }
 }
 
