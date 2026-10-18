@@ -6,7 +6,7 @@ import GRDB
 /// eligibility check on a fingerprinted file reads that row's overflow page.
 enum AddFilesProcessableIndexMigration {
     static func register(in migrator: inout DatabaseMigrator) {
-        migrator.registerMigration("026_add_files_processable_index") { database in
+        migrator.registerMigration("028_add_files_processable_index") { database in
             try database.create(index: "files_processable", on: "files",
                                 columns: ["library_membership", "file_availability", "fingerprint_status"])
         }

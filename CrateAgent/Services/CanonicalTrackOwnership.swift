@@ -82,6 +82,11 @@ enum CanonicalTrackOwnership {
         if let value = restored(\.isrc, wrote: identity) {
             track.isrc = value
         }
+        // A match journaled before #262 has no work in its snapshot, so
+        // undoing it also clears a work the backfill added for its recording.
+        if let value = restored(\.workMBID, wrote: identity) {
+            track.musicbrainzWorkId = value
+        }
         if let value = restored(\.artist, wrote: \.wroteDisplay.artist) {
             track.artist = value
         }

@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 /// Looks up full MusicBrainz recording metadata (releases, release-group
-/// first-release-date, artist-credit, ISRCs) by recording MBID. A cache hit
+/// first-release-date, artist-credit, ISRCs, performed works) by recording MBID. A cache hit
 /// returns without any network call; a miss sends `GET
 /// /ws/2/recording/<mbid>`, retrying on 429/503 via
 /// `RetryingLookupRequester` (the same backoff mechanic `AcoustIDClient`
@@ -191,7 +191,7 @@ public struct MusicBrainzClient: Sendable {
         return releases
     }
 
-    private func makeRequest(mbid: String, includes: String = "releases+release-groups+artist-credits+isrcs") -> URLRequest {
+    private func makeRequest(mbid: String, includes: String = "releases+release-groups+artist-credits+isrcs+work-rels") -> URLRequest {
         let encodedMBID = mbid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? mbid
         let url = URL(string: "\(Self.baseURLString)\(encodedMBID)?inc=\(includes)&fmt=json")!
         var request = URLRequest(url: url)
@@ -214,8 +214,9 @@ public struct MusicBrainzClient: Sendable {
     /// Not `private`: the test target computes the same key to seed a
     /// corrupt cache entry (`@testable import` only lifts `private` up to
     /// `internal`, not below it).
+    /// v3 added work relations (#262); a v2 entry has none, so it is refetched.
     static func cacheKey(forMBID mbid: String) -> String {
-        "mb:complete-v2:\(mbid)"
+        "mb:complete-v3:\(mbid)"
     }
 
     private static func detailsCacheKey(forMBID mbid: String) -> String {
