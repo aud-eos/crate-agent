@@ -82,6 +82,8 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case fileTrashed = "file_trashed"
     case trackRemovedFromSerato = "track_removed_from_serato"
     case fileRemovedFromCrates = "file_removed_from_crates"
+    case fileRestoredFromTrash = "file_restored_from_trash"
+    case seratoRecordsRestored = "serato_records_restored"
     case musicBrainzMatchApplied = "music_brainz_match_applied"
     case musicBrainzMatchReverted = "music_brainz_match_reverted"
     case songFamilyCreated = "song_family_created"
@@ -122,7 +124,7 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
             // re-synced (finding #3999974011).
             true
         case .trackImported, .fileRemoved, .metadataSet, .trackAddedToSerato,
-             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
+             .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates, .fileRestoredFromTrash, .seratoRecordsRestored, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged,
              .songFamilySplit, .songFamilyRepresentativeChanged, .songFamilyRestored,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,

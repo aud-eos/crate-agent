@@ -11,6 +11,7 @@ enum SeratoWriteDispositionMessages {
         case .legacyUnrecoverable: "\(changes(count, "pre-upgrade")) could not be resumed"
         case .noSeratoRecord: "\(changes(count, nil)) not applied because Serato's database has no entry at their path"
         case .discarded: QueuedChangeDiscardMessages.disposition(count: count)
+        case .storeMissing: RemovalUndoMessages.storeMissingSummary(count: count)
         }
     }
 

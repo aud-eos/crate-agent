@@ -60,7 +60,23 @@ final class PhysicalFileMoveTransaction {
         else {
             throw FileProcessingEligibilityError.superseded(fileId: payload.fileId)
         }
-        let destination = URL(fileURLWithPath: payload.newPath)
+        return try transfer(ownedSource, to: URL(fileURLWithPath: payload.newPath))
+    }
+
+    /// Moves a removed file's verified Trash item back to `originalPath`.
+    func restore(_ trashItem: FileMetadata, to originalPath: String) throws -> FileMetadata {
+        let ownedSource = try OwnedAudioIdentity.read(at: trashItem.path)
+        let source = ownedSource.metadata
+        guard source.volumeUuid == trashItem.volumeUuid, source.inode == trashItem.inode, source.fileSize == trashItem.fileSize,
+              source.hasSameModificationTime(as: trashItem), trashItem.lightweightHash == nil || source.lightweightHash == trashItem.lightweightHash
+        else {
+            throw MoveError.sourceChanged(trashItem.path)
+        }
+        return try transfer(ownedSource, to: URL(fileURLWithPath: originalPath))
+    }
+
+    private func transfer(_ ownedSource: OwnedAudioIdentity, to destination: URL) throws -> FileMetadata {
+        let source = ownedSource.metadata
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw LibraryOrganizer.OrganizerError.destinationAlreadyExists(path: destination.path)
         }

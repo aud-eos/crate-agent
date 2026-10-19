@@ -20,7 +20,8 @@ struct GuardedSeratoWrite: Sendable, Equatable {
     var externalBaseline: SeratoMetadata?
     /// The fields `externalBaseline` actually knows; nil means all of them.
     var baselineKnownFields: Set<String>?
-    var requiredKeeper: FileActionAuthority?
+    /// The pending removal this removal step's write was queued under.
+    var cleanupAuthority: RemovalAuthority?
     /// Set for one drain pass: a later rename in it moves a different file
     /// into this rename's old path, as in a chain or swap, so that file sitting
     /// there does not mean the path stopped naming this track.
@@ -66,7 +67,7 @@ enum SeratoWriteEligibility {
             result.write = .removeFromDatabase(.init(absolutePath: referencePath(write.absolutePath, file: file)))
         case let .removeFromCrates(write):
             result.write = .removeFromCrates(.init(absolutePath: referencePath(write.absolutePath, file: file)))
-        case .rename: break
+        case .rename, .restoreRecords: break
         }
         return result
     }
@@ -79,7 +80,7 @@ enum SeratoWriteEligibility {
     }
 
     static func requirePhysicalTarget(_ guarded: GuardedSeratoWrite, file: FileRecord, in database: Database) throws {
-        try guarded.requiredKeeper?.validate(in: database)
+        try guarded.cleanupAuthority?.validateKeeper(in: database)
         let current: FileMetadata
         do { current = try FileMetadataCollector.collectVerified(at: file.path) }
         catch { throw FileProcessingEligibilityError.superseded(fileId: guarded.token.fileId) }
@@ -100,6 +101,7 @@ enum SeratoWriteEligibility {
         switch guarded.write {
         case let .fileTagWrite(write): try requirePath(write.absolutePath, file: file)
         case let .trashFile(write): try requirePath(write.absolutePath, file: file)
+        case let .restoreRecords(write): try requirePath(write.absolutePath, file: file)
         case let .addTrack(write): try requirePath(write.absolutePath, file: file)
         case let .metadataUpdate(write): try requireReference(write.absolutePath, file: file)
         case let .removeFromDatabase(write): try requireReference(write.absolutePath, file: file)
@@ -167,6 +169,9 @@ enum SeratoWriteEligibility {
         if case .addTrack = write {
             return file.libraryMembership == .pendingImport && file.fileAvailability == .available
         }
+        if case let .restoreRecords(restore) = write, restore.absolutePath != file.path {
+            return false
+        }
         return file.libraryMembership == .active && file.fileAvailability == .available
     }
 
@@ -187,9 +192,9 @@ enum SeratoWriteEligibility {
 }
 
 extension GuardedSeratoWrite {
-    /// A cleanup step's write whose cleanup was cancelled or finished; it no
-    /// longer has the keeper authority it was queued under.
+    /// A removal step's write whose removal was cancelled or finished; it no
+    /// longer has the authority it was queued under.
     var isOrphanedCleanup: Bool {
-        cleanupTargetFileID != nil && requiredKeeper == nil
+        cleanupTargetFileID != nil && cleanupAuthority == nil
     }
 }

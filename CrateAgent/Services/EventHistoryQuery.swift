@@ -17,10 +17,14 @@ public struct BatchSummary: Sendable, Equatable, Identifiable {
     /// Human-readable summary like "Renamed 1 file · Updated metadata
     /// for 2 files". Built from per-event-type counts.
     public let description: String
-    /// `false` when the batch contains any event whose inverse isn't
-    /// supported by `OperationEngine.undoBatch` today (`trackAddedToSerato`,
-    /// `metadataCommittedToSerato`). Used to disable the Undo button.
-    public let canUndo: Bool
+    /// Why `OperationEngine.undoBatch` can't undo the batch today, or nil
+    /// when it can: an event type with no supported inverse, or a removal
+    /// journaled before removals were undoable. Disables the Undo button.
+    public let undoUnavailableReason: String?
+    public var canUndo: Bool {
+        undoUnavailableReason == nil
+    }
+
     /// `true` when the batch id starts with `undo:` — i.e., this
     /// batch was itself produced by an undoBatch call. Surfaced so
     /// the UI can label "Undo of …" rows differently if desired.
@@ -166,6 +170,7 @@ public enum EventHistoryQuery {
             let firstTimestamp: Int64
             let eventTypes: String // comma-separated EventType raw values
             let eventCount: Int
+            let hasLegacyRemoval: Bool
         }
 
         // GROUP BY batch_id; for each batch capture earliest timestamp,
@@ -176,7 +181,9 @@ public enum EventHistoryQuery {
             batch_id AS batchId,
             MIN(timestamp) AS firstTimestamp,
             GROUP_CONCAT(event_type) AS eventTypes,
-            COUNT(*) AS eventCount
+            COUNT(*) AS eventCount,
+            MAX(CASE WHEN event_type IN (\(legacyRemovalTypes))
+                THEN COALESCE(json_extract(inverse_payload_json, '$.reason') = ?, 0) ELSE 0 END) AS hasLegacyRemoval
         FROM events
         GROUP BY batch_id
         ORDER BY MIN(timestamp) DESC
@@ -184,7 +191,7 @@ public enum EventHistoryQuery {
         """
 
         let (rows, notApplied, stuck): ([Row], [String: NotAppliedBatchCounts], [QueuedSeratoChange]) = try await database.writer.read { db in
-            let rows = try Row.fetchAll(db, sql: sql, arguments: [limit])
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [OperationEngine.NonUndoableInverse.reasonValue, limit])
             return try (rows, SeratoWriteDispositions.notAppliedByBatch(rows.map(\.batchId), in: db), QueuedSeratoChanges.stuck(in: db))
         }
         let stuckByBatch = Dictionary(grouping: stuck, by: \.batchID)
@@ -198,7 +205,8 @@ public enum EventHistoryQuery {
                 firstTimestampMillis: row.firstTimestamp,
                 eventCount: row.eventCount,
                 description: describeBatch(typeCounts: typeCounts),
-                canUndo: canUndoBatch(typeList: typeList),
+                undoUnavailableReason: row.hasLegacyRemoval ? RemovalUndoMessages.legacyRemovalNotUndoable
+                    : canUndoBatch(typeList: typeList) ? nil : HistoryMessages.undoUnsupported,
                 isUndoBatch: row.batchId.hasPrefix("undo:"),
                 isDiscardBatch: row.batchId.hasPrefix(OperationEngine.discardBatchPrefix),
                 canResync: canResyncBatch(typeList: typeList)
@@ -208,6 +216,11 @@ public enum EventHistoryQuery {
             )
         }
     }
+
+    /// Removals journaled before this version carry the non-undoable sentinel
+    /// inverse; only their types can, so only they are decoded as JSON.
+    private static let legacyRemovalTypes = [EventType.fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates]
+        .map { eventType in "'\(eventType.rawValue)'" }.joined(separator: ", ")
 
     /// A batch has been undone when an `undo:<batchId>:<uuid>` batch exists for
     /// it. Offering Re-sync on such a batch would replay its old forward writes
@@ -231,13 +244,10 @@ public enum EventHistoryQuery {
     }
 
     static func canUndoBatch(typeList: [String]) -> Bool {
-        // Mirror OperationEngine.decodeInverseMutation's whitelist.
-        // `metadataCommittedToSerato` was on this list before SP-1.5
-        // landed undo-aware commits — every production caller today
-        // (the hygiene runner) supplies `previousMetadata`, so the
-        // engine accepts the inverse. Only `trackAddedToSerato`
-        // remains unconditionally unsupported (it needs a Rust-side
-        // removeTrackFromSerato FFI we don't have yet).
+        // Mirror OperationEngine.decodeInverseMutation: these event types
+        // have no inverse it accepts. Observations and import requests
+        // record state rather than change it, `trackAddedToSerato` has no
+        // inverse yet, and the two removal-restore types refuse redo.
         let unsupportedRaw: Set<String> = [
             EventType.trackAddedToSerato.rawValue,
             EventType.fileLocationObserved.rawValue,
@@ -245,9 +255,9 @@ public enum EventHistoryQuery {
             EventType.fileModificationTimeRecorded.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
             EventType.fileImportRequested.rawValue,
-            EventType.fileTrashed.rawValue,
-            EventType.trackRemovedFromSerato.rawValue,
-            EventType.fileRemovedFromCrates.rawValue,
+            // Redo of an undone removal is #270.
+            EventType.fileRestoredFromTrash.rawValue,
+            EventType.seratoRecordsRestored.rawValue,
         ]
         return !typeList.contains(where: unsupportedRaw.contains)
     }
@@ -310,6 +320,10 @@ public enum EventHistoryQuery {
             return "Removed \(count) track\(pluralS) from Serato's database"
         case .fileRemovedFromCrates:
             return "Removed \(count) file\(pluralS) from Serato crates"
+        case .fileRestoredFromTrash:
+            return RemovalUndoMessages.restoredFromTrashPhrase(count: count)
+        case .seratoRecordsRestored:
+            return RemovalUndoMessages.recordsRestoredPhrase(count: count)
         case .trackAddedToSerato:
             return "Added \(count) track\(pluralS) to Serato"
         case .musicBrainzMatchApplied:

@@ -102,7 +102,8 @@ enum QueuedChangeDiscardMutation {
         case .trackRemovedFromSerato: [.removeFromDatabase]
         case .fileRemovedFromCrates: [.removeFromCrates]
         case .fileTrashed: [.trashFile]
-        case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved,
+        case .seratoRecordsRestored: [.restoreRecords]
+        case .trackImported, .fileRemoved, .fileRestoredFromTrash, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved,
              .fileModificationTimeRecorded, .fileImportRequested, .songFamilyCreated, .songFamilyMembersAttached,
              .songFamilyMembersDetached, .songFamiliesMerged, .songFamilySplit, .songFamilyRepresentativeChanged,
              .songFamilyRestored, .songFamilyRecordingLinked, .songFamilyRecordingUnlinked, .duplicateLabelsKeptBoth,
@@ -156,7 +157,7 @@ enum QueuedChangeDiscardMutation {
                 DiscardedFieldChange(field: change.field, discarded: change.restored, restored: change.discarded)
             }
         case .trackImported, .fileRemoved, .trackAddedToSerato, .fileTrashed, .trackRemovedFromSerato, .fileRemovedFromCrates,
-             .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
+             .fileRestoredFromTrash, .seratoRecordsRestored, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .songFamilyCreated, .songFamilyMembersAttached, .songFamilyMembersDetached, .songFamiliesMerged, .songFamilySplit,
              .songFamilyRepresentativeChanged, .songFamilyRestored, .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,

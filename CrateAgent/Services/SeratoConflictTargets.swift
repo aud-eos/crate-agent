@@ -10,6 +10,9 @@ enum SeratoConflictTargets {
             fileID = try FileRecord.filter(Column("path") == payload.path).fetchOne(database)?.id
             target.paths.append(payload.path)
             target.physicalIdentities.insert(.init(volumeID: payload.volumeUuid, inode: UInt64(bitPattern: payload.inode)))
+            if let trackID = payload.recording?.trackId {
+                target.sharedTrackIDs.insert(trackID)
+            }
         case let .renameFile(payload):
             fileID = payload.fileId
             target.paths += [payload.previousPath, payload.newPath].filter { path in !path.isEmpty }
@@ -45,6 +48,16 @@ enum SeratoConflictTargets {
         case let .trashFile(payload): fileID = payload.fileId
         case let .removeTrackFromSerato(payload): fileID = payload.fileId
         case let .removeFileFromCrates(payload): fileID = payload.fileId
+        case let .restoreFromTrash(payload):
+            fileID = try FileRecord.filter(Column("path") == payload.originalPath).fetchOne(database)?.id
+            target.paths.append(payload.originalPath)
+            include(payload.identity, in: &target)
+            if let trashItem = try SeratoRemovalCaptureStore.trashDestination(eventID: payload.removalEventID, in: database)?.identity {
+                include(trashItem, in: &target)
+            }
+        case let .restoreSeratoRecords(payload):
+            fileID = try FileRecord.filter(Column("path") == payload.trackPath).fetchOne(database)?.id
+            target.paths.append(payload.trackPath)
         case let .applyMusicBrainzMatch(payload):
             fileID = payload.fileID
             try includeSharedTrack(payload.fingerprintHash, in: &target, database: database)
@@ -89,7 +102,7 @@ enum SeratoConflictTargets {
         if let file = try FileRecord.fetchOne(database, key: write.token.fileId) {
             target.include(file)
         }
-        if let keeper = write.requiredKeeper {
+        if let keeper = write.cleanupAuthority?.keeper {
             target.fileIDs.insert(keeper.token.fileId)
             include(keeper.identity, in: &target)
             if let file = try FileRecord.fetchOne(database, key: keeper.token.fileId) {
@@ -186,6 +199,7 @@ extension SeratoPendingWrite {
         case let .fileTagWrite(payload): [payload.absolutePath]
         case let .removeFromDatabase(payload), let .removeFromCrates(payload): [payload.absolutePath]
         case let .trashFile(payload): [payload.absolutePath]
+        case let .restoreRecords(payload): [payload.absolutePath]
         }
     }
 }

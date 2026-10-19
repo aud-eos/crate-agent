@@ -144,9 +144,7 @@ struct HistoryView: View {
                 Task { await undo(batch: batch) }
             }
             .disabled(!batch.canUndo || undoInFlightBatchId != nil || resyncInFlightBatchId != nil)
-            .help(batch.canUndo
-                ? "Reverse every change in this batch."
-                : "This batch contains operations that can't be undone yet (Serato-side imports/commits).")
+            .help(batch.undoUnavailableReason ?? "Reverse every change in this batch.")
         }
         .padding(.vertical, density.rowPadding)
     }

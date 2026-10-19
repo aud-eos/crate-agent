@@ -9,13 +9,14 @@ enum SeratoWriteKind: String, Codable, Sendable {
     case removeFromDatabase
     case removeFromCrates
     case trashFile
+    case restoreRecords
 
     /// Writes to Serato's library files (database V2, crates, smart crates),
     /// which all wait together while `database V2` is missing (#192). Audio
     /// tags and Trash are not Serato library files.
     var writesSeratoLibrary: Bool {
         switch self {
-        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates: true
+        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates, .restoreRecords: true
         case .fileTagWrite, .trashFile: false
         }
     }
@@ -36,6 +37,7 @@ extension SeratoPendingWrite: Codable {
         case .removeFromDatabase: .removeFromDatabase
         case .removeFromCrates: .removeFromCrates
         case .trashFile: .trashFile
+        case .restoreRecords: .restoreRecords
         }
     }
 
@@ -49,6 +51,7 @@ extension SeratoPendingWrite: Codable {
         case .removeFromDatabase: self = try .removeFromDatabase(container.decode(SeratoPendingRemoval.self, forKey: .value))
         case .removeFromCrates: self = try .removeFromCrates(container.decode(SeratoPendingRemoval.self, forKey: .value))
         case .trashFile: self = try .trashFile(container.decode(SeratoPendingTrash.self, forKey: .value))
+        case .restoreRecords: self = try .restoreRecords(container.decode(SeratoPendingRestore.self, forKey: .value))
         }
     }
 
@@ -62,6 +65,7 @@ extension SeratoPendingWrite: Codable {
         case let .fileTagWrite(value): try container.encode(value, forKey: .value)
         case let .removeFromDatabase(value), let .removeFromCrates(value): try container.encode(value, forKey: .value)
         case let .trashFile(value): try container.encode(value, forKey: .value)
+        case let .restoreRecords(value): try container.encode(value, forKey: .value)
         }
     }
 }
@@ -242,7 +246,7 @@ enum SeratoWriteQueue {
             case let .rename(later): later.oldAbsolutePath
             case let .metadataUpdate(update): update.absolutePath
             case let .removeFromDatabase(removal), let .removeFromCrates(removal): removal.absolutePath
-            case .addTrack, .fileTagWrite, .trashFile: nil
+            case .addTrack, .fileTagWrite, .trashFile, .restoreRecords: nil
             }
             guard let referencePath, SeratoPath.normalized(referencePath) == newPath else { continue }
             stranded.append(SeratoStrandedWrite(write: write, detail: SeratoWriteDispositionMessages.unarrivedRename(at: rename.newAbsolutePath),
@@ -475,6 +479,8 @@ enum SeratoWriteDisposition: String, Sendable, CaseIterable {
     case legacyUnrecoverable
     case malformed
     case noSeratoRecord
+    /// A restore's crate was deleted after the removal it undoes.
+    case storeMissing
     /// Dropped by the user, who reverted the change in the same batch (#163).
     case discarded
 }
@@ -668,18 +674,20 @@ struct NotAppliedFileRecord: Sendable, Equatable {
 /// the transaction of its first step and advanced in the transactions that
 /// complete each step's external effects.
 enum DuplicateCleanupStore {
+    /// A removal with no keeper is the owner's choice; rows saved before
+    /// owner-chosen removals existed always carry a keeper.
     private struct Authority: Codable {
         let target: FileActionAuthority
-        let keeper: FileActionAuthority
+        let keeper: FileActionAuthority?
         let batchID: String
         let evidenceRequirement: DuplicateEvidenceRequirement?
     }
 
-    static func fetch(targetFileID: Int64, in database: Database) throws -> PendingDuplicateCleanup? {
+    static func fetch(targetFileID: Int64, in database: Database) throws -> PendingFileRemoval? {
         try Row.fetchOne(database, sql: "SELECT * FROM duplicate_cleanup_intents WHERE target_file_id = ?", arguments: [targetFileID]).map(decode)
     }
 
-    static func fetchAll(in database: Database) throws -> [PendingDuplicateCleanup] {
+    static func fetchAll(in database: Database) throws -> [PendingFileRemoval] {
         try Row.fetchAll(database, sql: "SELECT * FROM duplicate_cleanup_intents ORDER BY target_file_id").map(decode)
     }
 
@@ -687,9 +695,18 @@ enum DuplicateCleanupStore {
         try Bool.fetchOne(database, sql: "SELECT EXISTS(SELECT 1 FROM duplicate_cleanup_intents)") ?? false
     }
 
-    static func save(_ intent: PendingDuplicateCleanup, in database: Database) throws {
-        let authority = try SyncCheckpointStore.encodeCanonical(Authority(target: intent.target, keeper: intent.keeper, batchID: intent.batchID,
-                                                                          evidenceRequirement: intent.evidenceRequirement))
+    static func isKeeper(fileID: Int64, in database: Database) throws -> Bool {
+        try fetchAll(in: database).contains { intent in intent.authority.keeper?.token.fileId == fileID }
+    }
+
+    static func save(_ intent: PendingFileRemoval, in database: Database) throws {
+        let stored = switch intent.authority {
+        case let .duplicateOf(keeper, requirement):
+            Authority(target: intent.target, keeper: keeper, batchID: intent.batchID, evidenceRequirement: requirement)
+        case .ownerChoice:
+            Authority(target: intent.target, keeper: nil, batchID: intent.batchID, evidenceRequirement: nil)
+        }
+        let authority = try SyncCheckpointStore.encodeCanonical(stored)
         try database.execute(sql: """
         INSERT OR REPLACE INTO duplicate_cleanup_intents (target_file_id, payload, step, waiting_event_id, removed_v2, failure)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -724,11 +741,17 @@ enum DuplicateCleanupStore {
         try save(intent, in: database)
     }
 
-    private static func decode(_ row: Row) throws -> PendingDuplicateCleanup {
+    private static func decode(_ row: Row) throws -> PendingFileRemoval {
         let bytes: Data = row["payload"]
-        let authority = try SyncCheckpointStore.decodeCanonical(Authority.self, from: bytes)
-        var intent = PendingDuplicateCleanup(target: authority.target, keeper: authority.keeper, batchID: authority.batchID,
-                                             evidenceRequirement: authority.evidenceRequirement)
+        let stored = try SyncCheckpointStore.decodeCanonical(Authority.self, from: bytes)
+        let authority: RemovalAuthority
+        if let keeper = stored.keeper {
+            authority = .duplicateOf(keeper, stored.evidenceRequirement)
+        } else {
+            guard stored.evidenceRequirement == nil else { throw SyncCheckpointError.malformed }
+            authority = .ownerChoice
+        }
+        var intent = PendingFileRemoval(target: stored.target, authority: authority, batchID: stored.batchID)
         intent.step = row["step"]
         intent.waitingEventID = row["waiting_event_id"]
         intent.removedV2 = row["removed_v2"]

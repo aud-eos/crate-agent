@@ -314,6 +314,7 @@ final class FinalRemovalIntegrationTests: XCTestCase {
         let engine = OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator, fileTrasher: { path in
             try FileManager.default.moveItem(atPath: path, toPath: retained.path)
             try replacement.write(to: URL(fileURLWithPath: path))
+            return retained.path
         })
         let group = try await DuplicateFinder.DuplicateGroup.confirmedByteLevel("final-delete", files: [keeper, target], in: fixture.database)
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
@@ -604,7 +605,9 @@ final class FinalRemovalIntegrationTests: XCTestCase {
     private func cleanupEngine(_ fixture: SeratoRemovalFixture) -> OperationEngine {
         let directory = fixture.directory
         return OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator, fileTrasher: { path in
-            try FileManager.default.moveItem(atPath: path, toPath: directory.appendingPathComponent("owned-trash-" + (path as NSString).lastPathComponent).path)
+            let destination = directory.appendingPathComponent("owned-trash-" + (path as NSString).lastPathComponent).path
+            try FileManager.default.moveItem(atPath: path, toPath: destination)
+            return destination
         })
     }
 

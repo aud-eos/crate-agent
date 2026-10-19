@@ -179,6 +179,12 @@ struct NativeTrashIndex {
 
     private var trashByVolume: [String: TrashDirectory] = [:]
     private var listingByTrash: [String: Listing] = [:]
+    private let trashDirectoryContaining: @Sendable (URL) throws -> URL
+
+    /// `trashDirectory` names the Trash that would hold a file, by default the user's.
+    init(trashDirectory: @escaping @Sendable (URL) throws -> URL = FileAvailabilityResolver.systemTrashDirectory) {
+        trashDirectoryContaining = trashDirectory
+    }
 
     private enum TrashDirectory {
         case path(String)
@@ -218,7 +224,7 @@ struct NativeTrashIndex {
         }
         let trash: TrashDirectory
         do {
-            trash = try .path(FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: directory, create: false).path)
+            trash = try .path(trashDirectoryContaining(directory).path)
         } catch let error as CocoaError where [.fileNoSuchFile, .fileReadNoSuchFile].contains(error.code) {
             trash = .absent
         } catch let error as CocoaError where error.code == .fileReadNoPermission {

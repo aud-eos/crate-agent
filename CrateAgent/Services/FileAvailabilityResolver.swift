@@ -4,21 +4,35 @@ import Foundation
 public struct FileAvailabilityResolver: Sendable {
     private let mountedVolumes: @Sendable () throws -> [URL]
     private let volumeIdentifier: @Sendable (URL) throws -> String?
+    let trashDirectory: @Sendable (URL) throws -> URL
 
     public init() {
-        self.init(mountedVolumes: {
-            guard let volumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeUUIDStringKey]) else {
-                throw CocoaError(.fileReadUnknown)
-            }
-            return volumes
-        }, volumeIdentifier: { volume in
-            try volume.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
-        })
+        self.init(mountedVolumes: Self.systemMountedVolumes, volumeIdentifier: Self.systemVolumeIdentifier)
     }
 
-    init(mountedVolumes: @escaping @Sendable () throws -> [URL], volumeIdentifier: @escaping @Sendable (URL) throws -> String?) {
+    /// `trashDirectory` names the Trash that would hold a file, by default the user's.
+    init(mountedVolumes: @escaping @Sendable () throws -> [URL] = Self.systemMountedVolumes,
+         volumeIdentifier: @escaping @Sendable (URL) throws -> String? = Self.systemVolumeIdentifier,
+         trashDirectory: @escaping @Sendable (URL) throws -> URL = Self.systemTrashDirectory)
+    {
         self.mountedVolumes = mountedVolumes
         self.volumeIdentifier = volumeIdentifier
+        self.trashDirectory = trashDirectory
+    }
+
+    static let systemMountedVolumes: @Sendable () throws -> [URL] = {
+        guard let volumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeUUIDStringKey]) else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return volumes
+    }
+
+    static let systemVolumeIdentifier: @Sendable (URL) throws -> String? = { volume in
+        try volume.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+    }
+
+    static let systemTrashDirectory: @Sendable (URL) throws -> URL = { fileURL in
+        try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: fileURL, create: false)
     }
 
     public func inspect(path: String, volumeID: String) throws -> FileAvailability {
@@ -43,7 +57,7 @@ public struct FileAvailabilityResolver: Sendable {
         }
         let fileURL = URL(fileURLWithPath: path)
         do {
-            let trashURL = try manager.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: fileURL, create: false)
+            let trashURL = try trashDirectory(fileURL)
             var relationship = FileManager.URLRelationship.other
             try manager.getRelationship(&relationship, ofDirectoryAt: trashURL, toItemAt: fileURL)
             if relationship == .contains || relationship == .same {
