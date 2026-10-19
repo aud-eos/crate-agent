@@ -119,12 +119,14 @@ struct SeratoLibraryFactsPlan: Sendable {
 
 enum SeratoLibraryFactsError: LocalizedError, Equatable {
     case missingStamp(ChecklistSource)
+    case unreadableStamp(ChecklistSource)
     case unexpectedSource(String)
     case unexpectedDateAddedSource(String)
 
     var errorDescription: String? {
         switch self {
         case let .missingStamp(source): "Serato facts have no stored read of \(source.rawValue)."
+        case let .unreadableStamp(source): "Serato facts couldn't check for a stored read of \(source.rawValue)."
         case let .unexpectedSource(source): "Serato facts found an unknown source \(source)."
         case let .unexpectedDateAddedSource(source): "Serato facts found an unknown date-added source \(source)."
         }
@@ -149,12 +151,15 @@ enum SeratoLibraryFacts {
 
     static func writeStamp(_ source: ChecklistSource, _ stamp: String, in database: GRDB.Database) throws {
         try database.execute(sql: """
-        INSERT INTO \(stampTable) (source, stamp) VALUES (?, ?) ON CONFLICT(source) DO UPDATE SET stamp = excluded.stamp
+        INSERT INTO \(stampTable) (source, stamp) VALUES (?, ?)
+        ON CONFLICT(source) DO UPDATE SET stamp = excluded.stamp WHERE stamp IS NOT excluded.stamp
         """, arguments: [source.rawValue, stamp])
     }
 
     static func hasStamp(_ source: ChecklistSource, in database: GRDB.Database) throws -> Bool {
-        try Bool.fetchOne(database, sql: "SELECT EXISTS (SELECT 1 FROM \(stampTable) WHERE source = ?)", arguments: [source.rawValue]) ?? false
+        guard let exists = try Bool.fetchOne(database, sql: "SELECT EXISTS (SELECT 1 FROM \(stampTable) WHERE source = ?)", arguments: [source.rawValue])
+        else { throw SeratoLibraryFactsError.unreadableStamp(source) }
+        return exists
     }
 
     static func facts(in database: GRDB.Database) throws -> [Int64: SeratoFileFacts] {
