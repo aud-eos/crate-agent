@@ -3,6 +3,7 @@ enum SeratoAnalysisMessages {
     static let malformedDetailPrefix = "Malformed Serato data"
     static let containerDetailPrefix = "Unreadable audio container"
     static let ioDetailPrefix = "Couldn't read the file"
+    static let readerFaultDetailPrefix = "The Serato data reader failed"
 
     static func detail(prefix: String, reason: String) -> String {
         "\(prefix): \(reason)"

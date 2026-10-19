@@ -7,7 +7,9 @@ extension SeratoAnalysis: @unchecked Sendable {}
 /// Why a file's Serato cues and beatgrid couldn't be read. An unsupported
 /// format can't carry Serato data crate-agent reads, so its cues are unknown,
 /// not missing; a malformed payload or container is a fault in the file; an
-/// I/O failure may clear, so it is read again on a later pass.
+/// I/O failure may clear, so it is read again on a later pass. A reader
+/// fault (a Rust panic) would recur on the same bytes, so it waits for the
+/// file to change.
 struct SeratoAnalysisFailure: Error, Equatable, Sendable {
     /// The raw value is the token that begins the stored failure text.
     enum Kind: String, CaseIterable, Sendable {
@@ -15,6 +17,7 @@ struct SeratoAnalysisFailure: Error, Equatable, Sendable {
         case malformed
         case container
         case io
+        case readerFault = "reader"
 
         var isRetryable: Bool {
             self == .io
@@ -26,6 +29,7 @@ struct SeratoAnalysisFailure: Error, Equatable, Sendable {
             case .malformed: SeratoAnalysisMessages.malformedDetailPrefix
             case .container: SeratoAnalysisMessages.containerDetailPrefix
             case .io: SeratoAnalysisMessages.ioDetailPrefix
+            case .readerFault: SeratoAnalysisMessages.readerFaultDetailPrefix
             }
         }
 
@@ -37,15 +41,13 @@ struct SeratoAnalysisFailure: Error, Equatable, Sendable {
     let kind: Kind
     let reason: String
 
-    /// An error other than the reader's own is an I/O failure: it says
-    /// nothing about the file's bytes.
     init(_ error: Error) {
         switch error as? SeratoAnalysisError {
         case let .UnsupportedFormat(format): self.init(kind: .unsupportedFormat, reason: format)
         case let .Malformed(field, reason): self.init(kind: .malformed, reason: SeratoAnalysisMessages.malformedReason(field: field, reason: reason))
         case let .Container(message): self.init(kind: .container, reason: message)
         case let .Io(message): self.init(kind: .io, reason: message)
-        case nil: self.init(kind: .io, reason: UserFacingErrorMessage.message(for: error))
+        case nil: self.init(kind: .readerFault, reason: UserFacingErrorMessage.message(for: error))
         }
     }
 

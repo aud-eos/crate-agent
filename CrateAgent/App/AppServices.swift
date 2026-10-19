@@ -128,6 +128,8 @@ public final class AppServices: ObservableObject {
     private let startupCoordinator: LibraryStartupCoordinator
     private let filesystemContinuation: AsyncStream<FilesystemEventBatch>.Continuation
     private var retryTask: Task<Void, Never>?
+    /// Awaited before stopping, so a launch-time start can't land after the stop.
+    private var analysisStart: Task<Void, Never>?
     let readiness: LibrarySyncReadiness
     private var filesystemDeliveryStopped = false
     private var fingerprintMilestones = FingerprintActivityMilestones()
@@ -319,9 +321,9 @@ public final class AppServices: ObservableObject {
 
         startFingerprinting()
         let analysisWorker = seratoAnalysisWorker
-        Task {
-            await analysisWorker.start { status in
-                Task { @MainActor [weak self] in self?.seratoAnalysisStatus = status }
+        analysisStart = Task {
+            await analysisWorker.start { [weak self] status in
+                Task { @MainActor in self?.seratoAnalysisStatus = status }
             }
         }
         checklistDuplicateRefresher.start()
@@ -337,7 +339,11 @@ public final class AppServices: ObservableObject {
         let worker = fingerprintWorker
         Task { await worker.stop() }
         let analysisWorker = seratoAnalysisWorker
-        Task { await analysisWorker.stop() }
+        let analysisStart = analysisStart
+        Task {
+            await analysisStart?.value
+            await analysisWorker.stop()
+        }
         let duplicateRefresher = checklistDuplicateRefresher
         Task { @MainActor in duplicateRefresher.stop() }
     }
@@ -392,11 +398,11 @@ public final class AppServices: ObservableObject {
                 await worker.waitUntilStopped()
             }
             guard let self else { return }
-            await worker.start { progress in
-                Task { @MainActor [weak self] in
+            await worker.start { [weak self] progress in
+                Task { @MainActor in
                     guard let self else { return }
-                    fingerprintProgress = progress
-                    logActivity(fingerprintMilestones.entries(for: progress), category: .fingerprint)
+                    self.fingerprintProgress = progress
+                    self.logActivity(self.fingerprintMilestones.entries(for: progress), category: .fingerprint)
                 }
             }
         }

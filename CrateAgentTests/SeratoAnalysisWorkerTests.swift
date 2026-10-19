@@ -8,6 +8,8 @@ import XCTest
 /// against the file basis they were read from.
 @MainActor
 final class SeratoAnalysisWorkerTests: XCTestCase {
+    private struct ReaderPanic: Error {}
+
     private struct StoredAnalysis {
         let cueCount: Int?
         let failure: String?
@@ -51,8 +53,12 @@ final class SeratoAnalysisWorkerTests: XCTestCase {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
         let malformed = try await fixture.add("malformed.mp3")
+        let panicked = try await fixture.add("panicked.mp3")
         let unsupported = try await fixture.add("a-unsupported.ogg")
         let worker = try makeWorker(fixture) { path in
+            if path == panicked.path {
+                throw ReaderPanic()
+            }
             throw path.hasSuffix(".ogg") ? SeratoAnalysisError.UnsupportedFormat(format: "Vorbis")
                 : SeratoAnalysisError.Malformed(field: "Serato Markers2", reason: "truncated cue")
         }
@@ -62,15 +68,16 @@ final class SeratoAnalysisWorkerTests: XCTestCase {
         let stored = try await analysis(of: malformed, in: fixture)
         XCTAssertNil(stored?.cueCount)
         XCTAssertNotNil(stored?.failure)
-        XCTAssertEqual(coverage, SeratoAnalysisCoverage(read: 0, pending: 0, failed: 1, unsupported: 1))
+        XCTAssertEqual(coverage, SeratoAnalysisCoverage(read: 0, pending: 0, failed: 2, unsupported: 1, retryable: 0),
+                       "A reader panic is a fault, not an I/O failure to read again unchanged")
         let libraryCoverage = try await fixture.database.writer.read { connection in try SeratoAnalysisStore.coverage(in: connection) }
         XCTAssertEqual(libraryCoverage, coverage)
         let failures = try await fixture.database.writer.read { connection in try SeratoAnalysisStore.failures(limit: 10, in: connection) }
-        XCTAssertEqual(failures.map(\.id), [malformed.id, unsupported.id], "Faults come before unsupported formats")
+        XCTAssertEqual(failures.map(\.id), [malformed.id, panicked.id, unsupported.id], "Faults come before unsupported formats")
         XCTAssertEqual(failures.map { failure in failure.detail?.hasPrefix(SeratoAnalysisMessages.malformedDetailPrefix) },
-                       [true, false], "The list says which file's Serato data is malformed")
+                       [true, false, false], "The list says which file's Serato data is malformed")
         XCTAssertEqual(failures.map { failure in failure.detail?.hasPrefix(SeratoAnalysisMessages.unsupportedDetailPrefix) },
-                       [false, true], "and which file's format can't carry readable cues")
+                       [false, false, true], "and which file's format can't carry readable cues")
     }
 
     private func makeWorker(_ fixture: SeratoRemovalFixture,
