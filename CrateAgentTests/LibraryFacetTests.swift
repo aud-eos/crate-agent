@@ -27,18 +27,20 @@ final class LibraryFacetTests: XCTestCase {
         XCTAssertEqual(CamelotKey(parsing: "Abm")?.label, "1A")
         XCTAssertEqual(CamelotKey(parsing: "8A")?.compatibleKeys.map(\.label).sorted(), ["7A", "8A", "8B", "9A"])
         XCTAssertEqual(CamelotKey(parsing: "12B")?.compatibleKeys.map(\.label).sorted(), ["11B", "12A", "12B", "1B"])
-        for garbage in ["", "Unknown", "o", "H#m", "13A"] {
+        for garbage in ["", "Unknown", "o", "H#m", "13A", "ßm"] {
             XCTAssertNil(CamelotKey(parsing: garbage), garbage)
         }
     }
 
     func testFacetsCombineWithChipAndSearch() async throws {
         let options = try await pool.read { connection in try LibraryFacetOptions.load(in: connection, filter: .active) }
-        var facets = LibraryFacets(genres: ["House"], bpmRange: 126 ... 128, compatibleKey: CamelotKey(parsing: "8A"))
+        let house = try XCTUnwrap(options.genres.first { option in option.value == "House" })
+        XCTAssertEqual(house.storedValues, ["House", "house "])
+        var facets = LibraryFacets(genres: house.storedValues, bpmRange: 126 ... 128, compatibleKey: CamelotKey(parsing: "8A"))
         facets.keyValues = try options.keyValues(compatibleWith: XCTUnwrap(facets.compatibleKey))
         XCTAssertEqual(facets.keyValues, ["Am", "8A", "Em"])
         let found = try await titles(.init(search: "Artist", chip: .needsWork, facets: facets))
-        XCTAssertEqual(found, ["House 128.000 Am", "House 126.5 Em"])
+        XCTAssertEqual(found, ["House 128.000 Am", "House 126.5 Em", "house 127 8A"])
         // Facet-only query on a family whose alternate is the only House Alt file: the alternate is revealed beneath its main row.
         let roles = try await visibleRoles(.init(facets: LibraryFacets(genres: ["House Alt"])))
         XCTAssertEqual(roles, [.main, .alternate])
@@ -65,7 +67,7 @@ final class LibraryFacetTests: XCTestCase {
         @discardableResult
         func add(_ title: String, artist: String = "Artist", genre: String, bpm: String, key: String, trackID: Int64? = nil) throws -> Int64 {
             inode += 1
-            var file = FileRecord(path: "/Music/\(inode).mp3", volumeUuid: "volume", inode: inode, fileSize: 10, mtime: 5, trackId: trackID,
+            var file = FileRecord(path: String(format: "/Music/%02d.mp3", inode), volumeUuid: "volume", inode: inode, fileSize: 10, mtime: 5, trackId: trackID,
                                   bitrateKbps: 320, artist: artist, title: title, genre: genre, bpm: bpm, musicalKey: key)
             file.libraryMembership = .active
             file.fileAvailability = .available
@@ -82,6 +84,7 @@ final class LibraryFacetTests: XCTestCase {
         try add("House 127 Unknown", genre: "House", bpm: "127", key: "Unknown")
         try add("Techno 128 Am", genre: "Techno", bpm: "128", key: "Am")
         try add("House 128 Unsearched", artist: "Someone", genre: "House", bpm: "128", key: "Am")
+        try add("house 127 8A", genre: "house ", bpm: "127", key: "8A")
 
         var family = SongFamilyRecord()
         try family.insert(connection)

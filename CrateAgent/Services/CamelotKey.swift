@@ -11,7 +11,7 @@ struct CamelotKey: Hashable, Comparable, Sendable {
     /// Camelot numbers of the major and minor keys on each pitch class, C = 0, from the Camelot wheel.
     private static let majorNumbers = [8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1]
     private static let minorNumbers = [5, 12, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10]
-    private static let naturalPitchClasses: [Character: Int] = ["C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11]
+    private static let naturalPitchClasses: [String: Int] = ["C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11]
     private static let accidentals: [Character: Int] = ["#": 1, "♯": 1, "b": -1, "♭": -1]
     private static let majorSuffixes: Set<String> = ["", "maj", "major"]
     private static let minorSuffixes: Set<String> = ["m", "min", "minor"]
@@ -65,7 +65,7 @@ struct CamelotKey: Hashable, Comparable, Sendable {
 
     /// A root letter, an optional sharp or flat, then a major or minor suffix.
     private static func musical(_ text: String) -> CamelotKey? {
-        guard let root = text.first.flatMap({ letter in naturalPitchClasses[Character(letter.uppercased())] }) else { return nil }
+        guard let root = text.first.flatMap({ letter in naturalPitchClasses[String(letter).uppercased()] }) else { return nil }
         var rest = text.dropFirst()
         var pitchClass = root
         if let accidental = rest.first.flatMap({ symbol in accidentals[symbol] }) {

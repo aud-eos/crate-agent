@@ -156,7 +156,8 @@ final class LibraryPagingTests: XCTestCase {
         let optionsElapsed = ContinuousClock.now - optionsStart
         XCTAssertLessThan(optionsElapsed, .milliseconds(500), "facet options")
         metrics.append("facet_options_ms=\(optionsElapsed.milliseconds)")
-        var facets = LibraryFacets(genres: ["House"], bpmRange: 122 ... 128, compatibleKey: CamelotKey(parsing: "8A"))
+        let house = try XCTUnwrap(options.genres.first { option in option.value == "House" })
+        var facets = LibraryFacets(genres: house.storedValues, bpmRange: 122 ... 128, compatibleKey: CamelotKey(parsing: "8A"))
         facets.keyValues = try options.keyValues(compatibleWith: XCTUnwrap(facets.compatibleKey))
         try await measure("all_facets", .init(search: "Artist A", chip: .needsWork, facets: facets, sort: .init(column: .stillNeeds)))
         let line = "CHECKLIST_PAGING_METRICS " + metrics.joined(separator: " ")

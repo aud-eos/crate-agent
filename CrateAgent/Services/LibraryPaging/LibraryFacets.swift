@@ -41,18 +41,34 @@ struct LibraryFacets: Hashable, Sendable {
     }
 }
 
+/// One genre as the user sees it: every stored spelling that differs only in case, width or
+/// whitespace, shown as its most frequent spelling. The facet matches `storedValues` exactly.
 struct GenreOption: Hashable, Sendable {
     let value: String
+    let storedValues: Set<String>
     let count: Int
+
+    /// Trimmed, whitespace collapsed, and folded for case and width; diacritics stay distinct.
+    static func normalized(_ genre: String) -> String {
+        genre.split(whereSeparator: \.isWhitespace).joined(separator: " ").folding(options: [.caseInsensitive, .widthInsensitive], locale: nil)
+    }
+
+    /// Groups each distinct stored genre and its file count by normalized form, ordered by display value.
+    static func grouped(_ stored: [(value: String, count: Int)]) -> [GenreOption] {
+        Dictionary(grouping: stored) { genre in normalized(genre.value) }.values.compactMap { spellings -> GenreOption? in
+            guard let commonest = spellings.max(by: { lhs, rhs in lhs.count != rhs.count ? lhs.count < rhs.count : lhs.value > rhs.value })
+            else { return nil }
+            return GenreOption(value: commonest.value, storedValues: Set(spellings.map(\.value)),
+                               count: spellings.reduce(0) { total, genre in total + genre.count })
+        }.sorted { lhs, rhs in lhs.value.localizedStandardCompare(rhs.value) == .orderedAscending }
+    }
 }
 
-/// The values the facets can choose from in a status scope: each stored genre with its file count,
-/// and each stored key string grouped by the Camelot key it parses to. Key strings no notation
-/// parses are listed as unrecognized, never guessed.
+/// The values the facets can choose from in a status scope: each genre with its file count, and each
+/// stored key string grouped by the Camelot key it parses to. A key string no notation parses joins no key.
 struct LibraryFacetOptions: Equatable, Sendable {
     let genres: [GenreOption]
     let keys: [CamelotKey: Set<String>]
-    let unrecognizedKeys: Set<String>
 
     /// Distinct non-blank genres and keys of the files `filter` admits, one pass each.
     static func load(in database: GRDB.Database, filter: LibraryStatusFilter) throws -> LibraryFacetOptions {
@@ -60,23 +76,20 @@ struct LibraryFacetOptions: Equatable, Sendable {
         SELECT files.genre, COUNT(*) FROM files
         WHERE \(filter.predicate) AND NULLIF(TRIM(files.genre), '') IS NOT NULL GROUP BY files.genre
         """)
-        let genres = try genreRows.map { row -> GenreOption in
+        let genres = try GenreOption.grouped(genreRows.map { row -> (value: String, count: Int) in
             guard let value: String = row[0], let count: Int = row[1] else { throw PagingError.incompletePage }
-            return GenreOption(value: value, count: count)
-        }.sorted { lhs, rhs in lhs.value.localizedStandardCompare(rhs.value) == .orderedAscending }
+            return (value, count)
+        })
         let keyValues = try String.fetchAll(database, sql: """
         SELECT DISTINCT files.musical_key FROM files WHERE \(filter.predicate) AND NULLIF(TRIM(files.musical_key), '') IS NOT NULL
         """)
         var keys: [CamelotKey: Set<String>] = [:]
-        var unrecognized: Set<String> = []
         for value in keyValues {
             if let key = CamelotKey(parsing: value) {
                 keys[key, default: []].insert(value)
-            } else {
-                unrecognized.insert(value)
             }
         }
-        return LibraryFacetOptions(genres: genres, keys: keys, unrecognizedKeys: unrecognized)
+        return LibraryFacetOptions(genres: genres, keys: keys)
     }
 
     /// Every stored key string that parses to a key compatible with `key`.
