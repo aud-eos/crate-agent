@@ -23,6 +23,15 @@ grouping files with identical audio is refused, Library offers **Group as
 Different Recordings**. Both are undoable. See
 [recording identity](docs/recording-identity.md).
 
+Each **Library** row shows what its file **Still needs** before the library is
+finished (a crate, cue points, a locked beatgrid, complete tags, good quality,
+no excess versions or duplicates), plus **Date added** and **My plays** columns.
+Chips such as **Needs work** and **Not in a crate** filter by those items with
+live counts, and combine with search and the genre, BPM and compatible-key
+filters. **Mark as Keeper** protects a recording and counts it as Finished;
+undo it from History. Facts not read yet show as unknown, never as failing. See
+the [library checklist](docs/library-checklist.md).
+
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the
 [list-control contract](docs/list-controls.md) for scopes, keyboard controls, and

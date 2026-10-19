@@ -15,7 +15,8 @@ final class LibraryBrowserModel: ObservableObject {
     /// Selection and eligibility of each visible family's members, including collapsed alternates.
     @Published private(set) var familyStates: [Int64: LibraryFamilyState] = [:]
     /// How many files each chip matches in the current scope without the chip; loaded after each snapshot's first page.
-    @Published private(set) var chipCounts: [ChecklistChip: Int] = [:]
+    /// Nil until the counts for the current search, status and facets have loaded.
+    @Published private(set) var chipCounts: [ChecklistChip: Int]?
     /// The genres and keys the facets can choose from in the status scope; loaded after each snapshot's first page.
     @Published private(set) var facetOptions: LibraryFacetOptions?
     /// Changes whenever a family row's selection or disclosure display changes.
@@ -274,6 +275,9 @@ final class LibraryBrowserModel: ObservableObject {
 
     private func apply(_ query: LibraryBrowseQuery, reset: Bool) {
         guard self.query != query else { return }
+        if query.filter != self.query.filter || query.search != self.query.search || query.facets != self.query.facets {
+            chipCounts = nil
+        }
         self.query = query
         queryVersion &+= 1
         if reset {

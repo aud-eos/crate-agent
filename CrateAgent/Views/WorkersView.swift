@@ -23,6 +23,9 @@ struct WorkersView: View {
                     fingerprintJob
                     deferredWrites
                     PlayCountCard(service: services.playCountService)
+                    SeratoFactsCard(service: services.libraryFactsService)
+                    seratoAnalysisCard
+                    ChecklistDuplicateCard(refresher: services.checklistDuplicateRefresher)
                     MusicBrainzWorkCard(backfill: services.musicBrainzWorkBackfill)
                     coverage
                     drillDown
@@ -90,6 +93,39 @@ struct WorkersView: View {
     private var deferredWrites: some View {
         WorkerCard(title: "Deferred Serato writes") {
             Text(deferredWriteStatus).font(.callout.monospacedDigit())
+        }
+    }
+
+    private var seratoAnalysisCard: some View {
+        WorkerCard(title: SeratoAnalysisMessages.title) {
+            if let error = services.seratoAnalysisStatus?.error {
+                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            if let analysis = model.seratoAnalysisCoverage {
+                Text(SeratoAnalysisMessages.coverage(analysis)).font(.callout.weight(.semibold).monospacedDigit())
+                CoverageLine(items: [
+                    (SeratoAnalysisMessages.read, analysis.read), (SeratoAnalysisMessages.pending, analysis.pending),
+                    (SeratoAnalysisMessages.failed, analysis.failed), (SeratoAnalysisMessages.unsupported, analysis.unsupported),
+                ])
+                if analysis.retryable > 0 {
+                    Text(SeratoAnalysisMessages.retrying(analysis.retryable)).font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text(SeratoAnalysisMessages.coverageLoading).font(.callout).foregroundStyle(.secondary)
+            }
+            let failures = model.seratoAnalysisFailures
+            if !failures.isEmpty {
+                TextDisclosure(show: SeratoAnalysisMessages.showFailures(failures.count), hide: SeratoAnalysisMessages.hideFailures) {
+                    if failures.count == WorkerCoverageQuery.drillDownLimit {
+                        Text(SeratoAnalysisMessages.firstFailures(WorkerCoverageQuery.drillDownLimit)).font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(failures) { row in
+                        WorkerFileRowView(row: row, showInLibrary: { services.showInLibrary(path: row.path) },
+                                          reveal: { Task { await services.fileOpener.reveal(fileID: row.id) } })
+                    }
+                }
+            }
+            Text(SeratoAnalysisMessages.explanation).font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -240,6 +276,57 @@ private struct PlayCountCard: View {
                 Text(SeratoPlayCountMessages.failed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
             Text(SeratoPlayCountMessages.explanation).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct SeratoFactsCard: View {
+    @ObservedObject var service: SeratoLibraryFactsService
+
+    var body: some View {
+        WorkerCard(title: SeratoLibraryFactsMessages.title) {
+            switch service.status {
+            case .notRefreshed:
+                Text(SeratoLibraryFactsMessages.notRefreshed).font(.callout)
+            case .refreshing:
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(SeratoLibraryFactsMessages.refreshing).font(.callout)
+                }
+            case let .refreshed(summary):
+                Text(SeratoLibraryFactsMessages.refreshed(summary)).font(.callout.monospacedDigit())
+                if summary.unmatchedPathCount > 0 {
+                    Text(SeratoLibraryFactsMessages.unmatched(summary.unmatchedPathCount)).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            case .skippedWhileSeratoRunning:
+                Text(SeratoLibraryFactsMessages.skippedWhileSeratoRunning).font(.callout)
+            case let .failed(reason):
+                Text(SeratoLibraryFactsMessages.failed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            Text(SeratoLibraryFactsMessages.explanation).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct ChecklistDuplicateCard: View {
+    @ObservedObject var refresher: ChecklistDuplicateRefresher
+
+    var body: some View {
+        WorkerCard(title: LibraryChecklistMessages.duplicatesTitle) {
+            switch refresher.status {
+            case .notRefreshed:
+                Text(LibraryChecklistMessages.duplicatesNotRefreshed).font(.callout)
+            case .refreshing:
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(LibraryChecklistMessages.duplicatesRefreshing).font(.callout)
+                }
+            case let .refreshed(memberCount):
+                Text(LibraryChecklistMessages.duplicatesRefreshed(memberCount)).font(.callout.monospacedDigit())
+            case let .failed(reason):
+                Text(LibraryChecklistMessages.duplicatesFailed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            Text(LibraryChecklistMessages.duplicatesExplanation).font(.caption).foregroundStyle(.secondary)
         }
     }
 }

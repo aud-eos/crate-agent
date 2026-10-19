@@ -17,8 +17,9 @@ enum LibraryBrowserColumns {
                      player: TrackPlayer? = nil, families: LibraryFamilyControls? = nil) -> [PagedTableColumn<BrowserRow>]
     {
         let definitions: [(LibraryBrowseSort.Column?, String, CGFloat)] = [
-            (.artist, "Artist", 220), (.title, "Title", 280), (.bpm, "BPM", 70),
-            (.musicalKey, "Key", 50), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
+            (.artist, "Artist", 220), (.title, "Title", 280), (.bpm, "BPM", 70), (.musicalKey, "Key", 50),
+            (.stillNeeds, LibraryChecklistMessages.stillNeedsColumn, 240), (.dateAdded, LibraryChecklistMessages.dateAddedColumn, 110),
+            (.myPlays, LibraryChecklistMessages.myPlaysColumn, 70), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
         ]
         let previewColumns = player.map { player in
             [PagedTableColumn<BrowserRow>(identifier: previewIdentifier, title: "", width: 28, makeCell: { TrackPlayCell() }, updateCell: { view, row in
@@ -124,12 +125,36 @@ private final class LibraryBrowserCell: NSTableCellView {
             primary.textColor = .secondaryLabelColor
         case .musicalKey: primary.stringValue = row.musicalKey ?? ""
         case .album: primary.stringValue = row.album ?? ""
-        case .stillNeeds: primary.stringValue = row.stillNeedsCount.map(String.init) ?? ""
+        case .stillNeeds:
+            let display = StillNeedsDisplay(row: row)
+            primary.attributedStringValue = display.text(font: primary.font ?? .systemFont(ofSize: NSFont.systemFontSize))
+            primary.maximumNumberOfLines = 2
+            toolTip = display.help
+            setAccessibilityLabel("\(title): \(primary.stringValue)")
+            return
         case .dateAdded:
-            primary.stringValue = row.dateAdded.map { seconds in
-                Date(timeIntervalSince1970: TimeInterval(seconds)).formatted(date: .abbreviated, time: .omitted)
-            } ?? ""
-        case .myPlays: primary.stringValue = row.playCount.map(String.init) ?? ""
+            guard row.hasChecklist else { primary.stringValue = ""; break }
+            guard let seconds = row.dateAdded else {
+                showUnknown()
+                break
+            }
+            primary.stringValue = Date(timeIntervalSince1970: TimeInterval(seconds)).formatted(date: .abbreviated, time: .omitted)
+            toolTip = row.dateAddedSource.map { source in
+                switch source {
+                case .serato: LibraryChecklistMessages.dateAddedFromSerato
+                case .indexed: LibraryChecklistMessages.dateAddedFirstIndexed
+                }
+            }
+            setAccessibilityLabel("\(title): \(primary.stringValue)")
+            return
+        case .myPlays:
+            guard row.hasChecklist else { primary.stringValue = ""; break }
+            guard let plays = row.playCount else {
+                showUnknown()
+                break
+            }
+            primary.stringValue = plays.formatted()
+            primary.font = .monospacedDigitSystemFont(ofSize: density == .compact ? 11 : 13, weight: .regular)
         case .none:
             primary.stringValue = row.statusText
             primary.textColor = row.canProcess ? .secondaryLabelColor : .systemOrange
@@ -139,6 +164,66 @@ private final class LibraryBrowserCell: NSTableCellView {
         }
         toolTip = column == nil ? row.statusText : row.path
         setAccessibilityLabel("\(title): \(primary.stringValue)")
+    }
+
+    private func showUnknown() {
+        primary.stringValue = LibraryChecklistMessages.unknown
+        primary.textColor = .secondaryLabelColor
+    }
+}
+
+/// A row's Still needs tags and the tooltip naming each fix. Unknown items read "<tag> unknown" in secondary color;
+/// a checklist with unexpected bits shows as unreadable, with the reason in the tooltip.
+private struct StillNeedsDisplay {
+    private var parts: [(text: String, color: NSColor)] = []
+    private(set) var help: String?
+
+    init(row: BrowserRow) {
+        let checklist: FileChecklist?
+        do {
+            checklist = try row.checklist()
+        } catch {
+            parts = [(LibraryChecklistMessages.unreadable, .systemRed)]
+            help = error.localizedDescription
+            return
+        }
+        guard let checklist else { return }
+        var sentences: [String] = []
+        if checklist.isProtected {
+            parts.append((LibraryChecklistMessages.keeperTag, .labelColor))
+            sentences.append(LibraryChecklistMessages.keeperHelp)
+        } else if checklist.isFinished {
+            parts.append((LibraryChecklistMessages.finishedTag, .systemGreen))
+            sentences.append(LibraryChecklistMessages.finishedHelp)
+        }
+        for item in ChecklistItem.allCases {
+            if checklist.failing.contains(item) {
+                parts.append((LibraryChecklistMessages.tag(item), .labelColor))
+                sentences.append(LibraryChecklistMessages.failingHelp(item, missing: checklist.missingMetadata,
+                                                                      beatgridMarkerCount: row.beatgridMarkerCount, bitrateKbps: row.bitrateKbps))
+            } else if checklist.unknown.contains(item) {
+                parts.append((LibraryChecklistMessages.unknownTag(item), .secondaryLabelColor))
+                sentences.append(LibraryChecklistMessages.unknownHelp(item))
+            }
+        }
+        if row.familyRole == .main, let needing = row.familyFilesNeedingWork, let total = row.familyFileCount {
+            let summary = LibraryChecklistMessages.familyFilesNeedingWork(needing, of: total)
+            parts.append((summary, .secondaryLabelColor))
+            sentences.append(summary + ".")
+        }
+        help = sentences.joined(separator: "\n")
+    }
+
+    func text(font: NSFont) -> NSAttributedString {
+        let text = NSMutableAttributedString()
+        for (index, part) in parts.enumerated() {
+            if index > 0 {
+                text.append(NSAttributedString(string: LibraryChecklistMessages.tagSeparator,
+                                               attributes: [.font: font, .foregroundColor: NSColor.tertiaryLabelColor]))
+            }
+            text.append(NSAttributedString(string: part.text, attributes: [.font: font, .foregroundColor: part.color]))
+        }
+        return text
     }
 }
 

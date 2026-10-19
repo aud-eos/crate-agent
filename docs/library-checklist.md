@@ -1,0 +1,119 @@
+# Library checklist
+
+Every file in **Library** shows what it still needs before the library is
+finished. The **Still needs** column lists those items as short tags, the chips
+above the table filter by them, and the genre, BPM and key filters narrow the
+list further. All of them combine with the search and the library status.
+
+## Items
+
+A file passes an item, fails it, or the item is *unknown* because crate-agent
+hasn't read the fact yet.
+
+| Tag | Fails when | Unknown when | Fix |
+| --- | --- | --- | --- |
+| Crate | The file is in no Serato crate (`Subcrates/*.crate`). SmartCrates don't count. | Serato's crates haven't been read yet. | Add it to a crate in Serato. |
+| Cues | The file's `Serato Markers2` tag has no cue points. | Its Serato data hasn't been read, or couldn't be: an unsupported format, a malformed tag or an unreadable file. Workers lists the reason. | Set cue points in Serato. |
+| Grid | Serato's database says the beatgrid isn't locked. The tooltip says **No beatgrid** when the file has no beatgrid markers at all. | Serato's database has no lock flag for the file. | Lock the beatgrid in Serato. |
+| Tags | Artist, title, genre, BPM or key is empty. | Never. | Artist and title through Auto-Tag, genre in your tag editor, BPM and key with Analyze in Serato. |
+| Quality | A lossy file below 256 kbps (`LibraryChecklist.minimumLossyBitrateKbps`). A lossless file (FLAC, WAV, AIFF) passes. | A lossy file's bitrate isn't known. | Replace it with a better copy. |
+| Versions | The file's song family has more than 4 versions (`LibraryChecklist.maximumFamilyVersions`) and the file isn't the main version or another encoding of it. Files outside a family always pass. | Never. | Remove filler, or mark the file as a keeper. |
+| Duplicate | The file is in a confirmed duplicate group, found from cached digests. Needs-listening groups don't count. | Never. | Remove the extra copy, or mark the file as a keeper. |
+
+## Unknown versus failing
+
+An unknown item is never shown as a failure. It reads as, for example,
+**Cues unknown** in secondary text, and the definite-failure chips (**No cues**,
+**Grid unchecked**, **Not in a crate**, **Low quality**) leave it out. An
+unknown item still keeps the file from being Finished, so it counts toward
+**Needs work**. After an upgrade, every row starts with unknown items and fills
+in as the background reads finish; browsing never waits for them.
+
+The tooltip on **Still needs** gives one sentence per item, naming its fix or
+why it's unknown. If a row's stored checklist has a bit no item names, the cell
+reads **Checklist unreadable** in red, with the reason in its tooltip; it never
+guesses.
+
+A family's main row shows its own checklist, without the Versions item, and adds
+**N of M files need work** for the family's files in the current library
+status. The checklist is per file: quality, duplicates, cues and grid belong to
+each file, not to the recording.
+
+**Date added** is Serato's date added when its database has one, and otherwise
+the time crate-agent first indexed the file; the tooltip says which. **My
+plays** is the play count from the last Serato History read; a file with no
+play has 0. A missing value reads **unknown**, and sorts last in both
+directions. Files removed from Serato have no checklist, so these columns are
+empty for them.
+
+## Keepers
+
+Right-click a row and choose **Mark as Keeper** to protect it, or **Clear
+Keeper** to remove the protection.
+
+- A keeper is recording-level. Every file that shares its recording key (its
+  MusicBrainz recording ID, else its `tracks` row, else the file itself) is
+  protected too, so the FLAC and MP3 of one Auto-Tagged song are kept together.
+- A protected file is **Finished**, shows **Keeper**, and its Versions item is
+  suppressed. Its other tags (Crate, Cues, Grid, Tags, Quality) still show.
+- Only the file's own mark suppresses **Duplicate**. Another encoding that is
+  protected through the shared recording still shows Duplicate, so the worse
+  copy stays removable.
+- **Clear Keeper** clears every mark on the recording.
+- Marking and clearing are `OperationEngine` mutations with History entries;
+  undo them from History. They change only crate-agent's database, never Serato
+  files, so they work while Serato is running.
+- Replacing a file's content drops its mark.
+
+## Chips
+
+The chips are **Needs work**, **Not in a crate**, **No cues**, **Grid
+unchecked**, **Low quality**, **Never played**, **Too many versions** and
+**Finished**. One chip can be chosen at a time; press it again to clear it.
+
+- Each count is the number of *files* in the current library status, search and
+  genre, BPM and key filters that the chip matches, ignoring the chosen chip.
+  Counts read **…** while they load, after the first page.
+- **Never played** is disabled until Serato History has been read in this
+  session, because play counts are only read while Serato is closed. Its
+  tooltip and a note beside the chips give the reason.
+- Like a search, a chip shows a family's main row when any of its files
+  matches, and lists the matching files beneath it.
+
+## Genre, BPM and key filters
+
+- **Genre** is a multi-select. Spellings that differ only in case, width or
+  spaces ("House", "house ") are one option, shown as the commonest spelling.
+- **BPM from** and **BPM to** form an inclusive range; press Return to apply.
+  Either end may be left empty. Files with no BPM, or a BPM of 0, never match.
+- **Key** matches the chosen key, one step either way on the Camelot wheel, and
+  its relative major or minor. Musical, Camelot and Open Key notations are all
+  read. A key no notation reads never matches.
+- The genre and key menus list what the current library status contains, and
+  the genre counts cover the whole status scope, before search, chips and the
+  other filters.
+- **Clear filters** clears the genre, BPM and key filters.
+
+## Where the facts come from
+
+Nothing in the checklist writes Serato files. The facts are cached in
+crate-agent's database by background services, and the checklist is computed in
+SQL from them each time the Library loads.
+
+| Fact | Source | Refreshed |
+| --- | --- | --- |
+| Crate membership | `Subcrates/*.crate`, by `SeratoLibraryFactsService` | After each sync, while Serato is closed, when the crate files change |
+| Beatgrid lock, date added | `database V2` (`bbgl`, `uadd`/`tadd`), by `SeratoLibraryFactsService` | Same as crates |
+| Cue points, beatgrid markers | The audio file's Serato tags, by `SeratoAnalysisWorker` | In the background, once per file content |
+| Duplicates | Cached digests, by `ChecklistDuplicateRefresher` | When duplicate evidence changes, at most every 30 seconds |
+| Play counts | Serato History, by `SeratoPlayCountService` | After each sync, while Serato is closed |
+| Artist, title, genre, BPM, key, bitrate | The indexed `files` columns | With every sync |
+
+**Workers** shows each service's status: the Serato crates and beatgrid locks
+card, the cue-point card with read, pending, failed and unsupported counts and
+the files that couldn't be read, and the duplicate checklist card. A failure in
+any of them is shown in red with its reason.
+
+The query contract, its CTE order and the budgets are in
+`LibraryChecklist.swift` and the
+[library readiness plan](superpowers/plans/2026-10-18-library-readiness-checklist.md).

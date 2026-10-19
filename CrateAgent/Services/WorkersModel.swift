@@ -11,6 +11,9 @@ final class WorkersModel: ObservableObject {
     static let refreshInterval: Duration = .seconds(2)
 
     @Published private(set) var coverage: WorkerCoverage?
+    /// Serato cue-point coverage over processable files, and the files whose Serato data couldn't be read.
+    @Published private(set) var seratoAnalysisCoverage: SeratoAnalysisCoverage?
+    @Published private(set) var seratoAnalysisFailures: [WorkerFileRow] = []
     @Published private(set) var category: WorkerFileCategory = .failed
     @Published private(set) var rows: [WorkerFileRow] = []
     @Published var selectedFileIDs: Set<Int64> = []
@@ -35,10 +38,14 @@ final class WorkersModel: ObservableObject {
     func refresh() async {
         let category = category
         do {
-            let (coverage, rows) = try await database.writer.read { database in
-                try (WorkerCoverageQuery.fetch(in: database), WorkerCoverageQuery.files(in: category, database: database))
+            let (coverage, rows, analysis, analysisFailures) = try await database.writer.read { database in
+                try (WorkerCoverageQuery.fetch(in: database), WorkerCoverageQuery.files(in: category, database: database),
+                     SeratoAnalysisStore.coverage(in: database),
+                     SeratoAnalysisStore.failures(limit: WorkerCoverageQuery.drillDownLimit, in: database))
             }
             self.coverage = coverage
+            seratoAnalysisCoverage = analysis
+            seratoAnalysisFailures = analysisFailures
             guard category == self.category else { return }
             self.rows = rows
             selectedFileIDs.formIntersection(rows.map(\.id))

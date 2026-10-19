@@ -36,6 +36,8 @@ struct LibraryBrowserView: View {
             }
             ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
             if let model {
+                LibraryChecklistFilters(model: model, playCounts: services.playCountService)
+                    .padding(.horizontal, density.pagePadding).padding(.bottom, density.spacing)
                 LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness,
                                     player: services.trackPlayer, opener: services.fileOpener)
                 { identifier, action in
@@ -245,6 +247,8 @@ struct LibraryBrowserView: View {
                 await services.fileOpener.open(fileID: identifier, with: target)
             case .reveal:
                 await services.fileOpener.reveal(fileID: identifier)
+            case let .keeper(isKeeper):
+                _ = try await services.operationEngine.setKeeper(isKeeper, for: FileMembershipToken(fileId: identifier, revision: record.membershipRevision))
             }
         } catch { model.error = error.localizedDescription }
     }
@@ -270,6 +274,32 @@ struct LibraryBrowserView: View {
         }
         .padding(.horizontal, density.pagePadding)
         .padding(.vertical, density.rowPadding)
+    }
+}
+
+/// The checklist chips and the genre, BPM and key filters, bound to the Library model. Never played waits
+/// until Serato History has been read this session (plan ruling 14).
+private struct LibraryChecklistFilters: View {
+    @ObservedObject var model: LibraryBrowserModel
+    @ObservedObject var playCounts: SeratoPlayCountService
+    @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: density.detailSpacing) {
+            LibraryChecklistChipBar(chip: Binding(get: { model.query.chip }, set: { chip in model.setChip(chip) }), counts: model.chipCounts,
+                                    neverPlayedAvailable: neverPlayedUnavailableReason == nil,
+                                    neverPlayedUnavailableReason: neverPlayedUnavailableReason ?? LibraryChecklistMessages.neverPlayedUnavailable)
+            LibraryFacetBar(facets: Binding(get: { model.query.facets }, set: { facets in model.setFacets(facets) }), options: model.facetOptions)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var neverPlayedUnavailableReason: String? {
+        switch playCounts.status {
+        case .refreshed: nil
+        case let .failed(reason): LibraryChecklistMessages.neverPlayedFailed(reason)
+        case .notRefreshed, .refreshing, .skippedWhileSeratoRunning: LibraryChecklistMessages.neverPlayedUnavailable
+        }
     }
 }
 

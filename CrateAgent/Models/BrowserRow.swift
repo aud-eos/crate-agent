@@ -169,6 +169,11 @@ public struct BrowserRow:
         playCount ?? Int.min
     }
 
+    /// Whether the Library projection computed a checklist for this file; retired files have none.
+    var hasChecklist: Bool {
+        checklistFailingMask != nil
+    }
+
     /// The file's checklist, or nil outside the Library projection and for retired files.
     func checklist() throws -> FileChecklist? {
         guard let checklistFailingMask else { return nil }
