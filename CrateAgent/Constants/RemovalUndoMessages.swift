@@ -10,11 +10,18 @@ enum RemovalUndoMessages {
         case .trashItemNotInTrash: "it was moved out of the Trash"
         case .originalPathOccupied: "another file is now at \(path)"
         case .trashItemNotRecorded: "where it went in the Trash was not recorded"
+        case .originalFileChanged: "it changed after its removal stopped"
         case let .recordsNotRecorded(store): "the records removed from \((store as NSString).lastPathComponent) were not recorded"
         case .fileNotRestored: "it is no longer in the library at \(path)"
         }
         return "Can't undo removing \(name): \(cause)."
     }
+
+    static func recordingNotRestored(path: String) -> String {
+        "Restored \((path as NSString).lastPathComponent) without its recording identity: it changed since the removal. Look the file up again in Auto-Tag."
+    }
+
+    static let legacyRemovalNotUndoable = "This removal was made before removals could be undone. Restore the file from the Trash in Finder instead."
 
     static let undoableWhileInTrash = "You can undo this from History while the file is still in the Trash."
 

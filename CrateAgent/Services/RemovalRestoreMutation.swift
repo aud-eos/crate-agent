@@ -32,6 +32,8 @@ public enum RestoreBlockReason: Sendable, Equatable {
     case trashItemNotInTrash
     case originalPathOccupied
     case trashItemNotRecorded
+    /// A Trash move that never ran left the file at its path, but it changed since.
+    case originalFileChanged
     /// The store's records were removed, but their capture was lost.
     case recordsNotRecorded(store: String)
     case fileNotRestored
@@ -83,6 +85,30 @@ enum RemovalRestoreMutation {
         }
         guard !FileManager.default.fileExists(atPath: payload.originalPath) else { throw blocked(payload, .originalPathOccupied) }
         return trashItem
+    }
+
+    /// A Trash move whose queued write was dropped as superseded, discarded or
+    /// interrupted, and which recorded no Trash item. Its file normally never
+    /// left its path; `requireUnmoved` proves that before undo skips the move.
+    static func trashMoveWasDropped(_ event: EventRecord, in database: GRDB.Database) throws -> Bool {
+        guard event.eventType == .fileTrashed, let eventID = event.eventId,
+              try SeratoRemovalCaptureStore.trashDestination(eventID: eventID, in: database) == nil,
+              let disposition = try SeratoWriteDispositions.openDispositions(eventID: eventID, in: database)[SeratoWriteKind.trashFile.rawValue]
+        else { return false }
+        return [SeratoWriteDisposition.superseded, .discarded, .interrupted].map(\.rawValue).contains(disposition)
+    }
+
+    /// Refuses unless the file of a dropped Trash move, row `fileID`, is still
+    /// at its original path with its original identity. An interrupted move
+    /// may have landed, and then nothing recorded where it went.
+    static func requireUnmoved(_ payload: RestoreFromTrashPayload, fileID: Int64?, in database: GRDB.Database) throws {
+        guard FileManager.default.fileExists(atPath: payload.originalPath) else { throw blocked(payload, .trashItemNotRecorded) }
+        guard let fileID, let file = try FileRecord.fetchOne(database, key: fileID),
+              file.path == payload.originalPath, file.identity == payload.identity
+        else { throw blocked(payload, .originalFileChanged) }
+        let current: FileMetadata
+        do { current = try FileMetadataCollector.collectVerified(at: payload.originalPath) } catch { throw blocked(payload, .originalFileChanged) }
+        guard !FileIdentityObservationMutation.isReplacement(file, identity: current) else { throw blocked(payload, .originalFileChanged) }
     }
 
     private static func blocked(_ payload: RestoreFromTrashPayload, _ reason: RestoreBlockReason) -> OperationEngineError {

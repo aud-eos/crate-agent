@@ -43,12 +43,37 @@ final class UndoableRemovalTests: XCTestCase {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
         let engine = try temporaryTrashEngine(fixture)
-        let cleaned = try await cleanDuplicate(fixture, engine: engine)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine, linkingTargetToARecording: true)
         XCTAssertFalse(FileManager.default.fileExists(atPath: cleaned.target.path))
 
         try await engine.undoBatch(cleaned.batchID)
 
         try await assertFileRestored(cleaned, in: fixture)
+        for (path, bytes) in cleaned.originalBytes {
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
+        }
+        let restoredTrackID = try await fixture.database.writer.read { database in
+            try FileRecord.filter(Column("path") == cleaned.target.path).fetchOne(database)?.trackId
+        }
+        XCTAssertEqual(restoredTrackID, try XCTUnwrap(cleaned.linkedTrackID), "Undo keeps the file's Auto-Tag recording")
+    }
+
+    func testUndoOfACleanupSupersededAtItsTrashStepRestoresTheSeratoRecords() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture, trashFails: true)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine, completes: false)
+        let keeper = fixture.directory.appendingPathComponent("keeper.wav")
+        try (Data(contentsOf: keeper) + Data([0])).write(to: keeper)
+        try await engine.drainPendingSeratoUpdates(retryingFailedCleanup: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cleaned.target.path), "The superseded cleanup leaves the file in place")
+
+        do {
+            try await engine.undoBatch(cleaned.batchID)
+        } catch {
+            XCTFail("Undo must restore the records of a removal whose Trash move never ran: \(error)")
+        }
+
         for (path, bytes) in cleaned.originalBytes {
             XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
         }
@@ -303,16 +328,21 @@ final class UndoableRemovalTests: XCTestCase {
         let batchID: String
         /// Database V2, `owned.crate` and `owned.scrate` before the cleanup.
         let originalBytes: [String: Data]
+        /// The recording the target was linked to before the cleanup, if any.
+        var linkedTrackID: Int64?
     }
 
     /// Cleans `target.wav`, a duplicate of `keeper.wav` held in database V2 and both crate kinds.
     /// `otherCrates`, by name, are saved as well, `extraDatabaseRecords` are appended to V2, and `completes: false` lets a cleanup step fail.
     /// `whileSeratoRuns` starts Serato before the cleanup, so its steps stay queued.
+    /// `linkingTargetToARecording` fingerprints the target and links it to a recording first, as an Auto-Tag match does.
     private func cleanDuplicate(_ fixture: SeratoRemovalFixture, engine: OperationEngine, otherCrates: [String: Data] = [:],
-                                extraDatabaseRecords: Data = Data(), completes: Bool = true, whileSeratoRuns: Bool = false) async throws -> RemovedFile
+                                extraDatabaseRecords: Data = Data(), completes: Bool = true, whileSeratoRuns: Bool = false,
+                                linkingTargetToARecording: Bool = false) async throws -> RemovedFile
     {
         let keeper = try await fixture.add("keeper.wav", bytes: FinalRemovalIntegrationTests.wav())
         let target = try await fixture.add("target.wav", bytes: FinalRemovalIntegrationTests.wav())
+        let linkedTrackID = try await linkingTargetToARecording ? linkToARecording(target, in: fixture) : nil
         let originalBytes = try saveStores(fixture, paths: [keeper.path, target.path], extraDatabaseRecords: extraDatabaseRecords)
         for (name, bytes) in otherCrates {
             try bytes.write(to: fixture.locator.subcratesDirectoryUrl.appendingPathComponent(name))
@@ -324,7 +354,21 @@ final class UndoableRemovalTests: XCTestCase {
         }
         let outcome = try await DuplicateResolver(operationEngine: engine, database: fixture.database).resolve(group: group, keeperId: XCTUnwrap(keeper.id))
         XCTAssertEqual(outcome.trashedCount, completes && !whileSeratoRuns ? 1 : 0)
-        return RemovedFile(target: target, batchID: outcome.batchId, originalBytes: originalBytes)
+        return RemovedFile(target: target, batchID: outcome.batchId, originalBytes: originalBytes, linkedTrackID: linkedTrackID)
+    }
+
+    private func linkToARecording(_ file: FileRecord, in fixture: SeratoRemovalFixture) async throws -> Int64 {
+        try await fixture.database.writer.write { database in
+            var fingerprinted = file
+            fingerprinted.chromaprintFingerprint = Data("target fingerprint".utf8)
+            fingerprinted.fingerprintStatus = .done
+            try fingerprinted.update(database)
+            var track = try TrackRecord(fingerprintHash: XCTUnwrap(RecordingIdentity.key(of: fingerprinted, in: database)))
+            try track.insert(database)
+            let trackID = try XCTUnwrap(track.id)
+            try database.execute(sql: "UPDATE files SET track_id = ? WHERE id = ?", arguments: [trackID, fingerprinted.id])
+            return trackID
+        }
     }
 
     private static func trashDirectory(_ fixture: SeratoRemovalFixture) -> URL {
@@ -332,11 +376,13 @@ final class UndoableRemovalTests: XCTestCase {
     }
 
     /// Trashes into the fixture's own Trash directory, never the user's.
-    private func temporaryTrashEngine(_ fixture: SeratoRemovalFixture) throws -> OperationEngine {
+    /// `trashFails` makes every Trash move throw before it moves anything.
+    private func temporaryTrashEngine(_ fixture: SeratoRemovalFixture, trashFails: Bool = false) throws -> OperationEngine {
         let trash = Self.trashDirectory(fixture)
         try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
         return OperationEngine(database: fixture.database, seratoWatchdog: fixture.watchdog, seratoLocator: fixture.locator,
                                fileTrasher: { path in
+                                   guard !trashFails else { throw CocoaError(.fileWriteUnknown) }
                                    let destination = trash.appendingPathComponent((path as NSString).lastPathComponent).path
                                    try FileManager.default.moveItem(atPath: path, toPath: destination)
                                    return destination

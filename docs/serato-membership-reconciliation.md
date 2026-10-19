@@ -506,9 +506,18 @@ step records in `removal_trash_destinations` the item it landed at. Undo first
 checks that this item is still in the Trash and unchanged and that nothing now
 sits at the original path; otherwise it refuses and changes nothing. It then moves
 the item back, re-indexes the file, and queues the record restores behind the
-Serato-running guard. A crate deleted since the removal is reported as not
-restored, and the other stores are still restored. Undoing a removal that has not
-finished drops its queued steps. Undoing that undo is not supported yet (#270).
+Serato-running guard. The re-indexed row gets back its fingerprint and basis, and
+its recording discriminator and `track_id` while the fingerprint still matches and
+that `tracks` row still exists under the key the file identifies; otherwise undo
+leaves them off and notes it in the activity log. Digests and play counts are
+derived caches that the next check rebuilds. A crate deleted since the removal is
+reported as not restored, and the other stores are still restored. Undoing a
+removal that has not finished drops its queued steps. A Trash step whose queued
+move was dropped (superseded, discarded or interrupted) without a recorded item
+restores only the Serato records, after verifying the file is still at its path
+with its original identity; an interrupted move whose file is gone refuses. Trash
+recovery after a crash records the item it finds in the Trash for the file.
+Undoing that undo is not supported yet (#270).
 
 Physical move rollback and retained-source cleanup use `OwnedAudioIdentity`:
 precise device/inode/size/mtime/ctime plus a streaming SHA-256 digest of every byte.

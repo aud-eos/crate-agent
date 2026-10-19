@@ -10,6 +10,9 @@ enum SeratoConflictTargets {
             fileID = try FileRecord.filter(Column("path") == payload.path).fetchOne(database)?.id
             target.paths.append(payload.path)
             target.physicalIdentities.insert(.init(volumeID: payload.volumeUuid, inode: UInt64(bitPattern: payload.inode)))
+            if let trackID = payload.recording?.trackId {
+                target.sharedTrackIDs.insert(trackID)
+            }
         case let .renameFile(payload):
             fileID = payload.fileId
             target.paths += [payload.previousPath, payload.newPath].filter { path in !path.isEmpty }

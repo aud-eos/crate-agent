@@ -4,7 +4,7 @@ import Foundation
 public struct FileAvailabilityResolver: Sendable {
     private let mountedVolumes: @Sendable () throws -> [URL]
     private let volumeIdentifier: @Sendable (URL) throws -> String?
-    private let trashDirectory: @Sendable (URL) throws -> URL
+    let trashDirectory: @Sendable (URL) throws -> URL
 
     public init() {
         self.init(mountedVolumes: Self.systemMountedVolumes, volumeIdentifier: Self.systemVolumeIdentifier)
