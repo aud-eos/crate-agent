@@ -9,7 +9,7 @@ import GRDB
 /// including the `chromaprint_fingerprint` BLOB (~500 bytes/row) and
 /// `lightweight_hash` BLOB (32 bytes/row). On a 32k-track library
 /// that's ~17 MB of bytes per ValueObservation emission, plus the
-/// Codable decode cost. Every FingerprintWorker batch fired the
+/// decode cost. Every FingerprintWorker batch fired the
 /// observation and the resulting per-emission cost beach-balled the
 /// UI even after #29's batched writes throttled the emission rate.
 ///
@@ -22,7 +22,7 @@ import GRDB
 /// runners, mutations) still operate on `FileRecord` — they fetch
 /// by id at the point of use.
 public struct BrowserRow:
-    Codable, FetchableRecord, Hashable, Identifiable, Sendable
+    FetchableRecord, Hashable, Identifiable, Sendable
 {
     public static let databaseTableName = "files"
 
@@ -38,34 +38,34 @@ public struct BrowserRow:
     public var libraryMembership: LibraryMembership
     public var membershipRevision: Int64
     public var fileAvailability: FileAvailability
-    public var processingBlockReason: String? = nil
+    public var processingBlockReason: String?
     /// Song-family placement, present only in the Library projection.
-    public var familyId: Int64? = nil
-    public var familyRole: LibraryFamilyRole? = nil
+    public var familyId: Int64?
+    public var familyRole: LibraryFamilyRole?
     /// Distinct recordings of the family in the current status scope.
-    public var familyVersions: Int? = nil
-    public var recordingId: Int64? = nil
+    public var familyVersions: Int?
+    public var recordingId: Int64?
     /// Whether this file's recording is the family's saved manual main version.
-    public var savedMain: Bool? = nil
+    public var savedMain: Bool?
     /// The checklist columns, present only in the Library projection and only for files that are not retired.
-    var checklistFailingMask: Int? = nil
-    var checklistUnknownMask: Int? = nil
-    var missingMetadataMask: Int? = nil
-    var isProtected: Bool? = nil
-    var isFinished: Bool? = nil
-    var stillNeedsCount: Int? = nil
-    var beatgridMarkerCount: Int? = nil
+    var checklistFailingMask: Int?
+    var checklistUnknownMask: Int?
+    var missingMetadataMask: Int?
+    var isProtected: Bool?
+    var isFinished: Bool?
+    var stillNeedsCount: Int?
+    var beatgridMarkerCount: Int?
     /// Unix seconds.
-    var dateAdded: Int64? = nil
-    var dateAddedSource: DateAddedSource? = nil
+    var dateAdded: Int64?
+    var dateAddedSource: DateAddedSource?
     /// 0 when Serato History has no play of the file.
-    var playCount: Int? = nil
+    var playCount: Int?
     /// Files of the row's family in the status scope that are not Finished, and all of them.
-    var familyFilesNeedingWork: Int? = nil
-    var familyFileCount: Int? = nil
+    var familyFilesNeedingWork: Int?
+    var familyFileCount: Int?
 
-    /// Decodes by column name rather than through `Decodable`, which costs several
-    /// times more per row on a 30-column Library page. Columns a query doesn't select are nil.
+    /// Reads each column by name; a column the query doesn't select is nil.
+    /// Hand-written because synthesized `Decodable` cost about 4x as much per row on a Library page.
     public init(row: Row) throws {
         id = row["id"]
         path = row["path"]
@@ -210,9 +210,7 @@ public extension BrowserRow {
     static let browserColumnsSQL = "files.id, files.path, files.artist, files.title, files.album, files.genre, files.bpm, files.musical_key, files.bitrate_kbps, files.library_membership, files.file_availability, files.membership_revision"
 
     /// Explicit projection query so we never accidentally pull the
-    /// BLOB columns. The column list mirrors the struct's properties
-    /// (snake_case in SQL, camelCase in Swift via the decoding
-    /// strategy above).
+    /// BLOB columns. `init(row:)` reads these columns by their snake_case names.
     static let browserFetchSQL = """
     SELECT \(browserColumnsSQL)
     FROM files

@@ -59,6 +59,19 @@ final class LibraryChecklistTests: XCTestCase {
         XCTAssertEqual(rows["Unread"]?.isFinished, false)
         XCTAssertEqual(rows["Unread"]?.stillNeedsCount, 2)
         XCTAssertEqual(rows["Uncrated"]?.stillNeedsCount, 1)
+
+        // A checklist sort computes every file's checklist before the page; other queries compute only the page's.
+        let collapsed = try await self.rows(LibraryBrowseQuery())
+        let families = Set(collapsed.compactMap { row in row.familyRole == .main ? row.familyId : nil })
+        let pageScoped = try await checklistsByTitle(LibraryBrowseQuery(expandedFamilies: families))
+        let allFiles = try await checklistsByTitle(LibraryBrowseQuery(sort: .init(column: .stillNeeds), expandedFamilies: families))
+        XCTAssertEqual(pageScoped.count, 31)
+        XCTAssertEqual(pageScoped, allFiles)
+        let collapsedAllFiles = try await self.rows(LibraryBrowseQuery(sort: .init(column: .stillNeeds)))
+        let pageMain = collapsed.first { row in row.title == "V1" }
+        let allFilesMain = collapsedAllFiles.first { row in row.title == "V1" }
+        XCTAssertEqual(pageMain?.familyFileCount, allFilesMain?.familyFileCount)
+        XCTAssertEqual(pageMain?.familyFilesNeedingWork, allFilesMain?.familyFilesNeedingWork)
     }
 
     func testRetiredFilesHaveNoChecklistAndCountTowardNoChip() async throws {

@@ -94,7 +94,7 @@ enum LibraryChecklist {
     static let minimumLossyBitrateKbps = 256
     static let losslessExtensions: Set<String> = ["flac", "wav", "aif", "aiff"]
     static let maximumFamilyVersions = 4
-    static let refreshThrottle: Duration = .seconds(2)
+    static let refreshThrottle: DispatchQueue.SchedulerTimeType.Stride = .seconds(2)
     static let observedTables = [SeratoLibraryFacts.factsTable, SeratoLibraryFacts.membershipTable, SeratoLibraryFacts.stampTable,
                                  SeratoAnalysisStore.table, ChecklistDuplicates.table, KeeperMarks.table, SeratoPlayCounts.table]
 

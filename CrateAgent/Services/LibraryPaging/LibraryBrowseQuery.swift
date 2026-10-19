@@ -34,11 +34,13 @@ struct LibraryBrowseSort: Hashable, Sendable {
     var ascending = true
 
     /// Families sort by their main row's values and keep their alternates directly beneath it.
-    var sql: String {
+    /// `table` is the alias that carries `group_key`, `group_id`, `family_role`, `sort_key` and `id`.
+    func sql(_ table: String = "placed") -> String {
         let direction = ascending ? "ASC" : "DESC"
-        let groupNulls = column.isChecklist ? "placed.group_key IS NULL ASC, " : ""
-        let memberNulls = column.isChecklist ? "placed.sort_key IS NULL ASC, " : ""
-        return "\(groupNulls)placed.group_key \(direction), placed.group_id ASC, placed.family_role ASC, \(memberNulls)placed.sort_key \(direction), placed.id ASC"
+        let groupNulls = column.isChecklist ? "\(table).group_key IS NULL ASC, " : ""
+        let memberNulls = column.isChecklist ? "\(table).sort_key IS NULL ASC, " : ""
+        return "\(groupNulls)\(table).group_key \(direction), \(table).group_id ASC, \(table).family_role ASC, "
+            + "\(memberNulls)\(table).sort_key \(direction), \(table).id ASC"
     }
 
     init(column: Column = .path, ascending: Bool = true) {
@@ -209,7 +211,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         return """
         \(placedSQL(withChecklist: ordersByChecklist)),
         \(page) AS MATERIALIZED (
-            SELECT \(pageColumns) FROM placed WHERE \(visibleSQL) ORDER BY \(sort.sql) LIMIT :limit OFFSET :offset
+            SELECT \(pageColumns) FROM placed WHERE \(visibleSQL) ORDER BY \(sort.sql()) LIMIT :limit OFFSET :offset
         )\(pageChecklist),
         page_family_counts AS (
             SELECT page_families.family_id, COUNT(\(finished)) AS file_count, SUM(CASE WHEN \(finished) = 0 THEN 1 ELSE 0 END) AS needing_work
@@ -231,7 +233,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         LEFT JOIN heads ON heads.family_id = \(page).family_id LEFT JOIN families ON families.family_id = \(page).family_id
         LEFT JOIN checklist_files AS \(checklist) ON \(checklist).file_id = \(page).id
         LEFT JOIN page_family_counts ON page_family_counts.family_id = \(page).family_id
-        ORDER BY \(sort.sql.replacingOccurrences(of: "placed.", with: "\(page)."))
+        ORDER BY \(sort.sql(page))
         """
     }
 
@@ -244,7 +246,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         """
         \(placedSQL(withChecklist: ordersByChecklist))
         SELECT \(columns) FROM placed
-        WHERE \(visibleSQL) ORDER BY \(sort.sql)
+        WHERE \(visibleSQL) ORDER BY \(sort.sql())
         """
     }
 
@@ -318,7 +320,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         var lookup = arguments
         lookup += ["id": id]
         return try Int.fetchOne(database, sql: """
-        SELECT position FROM (\(orderedSQL("placed.id, ROW_NUMBER() OVER (ORDER BY \(sort.sql)) - 1 AS position"))) WHERE id = :id
+        SELECT position FROM (\(orderedSQL("placed.id, ROW_NUMBER() OVER (ORDER BY \(sort.sql())) - 1 AS position"))) WHERE id = :id
         """, arguments: lookup)
     }
 

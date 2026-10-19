@@ -37,7 +37,7 @@ final class PagedLibraryFixture {
             try connection.execute(sql: "DELETE FROM files WHERE id > 30000")
             try connection.execute(sql: "UPDATE files SET track_id = NULL; DELETE FROM tracks; DELETE FROM works")
             try connection.execute(sql: "UPDATE files SET genre = NULL, bpm = NULL, musical_key = NULL, bitrate_kbps = NULL")
-            for table in Self.checklistTables {
+            for table in LibraryChecklist.observedTables {
                 try connection.execute(sql: "DELETE FROM \(table)")
             }
             for identifier in [1, 2, 3, 4, 15001, 30000] {
@@ -46,9 +46,6 @@ final class PagedLibraryFixture {
             }
         }
     }
-
-    private static let checklistTables = [SeratoLibraryFacts.factsTable, SeratoLibraryFacts.membershipTable, SeratoLibraryFacts.stampTable,
-                                          SeratoAnalysisStore.table, ChecklistDuplicates.table, KeeperMarks.table, SeratoPlayCounts.table]
 
     /// Checklist facts for every file: V2 facts for all 30,000, fresh analysis for 24,000,
     /// crate membership for 20,000, play counts for 10,000, 300 confirmed duplicate members,

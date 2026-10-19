@@ -1,3 +1,5 @@
+import Combine
+import Foundation
 import GRDB
 
 enum LibraryBrowseObservation {
@@ -14,61 +16,20 @@ enum LibraryBrowseObservation {
         FROM files LEFT JOIN tracks ON tracks.id = files.track_id LEFT JOIN works ON works.id = tracks.work_id
         """)
         let immediate = DatabaseRegionObservation(tracking: projection, families).start(in: database.writer, onError: onError) { _ in onChange() }
-        let throttle = RefreshThrottle(interval: LibraryChecklist.refreshThrottle, action: onChange)
-        let checklistRegions: [any DatabaseRegionConvertible] = LibraryChecklist.observedTables.map { table in SQLRequest<GRDB.Row>(sql: "SELECT * FROM \(table)") }
-        let checklist = DatabaseRegionObservation(tracking: checklistRegions).start(in: database.writer, onError: onError) { _ in
-            Task { await throttle.signal() }
+        let checklistRegions: [any DatabaseRegionConvertible] = LibraryChecklist.observedTables.map { table in
+            SQLRequest<GRDB.Row>(sql: "SELECT * FROM \(table)")
         }
+        let checklist = DatabaseRegionObservation(tracking: checklistRegions).publisher(in: database.writer)
+            .map { _ in () }
+            .throttle(for: LibraryChecklist.refreshThrottle, scheduler: DispatchQueue.global(qos: .utility), latest: true)
+            .sink(receiveCompletion: { completion in
+                if case let .failure(failure) = completion {
+                    onError(failure)
+                }
+            }, receiveValue: { _ in onChange() })
         return AnyDatabaseCancellable {
             immediate.cancel()
             checklist.cancel()
-            Task { await throttle.cancel() }
         }
-    }
-}
-
-/// Runs `action` on the first signal, then at most once per `interval`; signals inside an interval
-/// coalesce into one trailing run, so the last change is never dropped.
-actor RefreshThrottle {
-    private let interval: Duration
-    private let action: @Sendable () -> Void
-    private var lastRun: ContinuousClock.Instant?
-    private var trailing: Task<Void, Never>?
-    private var isCancelled = false
-
-    init(interval: Duration, action: @escaping @Sendable () -> Void) {
-        self.interval = interval
-        self.action = action
-    }
-
-    func signal() {
-        guard !isCancelled, trailing == nil else { return }
-        let now = ContinuousClock.now
-        guard let lastRun, now - lastRun < interval else {
-            run()
-            return
-        }
-        let delay = interval - (now - lastRun)
-        trailing = Task { [weak self] in
-            do { try await Task.sleep(for: delay) } catch { return }
-            await self?.runTrailing()
-        }
-    }
-
-    func cancel() {
-        isCancelled = true
-        trailing?.cancel()
-        trailing = nil
-    }
-
-    private func runTrailing() {
-        trailing = nil
-        guard !isCancelled else { return }
-        run()
-    }
-
-    private func run() {
-        lastRun = .now
-        action()
     }
 }
