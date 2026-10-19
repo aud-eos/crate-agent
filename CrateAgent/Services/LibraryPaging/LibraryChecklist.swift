@@ -87,6 +87,23 @@ enum ChecklistChip: String, CaseIterable, Identifiable, Sendable {
         case .finished: .finished
         }
     }
+
+    /// The one Serato source the chip's whole answer comes from. Until that source has been read,
+    /// the chip's count is unknown, not 0.
+    var source: ChecklistSource? {
+        switch self {
+        case .notInCrate: .subcrates
+        case .gridUnchecked: .databaseV2
+        case .neverPlayed: .history
+        case .needsWork, .noCues, .lowQuality, .tooManyVersions, .finished: nil
+        }
+    }
+}
+
+/// How many files a chip matches, or unknown while its source has never been read.
+enum ChecklistChipCount: Hashable, Sendable {
+    case files(Int)
+    case unknown
 }
 
 /// The checklist rules, as SQL over the Library projection's aliases.
@@ -204,3 +221,4 @@ enum LibraryChecklist {
         return "COALESCE(\(predicate), 0)"
     }
 }
+

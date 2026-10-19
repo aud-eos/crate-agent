@@ -16,7 +16,7 @@ final class LibraryBrowserModel: ObservableObject {
     @Published private(set) var familyStates: [Int64: LibraryFamilyState] = [:]
     /// How many files each chip matches in the current scope without the chip; loaded after each snapshot's first page.
     /// Nil until the counts for the current search, status and facets have loaded.
-    @Published private(set) var chipCounts: [ChecklistChip: Int]?
+    @Published private(set) var chipCounts: [ChecklistChip: ChecklistChipCount]?
     /// The genres and keys the facets can choose from in the status scope; loaded after each snapshot's first page.
     @Published private(set) var facetOptions: LibraryFacetOptions?
     /// Whether Serato History has ever been read, from its persisted stamp; nil until the first snapshot loads it.

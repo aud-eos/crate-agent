@@ -80,7 +80,7 @@ final class LibraryChecklistTests: XCTestCase {
         XCTAssertNil(try retired.first?.checklist())
         let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: .init(filter: .removedFromSerato))
         let counts = try await snapshot.chipCounts()
-        XCTAssertEqual(counts.values.reduce(0, +), 0)
+        XCTAssertEqual(Set(counts.values), [.files(0)])
     }
 
     func testKeeperIsFinishedButOnlyItsOwnMarkHidesDuplicate() async throws {
@@ -103,9 +103,9 @@ final class LibraryChecklistTests: XCTestCase {
     func testChipsCombineWithSearchAndCountFilesInScope() async throws {
         let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: .init(search: "Artist A", chip: .notInCrate))
         let counts = try await snapshot.chipCounts()
-        XCTAssertEqual(counts[.notInCrate], 2)
-        XCTAssertEqual(counts[.finished], 1)
-        XCTAssertEqual(counts[.needsWork], 2)
+        XCTAssertEqual(counts[.notInCrate], .files(2))
+        XCTAssertEqual(counts[.finished], .files(1))
+        XCTAssertEqual(counts[.needsWork], .files(2))
         let found = try await titles(.init(search: "Artist A", chip: .notInCrate))
         XCTAssertEqual(found, ["A Uncrated 1", "A Uncrated 2"])
     }
@@ -117,15 +117,17 @@ final class LibraryChecklistTests: XCTestCase {
         XCTAssertEqual(Array(played.prefix(2)), [fileIDs["Played 9"], fileIDs["Played 2"]])
     }
 
-    func testPlaysAreUnknownAndNeverPlayedMatchesNothingUntilHistoryHasBeenRead() async throws {
+    func testPlaysAndUnreadSourcesChipCountsAreUnknownAndNeverPlayedMatchesNothingUntilHistoryHasBeenRead() async throws {
         try await pool.write { connection in
-            try connection.execute(sql: "DELETE FROM checklist_source_stamps WHERE source = ?", arguments: [ChecklistSource.history.rawValue])
+            try connection.execute(sql: "DELETE FROM checklist_source_stamps WHERE source IN (?, ?)",
+                                   arguments: [ChecklistSource.history.rawValue, ChecklistSource.subcrates.rawValue])
         }
         var plays = try await playsByTitle()
         XCTAssertEqual(plays["Complete"], .some(nil))
         XCTAssertEqual(plays["Played 9"], .some(nil))
         let unreadCounts = try await LibraryPagedSnapshot.open(pool: pool, query: .init()).chipCounts()
-        XCTAssertEqual(unreadCounts[.neverPlayed], 0)
+        XCTAssertEqual(unreadCounts[.neverPlayed], .unknown)
+        XCTAssertEqual(unreadCounts[.notInCrate], .unknown)
         let unreadNeverPlayed = try await titles(.init(chip: .neverPlayed))
         XCTAssertEqual(unreadNeverPlayed, [])
 
@@ -208,7 +210,7 @@ final class LibraryChecklistTests: XCTestCase {
             try track.insert(connection)
             return try XCTUnwrap(track.id)
         }
-        for source in [ChecklistSource.subcrates, .history] {
+        for source in ChecklistSource.allCases {
             try connection.execute(sql: "INSERT INTO checklist_source_stamps (source, stamp) VALUES (?, '{}')", arguments: [source.rawValue])
         }
 

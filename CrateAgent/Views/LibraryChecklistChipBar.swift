@@ -3,7 +3,7 @@ import SwiftUI
 /// Single-select checklist chips with live file counts. Pressing the chosen chip again clears it.
 struct LibraryChecklistChipBar: View {
     @Binding var chip: ChecklistChip?
-    let counts: [ChecklistChip: Int]?
+    let counts: [ChecklistChip: ChecklistChipCount]?
     let neverPlayedAvailable: Bool
     /// Why Never played is unavailable when `neverPlayedAvailable` is false.
     var neverPlayedUnavailableReason = LibraryChecklistMessages.neverPlayedUnavailable

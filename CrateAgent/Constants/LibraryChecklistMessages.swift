@@ -48,8 +48,13 @@ enum LibraryChecklistMessages {
         }
     }
 
-    static func chipLabel(_ chip: ChecklistChip, count: Int?) -> String {
-        "\(chipTitle(chip)) \(count?.formatted() ?? countLoading)"
+    /// A nil count is still loading.
+    static func chipLabel(_ chip: ChecklistChip, count: ChecklistChipCount?) -> String {
+        switch count {
+        case nil: "\(chipTitle(chip)) \(countLoading)"
+        case let .files(files): "\(chipTitle(chip)) \(files.formatted())"
+        case .unknown: "\(chipTitle(chip)) \(unknown)"
+        }
     }
 
     static func unavailableNote(_ reason: String) -> String {
@@ -60,9 +65,13 @@ enum LibraryChecklistMessages {
         "Couldn't read Serato History: \(reason)"
     }
 
-    static func chipAccessibilityLabel(_ chip: ChecklistChip, count: Int?) -> String {
-        guard let count else { return "\(chipTitle(chip)), count loading" }
-        return count == 1 ? "\(chipTitle(chip)), 1 file" : "\(chipTitle(chip)), \(count.formatted()) files"
+    static func chipAccessibilityLabel(_ chip: ChecklistChip, count: ChecklistChipCount?) -> String {
+        switch count {
+        case nil: "\(chipTitle(chip)), count loading"
+        case .files(1): "\(chipTitle(chip)), 1 file"
+        case let .files(files): "\(chipTitle(chip)), \(files.formatted()) files"
+        case .unknown: "\(chipTitle(chip)), count \(unknown)"
+        }
     }
 
     static func tag(_ item: ChecklistItem) -> String {

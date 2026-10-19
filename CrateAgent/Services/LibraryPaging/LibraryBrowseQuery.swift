@@ -301,7 +301,8 @@ struct LibraryBrowseQuery: Hashable, Sendable {
     }
 
     /// How many files in the query's scope without its chip each chip matches: the status scope, search and facets, file by file.
-    func chipCounts(in database: GRDB.Database) throws -> [ChecklistChip: Int] {
+    /// A chip whose source has never been read is unknown, not 0.
+    func chipCounts(in database: GRDB.Database) throws -> [ChecklistChip: ChecklistChipCount] {
         var unfiltered = self
         unfiltered.chip = nil
         let sums = ChecklistChip.allCases.map { chip -> String in
@@ -311,8 +312,9 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         }.joined(separator: ", ")
         guard let row = try GRDB.Row.fetchOne(database, sql: "\(unfiltered.placedSQL(withChecklist: true))\nSELECT \(sums) FROM placed", arguments: unfiltered.arguments())
         else { throw PagingError.incompletePage }
-        return Dictionary(uniqueKeysWithValues: ChecklistChip.allCases.enumerated().map { position, chip -> (ChecklistChip, Int) in
-            (chip, row[position])
+        let unread = try Set(ChecklistSource.allCases.filter { source in try !SeratoLibraryFacts.hasStamp(source, in: database) })
+        return Dictionary(uniqueKeysWithValues: ChecklistChip.allCases.enumerated().map { position, chip -> (ChecklistChip, ChecklistChipCount) in
+            (chip, chip.source.map(unread.contains) == true ? .unknown : .files(row[position]))
         })
     }
 
