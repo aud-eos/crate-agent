@@ -196,7 +196,9 @@ alternating a baseline worktree at `3dcb14e` with the fixed build (load average
 | 2 | 669 ms (failed the assert) | 88 ms |
 | 3 | 466 ms | 102 ms (load average 84; the test's separate 5 s wait for the first analysis batch timed out) |
 
-The baseline was fast only when the refresh missed the render window. Navigation
+The full `make test-swift` run of the fixed build measured render 85 ms,
+navigation 57 ms, longest writer wait 32 ms, and `CHECKLIST_FACTS_WRITER_HOLD`
+longest wait 18 ms. The baseline was fast only when the refresh missed the render window. Navigation
 stayed 6-39 ms and the longest writer wait 16-44 ms in every run. The 30,000-file
 `CHECKLIST_PAGING_METRICS` matched `3dcb14e` within a few milliseconds (for
 example Still needs sort: page 322 ms, counts 130 ms; facet options 8 ms).
