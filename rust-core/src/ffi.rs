@@ -4,10 +4,14 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::serato;
+use crate::serato_analysis;
 use crate::tags;
 use fingerprint_core as fingerprint;
 
-pub use crate::serato::{SeratoMetadataUpdate, SeratoRemovedRecord, SeratoTrackRecord};
+pub use crate::serato::{
+    SeratoMetadataUpdate, SeratoRemovedRecord, SeratoTrackFacts, SeratoTrackRecord,
+};
+pub use crate::serato_analysis::SeratoAnalysis;
 pub use crate::serato_history::{SeratoHistoryPlay, SeratoHistoryScan};
 pub use crate::tags::{AudioTagUpdate, AudioTags};
 
@@ -183,6 +187,14 @@ impl From<tags::TagError> for CoreError {
             other => CoreError::Tag {
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<serato_analysis::AnalysisError> for CoreError {
+    fn from(err: serato_analysis::AnalysisError) -> Self {
+        CoreError::Tag {
+            message: err.to_string(),
         }
     }
 }
@@ -384,6 +396,14 @@ pub fn read_database_records_strict(
     Ok(database.strict_track_records()?)
 }
 
+pub fn read_database_track_facts(
+    database_path: String,
+) -> Result<Vec<SeratoTrackFacts>, CoreError> {
+    Ok(serato::read_database_track_facts(&PathBuf::from(
+        database_path,
+    ))?)
+}
+
 pub fn read_serato_history(history_directory: String) -> Result<SeratoHistoryScan, CoreError> {
     Ok(crate::serato_history::read_history(&PathBuf::from(
         history_directory,
@@ -503,6 +523,12 @@ pub fn encode_fingerprint(raw: Vec<u32>) -> String {
 pub fn read_audio_tags(file_path: String) -> Result<AudioTags, CoreError> {
     let path = PathBuf::from(file_path);
     Ok(tags::read_tags(&path)?)
+}
+
+pub fn read_serato_analysis(file_path: String) -> Result<SeratoAnalysis, CoreError> {
+    Ok(serato_analysis::read_serato_analysis(&PathBuf::from(
+        file_path,
+    ))?)
 }
 
 pub fn write_audio_tags(file_path: String, update: AudioTagUpdate) -> Result<(), CoreError> {

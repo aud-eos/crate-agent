@@ -5,6 +5,7 @@
 
 mod ffi;
 mod serato;
+mod serato_analysis;
 mod serato_history;
 mod tags;
 

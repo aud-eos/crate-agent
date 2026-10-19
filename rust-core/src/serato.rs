@@ -325,6 +325,61 @@ pub struct SeratoTrackRecord {
     pub year: Option<String>,
 }
 
+/// The library facts the readiness checklist reads from one `database V2`
+/// track: whether its beatgrid is locked (`bbgl`) and when it was added, in
+/// Unix seconds (`uadd`, else the `tadd` decimal string). A field the record
+/// lacks, or holds in an unrecognised form, is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeratoTrackFacts {
+    pub path: String,
+    pub beatgrid_locked: Option<bool>,
+    pub added_at: Option<u32>,
+}
+
+pub fn read_database_track_facts(path: &Path) -> Result<Vec<SeratoTrackFacts>, SeratoError> {
+    let bytes = fs::read(path)?;
+    let mut facts = Vec::new();
+    let mut every_track_well_formed = true;
+    let file_well_formed = walk_nested_fields(&bytes, |tag, payload| {
+        if tag != TAG_OTRK {
+            return;
+        }
+        let (track, well_formed) = track_facts(payload);
+        every_track_well_formed &= well_formed;
+        facts.extend(track);
+    });
+    if !(file_well_formed && every_track_well_formed) {
+        return Err(SeratoError::InvalidFile(
+            "malformed database V2 record".into(),
+        ));
+    }
+    Ok(facts)
+}
+
+/// The track's facts, `None` without a `pfil`, and whether its `otrk`
+/// payload parsed cleanly.
+fn track_facts(otrk_payload: &[u8]) -> (Option<SeratoTrackFacts>, bool) {
+    let mut path = None;
+    let mut beatgrid_locked = None;
+    let mut unix_added = None;
+    let mut text_added = None;
+    let well_formed = walk_nested_fields(otrk_payload, |tag, field| match tag {
+        TAG_PFIL => path = decode_utf16be(field),
+        b"bbgl" => beatgrid_locked = field.first().map(|flag| *flag != 0),
+        b"uadd" => unix_added = <[u8; 4]>::try_from(field).ok().map(u32::from_be_bytes),
+        b"tadd" => {
+            text_added = decode_utf16be(field).and_then(|text| text.trim().parse::<u32>().ok())
+        }
+        _ => {}
+    });
+    let track = path.map(|path| SeratoTrackFacts {
+        path,
+        beatgrid_locked,
+        added_at: unix_added.or(text_added),
+    });
+    (track, well_formed)
+}
+
 /// Return every track path stored in `otrk` containers of the given
 /// record list, keyed by the path tag (`ptrk` for `.crate`, `pfil` for
 /// `database V2`).
@@ -1809,6 +1864,68 @@ mod tests {
         assert_eq!(track.comment.as_deref(), Some("a comment"));
         assert_eq!(track.length.as_deref(), Some("03:24"));
         assert_eq!(track.label.as_deref(), Some("Some Label"));
+    }
+
+    #[test]
+    fn track_facts_read_bbgl_and_uadd_with_tadd_fallback() {
+        fn otrk(fields: &[TlvRecord]) -> TlvRecord {
+            let mut payload = Vec::new();
+            TlvRecord::write_all(fields, &mut payload).unwrap();
+            TlvRecord {
+                tag: *TAG_OTRK,
+                payload,
+            }
+        }
+        fn path_field(path: &str) -> TlvRecord {
+            TlvRecord {
+                tag: *TAG_PFIL,
+                payload: encode_utf16be(path),
+            }
+        }
+        let records = [
+            TlvRecord {
+                tag: *b"vrsn",
+                payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+            },
+            otrk(&[
+                path_field("Music/A/Locked.mp3"),
+                TlvRecord {
+                    tag: *b"bbgl",
+                    payload: vec![1],
+                },
+                TlvRecord {
+                    tag: *b"uadd",
+                    payload: 1_700_000_000u32.to_be_bytes().to_vec(),
+                },
+            ]),
+            otrk(&[
+                path_field("Music/B/Legacy.mp3"),
+                TlvRecord {
+                    tag: *b"tadd",
+                    payload: encode_utf16be("1600000000"),
+                },
+            ]),
+            otrk(&[path_field("Music/C/Bare.mp3")]),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("database V2");
+        let mut bytes = Vec::new();
+        TlvRecord::write_all(&records, &mut bytes).unwrap();
+        std::fs::write(&database_path, bytes).unwrap();
+
+        let facts: Vec<_> = read_database_track_facts(&database_path)
+            .unwrap()
+            .into_iter()
+            .map(|track| (track.beatgrid_locked, track.added_at))
+            .collect();
+        assert_eq!(
+            facts,
+            vec![
+                (Some(true), Some(1_700_000_000)),
+                (None, Some(1_600_000_000)),
+                (None, None)
+            ]
+        );
     }
 
     #[test]

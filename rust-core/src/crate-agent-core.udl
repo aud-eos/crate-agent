@@ -107,6 +107,12 @@ namespace crate_agent_core {
   [Throws=CoreError]
   sequence<SeratoTrackRecord> read_database_records_strict(string database_path);
 
+  // Read each `database V2` track's beatgrid lock (`bbgl`) and date added
+  // (`uadd`, else `tadd`), for the readiness checklist. A malformed record
+  // fails the whole read.
+  [Throws=CoreError]
+  sequence<SeratoTrackFacts> read_database_track_facts(string database_path);
+
   // Strictly read every `Sessions/*.session` file under Serato's
   // `History` directory and return the deck loads Serato marked as
   // played. Read-only; any unrecognised structure fails with the
@@ -190,6 +196,12 @@ namespace crate_agent_core {
   // regardless of whether the file carries tags.
   [Throws=CoreError]
   AudioTags read_audio_tags(string file_path);
+
+  // Count the cue points and beatgrid markers Serato stored in the audio
+  // file's own tags; absent tags count zero. Fails, naming the cause, for
+  // an unsupported container, an unreadable file or a malformed payload.
+  [Throws=CoreError]
+  SeratoAnalysis read_serato_analysis(string file_path);
 
   // Write metadata tags into the audio file at `file_path`. Each
   // field in `update` is independently optional: `null` leaves the
@@ -337,6 +349,19 @@ dictionary SeratoHistoryScan {
   u32 session_count;
   u32 unplayed_count;
   u32 non_file_count;
+};
+
+// One `database V2` track's readiness facts. `added_at` is Unix seconds.
+// A field the record lacks, or holds in an unrecognised form, is null.
+dictionary SeratoTrackFacts {
+  string path;
+  boolean? beatgrid_locked;
+  u32? added_at;
+};
+
+dictionary SeratoAnalysis {
+  u32 cue_count;
+  u32 beatgrid_marker_count;
 };
 
 dictionary AudioTags {
