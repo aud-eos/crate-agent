@@ -90,18 +90,7 @@ final class LibraryPagingTests: XCTestCase {
                 + "\(label)_distant_page_ms=\((distantPage - firstPage).milliseconds) \(label)_placements_ms=\((placements - distantPage).milliseconds)"
         }
         let ungrouped = try await measure("ungrouped")
-        try await fixture.pool.write { connection in
-            for family in 0 ..< 2000 {
-                var record = SongFamilyRecord()
-                try record.insert(connection)
-                for member in 0 ..< 3 {
-                    let fileID = Int64(family * 10 + member + 1)
-                    var track = TrackRecord(fingerprintHash: Data("family-\(fileID)".utf8), workId: record.id)
-                    try track.insert(connection)
-                    try connection.execute(sql: "UPDATE files SET track_id = ? WHERE id = ?", arguments: [track.id, fileID])
-                }
-            }
-        }
+        try await fixture.pool.write { connection in try PagedLibraryFixture.groupFamilies(connection) }
         let grouped = try await measure("grouped")
         let snapshot = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: fixture.query)
         let visible = await snapshot.count()
@@ -131,6 +120,39 @@ final class LibraryPagingTests: XCTestCase {
         let metrics = "\(ungrouped) \(grouped) \(expanded) \(collapsed) \(included) \(searched)"
         print("SONG_FAMILY_PAGING_METRICS \(metrics)")
         let attachment = XCTAttachment(string: metrics)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    /// Invariant 8 evidence for the checklist: every new sort, every chip, and a chip with a search,
+    /// each opened with its first page and, separately, its chip counts, over checklist facts for 30,000 files.
+    func testChecklistSortFilterAndCountsStayWithinBudgetsAtThirtyThousandFiles() async throws {
+        let fixture = try fixture
+        try fixture.seedChecklist()
+        var metrics: [String] = []
+        func measure(_ label: String, _ query: LibraryBrowseQuery) async throws {
+            let start = ContinuousClock.now
+            let snapshot = try await LibraryPagedSnapshot.open(pool: fixture.pool, query: query)
+            let total = await snapshot.count()
+            _ = try await snapshot.rows(in: 0 ..< min(200, total))
+            let paged = ContinuousClock.now - start
+            let countsStart = ContinuousClock.now
+            _ = try await snapshot.chipCounts()
+            let counted = ContinuousClock.now - countsStart
+            XCTAssertLessThan(paged, .milliseconds(500), label)
+            XCTAssertLessThan(counted, .milliseconds(500), "\(label) counts")
+            metrics.append("\(label)_rows=\(total) \(label)_page_ms=\(paged.milliseconds) \(label)_counts_ms=\(counted.milliseconds)")
+        }
+        for column in [LibraryBrowseSort.Column.stillNeeds, .dateAdded, .myPlays] {
+            try await measure("sort_\(column.rawValue)", .init(sort: .init(column: column)))
+        }
+        for chip in ChecklistChip.allCases {
+            try await measure("chip_\(chip.rawValue)", .init(chip: chip))
+        }
+        try await measure("search_needs_work", .init(search: "Artist A", chip: .needsWork))
+        let line = "CHECKLIST_PAGING_METRICS " + metrics.joined(separator: " ")
+        print(line)
+        let attachment = XCTAttachment(string: line)
         attachment.lifetime = .keepAlways
         add(attachment)
     }

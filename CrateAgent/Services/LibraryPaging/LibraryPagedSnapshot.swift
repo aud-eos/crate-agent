@@ -48,6 +48,12 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
         return try reader.read { database in try signature.rows(in: database, range: range) }
     }
 
+    /// How many files each chip matches in the scope this snapshot shows without its chip.
+    func chipCounts() throws -> [ChecklistChip: Int] {
+        try Task.checkCancellation()
+        return try reader.read { database in try signature.chipCounts(in: database) }
+    }
+
     func index(of id: Int64) throws -> Int? {
         try Task.checkCancellation()
         return try reader.read { database in try signature.index(of: id, in: database) }

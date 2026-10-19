@@ -1,0 +1,219 @@
+@testable import CrateAgent
+import GRDB
+import XCTest
+
+/// The per-file checklist the Library projection computes from stored facts,
+/// over a real WAL database with one file per case and facts seeded in SQL.
+final class LibraryChecklistTests: XCTestCase {
+    private var directory: URL!
+    private var database: LibraryDatabase!
+    private var pool: DatabasePool!
+    private var fileIDs: [String: Int64] = [:]
+
+    /// Everything a complete file has; each case removes or changes one fact.
+    private struct Seed {
+        var title: String
+        var artist = "Artist"
+        var genre: String? = "House"
+        var bitrateKbps: Int? = 320
+        var pathExtension = "mp3"
+        var inCrate = true
+        var cueCount: Int?? = .some(4)
+        var beatgridLocked: Bool?? = .some(true)
+        var addedAt: Int64? = 100
+        var addedSource = DateAddedSource.serato
+        var playCount: Int?
+        var duplicateGroup: String?
+        var trackID: Int64?
+    }
+
+    override func setUp() async throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("LibraryChecklist-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        database = try LibraryDatabase.openWAL(at: directory.appendingPathComponent("library.sqlite"))
+        pool = try XCTUnwrap(database.writer as? DatabasePool)
+        fileIDs = try await pool.write { connection in try Self.seed(connection) }
+    }
+
+    override func tearDown() async throws {
+        try pool.close()
+        try FileManager.default.removeItem(at: directory)
+    }
+
+    func testChecklistReportsEachItemFromStoredFacts() async throws {
+        let rows = try await checklistsByTitle(LibraryBrowseQuery())
+        XCTAssertEqual(rows["Uncrated"]?.failing, [.inCrate])
+        XCTAssertEqual(rows["Unread"]?.unknown, [.cuePoints, .beatgridChecked])
+        XCTAssertEqual(rows["Unread"]?.failing, [])
+        XCTAssertEqual(rows["NoCues"]?.failing, [.cuePoints])
+        XCTAssertEqual(rows["UnreadableCues"]?.unknown, [.cuePoints])
+        XCTAssertEqual(rows["GridUnlocked"]?.failing, [.beatgridChecked])
+        XCTAssertEqual(rows["NoGenre"]?.missingMetadata, [.genre])
+        XCTAssertEqual(rows["NoGenre"]?.failing, [.metadata])
+        XCTAssertEqual(rows["Lossy192"]?.failing, [.quality])
+        XCTAssertEqual(rows["FlacNoBitrate"]?.failing, [])
+        XCTAssertEqual(rows["FlacNoBitrate"]?.unknown, [])
+        XCTAssertEqual(rows["Mp3NoBitrate"]?.unknown, [.quality])
+        XCTAssertEqual(rows["Dupe"]?.failing, [.duplicate])
+        XCTAssertEqual(rows["Complete"]?.isFinished, true)
+        XCTAssertEqual(rows["Unread"]?.isFinished, false)
+        XCTAssertEqual(rows["Unread"]?.stillNeedsCount, 2)
+        XCTAssertEqual(rows["Uncrated"]?.stillNeedsCount, 1)
+    }
+
+    func testRetiredFilesHaveNoChecklistAndCountTowardNoChip() async throws {
+        let retired = try await rows(LibraryBrowseQuery(filter: .removedFromSerato))
+        XCTAssertEqual(retired.map(\.title), ["Retired"])
+        XCTAssertNil(try retired.first?.checklist())
+        let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: .init(filter: .removedFromSerato))
+        let counts = try await snapshot.chipCounts()
+        XCTAssertEqual(counts.values.reduce(0, +), 0)
+    }
+
+    func testKeeperIsFinishedButOnlyItsOwnMarkHidesDuplicate() async throws {
+        let rows = try await checklistsByTitle(.init())
+        XCTAssertEqual(rows["KeptLossyDupe"]?.isFinished, true)
+        XCTAssertEqual(rows["KeptLossyDupe"]?.failing, [.quality])
+        XCTAssertEqual(rows["KeptLossyDupe"]?.stillNeedsCount, 0)
+        XCTAssertEqual(rows["KeptSiblingDupe"]?.isFinished, true)
+        XCTAssertEqual(rows["KeptSiblingDupe"]?.failing, [.duplicate])
+    }
+
+    func testTooManyVersionsFlagsOnlyNonMainVersionsOfFamiliesOverTheLimit() async throws {
+        let flagged = try await titles(.init(chip: .tooManyVersions))
+        XCTAssertEqual(flagged, ["V2", "V3", "V4", "V5"])
+        let main = try await rows(.init()).first { row in row.title == "V1" }
+        XCTAssertEqual(main?.familyFileCount, 6)
+        XCTAssertEqual(main?.familyFilesNeedingWork, 4)
+    }
+
+    func testChipsCombineWithSearchAndCountFilesInScope() async throws {
+        let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: .init(search: "Artist A", chip: .notInCrate))
+        let counts = try await snapshot.chipCounts()
+        XCTAssertEqual(counts[.notInCrate], 2)
+        XCTAssertEqual(counts[.finished], 1)
+        XCTAssertEqual(counts[.needsWork], 2)
+        let found = try await titles(.init(search: "Artist A", chip: .notInCrate))
+        XCTAssertEqual(found, ["A Uncrated 1", "A Uncrated 2"])
+    }
+
+    func testDateAddedFallsBackToFirstIndexedAndMissingValuesSortLast() async throws {
+        let dated = try await ids(.init(search: "Dated", sort: .init(column: .dateAdded, ascending: false)))
+        XCTAssertEqual(dated, [fileIDs["Dated Serato Newest"], fileIDs["Dated Indexed Older"], fileIDs["Dated No Facts"]])
+        let played = try await ids(.init(sort: .init(column: .myPlays, ascending: false)))
+        XCTAssertEqual(Array(played.prefix(2)), [fileIDs["Played 9"], fileIDs["Played 2"]])
+    }
+
+    // MARK: - Helpers
+
+    private func rows(_ query: LibraryBrowseQuery) async throws -> [BrowserRow] {
+        let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: query)
+        return try await snapshot.rows(in: 0 ..< snapshot.count())
+    }
+
+    private func checklistsByTitle(_ query: LibraryBrowseQuery) async throws -> [String: FileChecklist] {
+        var checklists: [String: FileChecklist] = [:]
+        for row in try await rows(query) {
+            checklists[row.title ?? row.path] = try row.checklist()
+        }
+        return checklists
+    }
+
+    /// Titles of the matching rows, leaving out a family's main row shown only as context.
+    private func titles(_ query: LibraryBrowseQuery) async throws -> [String] {
+        try await rows(query).filter { row in row.familyRole != .main }.map { row in row.title ?? row.path }
+    }
+
+    private func ids(_ query: LibraryBrowseQuery) async throws -> [Int64?] {
+        try await rows(query).map(\.id)
+    }
+
+    private static func seed(_ connection: GRDB.Database) throws -> [String: Int64] {
+        var ids: [String: Int64] = [:]
+        var inode: Int64 = 0
+        func add(_ seed: Seed) throws {
+            inode += 1
+            var file = FileRecord(path: "/Music/\(seed.title).\(seed.pathExtension)", volumeUuid: "volume", inode: inode, fileSize: 10, mtime: 5,
+                                  trackId: seed.trackID, bitrateKbps: seed.bitrateKbps, artist: seed.artist, title: seed.title,
+                                  genre: seed.genre, bpm: "124", musicalKey: "8A")
+            file.libraryMembership = .active
+            file.fileAvailability = .available
+            try file.insert(connection)
+            let fileID = try XCTUnwrap(file.id)
+            ids[seed.title] = fileID
+            if seed.inCrate {
+                try connection.execute(sql: "INSERT INTO serato_crate_memberships (file_id, crate_name) VALUES (?, 'Warmup')", arguments: [fileID])
+            }
+            if case let .some(cueCount) = seed.cueCount {
+                try connection.execute(sql: """
+                INSERT INTO file_serato_analysis (file_id, file_size, mtime, inode, modified_nanoseconds, changed_seconds, changed_nanoseconds,
+                                                  cue_count, beatgrid_marker_count, failure)
+                VALUES (?, 10, 5, ?, 0, 5, 0, ?, 1, ?)
+                """, arguments: [fileID, inode, cueCount, cueCount == nil ? "malformed: bad Markers2" : nil])
+            }
+            if case let .some(locked) = seed.beatgridLocked {
+                try connection.execute(sql: "INSERT INTO serato_track_facts (file_id, beatgrid_locked, added_at, added_source) VALUES (?, ?, ?, ?)",
+                                       arguments: [fileID, locked, seed.addedAt, seed.addedSource])
+            }
+            if let playCount = seed.playCount {
+                try connection.execute(sql: "INSERT INTO serato_play_counts (file_id, play_count) VALUES (?, ?)", arguments: [fileID, playCount])
+            }
+            if let group = seed.duplicateGroup {
+                try connection.execute(sql: "INSERT INTO checklist_duplicate_members (file_id, group_key) VALUES (?, ?)", arguments: [fileID, group])
+            }
+        }
+        func track(mbid: String?, family: Int64?, name: String) throws -> Int64 {
+            var track = TrackRecord(fingerprintHash: Data(name.utf8), musicbrainzRecordingId: mbid, workId: family)
+            try track.insert(connection)
+            return try XCTUnwrap(track.id)
+        }
+        try connection.execute(sql: "INSERT INTO checklist_source_stamps (source, stamp) VALUES (?, '{}')", arguments: [ChecklistSource.subcrates.rawValue])
+
+        try add(Seed(title: "Complete"))
+        try add(Seed(title: "Uncrated", inCrate: false))
+        try add(Seed(title: "Unread", cueCount: .none, beatgridLocked: .none))
+        try add(Seed(title: "NoCues", cueCount: .some(0)))
+        try add(Seed(title: "UnreadableCues", cueCount: .some(nil)))
+        try add(Seed(title: "GridUnlocked", beatgridLocked: .some(false)))
+        try add(Seed(title: "NoGenre", genre: "  "))
+        try add(Seed(title: "Lossy192", bitrateKbps: 192))
+        try add(Seed(title: "FlacNoBitrate", bitrateKbps: nil, pathExtension: "flac"))
+        try add(Seed(title: "Mp3NoBitrate", bitrateKbps: nil))
+        try add(Seed(title: "Dupe", duplicateGroup: "dupes"))
+        try add(Seed(title: "Retired"))
+        try connection.execute(sql: "UPDATE files SET library_membership = 'retired' WHERE title = 'Retired'")
+
+        let keptLossy = try track(mbid: "rec-kept", family: nil, name: "kept-lossy")
+        let keptSibling = try track(mbid: "rec-kept", family: nil, name: "kept-sibling")
+        try add(Seed(title: "KeptLossyDupe", bitrateKbps: 192, duplicateGroup: "kept", trackID: keptLossy))
+        try add(Seed(title: "KeptSiblingDupe", duplicateGroup: "kept", trackID: keptSibling))
+        try connection.execute(sql: "INSERT INTO keeper_marks (file_id, marked_revision, marked_at) VALUES (?, 0, 1)", arguments: [ids["KeptLossyDupe"]])
+
+        var overLimit = SongFamilyRecord()
+        try overLimit.insert(connection)
+        let mainMP3 = try track(mbid: "rec-v1", family: overLimit.id, name: "v1-mp3")
+        let mainFLAC = try track(mbid: "rec-v1", family: overLimit.id, name: "v1-flac")
+        try add(Seed(title: "V1", trackID: mainMP3))
+        try add(Seed(title: "V1 FLAC", pathExtension: "flac", trackID: mainFLAC))
+        for version in 2 ... 5 {
+            try add(Seed(title: "V\(version)", trackID: track(mbid: nil, family: overLimit.id, name: "v\(version)")))
+        }
+        try connection.execute(sql: "UPDATE works SET representative_track_id = ? WHERE id = ?", arguments: [mainMP3, overLimit.id])
+        var atLimit = SongFamilyRecord()
+        try atLimit.insert(connection)
+        for version in 1 ... 4 {
+            try add(Seed(title: "W\(version)", trackID: track(mbid: nil, family: atLimit.id, name: "w\(version)")))
+        }
+
+        try add(Seed(title: "A Uncrated 1", artist: "Artist A", inCrate: false))
+        try add(Seed(title: "A Uncrated 2", artist: "Artist A", inCrate: false))
+        try add(Seed(title: "A Complete", artist: "Artist A"))
+
+        try add(Seed(title: "Dated Serato Newest", addedAt: 2000))
+        try add(Seed(title: "Dated Indexed Older", addedAt: 1000, addedSource: .indexed))
+        try add(Seed(title: "Dated No Facts", beatgridLocked: .none))
+        try add(Seed(title: "Played 9", playCount: 9))
+        try add(Seed(title: "Played 2", playCount: 2))
+        return ids
+    }
+}

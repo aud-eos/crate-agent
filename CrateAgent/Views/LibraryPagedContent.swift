@@ -163,7 +163,7 @@ struct LibraryPagedContent: View {
             menu.addItem(item)
         }
         if row.familyRole == .main, let familyID = row.familyId, let state = model.familyStates[familyID] {
-            if state.alternateCount > 0, !state.isRevealedBySearch {
+            if state.alternateCount > 0, !state.isRevealedByFilter {
                 menu.addItem(LibraryActionMenuItem(title: state.disclosureLabel) { model.setExpanded(!state.isExpanded, family: familyID) })
             }
             if !state.eligibleAlternates.isEmpty {

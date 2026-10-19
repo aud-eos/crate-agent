@@ -72,13 +72,11 @@ enum KeeperMarks {
 
     private static let recordingJoinSQL = "LEFT JOIN tracks ON tracks.id = files.track_id"
     private static let validMarksSQL = "FROM \(table) JOIN files ON files.id = \(table).file_id \(recordingJoinSQL) WHERE \(validMarkSQL)"
-    private static let keptRecordingKeysSQL = "SELECT \(recordingKeySQL) \(validMarksSQL)"
+    /// Every recording key a valid mark keeps; a file is protected when its key is one of them.
+    static let keptRecordingKeysSQL = "SELECT \(recordingKeySQL) \(validMarksSQL)"
 
     /// CTE body selecting every protected file id: a valid own mark, or a recording key shared with a validly marked file.
     static let protectedFilesSQL = "SELECT files.id AS file_id FROM files \(recordingJoinSQL) WHERE \(recordingKeySQL) IN (\(keptRecordingKeysSQL))"
-
-    /// CTE body selecting files with a valid mark of their own (suppresses the duplicate item).
-    static let ownMarkFilesSQL = "SELECT \(table).file_id AS file_id FROM \(table) JOIN files ON files.id = \(table).file_id WHERE \(validMarkSQL)"
 
     static func isProtected(fileID: Int64, in database: GRDB.Database) throws -> Bool {
         try Bool.fetchOne(database, sql: """

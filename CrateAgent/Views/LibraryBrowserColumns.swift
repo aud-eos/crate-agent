@@ -124,6 +124,12 @@ private final class LibraryBrowserCell: NSTableCellView {
             primary.textColor = .secondaryLabelColor
         case .musicalKey: primary.stringValue = row.musicalKey ?? ""
         case .album: primary.stringValue = row.album ?? ""
+        case .stillNeeds: primary.stringValue = row.stillNeedsCount.map(String.init) ?? ""
+        case .dateAdded:
+            primary.stringValue = row.dateAdded.map { seconds in
+                Date(timeIntervalSince1970: TimeInterval(seconds)).formatted(date: .abbreviated, time: .omitted)
+            } ?? ""
+        case .myPlays: primary.stringValue = row.playCount.map(String.init) ?? ""
         case .none:
             primary.stringValue = row.statusText
             primary.textColor = row.canProcess ? .secondaryLabelColor : .systemOrange
@@ -191,13 +197,13 @@ private final class LibraryFamilyDisclosureCell: NSTableCellView {
                 ?? LibraryFamilyMessages.versions(row.familyVersions ?? 1, selected: 0, of: 0, hidden: 0, selectedHidden: 0)
             summary.toolTip = LibraryFamilyMessages.versionsHelp
             summary.textColor = .labelColor
-            guard let state, state.alternateCount > 0 || state.isRevealedBySearch else { return }
+            guard let state, state.alternateCount > 0 || state.isRevealedByFilter else { return }
             self.familyID = familyID
             expanded = state.isExpanded
             toggle.isHidden = false
-            toggle.isEnabled = !state.isRevealedBySearch
+            toggle.isEnabled = !state.isRevealedByFilter
             toggle.title = state.disclosureLabel
-            toggle.toolTip = state.isRevealedBySearch ? LibraryFamilyMessages.searchRevealHelp : LibraryFamilyMessages.versionsHelp
+            toggle.toolTip = state.isRevealedByFilter ? LibraryFamilyMessages.searchRevealHelp : LibraryFamilyMessages.versionsHelp
             toggle.setAccessibilityLabel(LibraryFamilyMessages.disclosureAccessibility(state.disclosureLabel, title: row.title ?? row.filenameOnly))
             toggle.setAccessibilityExpanded(state.isShowingAlternates)
         }

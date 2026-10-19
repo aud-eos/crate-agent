@@ -14,11 +14,14 @@ final class LibraryBrowserModel: ObservableObject {
     @Published var differentRecordingsOffer: LibraryDifferentRecordingsOffer?
     /// Selection and eligibility of each visible family's members, including collapsed alternates.
     @Published private(set) var familyStates: [Int64: LibraryFamilyState] = [:]
+    /// How many files each chip matches in the current scope without the chip; loaded after each snapshot's first page.
+    @Published private(set) var chipCounts: [ChecklistChip: Int] = [:]
     /// Changes whenever a family row's selection or disclosure display changes.
     @Published private(set) var familyRevision: UInt64 = 0
     private let selectionStore: LibrarySelectionStore
     private var familyMembers: [Int64: [LibraryFamilyPlacement]] = [:]
     private var familyTask: Task<Void, Never>?
+    private var chipCountTask: Task<Void, Never>?
     private var loadedFamilies: (snapshot: LibraryPagedSnapshot, familyIDs: Set<Int64>)?
     private let database: LibraryDatabase
     private let pool: DatabasePool
@@ -87,7 +90,7 @@ final class LibraryBrowserModel: ObservableObject {
         var states: [Int64: LibraryFamilyState] = [:]
         for (familyID, members) in familyMembers {
             states[familyID] = LibraryFamilyState(members: members, selected: selected, isExpanded: query.expandedFamilies.contains(familyID),
-                                                  isSearching: query.isSearching)
+                                                  isFiltering: query.isFiltering)
         }
         guard states != familyStates else { return }
         familyStates = states
@@ -109,7 +112,7 @@ final class LibraryBrowserModel: ObservableObject {
     /// alternate collapses its family onto the main row. Returns false when nothing
     /// changes, so the key keeps its usual meaning.
     func disclose(_ expand: Bool, row rowID: Int64) -> Bool {
-        guard !query.isSearching, let row = results.cachedRows.first(where: { row in row.id == rowID }),
+        guard !query.isFiltering, let row = results.cachedRows.first(where: { row in row.id == rowID }),
               let familyID = row.familyId, let state = familyStates[familyID]
         else { return false }
         switch row.familyRole {
@@ -164,6 +167,29 @@ final class LibraryBrowserModel: ObservableObject {
     func acceptDifferentRecordingsOffer() async {
         guard let offer = differentRecordingsOffer else { return }
         await performFamilyAction(offer.action, on: offer.row, using: offer.actions, asDifferentRecordings: true)
+    }
+
+    /// Shows only the files `chip` matches, or every file for nil.
+    func setChip(_ chip: ChecklistChip?) {
+        var updated = query
+        updated.chip = chip
+        apply(updated, reset: true)
+    }
+
+    /// Counts load in their own task after the page, so they never delay it; a newer snapshot cancels them.
+    private func loadChipCounts(for snapshot: LibraryPagedSnapshot) {
+        chipCountTask?.cancel()
+        chipCountTask = Task { [weak self] in
+            do {
+                let counts = try await snapshot.chipCounts()
+                guard let self, !Task.isCancelled, results.snapshot === snapshot else { return }
+                chipCounts = counts
+            } catch is CancellationError {
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.error = error.localizedDescription
+            }
+        }
     }
 
     func setIncludeAlternates(_ include: Bool) {
@@ -263,6 +289,8 @@ final class LibraryBrowserModel: ObservableObject {
         refreshTask = nil
         familyTask?.cancel()
         familyTask = nil
+        chipCountTask?.cancel()
+        chipCountTask = nil
         familyMembers = [:]
         loadedFamilies = nil
         dirty = false
@@ -310,6 +338,7 @@ final class LibraryBrowserModel: ObservableObject {
                     guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }
                     selection.updateScope(snapshot, visibleIdentities: trackedIdentities)
                     selection.reconcile(in: snapshot)
+                    loadChipCounts(for: snapshot)
                     error = nil
                 } catch {
                     guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }
