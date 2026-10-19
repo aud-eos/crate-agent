@@ -199,9 +199,10 @@ namespace crate_agent_core {
   AudioTags read_audio_tags(string file_path);
 
   // Count the cue points and beatgrid markers Serato stored in the audio
-  // file's own tags; absent tags count zero. Fails, naming the cause, for
-  // an unsupported container, an unreadable file or a malformed payload.
-  [Throws=CoreError]
+  // file's own tags; absent tags count zero. Fails with the cause: an
+  // unsupported container, an I/O failure, an unparseable container or a
+  // malformed payload.
+  [Throws=SeratoAnalysisError]
   SeratoAnalysis read_serato_analysis(string file_path);
 
   // Write metadata tags into the audio file at `file_path`. Each
@@ -388,6 +389,16 @@ dictionary AudioTags {
 // Strongly-typed error surface for Rust → Swift error propagation.
 // `interface`-style errors carry per-variant data, so error messages
 // survive the FFI boundary instead of being reduced to a bare name.
+// Why `read_serato_analysis` failed. Only `Io` may succeed when the same
+// bytes are read again.
+[Error]
+interface SeratoAnalysisError {
+  UnsupportedFormat(string format);
+  Io(string message);
+  Container(string message);
+  Malformed(string field, string reason);
+};
+
 [Error]
 interface CoreError {
   NotImplemented();

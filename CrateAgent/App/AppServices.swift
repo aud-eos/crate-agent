@@ -117,6 +117,10 @@ public final class AppServices: ObservableObject {
     /// via @Published; nil before the worker has emitted anything.
     @Published public private(set) var fingerprintProgress: FingerprintWorker.Progress?
 
+    /// Latest report from the Serato cue-point worker: coverage after each
+    /// pass, or why it stopped. Nil before its first pass finishes.
+    @Published private(set) var seratoAnalysisStatus: SeratoAnalysisWorker.Status?
+
     private let seratoSyncCoordinator: SeratoSyncCoordinator
     private let fsEventsWatcher: FSEventsWatcher
     private var filesystemEventsTask: Task<Void, Never>?
@@ -315,7 +319,11 @@ public final class AppServices: ObservableObject {
 
         startFingerprinting()
         let analysisWorker = seratoAnalysisWorker
-        Task { await analysisWorker.start() }
+        Task {
+            await analysisWorker.start { status in
+                Task { @MainActor [weak self] in self?.seratoAnalysisStatus = status }
+            }
+        }
         checklistDuplicateRefresher.start()
         startup.start()
     }

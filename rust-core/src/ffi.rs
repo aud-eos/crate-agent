@@ -12,7 +12,7 @@ pub use crate::serato::{
     SeratoMetadataUpdate, SeratoRemovedRecord, SeratoTrackFacts, SeratoTrackFactsScan,
     SeratoTrackRecord,
 };
-pub use crate::serato_analysis::SeratoAnalysis;
+pub use crate::serato_analysis::{SeratoAnalysis, SeratoAnalysisError};
 pub use crate::serato_history::{SeratoHistoryPlay, SeratoHistoryScan};
 pub use crate::tags::{AudioTagUpdate, AudioTags};
 
@@ -188,14 +188,6 @@ impl From<tags::TagError> for CoreError {
             other => CoreError::Tag {
                 message: other.to_string(),
             },
-        }
-    }
-}
-
-impl From<serato_analysis::AnalysisError> for CoreError {
-    fn from(err: serato_analysis::AnalysisError) -> Self {
-        CoreError::Tag {
-            message: err.to_string(),
         }
     }
 }
@@ -524,10 +516,8 @@ pub fn read_audio_tags(file_path: String) -> Result<AudioTags, CoreError> {
     Ok(tags::read_tags(&path)?)
 }
 
-pub fn read_serato_analysis(file_path: String) -> Result<SeratoAnalysis, CoreError> {
-    Ok(serato_analysis::read_serato_analysis(&PathBuf::from(
-        file_path,
-    ))?)
+pub fn read_serato_analysis(file_path: String) -> Result<SeratoAnalysis, SeratoAnalysisError> {
+    serato_analysis::read_serato_analysis(&PathBuf::from(file_path))
 }
 
 pub fn write_audio_tags(file_path: String, update: AudioTagUpdate) -> Result<(), CoreError> {

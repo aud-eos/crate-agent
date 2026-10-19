@@ -13,16 +13,26 @@ final class SeratoAnalysisWorkerTests: XCTestCase {
         let failure: String?
     }
 
-    func testWorkerRecordsCuesAndReadsTheFileAgainAfterItChanges() async throws {
+    func testWorkerRecordsCuesAndReadsAFileAgainAfterItChangesOrAfterAnIOFailure() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
         let file = try await fixture.add("cued.mp3")
+        let locked = try await fixture.add("locked.mp3")
         let cueCount = OSAllocatedUnfairLock(initialState: UInt32(3))
-        let worker = try makeWorker(fixture) { _ in SeratoAnalysis(cueCount: cueCount.withLock { count in count }, beatgridMarkerCount: 1) }
+        let lockedReads = OSAllocatedUnfairLock(initialState: 0)
+        let worker = try makeWorker(fixture) { path in
+            if path == locked.path, lockedReads.withLock({ reads in reads += 1; return reads }) == 1 {
+                throw SeratoAnalysisError.Io(message: "Permission denied")
+            }
+            return SeratoAnalysis(cueCount: cueCount.withLock { count in count }, beatgridMarkerCount: 1)
+        }
 
         _ = try await worker.processAllPendingOnce()
         let first = try await analysis(of: file, in: fixture)
         XCTAssertEqual(first?.cueCount, 3)
+        let lockedFirst = try await analysis(of: locked, in: fixture)
+        XCTAssertNil(lockedFirst?.cueCount)
+        XCTAssertEqual(lockedReads.withLock { reads in reads }, 1, "A pass reads a failing file once")
 
         let edited = file.mtime + 60
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: TimeInterval(edited))], ofItemAtPath: file.path)
@@ -33,15 +43,18 @@ final class SeratoAnalysisWorkerTests: XCTestCase {
         _ = try await worker.processAllPendingOnce()
         let second = try await analysis(of: file, in: fixture)
         XCTAssertEqual(second?.cueCount, 5)
+        let lockedSecond = try await analysis(of: locked, in: fixture)
+        XCTAssertEqual(lockedSecond?.cueCount, 5, "An I/O failure is read again on the next pass, though the file is unchanged")
     }
 
     func testUnreadableFileIsRecordedAsAFailureNotAsNoCues() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
         let malformed = try await fixture.add("malformed.mp3")
-        let unsupported = try await fixture.add("unsupported.ogg")
+        let unsupported = try await fixture.add("a-unsupported.ogg")
         let worker = try makeWorker(fixture) { path in
-            throw CoreError.Tag(message: path.hasSuffix(".ogg") ? "unsupported format: Vorbis" : "malformed Serato Markers2: truncated cue")
+            throw path.hasSuffix(".ogg") ? SeratoAnalysisError.UnsupportedFormat(format: "Vorbis")
+                : SeratoAnalysisError.Malformed(field: "Serato Markers2", reason: "truncated cue")
         }
 
         let coverage = try await worker.processAllPendingOnce()
@@ -53,7 +66,7 @@ final class SeratoAnalysisWorkerTests: XCTestCase {
         let libraryCoverage = try await fixture.database.writer.read { connection in try SeratoAnalysisStore.coverage(in: connection) }
         XCTAssertEqual(libraryCoverage, coverage)
         let failures = try await fixture.database.writer.read { connection in try SeratoAnalysisStore.failures(limit: 10, in: connection) }
-        XCTAssertEqual(failures.map(\.id), [malformed.id, unsupported.id])
+        XCTAssertEqual(failures.map(\.id), [malformed.id, unsupported.id], "Faults come before unsupported formats")
         XCTAssertEqual(failures.map { failure in failure.detail?.hasPrefix(SeratoAnalysisMessages.malformedDetailPrefix) },
                        [true, false], "The list says which file's Serato data is malformed")
         XCTAssertEqual(failures.map { failure in failure.detail?.hasPrefix(SeratoAnalysisMessages.unsupportedDetailPrefix) },

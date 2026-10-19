@@ -66,22 +66,32 @@ enum ChecklistDuplicates {
     }
 }
 
-/// Keeps `checklist_duplicate_members` in step with the duplicate groups:
-/// once at start, then a second after the first of any burst of changes
-/// that can alter a group.
+/// Keeps `checklist_duplicate_members` in step with the duplicate groups. A
+/// scan of a fully fingerprinted 30,000-file library costs up to a second,
+/// so refreshes start at least `minimumRefreshInterval` apart: one at start,
+/// then one for the changes since, so the final state is always written.
 @MainActor
 final class ChecklistDuplicateRefresher: ObservableObject {
-    private static let coalescingDelay: Duration = .seconds(1)
+    enum Status: Equatable {
+        case notRefreshed
+        case refreshing
+        case refreshed(memberCount: Int)
+        /// The reason the last refresh failed; the members shown are older.
+        case failed(String)
+    }
+
+    static let minimumRefreshInterval: Duration = .seconds(30)
     private static let logger = Logger(subsystem: "com.crateagent.app", category: "ChecklistDuplicateRefresher")
 
-    /// The reason the last refresh failed; the members shown are older.
-    @Published private(set) var failure: String?
+    @Published private(set) var status: Status = .notRefreshed
 
     private let database: LibraryDatabase
+    private let clock = ContinuousClock()
     private var observation: AnyDatabaseCancellable?
     private var scheduled: Task<Void, Never>?
+    private var lastRefreshStart: ContinuousClock.Instant?
     private var isRefreshing = false
-    private var refreshRequested = false
+    private var changedDuringRefresh = false
 
     init(database: LibraryDatabase) {
         self.database = database
@@ -90,11 +100,11 @@ final class ChecklistDuplicateRefresher: ObservableObject {
     func start() {
         guard observation == nil else { return }
         observation = DuplicateScanObservation.start(in: database, onChange: { [weak self] in
-            Task { @MainActor in self?.schedule() }
+            Task { @MainActor in self?.requestRefresh() }
         }, onError: { [weak self] error in
             Task { @MainActor in self?.record(error) }
         })
-        Task { await refreshReportingFailure() }
+        requestRefresh()
     }
 
     func stop() {
@@ -104,39 +114,48 @@ final class ChecklistDuplicateRefresher: ObservableObject {
         scheduled = nil
     }
 
-    /// A request made while a refresh runs is coalesced into one more pass.
-    func refresh() async throws {
-        guard !isRefreshing else {
-            refreshRequested = true
+    /// Schedules a refresh `minimumRefreshInterval` after the last one
+    /// started, or now; requests until it starts share it, and a request
+    /// during a refresh schedules the next one.
+    func requestRefresh() {
+        guard observation != nil else { return }
+        if isRefreshing {
+            changedDuringRefresh = true
             return
         }
-        isRefreshing = true
-        defer { isRefreshing = false }
-        repeat {
-            refreshRequested = false
-            let members = try await database.writer.read { connection in try ChecklistDuplicates.confirmedMembers(in: connection) }
-            try await ChecklistDuplicates.replace(with: members, in: database.writer)
-        } while refreshRequested
-        failure = nil
-    }
-
-    private func schedule() {
-        guard scheduled == nil, observation != nil else { return }
+        guard scheduled == nil else { return }
+        let delay = lastRefreshStart.map { start in max(.zero, Self.minimumRefreshInterval - start.duration(to: clock.now)) } ?? .zero
         scheduled = Task { [weak self] in
-            try? await Task.sleep(for: Self.coalescingDelay)
-            guard let self, !Task.isCancelled else { return }
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled, let self else { return }
             scheduled = nil
-            await refreshReportingFailure()
+            await refresh()
         }
     }
 
-    private func refreshReportingFailure() async {
-        do { try await refresh() } catch { record(error) }
+    private func refresh() async {
+        isRefreshing = true
+        changedDuringRefresh = false
+        lastRefreshStart = clock.now
+        status = .refreshing
+        do {
+            let members = try await database.writer.read { connection in try ChecklistDuplicates.confirmedMembers(in: connection) }
+            try await ChecklistDuplicates.replace(with: members, in: database.writer)
+            status = .refreshed(memberCount: members.count)
+        } catch {
+            record(error)
+        }
+        isRefreshing = false
+        if changedDuringRefresh {
+            requestRefresh()
+        }
     }
 
     private func record(_ error: Error) {
         let message = UserFacingErrorMessage.message(for: error)
-        failure = message
+        status = .failed(message)
         Self.logger.error("Duplicate checklist refresh failed: \(message, privacy: .public)")
     }
 }

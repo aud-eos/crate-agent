@@ -1,15 +1,15 @@
 enum SeratoAnalysisMessages {
-    /// The Rust core's `AnalysisError` messages begin with these.
-    static let unsupportedFormatPrefix = "unsupported format: "
-    static let malformedPrefix = "malformed "
-    static let unreadableFilePrefix = "unreadable file: "
-
     static let unsupportedDetailPrefix = "Unsupported format"
     static let malformedDetailPrefix = "Malformed Serato data"
-    static let unreadableDetailPrefix = "Unreadable file"
+    static let containerDetailPrefix = "Unreadable audio container"
+    static let ioDetailPrefix = "Couldn't read the file"
 
     static func detail(prefix: String, reason: String) -> String {
         "\(prefix): \(reason)"
+    }
+
+    static func malformedReason(field: String, reason: String) -> String {
+        "\(field): \(reason)"
     }
 
     static func unknownFailure(_ stored: String) -> String {

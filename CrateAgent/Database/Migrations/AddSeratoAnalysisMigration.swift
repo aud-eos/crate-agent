@@ -2,7 +2,8 @@ import GRDB
 
 /// Cue point and beatgrid marker counts read from each file's Serato tags,
 /// kept by `SeratoAnalysisWorker` against the file basis they were read
-/// from. A derived cache, never written through `applyMutation`.
+/// from. `retryable` marks a failure that may clear, read again on a later
+/// pass. A derived cache, never written through `applyMutation`.
 enum AddSeratoAnalysisMigration {
     static func register(in migrator: inout DatabaseMigrator) {
         migrator.registerMigration("031_add_serato_analysis") { database in
@@ -18,7 +19,9 @@ enum AddSeratoAnalysisMigration {
                 cue_count INTEGER,
                 beatgrid_marker_count INTEGER,
                 failure TEXT,
-                CHECK ((failure IS NULL) = (cue_count IS NOT NULL))
+                retryable INTEGER NOT NULL DEFAULT 0,
+                CHECK ((failure IS NULL) = (cue_count IS NOT NULL)),
+                CHECK (NOT retryable OR failure IS NOT NULL)
             );
             """)
         }

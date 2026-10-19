@@ -61,22 +61,37 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         try await verifyBrowsingWhileChecklistFactsCompute(fixture)
     }
 
-    /// The first cue-point backfill over 30,000 WAVs, and a full facts
-    /// refresh, run while the production Library renders and navigates.
+    /// The first cue-point backfill over 30,000 WAVs, a full facts refresh
+    /// and a duplicate-members refresh over one 30,000-file byte-level
+    /// cluster run while the production Library renders and navigates.
     private func verifyBrowsingWhileChecklistFactsCompute(_ fixture: LibraryStartupPerformanceFixture) async throws {
         try await fixture.database.writer.write { database in
             try database.execute(sql: "DELETE FROM checklist_source_stamps; DELETE FROM serato_track_facts")
         }
         let worker = SeratoAnalysisWorker(database: fixture.database, readiness: fixture.readiness)
         let service = SeratoLibraryFactsService(database: fixture.database, seratoLocator: fixture.locator, watchdog: fixture.watchdog)
+        let duplicates = ChecklistDuplicateRefresher(database: fixture.database)
         let probe = WriterHoldProbe()
         probe.start(fixture.database) { nil }
         await worker.start()
         let refreshing = Task { await service.refresh() }
+        let duplicatesStart = ContinuousClock.now
+        duplicates.start()
         let browsing = try await measureBrowsing(fixture) {
             await pagingEventually { await (try? self.analysedFileCount(fixture.database)) ?? 0 >= SeratoAnalysisWorker.batchSize }
         }
         await refreshing.value
+        var duplicatesRefreshed: Duration?
+        let duplicatesDeadline = duplicatesStart.advanced(by: .seconds(60))
+        while duplicatesRefreshed == nil, ContinuousClock.now < duplicatesDeadline {
+            switch duplicates.status {
+            case .refreshed, .failed: duplicatesRefreshed = duplicatesStart.duration(to: .now)
+            case .notRefreshed, .refreshing: try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        duplicates.stop()
+        XCTAssertEqual(duplicates.status, .refreshed(memberCount: 0), "Unverified copies are not confirmed duplicates")
+        let duplicatesMilliseconds = try Self.milliseconds(XCTUnwrap(duplicatesRefreshed))
         await worker.stop()
         await worker.waitUntilStopped()
         let waits = await probe.stop()
@@ -86,7 +101,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         XCTAssertLessThan(browsing.render, .milliseconds(500))
         XCTAssertLessThan(browsing.navigation, .milliseconds(500))
         XCTAssertLessThan(longest.duration, .milliseconds(500))
-        let result = "CHECKLIST_BACKGROUND files=30000 render_ms=\(Self.milliseconds(browsing.render)) navigation_ms=\(Self.milliseconds(browsing.navigation)) longest_writer_wait=\(longest.duration) analysed=\(analysed)"
+        let result = "CHECKLIST_BACKGROUND files=30000 render_ms=\(Self.milliseconds(browsing.render)) navigation_ms=\(Self.milliseconds(browsing.navigation)) longest_writer_wait=\(longest.duration) analysed=\(analysed) duplicate_refresh_ms=\(duplicatesMilliseconds)"
         print(result)
         let attachment = XCTAttachment(string: result)
         attachment.lifetime = .keepAlways

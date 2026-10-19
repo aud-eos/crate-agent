@@ -15,6 +15,7 @@ use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::DecodePaddingMode;
 use base64::Engine;
 use lofty::config::ParseOptions;
+use lofty::error::{ErrorKind, LoftyError};
 use lofty::file::{AudioFile, FileType};
 use lofty::flac::FlacFile;
 use lofty::id3::v2::{Frame, GeneralEncapsulatedObject, Id3v2Tag};
@@ -50,20 +51,62 @@ pub struct SeratoAnalysis {
     pub beatgrid_marker_count: u32,
 }
 
+/// Why the Serato payloads couldn't be counted. Only `Io` can succeed on a
+/// retry of the same bytes; the others describe the file itself.
 #[derive(Debug, Error)]
-pub enum AnalysisError {
-    #[error("unsupported format: {0}")]
-    UnsupportedFormat(String),
-    #[error("unreadable file: {0}")]
-    Unreadable(String),
+pub enum SeratoAnalysisError {
+    #[error("unsupported format: {format}")]
+    UnsupportedFormat { format: String },
+    #[error("couldn't read the file: {message}")]
+    Io { message: String },
+    #[error("unreadable audio container: {message}")]
+    Container { message: String },
     #[error("malformed {field}: {reason}")]
-    Malformed { field: &'static str, reason: String },
+    Malformed { field: String, reason: String },
 }
 
-fn malformed(field: &'static str, reason: impl Into<String>) -> AnalysisError {
-    AnalysisError::Malformed {
-        field,
+fn malformed(field: &'static str, reason: impl Into<String>) -> SeratoAnalysisError {
+    SeratoAnalysisError::Malformed {
+        field: field.to_string(),
         reason: reason.into(),
+    }
+}
+
+/// Opening the file fails for reasons outside its bytes (missing, no
+/// permission), so a later read may succeed.
+fn open_failure(error: &LoftyError) -> SeratoAnalysisError {
+    SeratoAnalysisError::Io {
+        message: error.to_string(),
+    }
+}
+
+/// Once open, a read fails the same way on the same bytes, except for an
+/// interrupted, timed-out or device-level (EIO) read.
+fn io_failure(error: &std::io::Error) -> SeratoAnalysisError {
+    const DEVICE_IO_ERROR: i32 = 5;
+    let transient = matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+    ) || error.raw_os_error() == Some(DEVICE_IO_ERROR);
+    if transient {
+        SeratoAnalysisError::Io {
+            message: error.to_string(),
+        }
+    } else {
+        SeratoAnalysisError::Container {
+            message: error.to_string(),
+        }
+    }
+}
+
+fn container_failure(error: &LoftyError) -> SeratoAnalysisError {
+    match error.kind() {
+        ErrorKind::Io(io_error) => io_failure(io_error),
+        _ => SeratoAnalysisError::Container {
+            message: error.to_string(),
+        },
     }
 }
 
@@ -74,7 +117,7 @@ struct SeratoPayloads {
     beatgrid: Option<Vec<u8>>,
 }
 
-pub fn read_serato_analysis(path: &Path) -> Result<SeratoAnalysis, AnalysisError> {
+pub fn read_serato_analysis(path: &Path) -> Result<SeratoAnalysis, SeratoAnalysisError> {
     let payloads = read_payloads(path)?;
     let cue_count = match payloads.markers2 {
         Some(data) => count_markers2_cues(&decode_markers2_geob(&data)?)?,
@@ -90,14 +133,13 @@ pub fn read_serato_analysis(path: &Path) -> Result<SeratoAnalysis, AnalysisError
     })
 }
 
-fn read_payloads(path: &Path) -> Result<SeratoPayloads, AnalysisError> {
-    let unreadable = |error: &dyn std::fmt::Display| AnalysisError::Unreadable(error.to_string());
+fn read_payloads(path: &Path) -> Result<SeratoPayloads, SeratoAnalysisError> {
     let options = ParseOptions::new().read_properties(false);
     let probe = Probe::open(path)
-        .map_err(|error| unreadable(&error))?
+        .map_err(|error| open_failure(&error))?
         .options(options)
         .guess_file_type()
-        .map_err(|error| unreadable(&error))?;
+        .map_err(|error| io_failure(&error))?;
     let file_type = probe.file_type();
     let mut reader = probe.into_inner();
     match file_type {
@@ -116,18 +158,20 @@ fn read_payloads(path: &Path) -> Result<SeratoPayloads, AnalysisError> {
         Some(FileType::Flac) => FlacFile::read_from(&mut reader, options)
             .map(|file| flac_payloads(file.vorbis_comments())),
         Some(other) => {
-            return Err(AnalysisError::UnsupportedFormat(format!("{other:?}")));
+            return Err(SeratoAnalysisError::UnsupportedFormat {
+                format: format!("{other:?}"),
+            });
         }
         None => {
-            return Err(AnalysisError::UnsupportedFormat(
-                "unrecognised audio container".into(),
-            ));
+            return Err(SeratoAnalysisError::UnsupportedFormat {
+                format: "unrecognised audio container".into(),
+            });
         }
     }
-    .map_err(|error| unreadable(&error))?
+    .map_err(|error| container_failure(&error))?
 }
 
-fn id3_payloads(tag: Option<&Id3v2Tag>) -> Result<SeratoPayloads, AnalysisError> {
+fn id3_payloads(tag: Option<&Id3v2Tag>) -> Result<SeratoPayloads, SeratoAnalysisError> {
     let mut payloads = SeratoPayloads::default();
     for frame in tag.into_iter().flatten() {
         let Frame::Binary(binary) = frame else {
@@ -147,11 +191,11 @@ fn id3_payloads(tag: Option<&Id3v2Tag>) -> Result<SeratoPayloads, AnalysisError>
     Ok(payloads)
 }
 
-fn mp4_payloads(ilst: Option<&Ilst>) -> Result<SeratoPayloads, AnalysisError> {
+fn mp4_payloads(ilst: Option<&Ilst>) -> Result<SeratoPayloads, SeratoAnalysisError> {
     let Some(ilst) = ilst else {
         return Ok(SeratoPayloads::default());
     };
-    let atom_text = |name: &'static str| -> Result<Option<Vec<u8>>, AnalysisError> {
+    let atom_text = |name: &'static str| -> Result<Option<Vec<u8>>, SeratoAnalysisError> {
         let ident = AtomIdent::Freeform {
             mean: MP4_MEAN.into(),
             name: name.into(),
@@ -178,7 +222,7 @@ fn mp4_payloads(ilst: Option<&Ilst>) -> Result<SeratoPayloads, AnalysisError> {
     })
 }
 
-fn flac_payloads(comments: Option<&VorbisComments>) -> Result<SeratoPayloads, AnalysisError> {
+fn flac_payloads(comments: Option<&VorbisComments>) -> Result<SeratoPayloads, SeratoAnalysisError> {
     let Some(comments) = comments else {
         return Ok(SeratoPayloads::default());
     };
@@ -194,7 +238,7 @@ fn flac_payloads(comments: Option<&VorbisComments>) -> Result<SeratoPayloads, An
     })
 }
 
-fn decode_lenient_base64(text: &[u8], field: &'static str) -> Result<Vec<u8>, AnalysisError> {
+fn decode_lenient_base64(text: &[u8], field: &'static str) -> Result<Vec<u8>, SeratoAnalysisError> {
     let mut cleaned: Vec<u8> = text
         .iter()
         .copied()
@@ -210,7 +254,7 @@ fn decode_lenient_base64(text: &[u8], field: &'static str) -> Result<Vec<u8>, An
 
 /// The GEOB-form payload inside an MP4 or Vorbis value: base64 of the MIME
 /// type, an empty file name and the descriptor, each NUL-terminated.
-fn unwrap_envelope(text: &[u8], descriptor: &str) -> Result<Vec<u8>, AnalysisError> {
+fn unwrap_envelope(text: &[u8], descriptor: &str) -> Result<Vec<u8>, SeratoAnalysisError> {
     let decoded = decode_lenient_base64(text, "Serato envelope")?;
     let mut header = ENVELOPE_PREFIX.to_vec();
     header.extend_from_slice(descriptor.as_bytes());
@@ -221,7 +265,7 @@ fn unwrap_envelope(text: &[u8], descriptor: &str) -> Result<Vec<u8>, AnalysisErr
         .ok_or_else(|| malformed("Serato envelope", format!("missing {descriptor} header")))
 }
 
-fn decode_markers2_geob(data: &[u8]) -> Result<Vec<u8>, AnalysisError> {
+fn decode_markers2_geob(data: &[u8]) -> Result<Vec<u8>, SeratoAnalysisError> {
     let text = data
         .strip_prefix(&MARKERS2_VERSION)
         .ok_or_else(|| malformed(MARKERS2_DESCRIPTOR, "unsupported version"))?;
@@ -229,7 +273,7 @@ fn decode_markers2_geob(data: &[u8]) -> Result<Vec<u8>, AnalysisError> {
     decode_lenient_base64(text, MARKERS2_DESCRIPTOR)
 }
 
-fn count_markers2_cues(body: &[u8]) -> Result<u32, AnalysisError> {
+fn count_markers2_cues(body: &[u8]) -> Result<u32, SeratoAnalysisError> {
     let mut remaining = body
         .strip_prefix(&MARKERS2_VERSION)
         .ok_or_else(|| malformed(MARKERS2_DESCRIPTOR, "unsupported version"))?;
@@ -265,7 +309,7 @@ fn count_markers2_cues(body: &[u8]) -> Result<u32, AnalysisError> {
 }
 
 /// Header, `marker_count` markers of 8 bytes each, then one footer byte.
-fn count_beatgrid_markers(data: &[u8]) -> Result<u32, AnalysisError> {
+fn count_beatgrid_markers(data: &[u8]) -> Result<u32, SeratoAnalysisError> {
     let after_version = data
         .strip_prefix(&BEATGRID_VERSION)
         .ok_or_else(|| malformed(BEATGRID_DESCRIPTOR, "unsupported version"))?;
@@ -486,6 +530,30 @@ mod tests {
             FrameId::Valid(Cow::Borrowed("GEOB")),
             object.as_bytes(WriteOptions::default()).unwrap(),
         ))
+    }
+
+    #[test]
+    fn failures_separate_retryable_io_from_faults_in_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.wav");
+        let truncated = directory.path().join("truncated.flac");
+        let unknown = directory.path().join("notes.bin");
+        std::fs::write(&truncated, b"fLaC\x00\x00\x00\x22\x10").unwrap();
+        std::fs::write(&unknown, b"not an audio container at all").unwrap();
+
+        assert!(matches!(
+            read_serato_analysis(&missing),
+            Err(SeratoAnalysisError::Io { .. })
+        ));
+        let truncated_result = read_serato_analysis(&truncated);
+        assert!(
+            matches!(truncated_result, Err(SeratoAnalysisError::Container { .. })),
+            "{truncated_result:?}"
+        );
+        assert!(matches!(
+            read_serato_analysis(&unknown),
+            Err(SeratoAnalysisError::UnsupportedFormat { .. })
+        ));
     }
 
     #[test]
