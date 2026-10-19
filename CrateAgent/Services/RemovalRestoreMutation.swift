@@ -32,6 +32,8 @@ public enum RestoreBlockReason: Sendable, Equatable {
     case trashItemNotInTrash
     case originalPathOccupied
     case trashItemNotRecorded
+    /// A Trash move that never ran left the file at its path, but the user has since moved or deleted it.
+    case originalFileMissing
     /// A Trash move that never ran left the file at its path, but it changed since.
     case originalFileChanged
     /// The store's records were removed, but their capture was lost.
@@ -102,7 +104,11 @@ enum RemovalRestoreMutation {
     /// at its original path with its original identity. An interrupted move
     /// may have landed, and then nothing recorded where it went.
     static func requireUnmoved(_ payload: RestoreFromTrashPayload, fileID: Int64?, in database: GRDB.Database) throws {
-        guard FileManager.default.fileExists(atPath: payload.originalPath) else { throw blocked(payload, .trashItemNotRecorded) }
+        guard FileManager.default.fileExists(atPath: payload.originalPath) else {
+            let disposition = try SeratoWriteDispositions.openDispositions(eventID: payload.removalEventID, in: database)[SeratoWriteKind.trashFile.rawValue]
+            let neverRan = [SeratoWriteDisposition.superseded, .discarded].map(\.rawValue).contains(disposition)
+            throw blocked(payload, neverRan ? .originalFileMissing : .trashItemNotRecorded)
+        }
         guard let fileID, let file = try FileRecord.fetchOne(database, key: fileID),
               file.path == payload.originalPath, file.identity == payload.identity
         else { throw blocked(payload, .originalFileChanged) }

@@ -79,6 +79,22 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
+    func testUndoRefusesWhenAFileWhoseTrashMoveNeverRanWasRemovedByTheUser() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture, trashFails: true)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine, completes: false)
+        let keeper = fixture.directory.appendingPathComponent("keeper.wav")
+        try (Data(contentsOf: keeper) + Data([0])).write(to: keeper)
+        try await engine.drainPendingSeratoUpdates(retryingFailedCleanup: true)
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "UPDATE serato_write_dispositions SET disposition = 'superseded' WHERE kind = 'trashFile'")
+        }
+        try FileManager.default.removeItem(atPath: cleaned.target.path)
+
+        await assertUndoBlocked(cleaned, engine: engine, reason: .originalFileMissing)
+    }
+
     func testUndoQueuesSeratoRestoresWhileSeratoRuns() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }

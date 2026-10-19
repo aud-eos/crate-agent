@@ -1711,6 +1711,7 @@ public actor OperationEngine {
         let decoded = try events.filter { event in event.eventId.map(unmoved.contains) != true }.map { event in
             try (event: event, inverse: Self.decodeInverseMutation(event: event))
         }
+        let removalTargets = try Self.removalTargets(of: events)
         // A Trash move dropped before it could land never moved the file, so
         // only its unmoved file is checked; the rest of the removal is undone.
         let droppedTrashMoves = try await database.writer.read { database in
@@ -1755,7 +1756,7 @@ public actor OperationEngine {
             try authorization?.check()
             return results
         }
-        for fileID in try Self.removalTargets(of: events) {
+        for fileID in removalTargets {
             duplicateCleanupResults[fileID] = nil
         }
         try await routeSeratoWrites(results.flatMap(\.seratoWrites), batchId: undoBatchId)
