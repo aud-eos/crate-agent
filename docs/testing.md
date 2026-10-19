@@ -194,7 +194,7 @@ alternating a baseline worktree at `3dcb14e` with the fixed build (load average
 | --- | ---: | ---: |
 | 1 | 87 ms | 103 ms |
 | 2 | 669 ms (failed the assert) | 88 ms |
-| 3 | 466 ms | 102 ms |
+| 3 | 466 ms | 102 ms (load average 84; the test's separate 5 s wait for the first analysis batch timed out) |
 
 The baseline was fast only when the refresh missed the render window. Navigation
 stayed 6-39 ms and the longest writer wait 16-44 ms in every run. The 30,000-file
