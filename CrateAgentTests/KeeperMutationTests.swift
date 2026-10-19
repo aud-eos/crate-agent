@@ -53,6 +53,13 @@ final class KeeperMutationTests: XCTestCase {
         try await engine.undoBatch(batch)
         let marksAfterUndo = try await markedFileIDs()
         XCTAssertEqual(marksAfterUndo, [flac, mp3])
+
+        let reclear = try await engine.setKeeper(false, for: token(mp3))
+        let newerEncoding = try await addFile(trackID: addTrack(fingerprint: "wav", recordingMBID: "rec-1"))
+        _ = try await engine.setKeeper(true, for: token(newerEncoding))
+        await XCTAssertThrowsErrorAsync(try await engine.undoBatch(reclear)) { error in
+            XCTAssertEqual(error as? KeeperError, .superseded, "A newer keeper already protects the recording")
+        }
     }
 
     func testKeeperIsRefusedWhenTheFileChangedSinceItWasShown() async throws {
@@ -77,8 +84,9 @@ final class KeeperMutationTests: XCTestCase {
         XCTAssertEqual(protectedAfterRemark, [standalone])
     }
 
-    func testSeparatingAKeptRecordingLeavesProtectionOnTheMarkedFileOnly() async throws {
+    func testProtectionFollowsTheLiveRecordingKeyWhenAnEncodingLosesItsMBID() async throws {
         _ = try await engine.setKeeper(true, for: token(flac))
+        // Stands in for undoing the Auto-Tag match that gave this encoding the shared MBID.
         try await setRecordingMBID(nil, ofTrack: mp3Track)
 
         let protected = try await protectedIDs()

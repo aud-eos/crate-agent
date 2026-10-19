@@ -1724,7 +1724,7 @@ public actor OperationEngine {
         let dropped = Set(droppedTrashMoves.map(\.payload.removalEventID))
         let reverted = decoded.filter { entry in entry.event.eventId.map(dropped.contains) != true }
         let revertedEvents = reverted.map(\.event)
-        let inverseMutations = reverted.compactMap(\.inverse)
+        let inverseMutations = Self.mergingKeeperRestores(reverted.compactMap(\.inverse))
         let context = mutationContext
         try await database.writer.read { database in
             for move in droppedTrashMoves {
@@ -1767,6 +1767,21 @@ public actor OperationEngine {
             try await refreshQueueDepth()
         }
         return undoBatchId
+    }
+
+    /// A keeper clear journals one event per mark. Undo restores them as one
+    /// set, so the restore refuses only a keeper the clear didn't remove.
+    private static func mergingKeeperRestores(_ mutations: [TrackMutation]) -> [TrackMutation] {
+        let marks = mutations.flatMap { mutation -> [KeeperMark] in
+            guard case let .keeper(.restore(restored)) = mutation else { return [] }
+            return restored
+        }
+        var merged = false
+        return mutations.compactMap { mutation in
+            guard case .keeper(.restore) = mutation else { return mutation }
+            defer { merged = true }
+            return merged ? nil : .keeper(.restore(marks))
+        }
     }
 
     /// The files whose removal `events` journal, finished or not; a finished

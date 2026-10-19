@@ -32,7 +32,8 @@ public enum KeeperOperation: Sendable {
     case mark(KeeperTarget)
     /// Clears every mark on the target's recording.
     case clear(KeeperTarget)
-    /// Puts cleared marks back; produced only by `decodeInverseMutation`.
+    /// Puts cleared marks back; produced only by `decodeInverseMutation`. Refused as superseded when
+    /// a mark outside the set already protects one of their recordings, so a recording never gains a second keeper.
     case restore([KeeperMark])
     /// Deletes marks; produced only by `decodeInverseMutation`.
     case remove([KeeperMark])
@@ -49,12 +50,14 @@ public enum KeeperError: LocalizedError, Equatable {
     case alreadyKept
     case notKept
     case superseded
+    case unreadableProtection(fileId: Int64)
 
     public var errorDescription: String? {
         switch self {
         case .alreadyKept: "This recording already has a keeper."
         case .notKept: "This recording no longer has a keeper."
         case .superseded: "This file changed since it was shown. Refresh the library and try again."
+        case let .unreadableProtection(fileID): "crate-agent couldn't check whether file \(fileID)'s recording has a keeper."
         }
     }
 }
@@ -79,9 +82,10 @@ enum KeeperMarks {
     static let protectedFilesSQL = "SELECT files.id AS file_id FROM files \(recordingJoinSQL) WHERE \(recordingKeySQL) IN (\(keptRecordingKeysSQL))"
 
     static func isProtected(fileID: Int64, in database: GRDB.Database) throws -> Bool {
-        try Bool.fetchOne(database, sql: """
+        guard let isProtected = try Bool.fetchOne(database, sql: """
         SELECT EXISTS (SELECT 1 FROM files \(recordingJoinSQL) WHERE files.id = ? AND \(recordingKeySQL) IN (\(keptRecordingKeysSQL)))
-        """, arguments: [fileID]) ?? false
+        """, arguments: [fileID]) else { throw KeeperError.unreadableProtection(fileId: fileID) }
+        return isProtected
     }
 
     /// Every file sharing a recording key with one of `fileIDs`, those included.
@@ -131,6 +135,9 @@ enum KeeperMutation {
                 try delete(mark, in: database)
             }
         case let .restore(marks):
+            guard try !marks.contains(where: { mark in try KeeperMarks.isProtected(fileID: mark.fileId, in: database) }) else {
+                throw KeeperError.superseded
+            }
             return try journal(marks, as: .keeperMarked, batchId: batchId, timestamp: timestamp, in: database) { mark in
                 guard try KeeperMarks.storedMark(of: mark.fileId, in: database) == nil else { throw KeeperError.superseded }
                 try insert(mark, replacingStale: false, in: database)

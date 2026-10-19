@@ -62,11 +62,20 @@ Keeper** to remove the protection.
 - Only the file's own mark suppresses **Duplicate**. Another encoding that is
   protected through the shared recording still shows Duplicate, so the worse
   copy stays removable.
-- **Clear Keeper** clears every mark on the recording.
+- Protection follows each file's current recording key. Applying an Auto-Tag
+  match that gives a file the kept recording's MusicBrainz ID protects it too,
+  and undoing that match takes the protection away again. Neither writes a
+  keeper event of its own: the match event in History is the record.
+- **Clear Keeper** clears every mark on the recording. Undoing a clear restores
+  them all, unless a newer keeper already protects the recording; then the undo
+  is refused as changed since it was shown, so a recording never ends up with
+  a keeper it didn't have.
 - Marking and clearing are `OperationEngine` mutations with History entries;
   undo them from History. They change only crate-agent's database, never Serato
   files, so they work while Serato is running.
-- Replacing a file's content drops its mark.
+- Replacing a file's content, or removing the file from the library, drops
+  its mark. Undoing a removal doesn't bring the mark back: the file's
+  retirement invalidated it, so mark the file again if it should stay a keeper.
 
 ## Chips
 
