@@ -144,6 +144,7 @@ public final class LibraryDatabase {
         AddFilesProcessableIndexMigration.register(in: &migrator)
         AddSeratoRemovalCapturesMigration.register(in: &migrator)
         AddChecklistFactsMigration.register(in: &migrator)
+        AddSeratoAnalysisMigration.register(in: &migrator)
         return migrator
     }
 }

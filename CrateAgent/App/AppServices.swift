@@ -32,6 +32,8 @@ public final class AppServices: ObservableObject {
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
+    let seratoAnalysisWorker: SeratoAnalysisWorker
+    let checklistDuplicateRefresher: ChecklistDuplicateRefresher
     public let duplicateEvidenceVerifier: DuplicateEvidenceVerifier
     let recordingIdentity: RecordingIdentityService
     public let activityLog: ActivityLog
@@ -196,6 +198,8 @@ public final class AppServices: ObservableObject {
 
         let worker = FingerprintWorker(database: database, readiness: readiness)
         fingerprintWorker = worker
+        seratoAnalysisWorker = SeratoAnalysisWorker(database: database, readiness: readiness)
+        checklistDuplicateRefresher = ChecklistDuplicateRefresher(database: database)
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and
@@ -310,6 +314,9 @@ public final class AppServices: ObservableObject {
         )
 
         startFingerprinting()
+        let analysisWorker = seratoAnalysisWorker
+        Task { await analysisWorker.start() }
+        checklistDuplicateRefresher.start()
         startup.start()
     }
 
@@ -321,6 +328,10 @@ public final class AppServices: ObservableObject {
         fsEventsWatcher.stop()
         let worker = fingerprintWorker
         Task { await worker.stop() }
+        let analysisWorker = seratoAnalysisWorker
+        Task { await analysisWorker.stop() }
+        let duplicateRefresher = checklistDuplicateRefresher
+        Task { @MainActor in duplicateRefresher.stop() }
     }
 
     func retrySync() {

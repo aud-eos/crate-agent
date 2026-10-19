@@ -169,3 +169,17 @@ enum WorkerCoverageError: LocalizedError {
         }
     }
 }
+
+struct SeratoAnalysisCoverage: Equatable, Sendable {
+    let read: Int
+    let pending: Int
+    let failed: Int
+    let unsupported: Int
+
+    init(read: Int, pending: Int, failed: Int, unsupported: Int = 0) {
+        self.read = read
+        self.pending = pending
+        self.failed = failed
+        self.unsupported = unsupported
+    }
+}
