@@ -49,11 +49,15 @@ final class PagedLibraryFixture {
 
     /// Checklist facts for every file: V2 facts for all 30,000, fresh analysis for 24,000,
     /// crate membership for 20,000, play counts for 10,000, 300 confirmed duplicate members,
-    /// 500 keeper marks, and 2,000 three-version families. Half the files have full metadata.
+    /// 500 keeper marks, and 2,000 three-version families. Half the files have full metadata, with
+    /// three genres, BPMs from 118 to 130 in two spellings, and keys in musical, Camelot and Open Key notation.
     func seedChecklist() throws {
         try pool.write { connection in
             try connection.execute(sql: """
-            UPDATE files SET genre = 'House', bpm = '124', musical_key = '8A',
+            UPDATE files SET genre = CASE id % 8 WHEN 0 THEN 'Techno' WHEN 2 THEN 'Disco' ELSE 'House' END,
+                             bpm = CASE WHEN id % 6 = 0 THEN printf('%d.000', 118 + id % 13) ELSE CAST(118 + id % 13 AS TEXT) END,
+                             musical_key = json_extract('["Am", "8A", "Em", "1m", "C", "F#m", "Abm", "12B", "Unknown", "Dm", "5A", "G"]',
+                                                        '$[' || ((id / 2) % 12) || ']'),
                              bitrate_kbps = CASE WHEN id % 4 = 0 THEN 192 ELSE 320 END WHERE id % 2 = 0;
             INSERT INTO serato_track_facts (file_id, beatgrid_locked, added_at, added_source)
                 SELECT id, id % 3 != 0, 1700000000 - id, CASE WHEN id % 5 = 0 THEN 'indexed' ELSE 'serato' END FROM files;

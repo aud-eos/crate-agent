@@ -16,6 +16,8 @@ final class LibraryBrowserModel: ObservableObject {
     @Published private(set) var familyStates: [Int64: LibraryFamilyState] = [:]
     /// How many files each chip matches in the current scope without the chip; loaded after each snapshot's first page.
     @Published private(set) var chipCounts: [ChecklistChip: Int] = [:]
+    /// The genres and keys the facets can choose from in the status scope; loaded after each snapshot's first page.
+    @Published private(set) var facetOptions: LibraryFacetOptions?
     /// Changes whenever a family row's selection or disclosure display changes.
     @Published private(set) var familyRevision: UInt64 = 0
     private let selectionStore: LibrarySelectionStore
@@ -176,14 +178,36 @@ final class LibraryBrowserModel: ObservableObject {
         apply(updated, reset: true)
     }
 
-    /// Counts load in their own task after the page, so they never delay it; a newer snapshot cancels them.
+    /// Shows only the files `facets` match. The compatible key matches the stored key strings
+    /// the loaded options resolve it to; they are resolved again whenever the options reload.
+    func setFacets(_ facets: LibraryFacets) {
+        var updated = query
+        updated.facets = resolved(facets)
+        apply(updated, reset: true)
+    }
+
+    private func resolved(_ facets: LibraryFacets) -> LibraryFacets {
+        var resolved = facets
+        resolved.keyValues = facets.compatibleKey.map { key in facetOptions?.keyValues(compatibleWith: key) ?? [] } ?? []
+        return resolved
+    }
+
+    /// Counts and facet options load in their own task after the page, so they never delay it; a newer snapshot cancels them.
     private func loadChipCounts(for snapshot: LibraryPagedSnapshot) {
         chipCountTask?.cancel()
         chipCountTask = Task { [weak self] in
             do {
                 let counts = try await snapshot.chipCounts()
+                let options = try await snapshot.facetOptions()
                 guard let self, !Task.isCancelled, results.snapshot === snapshot else { return }
                 chipCounts = counts
+                facetOptions = options
+                let facets = resolved(query.facets)
+                if facets != query.facets {
+                    var updated = query
+                    updated.facets = facets
+                    apply(updated, reset: false)
+                }
             } catch is CancellationError {
             } catch {
                 guard let self, !Task.isCancelled else { return }
@@ -204,7 +228,7 @@ final class LibraryBrowserModel: ObservableObject {
         selection.set(state.eligibleAlternates, selected: selected)
     }
 
-    /// Selects or deselects the processable members of the family that the search hides.
+    /// Selects or deselects the processable members of the family that the search or filters hide.
     func setHiddenMembersSelected(_ selected: Bool, family familyID: Int64) {
         guard let state = familyStates[familyID] else { return }
         selection.set(state.hiddenEligible, selected: selected)

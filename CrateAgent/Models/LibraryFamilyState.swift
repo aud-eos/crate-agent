@@ -22,8 +22,8 @@ struct LibraryFamilyState: Equatable, Sendable {
     let isRevealedByFilter: Bool
 
     init(members: [LibraryFamilyPlacement], selected: Set<Int64>, isExpanded: Bool, isFiltering: Bool) {
-        let hidden = members.filter(\.isHiddenBySearch)
-        let alternates = members.filter { member in member.role == .alternate && !member.isHiddenBySearch }
+        let hidden = members.filter(\.isHiddenByFilter)
+        let alternates = members.filter { member in member.role == .alternate && !member.isHiddenByFilter }
         mainID = members.first { member in member.role == .main }?.identity.id
         selectedCount = members.filter { member in selected.contains(member.identity.id) }.count
         memberCount = members.count

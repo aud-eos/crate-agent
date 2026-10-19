@@ -66,7 +66,7 @@ struct LibraryBrowseSort: Hashable, Sendable {
 
 /// The Library projection: one row per standalone file, one main row per song
 /// family with two or more live versions, and a family's alternates beneath it
-/// while it is expanded or while a search or chip matches them. A file whose recording
+/// while it is expanded or while a search, chip or facet matches them. A file whose recording
 /// has no live file is standalone. `placed` holds every file in the status scope with its
 /// family placement; `in_scope` marks the files the result counts (every match,
 /// plus the main row of each family that has a matching member). Each row carries its
@@ -75,6 +75,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
     var filter: LibraryStatusFilter = .active
     var search = ""
     var chip: ChecklistChip?
+    var facets = LibraryFacets()
     var sort = LibraryBrowseSort()
     var expandedFamilies: Set<Int64> = []
     /// Whether Select all also selects the eligible alternates of in-scope families.
@@ -90,12 +91,19 @@ struct LibraryBrowseQuery: Hashable, Sendable {
 
     /// While searching or filtering, every matching alternate is shown, whatever the saved disclosure.
     var isFiltering: Bool {
-        isSearching || chip != nil
+        isSearching || chip != nil || !facets.isEmpty
     }
 
-    private var arguments: StatementArguments {
+    /// Whether a search or facet narrows the files, through `matched_files`.
+    private var narrowsFiles: Bool {
+        isSearching || !facets.isEmpty
+    }
+
+    private func arguments() throws -> StatementArguments {
         let expanded = expandedFamilies.sorted().map(String.init).joined(separator: ",")
-        return ["search": trimmedSearch, "expanded": "[\(expanded)]"]
+        var arguments: StatementArguments = ["search": trimmedSearch, "expanded": "[\(expanded)]"]
+        try arguments += facets.arguments()
+        return arguments
     }
 
     /// Whether ordering or filtering reads the checklist, so every file's is computed before the page.
@@ -104,10 +112,10 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         chip != nil || sort.column.isChecklist
     }
 
-    /// Whether file `id` matches the search and chip, as 0 or 1.
+    /// Whether file `id` matches the search, facets and chip, as 0 or 1.
     private func matchesSQL(_ id: String, failing: String) -> String {
         var terms: [String] = []
-        if isSearching {
+        if narrowsFiles {
             terms.append("\(id) IN (SELECT id FROM matched_files)")
         }
         if let chip {
@@ -122,7 +130,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         LibraryChecklist.failingSQL(versionsBit: LibraryChecklist.versionsBitSQL(versions: versions, headRecordingKey: headRecordingKey))
     }
 
-    /// A search runs its text match once per file, in `matched_files`, however often the passes below test it.
+    /// A search and the facets run their match once per file, in `matched_files`, however often the passes below test it.
     /// With `withChecklist`, each file's checklist is computed once, in `checklist_files`, from primary-key joins.
     /// `family_base` ranks family files into `heads`; `family_files` then evaluates `matches`, whose versions bit
     /// needs the head's recording. The outer pass over `files` only joins their results, so a library without
@@ -141,8 +149,9 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         COALESCE(works.representative_track_id = files.track_id, 0) AS saved_main
         """
         let live = SongFamilyMutation.liveTrackSQL
-        let matchedFiles = isSearching
-            ? "matched_files AS MATERIALIZED (SELECT id FROM files WHERE \(ListSearch.predicate(prefix: "files.", parameter: ":search"))),\n"
+        let fileMatches = (isSearching ? [ListSearch.predicate(prefix: "files.", parameter: ":search")] : []) + facets.predicates
+        let matchedFiles = narrowsFiles
+            ? "matched_files AS MATERIALIZED (SELECT id FROM files WHERE \(fileMatches.joined(separator: " AND "))),\n"
             : ""
         let checklistFiles = withChecklist ? LibraryChecklist.filesCTEs(scope: filter.predicate) + ",\n" : ""
         let checklistJoin = withChecklist ? LibraryChecklist.joinSQL : ""
@@ -252,7 +261,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
 
     private func page(_ range: Range<Int>) throws -> StatementArguments {
         guard range.lowerBound >= 0 else { throw PagingError.invalidRange }
-        var page = arguments
+        var page = try arguments()
         page += ["limit": range.count, "offset": range.lowerBound]
         return page
     }
@@ -267,7 +276,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         var visible = 0
         var selectAll = 0
         var hasFamilies = false
-        for placement in placements where !placement.isHiddenBySearch {
+        for placement in placements where !placement.isHiddenByFilter {
             if isVisible(placement) {
                 visible += 1
             }
@@ -279,19 +288,19 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         return (visible, selectAll, hasFamilies)
     }
 
-    /// A counted file shows as a row unless it is the alternate of a family that is neither expanded nor searched,
+    /// A counted file shows as a row unless it is the alternate of a family that is neither expanded nor filtered,
     /// as `visibleSQL` pages them.
     func isVisible(_ placement: LibraryFamilyPlacement) -> Bool {
-        !placement.isHiddenBySearch
+        !placement.isHiddenByFilter
             && (placement.role != .alternate || isFiltering || placement.familyId.map(expandedFamilies.contains) == true)
     }
 
     /// Select all takes main and standalone rows, plus eligible alternates when the query includes them.
     func isSelectedByAll(_ placement: LibraryFamilyPlacement) -> Bool {
-        !placement.isHiddenBySearch && (placement.role != .alternate || (includeAlternates && placement.isEligible))
+        !placement.isHiddenByFilter && (placement.role != .alternate || (includeAlternates && placement.isEligible))
     }
 
-    /// How many files in the query's scope without its chip each chip matches: the status scope and search, file by file.
+    /// How many files in the query's scope without its chip each chip matches: the status scope, search and facets, file by file.
     func chipCounts(in database: GRDB.Database) throws -> [ChecklistChip: Int] {
         var unfiltered = self
         unfiltered.chip = nil
@@ -300,7 +309,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
                                                    playCount: "placed.play_count")
             return "COALESCE(SUM(placed.matches AND \(matches)), 0)"
         }.joined(separator: ", ")
-        guard let row = try GRDB.Row.fetchOne(database, sql: "\(unfiltered.placedSQL(withChecklist: true))\nSELECT \(sums) FROM placed", arguments: unfiltered.arguments)
+        guard let row = try GRDB.Row.fetchOne(database, sql: "\(unfiltered.placedSQL(withChecklist: true))\nSELECT \(sums) FROM placed", arguments: unfiltered.arguments())
         else { throw PagingError.incompletePage }
         return Dictionary(uniqueKeysWithValues: ChecklistChip.allCases.enumerated().map { position, chip -> (ChecklistChip, Int) in
             (chip, row[position])
@@ -317,7 +326,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
     }
 
     func index(of id: Int64, in database: GRDB.Database) throws -> Int? {
-        var lookup = arguments
+        var lookup = try arguments()
         lookup += ["id": id]
         return try Int.fetchOne(database, sql: """
         SELECT position FROM (\(orderedSQL("placed.id, ROW_NUMBER() OVER (ORDER BY \(sort.sql())) - 1 AS position"))) WHERE id = :id
@@ -325,19 +334,19 @@ struct LibraryBrowseQuery: Hashable, Sendable {
     }
 
     /// Every counted file's family placement, in id order, with the members
-    /// of shown families that the search hides, so a selection of them stays
+    /// of shown families that the search or filters hide, so a selection of them stays
     /// in scope for family commands.
     /// Read through a cursor by column position: every snapshot opens with this read, over every file.
     func placements(in database: GRDB.Database) throws -> [LibraryFamilyPlacement] {
         let rows = try GRDB.Row.fetchCursor(database, sql: """
         \(placedSQL(withChecklist: ordersByChecklist))
-        SELECT id, membership_revision, family_id, family_role, available, NOT in_scope AS hidden_by_search FROM placed
+        SELECT id, membership_revision, family_id, family_role, available, NOT in_scope AS hidden_by_filter FROM placed
         WHERE in_scope OR (family_role = \(LibraryFamilyRole.alternate.rawValue) AND family_matched) ORDER BY id
-        """, arguments: arguments)
+        """, arguments: arguments())
         var placements: [LibraryFamilyPlacement] = []
         while let row = try rows.next() {
             try placements.append(LibraryFamilyPlacement(identity: .init(id: row[0], revision: row[1]), familyId: row[2],
-                                                         role: LibraryFamilyRole.decode(row[3]), isEligible: row[4], isHiddenBySearch: row[5]))
+                                                         role: LibraryFamilyRole.decode(row[3]), isEligible: row[4], isHiddenByFilter: row[5]))
         }
         return placements
     }
@@ -358,7 +367,7 @@ struct LibraryFamilyPlacement: Equatable, Sendable {
     let role: LibraryFamilyRole
     /// Processable now. Only eligible alternates join a selection through a family control or Select all.
     let isEligible: Bool
-    /// A member of a shown family that the search doesn't match. Only "Also
-    /// select N hidden" selects it, never the checkbox or Select all.
-    let isHiddenBySearch: Bool
+    /// A member of a shown family that the search or filters don't match. Only
+    /// "Also select N hidden" selects it, never the checkbox or Select all.
+    let isHiddenByFilter: Bool
 }

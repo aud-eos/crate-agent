@@ -54,13 +54,19 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
         return try reader.read { database in try signature.chipCounts(in: database) }
     }
 
+    /// The genres and keys the facets can choose from in this snapshot's status scope.
+    func facetOptions() throws -> LibraryFacetOptions {
+        try Task.checkCancellation()
+        return try reader.read { database in try LibraryFacetOptions.load(in: database, filter: signature.filter) }
+    }
+
     func index(of id: Int64) throws -> Int? {
         try Task.checkCancellation()
         return try reader.read { database in try signature.index(of: id, in: database) }
     }
 
     /// Every counted file, including alternates of collapsed families and
-    /// shown families' members a search hides, so those selections stay in scope.
+    /// shown families' members a search or filter hides, so those selections stay in scope.
     func identities(after id: Int64?, limit: Int) throws -> [PagedIdentity<Int64>] {
         try slice(placements, after: id, limit: limit)
     }

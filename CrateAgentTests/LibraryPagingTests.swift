@@ -124,8 +124,9 @@ final class LibraryPagingTests: XCTestCase {
         add(attachment)
     }
 
-    /// Invariant 8 evidence for the checklist: every new sort, every chip, and a chip with a search,
-    /// each opened with its first page and, separately, its chip counts, over checklist facts for 30,000 files.
+    /// Invariant 8 evidence for the checklist: every new sort, every chip, a chip with a search, and a search,
+    /// chip, genre, BPM range and compatible key together, each opened with its first page and, separately,
+    /// its chip counts, over checklist facts for 30,000 files; plus the facet options load.
     func testChecklistSortFilterAndCountsStayWithinBudgetsAtThirtyThousandFiles() async throws {
         let fixture = try fixture
         try fixture.seedChecklist()
@@ -150,6 +151,14 @@ final class LibraryPagingTests: XCTestCase {
             try await measure("chip_\(chip.rawValue)", .init(chip: chip))
         }
         try await measure("search_needs_work", .init(search: "Artist A", chip: .needsWork))
+        let optionsStart = ContinuousClock.now
+        let options = try await fixture.pool.read { connection in try LibraryFacetOptions.load(in: connection, filter: .active) }
+        let optionsElapsed = ContinuousClock.now - optionsStart
+        XCTAssertLessThan(optionsElapsed, .milliseconds(500), "facet options")
+        metrics.append("facet_options_ms=\(optionsElapsed.milliseconds)")
+        var facets = LibraryFacets(genres: ["House"], bpmRange: 122 ... 128, compatibleKey: CamelotKey(parsing: "8A"))
+        facets.keyValues = try options.keyValues(compatibleWith: XCTUnwrap(facets.compatibleKey))
+        try await measure("all_facets", .init(search: "Artist A", chip: .needsWork, facets: facets, sort: .init(column: .stillNeeds)))
         let line = "CHECKLIST_PAGING_METRICS " + metrics.joined(separator: " ")
         print(line)
         let attachment = XCTAttachment(string: line)

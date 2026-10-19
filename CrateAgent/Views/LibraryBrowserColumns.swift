@@ -217,7 +217,7 @@ private final class LibraryFamilyDisclosureCell: NSTableCellView {
 
 /// The per-family Include alternates checkbox, mixed when some eligible
 /// alternates are selected, and the text button that extends a selection to
-/// the members a search hides.
+/// the members a search or filter hides.
 private final class LibraryFamilyInclusionCell: NSTableCellView {
     private let checkbox = NSButton(checkboxWithTitle: LibraryFamilyMessages.includeAlternates, target: nil, action: nil)
     private let hiddenButton = NSButton(title: "", target: nil, action: nil)
