@@ -364,6 +364,10 @@ public enum EventHistoryQuery {
             return MusicBrainzWorkMessages.recordedPhrase(count: count)
         case .musicBrainzWorkCleared:
             return MusicBrainzWorkMessages.clearedPhrase(count: count)
+        case .keeperMarked:
+            return HistoryMessages.keeperMarkedPhrase(count: count)
+        case .keeperCleared:
+            return HistoryMessages.keeperClearedPhrase(count: count)
         }
     }
 

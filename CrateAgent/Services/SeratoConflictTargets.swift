@@ -85,6 +85,17 @@ enum SeratoConflictTargets {
             for file in try FileRecord.fetchAll(database, keys: payload.fileIds) {
                 target.include(file)
             }
+        case let .keeper(operation):
+            // Writes only `keeper_marks`, but protects every file sharing the
+            // marked recording's key, so it targets each of them.
+            fileID = nil
+            target.fileIDs.formUnion(operation.fileIDs)
+            for file in try KeeperMarks.filesSharingRecording(with: operation.fileIDs, in: database) {
+                target.include(file)
+                if let trackID = file.trackId {
+                    target.sharedTrackIDs.insert(trackID)
+                }
+            }
         }
         if let fileID {
             target.fileIDs.insert(fileID)

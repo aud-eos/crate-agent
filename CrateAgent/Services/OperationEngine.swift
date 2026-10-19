@@ -1183,7 +1183,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared: nil
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared: nil
         }
     }
 
@@ -1574,7 +1574,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
             false
         }
     }
@@ -1677,7 +1677,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
             return []
         }
     }
@@ -2251,6 +2251,10 @@ public actor OperationEngine {
             return try .recordingIdentity(.reseparate(decoder.decode(RecordingSeparation.self, from: inverseJsonData)))
         case .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             return try .recordMusicBrainzWork(decoder.decode(RecordMusicBrainzWorkPayload.self, from: inverseJsonData))
+        case .keeperMarked:
+            return try .keeper(.remove([decoder.decode(KeeperMark.self, from: inverseJsonData)]))
+        case .keeperCleared:
+            return try .keeper(.restore([decoder.decode(KeeperMark.self, from: inverseJsonData)]))
         }
     }
 
@@ -3853,6 +3857,9 @@ public actor OperationEngine {
         case let .recordMusicBrainzWork(payload):
             let eventId = try MusicBrainzWorkMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .keeper(operation):
+            let eventId = try KeeperMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         }
     }
 
@@ -4784,6 +4791,8 @@ public enum TrackMutation: Sendable {
     /// Records an already-matched recording's MusicBrainz work; produced by
     /// `MusicBrainzWorkBackfill` and by undoing it.
     case recordMusicBrainzWork(RecordMusicBrainzWorkPayload)
+    /// Marks or clears a recording's keeper, or undoes that.
+    case keeper(KeeperOperation)
 }
 
 /// Move the file at `fileId` to the user's Trash via

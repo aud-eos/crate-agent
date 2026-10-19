@@ -103,6 +103,8 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
     case recordingRejoined = "recording_rejoined"
     case musicBrainzWorkRecorded = "music_brainz_work_recorded"
     case musicBrainzWorkCleared = "music_brainz_work_cleared"
+    case keeperMarked = "keeper_marked"
+    case keeperCleared = "keeper_cleared"
 
     /// Whether this event type projects onto Serato/audio-file writes that
     /// `OperationEngine.resyncSeratoForBatch` can idempotently replay from the
@@ -130,7 +132,7 @@ public enum EventType: String, Codable, DatabaseValueConvertible,
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
             false
         }
     }
