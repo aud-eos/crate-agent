@@ -41,6 +41,55 @@ struct LibraryFacets: Hashable, Sendable {
     }
 }
 
+enum BPMRangeError: LocalizedError, Equatable {
+    case notANumber
+    case negative
+    case reversed
+
+    var errorDescription: String? {
+        switch self {
+        case .notANumber: LibraryChecklistMessages.bpmNotNumber
+        case .negative: LibraryChecklistMessages.bpmNegative
+        case .reversed: LibraryChecklistMessages.bpmReversed
+        }
+    }
+}
+
+extension LibraryFacets {
+    /// An open lower end; BPM 0 never matches, so it adds no bound.
+    static let openLowerBPM = 0.0
+    static let openUpperBPM = Double.greatestFiniteMagnitude
+
+    /// The inclusive range typed into the two BPM fields. An empty field, or a lower end of 0, is an open end,
+    /// and two open ends are no range, so the result always reads back from `bpmText`.
+    static func bpmRange(lower lowerText: String, upper upperText: String) throws -> ClosedRange<Double>? {
+        let lower = try bpm(lowerText) ?? openLowerBPM
+        let upper = try bpm(upperText) ?? openUpperBPM
+        guard lower <= upper else { throw BPMRangeError.reversed }
+        return lower == openLowerBPM && upper == openUpperBPM ? nil : lower ... upper
+    }
+
+    /// The field text that `bpmRange(lower:upper:)` reads back as `range`; an open end is empty.
+    static func bpmText(_ range: ClosedRange<Double>?) -> (lower: String, upper: String) {
+        guard let range else { return ("", "") }
+        return (range.lowerBound == openLowerBPM ? "" : text(range.lowerBound), range.upperBound == openUpperBPM ? "" : text(range.upperBound))
+    }
+
+    /// Nil for an empty field; a finite, non-negative number, or an error.
+    private static func bpm(_ text: String) throws -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        guard let value = Double(trimmed), value.isFinite else { throw BPMRangeError.notANumber }
+        guard value >= 0 else { throw BPMRangeError.negative }
+        return value
+    }
+
+    /// Plain digits that `Double(_:)` reads back, whatever the locale.
+    private static func text(_ bpm: Double) -> String {
+        bpm == bpm.rounded() && bpm < 1_000_000 ? String(Int(bpm)) : String(bpm)
+    }
+}
+
 /// One genre as the user sees it: every stored spelling that differs only in case, width or
 /// whitespace, shown as its most frequent spelling. The facet matches `storedValues` exactly.
 struct GenreOption: Hashable, Sendable {

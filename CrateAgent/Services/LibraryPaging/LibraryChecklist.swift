@@ -148,7 +148,8 @@ enum LibraryChecklist {
                    EXISTS (SELECT 1 FROM \(SeratoLibraryFacts.membershipTable) AS crates WHERE crates.file_id = files.id) AS in_crate,
                    \(analysis).cue_count, \(analysis).beatgrid_marker_count,
                    \(fact).beatgrid_locked, \(fact).added_at AS date_added, \(fact).added_source AS date_added_source,
-                   COALESCE(plays.play_count, 0) AS play_count, duplicates.file_id IS NOT NULL AS is_duplicate,
+                   CASE WHEN EXISTS (SELECT 1 FROM \(SeratoLibraryFacts.stampTable) WHERE source = '\(ChecklistSource.history.rawValue)')
+                        THEN COALESCE(plays.play_count, 0) END AS play_count, duplicates.file_id IS NOT NULL AS is_duplicate,
                    files.bitrate_kbps, \(losslessSQL) AS is_lossless, \(missingMetadataSQL) AS missing_metadata
             FROM files LEFT JOIN tracks ON tracks.id = files.track_id
             \(SeratoAnalysisStore.freshJoinSQL(as: analysis))

@@ -1,10 +1,13 @@
 import Foundation
 import GRDB
 
-/// A Serato library source the checklist caches, keyed in `checklist_source_stamps`.
+/// A Serato source the checklist caches, keyed in `checklist_source_stamps`. `SeratoLibraryFactsService`
+/// owns `databaseV2` and `subcrates`; `SeratoPlayCountService` owns `history`, whose stamp says
+/// Serato History has been read at least once, so play counts are known.
 enum ChecklistSource: String, CaseIterable, Sendable {
     case databaseV2 = "database_v2"
     case subcrates
+    case history
 }
 
 /// Where a file's date added came from: Serato's V2 record, or, when V2 has
@@ -141,6 +144,18 @@ enum SeratoLibraryFacts {
     static let membershipTable = "serato_crate_memberships"
     static let stampTable = "checklist_source_stamps"
     static let rowsPerTransaction = 1000
+    /// The sources this service reads and stamps.
+    static let sources: [ChecklistSource] = [.databaseV2, .subcrates]
+
+    static func writeStamp(_ source: ChecklistSource, _ stamp: String, in database: GRDB.Database) throws {
+        try database.execute(sql: """
+        INSERT INTO \(stampTable) (source, stamp) VALUES (?, ?) ON CONFLICT(source) DO UPDATE SET stamp = excluded.stamp
+        """, arguments: [source.rawValue, stamp])
+    }
+
+    static func hasStamp(_ source: ChecklistSource, in database: GRDB.Database) throws -> Bool {
+        try Bool.fetchOne(database, sql: "SELECT EXISTS (SELECT 1 FROM \(stampTable) WHERE source = ?)", arguments: [source.rawValue]) ?? false
+    }
 
     static func facts(in database: GRDB.Database) throws -> [Int64: SeratoFileFacts] {
         var facts: [Int64: SeratoFileFacts] = [:]
@@ -176,6 +191,7 @@ enum SeratoLibraryFacts {
         """, arguments: StatementArguments(types))
     }
 
+    /// The stamps of this service's own `sources`; another owner's source is skipped, and an unknown one throws.
     static func storedStamps(in database: GRDB.Database) throws -> [ChecklistSource: ChecklistSourceStamp] {
         var stamps: [ChecklistSource: ChecklistSourceStamp] = [:]
         let decoder = JSONDecoder()
@@ -183,7 +199,12 @@ enum SeratoLibraryFacts {
         while let row = try rows.next() {
             let name: String = row["source"]
             guard let source = ChecklistSource(rawValue: name) else { throw SeratoLibraryFactsError.unexpectedSource(name) }
-            stamps[source] = try decoder.decode(ChecklistSourceStamp.self, from: Data((row["stamp"] as String).utf8))
+            switch source {
+            case .databaseV2, .subcrates:
+                stamps[source] = try decoder.decode(ChecklistSourceStamp.self, from: Data((row["stamp"] as String).utf8))
+            case .history:
+                continue
+            }
         }
         return stamps
     }
@@ -322,9 +343,7 @@ enum SeratoLibraryFacts {
                 try database.execute(sql: "DELETE FROM \(membershipTable) WHERE file_id = ? AND crate_name = ?",
                                      arguments: [membership.fileID, membership.crateName])
             case let .stamp(source, stamp):
-                try database.execute(sql: """
-                INSERT INTO \(stampTable) (source, stamp) VALUES (?, ?) ON CONFLICT(source) DO UPDATE SET stamp = excluded.stamp
-                """, arguments: [source.rawValue, stamp])
+                try writeStamp(source, stamp, in: database)
             }
         }
     }

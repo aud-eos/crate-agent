@@ -58,7 +58,7 @@ public struct BrowserRow:
     /// Unix seconds.
     var dateAdded: Int64?
     var dateAddedSource: DateAddedSource?
-    /// 0 when Serato History has no play of the file.
+    /// 0 when Serato History has no play of the file; nil until History has ever been read.
     var playCount: Int?
     /// Files of the row's family in the status scope that are not Finished, and all of them.
     var familyFilesNeedingWork: Int?

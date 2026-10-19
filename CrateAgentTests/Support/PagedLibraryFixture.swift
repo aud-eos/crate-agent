@@ -69,8 +69,9 @@ final class PagedLibraryFixture {
             INSERT INTO checklist_duplicate_members (file_id, group_key) SELECT id, 'group-' || (id / 200) FROM files WHERE id % 100 = 7;
             INSERT INTO keeper_marks (file_id, marked_revision, marked_at) SELECT id, 0, 1 FROM files WHERE id % 60 = 1;
             """)
-            try connection.execute(sql: "INSERT INTO checklist_source_stamps (source, stamp) VALUES (?, '{}')",
-                                   arguments: [ChecklistSource.subcrates.rawValue])
+            for source in [ChecklistSource.subcrates, .history] {
+                try connection.execute(sql: "INSERT INTO checklist_source_stamps (source, stamp) VALUES (?, '{}')", arguments: [source.rawValue])
+            }
             try Self.groupFamilies(connection)
         }
     }

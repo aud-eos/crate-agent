@@ -17,7 +17,7 @@ final class SeratoPlayCountService: ObservableObject {
 
     /// What a refresh read: every session file's name, size and modification
     /// time, and the library's path history.
-    private struct Inputs: Equatable {
+    private struct Inputs: Codable, Equatable {
         let sessions: [SeratoDirectoryStamp]
         let library: SeratoLibraryPathSignature
     }
@@ -84,13 +84,15 @@ final class SeratoPlayCountService: ObservableObject {
                 return
             }
             let plan = try await database.writer.read { connection in try SeratoPlayCounts.plan(from: scan, in: connection) }
-            if plan.changesTable {
-                guard try await database.writer.write({ connection in try SeratoPlayCounts.apply(plan, in: connection) }) else {
-                    refreshRequested = true
-                    return
-                }
+            let readInputs = Inputs(sessions: sessions, library: plan.library)
+            let historyStamp = try String(decoding: JSONEncoder().encode(readInputs), as: UTF8.self)
+            guard try await database.writer.write({ connection in
+                try SeratoPlayCounts.apply(plan, historyStamp: historyStamp, in: connection)
+            }) else {
+                refreshRequested = true
+                return
             }
-            finish(Inputs(sessions: sessions, library: plan.library), outcome: .refreshed(plan.summary))
+            finish(readInputs, outcome: .refreshed(plan.summary))
         } catch {
             let reason = (error as? CoreError)?.message ?? error.localizedDescription
             if let inputs {

@@ -32,6 +32,30 @@ final class LibraryFacetTests: XCTestCase {
         }
     }
 
+    func testBPMRangeFieldsParseOpenEndsRejectBadInputAndRoundTrip() throws {
+        let valid: [(lower: String, upper: String, range: ClosedRange<Double>?)] = [
+            ("124", "128", 124 ... 128), (" 124.5 ", "128", 124.5 ... 128), ("", "", nil),
+            ("124", "", 124 ... LibraryFacets.openUpperBPM), ("", "128", LibraryFacets.openLowerBPM ... 128), ("126", "126", 126 ... 126),
+        ]
+        for input in valid {
+            let range = try LibraryFacets.bpmRange(lower: input.lower, upper: input.upper)
+            XCTAssertEqual(range, input.range, "\(input)")
+            let text = LibraryFacets.bpmText(range)
+            XCTAssertEqual(try LibraryFacets.bpmRange(lower: text.lower, upper: text.upper), range, "round trip of \(input)")
+        }
+        XCTAssertEqual(LibraryFacets.bpmText(124.5 ... 128).lower, "124.5")
+        XCTAssertEqual(LibraryFacets.bpmText(124 ... LibraryFacets.openUpperBPM).upper, "")
+        let rejected: [(lower: String, upper: String, error: BPMRangeError)] = [
+            ("abc", "", .notANumber), ("", "12x", .notANumber), ("inf", "", .notANumber), ("", "nan", .notANumber),
+            ("-5", "128", .negative), ("130", "120", .reversed),
+        ]
+        for input in rejected {
+            XCTAssertThrowsError(try LibraryFacets.bpmRange(lower: input.lower, upper: input.upper), "\(input)") { error in
+                XCTAssertEqual(error as? BPMRangeError, input.error, "\(input)")
+            }
+        }
+    }
+
     func testFacetsCombineWithChipAndSearch() async throws {
         let options = try await pool.read { connection in try LibraryFacetOptions.load(in: connection, filter: .active) }
         let house = try XCTUnwrap(options.genres.first { option in option.value == "House" })

@@ -41,8 +41,11 @@ each file, not to the recording.
 
 **Date added** is Serato's date added when its database has one, and otherwise
 the time crate-agent first indexed the file; the tooltip says which. **My
-plays** is the play count from the last Serato History read; a file with no
-play has 0. A missing value reads **unknown**, and sorts last in both
+plays** is the play count from the last Serato History read; once History has
+been read, a file with no play has 0. Until History has been read for the
+first time, which crate-agent records in a persisted stamp (source `history`
+in `checklist_source_stamps`) written with the counts, every file's plays read
+**unknown**. A missing value reads **unknown**, and sorts last in both
 directions. Files removed from Serato have no checklist, so these columns are
 empty for them.
 
@@ -74,9 +77,12 @@ unchecked**, **Low quality**, **Never played**, **Too many versions** and
 - Each count is the number of *files* in the current library status, search and
   genre, BPM and key filters that the chip matches, ignoring the chosen chip.
   Counts read **…** while they load, after the first page.
-- **Never played** is disabled until Serato History has been read in this
-  session, because play counts are only read while Serato is closed. Its
-  tooltip and a note beside the chips give the reason.
+- **Never played** is disabled until Serato History has been read for the
+  first time, because play counts are only read while Serato is closed. Until
+  then it matches nothing. Once the History stamp exists it stays available
+  across later refreshes, Serato reopening and relaunches. While it is
+  disabled, its tooltip and a note beside the chips give the reason, including
+  why the last read failed.
 - Like a search, a chip shows a family's main row when any of its files
   matches, and lists the matching files beneath it.
 
@@ -85,7 +91,9 @@ unchecked**, **Low quality**, **Never played**, **Too many versions** and
 - **Genre** is a multi-select. Spellings that differ only in case, width or
   spaces ("House", "house ") are one option, shown as the commonest spelling.
 - **BPM from** and **BPM to** form an inclusive range; press Return to apply.
-  Either end may be left empty. Files with no BPM, or a BPM of 0, never match.
+  Either end may be left empty, and two empty ends (or a lower end of 0 with no
+  upper end) apply no range. Negative, non-numeric and reversed ranges are
+  refused with a message. Files with no BPM, or a BPM of 0, never match.
 - **Key** matches the chosen key, one step either way on the Camelot wheel, and
   its relative major or minor. Musical, Camelot and Open Key notations are all
   read. A key no notation reads never matches.

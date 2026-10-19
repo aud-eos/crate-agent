@@ -117,7 +117,35 @@ final class LibraryChecklistTests: XCTestCase {
         XCTAssertEqual(Array(played.prefix(2)), [fileIDs["Played 9"], fileIDs["Played 2"]])
     }
 
+    func testPlaysAreUnknownAndNeverPlayedMatchesNothingUntilHistoryHasBeenRead() async throws {
+        try await pool.write { connection in
+            try connection.execute(sql: "DELETE FROM checklist_source_stamps WHERE source = ?", arguments: [ChecklistSource.history.rawValue])
+        }
+        var plays = try await playsByTitle()
+        XCTAssertEqual(plays["Complete"], .some(nil))
+        XCTAssertEqual(plays["Played 9"], .some(nil))
+        let unreadCounts = try await LibraryPagedSnapshot.open(pool: pool, query: .init()).chipCounts()
+        XCTAssertEqual(unreadCounts[.neverPlayed], 0)
+        let unreadNeverPlayed = try await titles(.init(chip: .neverPlayed))
+        XCTAssertEqual(unreadNeverPlayed, [])
+
+        try await pool.write { connection in try SeratoLibraryFacts.writeStamp(.history, "{}", in: connection) }
+        plays = try await playsByTitle()
+        XCTAssertEqual(plays["Complete"], .some(0))
+        XCTAssertEqual(plays["Played 9"], .some(9))
+        let readNeverPlayed = try await titles(.init(chip: .neverPlayed))
+        XCTAssertTrue(readNeverPlayed.contains("Complete"))
+    }
+
     // MARK: - Helpers
+
+    private func playsByTitle() async throws -> [String: Int?] {
+        var plays: [String: Int?] = [:]
+        for row in try await rows(LibraryBrowseQuery()) {
+            plays[row.title ?? row.path] = row.playCount
+        }
+        return plays
+    }
 
     private func rows(_ query: LibraryBrowseQuery) async throws -> [BrowserRow] {
         let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: query)
@@ -180,7 +208,9 @@ final class LibraryChecklistTests: XCTestCase {
             try track.insert(connection)
             return try XCTUnwrap(track.id)
         }
-        try connection.execute(sql: "INSERT INTO checklist_source_stamps (source, stamp) VALUES (?, '{}')", arguments: [ChecklistSource.subcrates.rawValue])
+        for source in [ChecklistSource.subcrates, .history] {
+            try connection.execute(sql: "INSERT INTO checklist_source_stamps (source, stamp) VALUES (?, '{}')", arguments: [source.rawValue])
+        }
 
         try add(Seed(title: "Complete"))
         try add(Seed(title: "Uncrated", inCrate: false))

@@ -158,6 +158,7 @@ enum LibraryChecklistMessages {
     static let facetHelp = "Counts cover every file in the chosen library status, before search and other filters."
     static let bpmHelp = "An inclusive BPM range. Files with no BPM never match. Press Return to apply."
     static let bpmNotNumber = "Enter BPM as a number, such as 124 or 124.5."
+    static let bpmNegative = "BPM can't be negative."
     static let bpmReversed = "The lower BPM must not be above the upper one."
     static let facetBarLabel = "Genre, BPM and key filters"
 

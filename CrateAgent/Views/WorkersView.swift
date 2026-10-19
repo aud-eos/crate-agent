@@ -115,7 +115,8 @@ struct WorkersView: View {
             }
             let failures = model.seratoAnalysisFailures
             if !failures.isEmpty {
-                TextDisclosure(show: SeratoAnalysisMessages.showFailures(failures.count), hide: SeratoAnalysisMessages.hideFailures) {
+                let notRead = model.seratoAnalysisCoverage.map { analysis in analysis.failed + analysis.unsupported } ?? failures.count
+                TextDisclosure(show: SeratoAnalysisMessages.showFailures(notRead), hide: SeratoAnalysisMessages.hideFailures) {
                     if failures.count == WorkerCoverageQuery.drillDownLimit {
                         Text(SeratoAnalysisMessages.firstFailures(WorkerCoverageQuery.drillDownLimit)).font(.caption).foregroundStyle(.secondary)
                     }

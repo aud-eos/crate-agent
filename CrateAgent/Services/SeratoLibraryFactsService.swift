@@ -82,7 +82,7 @@ final class SeratoLibraryFactsService: ObservableObject {
                 ChecklistSource.databaseV2: Self.encode(SourceInputs(files: identity, library: library, lastMembershipChange: membershipChange)),
                 .subcrates: Self.encode(SourceInputs(files: crateFiles, library: library, lastMembershipChange: membershipChange)),
             ]
-            let changed = Set(ChecklistSource.allCases.filter { source in stored[source]?.inputs != stamps[source] })
+            let changed = Set(SeratoLibraryFacts.sources.filter { source in stored[source]?.inputs != stamps[source] })
             guard !changed.isEmpty else {
                 status = Self.status(for: stored.values.map(\.outcome).reduce(SeratoLibraryFactsOutcome(), +))
                 return

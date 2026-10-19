@@ -54,6 +54,12 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
         return try reader.read { database in try signature.chipCounts(in: database) }
     }
 
+    /// Whether Serato History has been read at least once, so play counts and Never played are known.
+    func playCountsKnown() throws -> Bool {
+        try Task.checkCancellation()
+        return try reader.read { database in try SeratoLibraryFacts.hasStamp(.history, in: database) }
+    }
+
     /// The genres and keys the facets can choose from in this snapshot's status scope.
     func facetOptions() throws -> LibraryFacetOptions {
         try Task.checkCancellation()

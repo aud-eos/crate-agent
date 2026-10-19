@@ -19,6 +19,9 @@ final class LibraryBrowserModel: ObservableObject {
     @Published private(set) var chipCounts: [ChecklistChip: Int]?
     /// The genres and keys the facets can choose from in the status scope; loaded after each snapshot's first page.
     @Published private(set) var facetOptions: LibraryFacetOptions?
+    /// Whether Serato History has ever been read, from its persisted stamp; nil until the first snapshot loads it.
+    /// Never played and My plays are unknown until it is true.
+    @Published private(set) var playCountsKnown: Bool?
     /// Changes whenever a family row's selection or disclosure display changes.
     @Published private(set) var familyRevision: UInt64 = 0
     private let selectionStore: LibrarySelectionStore
@@ -200,9 +203,11 @@ final class LibraryBrowserModel: ObservableObject {
             do {
                 let counts = try await snapshot.chipCounts()
                 let options = try await snapshot.facetOptions()
+                let playsKnown = try await snapshot.playCountsKnown()
                 guard let self, !Task.isCancelled, results.snapshot === snapshot else { return }
                 chipCounts = counts
                 facetOptions = options
+                playCountsKnown = playsKnown
                 let facets = resolved(query.facets)
                 if facets != query.facets {
                     var updated = query

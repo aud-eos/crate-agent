@@ -6,8 +6,8 @@ enum LibraryBrowserAction: Equatable {
     case history
     case open(OpenTarget)
     case reveal
-    /// Marks the file's recording as a keeper, or clears its keeper.
-    case keeper(Bool)
+    /// Marks the file's recording as a keeper, or clears its keeper, if the file is still at the revision the row showed.
+    case keeper(Bool, revision: Int64)
 }
 
 /// Song-family changes offered from a Library row's context menu.
@@ -157,7 +157,7 @@ struct LibraryPagedContent: View {
         if row.hasChecklist, let isProtected = row.isProtected {
             menu.addItem(.separator())
             let keeper = LibraryActionMenuItem(title: isProtected ? LibraryChecklistMessages.clearKeeper : LibraryChecklistMessages.markKeeper) {
-                onAction(identifier, .keeper(!isProtected))
+                onAction(identifier, .keeper(!isProtected, revision: row.membershipRevision))
             }
             keeper.toolTip = LibraryChecklistMessages.keeperMenuHelp
             menu.addItem(keeper)

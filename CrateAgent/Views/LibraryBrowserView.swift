@@ -232,23 +232,27 @@ struct LibraryBrowserView: View {
     private func perform(_ action: LibraryBrowserAction, for identifier: Int64) async {
         guard let model else { return }
         do {
-            let record = try await model.resolveFile(id: identifier)
             switch action {
             case .rename:
+                let record = try await model.resolveFile(id: identifier)
                 try FileProcessingEligibility.requireProcessable(record)
                 try services.readiness.requireUnconflicted(.file(record))
                 renameTarget = record
             case .history:
+                let record = try await model.resolveFile(id: identifier)
                 historyTarget = BrowserRow(id: identifier, path: record.path, artist: record.artist, title: record.title,
                                            album: record.album, bpm: record.bpm, musicalKey: record.musicalKey,
                                            libraryMembership: record.libraryMembership, fileAvailability: record.fileAvailability,
                                            membershipRevision: record.membershipRevision)
             case let .open(target):
+                _ = try await model.resolveFile(id: identifier)
                 await services.fileOpener.open(fileID: identifier, with: target)
             case .reveal:
+                _ = try await model.resolveFile(id: identifier)
                 await services.fileOpener.reveal(fileID: identifier)
-            case let .keeper(isKeeper):
-                _ = try await services.operationEngine.setKeeper(isKeeper, for: FileMembershipToken(fileId: identifier, revision: record.membershipRevision))
+            case let .keeper(isKeeper, revision):
+                // The row's revision, so a file replaced since it was shown refuses the mark as superseded.
+                _ = try await services.operationEngine.setKeeper(isKeeper, for: FileMembershipToken(fileId: identifier, revision: revision))
             }
         } catch { model.error = error.localizedDescription }
     }
@@ -278,7 +282,7 @@ struct LibraryBrowserView: View {
 }
 
 /// The checklist chips and the genre, BPM and key filters, bound to the Library model. Never played waits
-/// until Serato History has been read this session (plan ruling 14).
+/// until Serato History has ever been read, from its persisted stamp (amended plan ruling 14).
 private struct LibraryChecklistFilters: View {
     @ObservedObject var model: LibraryBrowserModel
     @ObservedObject var playCounts: SeratoPlayCountService
@@ -287,18 +291,17 @@ private struct LibraryChecklistFilters: View {
     var body: some View {
         VStack(alignment: .leading, spacing: density.detailSpacing) {
             LibraryChecklistChipBar(chip: Binding(get: { model.query.chip }, set: { chip in model.setChip(chip) }), counts: model.chipCounts,
-                                    neverPlayedAvailable: neverPlayedUnavailableReason == nil,
-                                    neverPlayedUnavailableReason: neverPlayedUnavailableReason ?? LibraryChecklistMessages.neverPlayedUnavailable)
+                                    neverPlayedAvailable: model.playCountsKnown == true, neverPlayedUnavailableReason: neverPlayedUnavailableReason)
             LibraryFacetBar(facets: Binding(get: { model.query.facets }, set: { facets in model.setFacets(facets) }), options: model.facetOptions)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var neverPlayedUnavailableReason: String? {
+    /// Shown only while History has never been read; a failed read then says why.
+    private var neverPlayedUnavailableReason: String {
         switch playCounts.status {
-        case .refreshed: nil
         case let .failed(reason): LibraryChecklistMessages.neverPlayedFailed(reason)
-        case .notRefreshed, .refreshing, .skippedWhileSeratoRunning: LibraryChecklistMessages.neverPlayedUnavailable
+        case .notRefreshed, .refreshing, .refreshed, .skippedWhileSeratoRunning: LibraryChecklistMessages.neverPlayedUnavailable
         }
     }
 }

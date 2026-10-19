@@ -124,42 +124,18 @@ struct LibraryFacetBar: View {
     }
 
     private func applyRange() {
-        let lowerText = lowerBPM.trimmingCharacters(in: .whitespaces)
-        let upperText = upperBPM.trimmingCharacters(in: .whitespaces)
-        guard !lowerText.isEmpty || !upperText.isEmpty else {
+        do {
+            let range = try LibraryFacets.bpmRange(lower: lowerBPM, upper: upperBPM)
             bpmError = nil
-            update { facets in facets.bpmRange = nil }
-            return
+            update { facets in facets.bpmRange = range }
+        } catch {
+            bpmError = error.localizedDescription
         }
-        guard let lower = lowerText.isEmpty ? 0 : Double(lowerText), let upper = upperText.isEmpty ? .greatestFiniteMagnitude : Double(upperText),
-              lower.isFinite, !upper.isNaN
-        else {
-            bpmError = LibraryChecklistMessages.bpmNotNumber
-            return
-        }
-        guard lower <= upper else {
-            bpmError = LibraryChecklistMessages.bpmReversed
-            return
-        }
-        bpmError = nil
-        update { facets in facets.bpmRange = lower ... upper }
     }
 
     /// Shows the applied range, so a range cleared elsewhere clears the fields too.
     private func showStoredRange() {
-        guard let range = facets.bpmRange else {
-            if bpmError == nil {
-                lowerBPM = ""
-                upperBPM = ""
-            }
-            return
-        }
-        lowerBPM = range.lowerBound > 0 ? Self.text(range.lowerBound) : ""
-        upperBPM = range.upperBound < .greatestFiniteMagnitude ? Self.text(range.upperBound) : ""
-    }
-
-    /// Plain digits that `Double(_:)` reads back, whatever the locale.
-    private static func text(_ bpm: Double) -> String {
-        bpm == bpm.rounded() && abs(bpm) < 1_000_000 ? String(Int(bpm)) : String(bpm)
+        guard facets.bpmRange != nil || bpmError == nil else { return }
+        (lowerBPM, upperBPM) = LibraryFacets.bpmText(facets.bpmRange)
     }
 }
