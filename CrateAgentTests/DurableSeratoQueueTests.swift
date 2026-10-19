@@ -684,6 +684,8 @@ final class DurableSeratoQueueTests: XCTestCase {
                 XCTAssertNil(targetRow, "The cleanup must finish, not retire the target")
                 XCTAssertEqual(recorder.trashed, [target.path])
                 XCTAssertEqual(summary.notAppliedWrites.total, 0)
+                try await restarted.undoBatch("interrupted-trash")
+                XCTAssertTrue(FileManager.default.fileExists(atPath: target.path), "The recovery must record where the audio went so undo can restore it")
             } else {
                 XCTAssertNotNil(targetRow, "A failed Trash attempt must not be taken as proof the audio was trashed")
                 XCTAssertEqual(recorder.trashed, [])
@@ -1259,7 +1261,8 @@ final class DurableSeratoQueueTests: XCTestCase {
                             try FileManager.default.moveItem(atPath: path, toPath: destination)
                             recorder.recordTrash(path)
                             return destination
-                        })
+                        },
+                        availabilityResolver: FileAvailabilityResolver(trashDirectory: { _ in fixture.directory }))
     }
 
     private func makeSession(_ fixture: SeratoRemovalFixture, engine: OperationEngine, store: SyncCheckpointStore? = nil,

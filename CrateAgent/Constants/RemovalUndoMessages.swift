@@ -10,6 +10,7 @@ enum RemovalUndoMessages {
         case .trashItemNotInTrash: "it was moved out of the Trash"
         case .originalPathOccupied: "another file is now at \(path)"
         case .trashItemNotRecorded: "where it went in the Trash was not recorded"
+        case .originalFileMissing: "its file at \(path) was moved or deleted after the removal stopped"
         case .originalFileChanged: "it changed after its removal stopped"
         case let .recordsNotRecorded(store): "the records removed from \((store as NSString).lastPathComponent) were not recorded"
         case .fileNotRestored: "it is no longer in the library at \(path)"
