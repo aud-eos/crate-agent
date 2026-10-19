@@ -17,22 +17,27 @@ Each ruling lists its reason and what it costs if it turns out to be wrong.
 1. **Cue points come from `Serato Markers2` `CUE` entries in the audio file's tags.** An in-house Rust parser follows the Holzhaus/serato-tags format documentation, which `serato.rs` already cites. The project chose in-house Serato parsing over `triseratops` (see the `rust-core/Cargo.toml` comment), and no other maintained Rust parser exists, so the only new dependency is `base64`. The parser covers ID3v2 `GEOB` frames (MP3, AIFF, WAV), MP4 freeform `----:com.serato.dj:markersv2` and Vorbis `SERATO_MARKERS_V2` (FLAC, Ogg). A file with no Markers2 has 0 cues. An unsupported container or a malformed payload is *unknown*, never "No cues", and its reason appears in Workers. *If wrong:* some formats show wrong counts or unknown. The fault is confined to one Rust module and its byte-level tests.
 2. **"Beatgrid checked" is the V2 `bbgl` (beatgrid locked) flag.** It is read from `database V2` with no audio reads, as Mixxx's Serato importer reads it. The audio reader also returns `beatgrid_marker_count` from `Serato BeatGrid`, which the tooltip uses to say "No beatgrid" rather than "Grid not locked". The smoke checklist confirms that locking a grid in Serato flips the flag. *If wrong:* the Grid unchecked chip is wrong for everyone. The honest fallback is one SQL expression in `LibraryChecklist`: `beatgrid_marker_count > 0`, labelled "No beatgrid".
 3. **Crate membership counts Subcrates only (`Subcrates/*.crate`; SmartCrates excluded).** It is read through the existing `read_crate_paths` and cached in `serato_crate_memberships` by `file_id`. `SeratoLibraryFactsService` refreshes it after each completed sync, while Serato is closed, and only when the persisted crate stamps or the library path signature changed. It is not computed inside `SeratoLibrarySyncSession`. That session's checkpoint fast path rebuilds records from `SeratoMetadata` and would drop these facts, and coupling to it puts the most delicate code at risk. *If wrong:* membership changed in Serato appears only after Serato closes, the same lag as every other Serato fact.
-4. **Date added is `uadd` from V2, else `tadd`, else the file's first journaled event time.** The fallback is labelled "First indexed". It is computed once per facts refresh, not per query.
+4. **Date added is `uadd` from V2, else `tadd`, else the file's first journaled event time.** `uadd` is the binary form of the same date as `tadd`. The fallback is labelled "First indexed". Every active file gets a facts row, including files absent from V2, which get `indexed` and NULL grid facts. It is computed once per facts refresh, not per query. *If wrong:* if `uadd` and `tadd` disagree in real libraries, swap their order in one Rust function.
 5. **Quality passes at 256 kbps or more (`LibraryChecklist.minimumLossyBitrateKbps = 256`).** It also passes when the bitrate is unknown and the extension is lossless (`flac`, `wav`, `aif`, `aiff`). It is unknown when the bitrate is unknown and the format is lossy. Lossless files carry a bitrate of 256 or more, so the extension matters only when the bitrate is missing. *If wrong:* the threshold is one constant.
-6. **Too many versions means more than 4 distinct recordings in the song family (`LibraryChecklist.maximumFamilyVersions = 4`).** Files of the family's main recording are exempt, including other encodings of it. Four covers a common DJ-pool set (dirty, clean, instrumental, acapella), so a fifth version suggests filler. The item applies only to files in a family. *If wrong:* it over- or under-flags until the constant changes.
-7. **Keeper storage is `keeper_marks(file_id PK, marked_revision, marked_at)`.** A file is *protected* when it has a valid mark, or when it shares its `track_id` with a file that has one. A mark is valid while `marked_revision >= COALESCE(files.last_projection_invalidation_revision, 0)`, so content replacement or retirement drops it. This differs from the spec's own call (in "My calls", open to change) that the flag *moves* when a file gains a `track_id`. Five code paths link files to recordings (match, song-family link, recording separation, rejoin and restore). With this shape, protection follows each link and each undo of a link automatically, because those links are already journaled mutations, and nothing has to move. Clearing a keeper clears every mark on the recording. *If wrong:* the owner wanted an explicit "keeper moved" event in History, which can be added to the link mutations later without a schema change.
-8. **The checklist is computed in SQL from stored facts, not stored as a mask.** Its inputs change through at least ten writers: metadata mirroring, tag edits, family mutations, recording identity, keeper, duplicate digests, crates, V2 facts, analysis and play counts. A stored mask would need invalidation in every one of them. Primary-key joins inside the existing projection are cheap, and Task 5's 30k test is the gate. *If wrong:* if that test misses 500 ms, the fallback is a `file_checklist` table maintained by a `LibraryChecklistService` on the same observation regions. The query contract (Task 5 Interfaces) does not change.
-9. **Duplicates come from `DuplicateFinder.findDuplicates`, both modes, using cached digests only.** It never decodes and runs in about 0.17 s at 30k. Groups with `check == .confirmed` and no kept label review are recorded. Needs-listening groups are not. Members are cached in `checklist_duplicate_members` and refreshed on `DuplicateScanObservation` changes. Protection suppresses the flag. If every member of a group is protected, nothing is flagged, and Duplicates still lists the group.
-10. **Chips and facets filter the way search does.** A family's main row shows when any member matches, and matching alternates are revealed. `LibraryBrowseQuery.isSearching` becomes `isFiltering`, and the "hidden by search" copy becomes "hidden by search or filters". Chips are single-select. A chip's count is the number of *files* in the current scope (status, search and facets, with no chip) that the chip matches.
+6. **Too many versions means more than 4 distinct versions in the song family (`LibraryChecklist.maximumFamilyVersions = 4`), counted by `SongFamilyMutation.versionKeySQL` as families already are.** Files whose version key equals the main row's are exempt, including other encodings of the main version. Four covers a common DJ-pool set (dirty, clean, instrumental, acapella), so a fifth version suggests filler. The item applies only to files in a family. *If wrong:* it over- or under-flags until the constant changes.
+7. **Keeper storage is `keeper_marks(file_id PK, marked_revision, marked_at)`, scoped by the recording key `KeeperMarks.recordingKeySQL = COALESCE(SongFamilyMutation.versionKeySQL, 'file:' || files.id)`.** That key is the MusicBrainz recording ID, else the `tracks` row, else the file itself. A shared `track_id` alone is not used: under Invariant 4 a FLAC and an MP3 normally have separate `tracks` rows, and a shared MusicBrainz ID is the cross-encode signal.
+   - A file is *protected* when it has a valid mark, or when it shares its recording key with a file that has one. A mark is valid while `marked_revision >= COALESCE(files.last_projection_invalidation_revision, 0)`, so content replacement or retirement drops it.
+   - Marking a file that holds an invalid stale row replaces that row in the same transaction.
+   - Clearing a keeper clears every valid mark that shares the key. Conflict targets include every file and `track_id` sharing it.
+   - This differs from the spec's own call ("My calls", open to change) that the flag *moves* when a file gains a recording. Every path that changes a file's recording key (match, song-family link, recording separation, rejoin, restore) is already a journaled mutation, so protection follows each change and its undo, and nothing has to move.
+   - *If wrong:* if MusicBrainz IDs are wrongly shared, a keeper over-protects siblings, which is visible and undoable. If the owner wants an explicit "keeper moved" History event, it can be added to the link mutations later without a schema change.
+8. **The checklist is computed in SQL from stored facts, not stored as a mask.** Its inputs change through at least ten writers: metadata mirroring, tag edits, family mutations, recording identity, keeper, duplicate digests, crates, V2 facts, analysis and play counts. A stored mask would need invalidation in every one of them. Primary-key joins inside the existing projection are cheap, and Task 5's 30k test is the gate. SQL is the only source of the rule: it projects `is_finished` and `still_needs_count`, and Swift reads them rather than recomputing. *If wrong:* if that test misses 500 ms, the fallback is a `file_checklist` table maintained by a `LibraryChecklistService` on the same observation regions. The query contract (Task 5 Interfaces) does not change.
+9. **Duplicates come from `DuplicateFinder.findDuplicates`, both modes, using cached digests only.** It never decodes and runs in about 0.17 s at 30k. Groups with `check == .confirmed` and no kept label review are recorded. Needs-listening groups are not. Members are cached in `checklist_duplicate_members` and refreshed on `DuplicateScanObservation` changes. Only the file's *own* valid keeper mark suppresses the flag. Recording-level protection does not, so the worse copy of a kept recording still shows Duplicate and stays removable, as the spec says.
+10. **Chips and facets filter the way search does.** A family's main row shows when any member matches, and matching alternates are revealed. Alternate reveal switches from `LibraryBrowseQuery.isSearching` to a new `isFiltering` (search or chip in Task 5; Task 6 adds facets), and the "hidden by search" copy becomes "hidden by search or filters". Chips are single-select. A chip's count is the number of *files* in the current scope (status, search and facets, with no chip) that the chip matches.
 11. **Genre, BPM and key filters do not exist on main, so Task 6 builds them.** Genre is a multi-select of stored values. BPM is an inclusive numeric range over `CAST(bpm AS REAL)`, and empty or 0 never matches. Key is Camelot-compatible: the same key, ±1 in the same mode, or the relative major or minor. Musical, Camelot and Open Key notations are all accepted. Keys and genres are matched through stored strings resolved in Swift from the distinct values (`json_each`), never through a per-row Swift SQL function. `ListSearch` records that per-row Swift calls broke the 30k budget.
 12. **Unknown is not failing.** An unread fact shows as unknown (for example "Cues unknown"). Definite-failure chips exclude it. It blocks Finished, so the file counts toward Needs work.
-13. **Keeper and Finished.** A protected file is Finished. Protection suppresses only the filler items (versions and duplicate), so a kept file's preparation tags (crate, cues, grid, metadata, quality) still show.
+13. **Keeper and Finished.** A protected file is Finished, and protection suppresses the versions item. Only the file's own mark suppresses the duplicate item (Ruling 9). A kept file's preparation tags (crate, cues, grid, metadata, quality) still show.
 14. **My plays is in scope, because `serato_play_counts` exists on main (migration 022).** A file with no row has 0 plays, and Never played means no row. The Never played chip is disabled, with help text, until `SeratoPlayCountService` reaches `.refreshed` in this session.
 15. **Readiness table changes refresh the Library at most every 2 s (`LibraryChecklist.refreshThrottle`).** Without the throttle, the analysis backfill's batch writes would reopen the snapshot continuously. `files` and family changes keep their immediate refresh.
 
 ## Global Constraints
 
-- Invariants 1–4 and 8 in `CLAUDE.md`. Keeper is a `TrackMutation` with a complete `SeratoConflictTargets.mutation` case (it writes no Serato file, so its targets are the file IDs and shared `track_id`s). Derived observation tables are written by their services, never through `applyMutation`, like `serato_play_counts`.
+- Invariants 1–4 and 8 in `CLAUDE.md`. Keeper is a `TrackMutation` with a complete `SeratoConflictTargets.mutation` case (it writes no Serato file, so its targets are every file and `track_id` sharing the recording key of Ruling 7). Derived observation tables are written by their services, never through `applyMutation`, like `serato_play_counts`.
 - Every V2 and crate read runs while Serato is closed (`watchdog.isClosed(atRevision:)`). Nothing in this plan writes Serato files.
 - Migrations are 030, 031 and 032. They are schema-only and registered in `CrateAgent/Database/Database.swift` after `AddSeratoRemovalCapturesMigration`.
 - **Naming.** "Readiness" already means sync readiness (`LibrarySyncReadiness`), so checklist code uses `Checklist`: `ChecklistItem`, `FileChecklist`, `ChecklistChip`, `LibraryChecklist` and `LibraryChecklistMessages`.
@@ -75,7 +80,7 @@ Each of the five conditions below is pinned by a test in its owning task.
 2. **A file renamed by crate-agent after facts were read** keeps its membership: crates are rewritten, so the stamp changes and the facts are remapped by file. Pinned in the same test.
 3. **BPM text variants** ("128.000", "128", "", "0", "126.5") filter numerically, and empty or zero never matches a range. Pinned in Task 6, `testFacetsCombineWithChipAndSearch`.
 4. **Unparseable keys** ("", "Unknown", "o", "H#m") never match a compatible-key filter and never crash. Pinned in Task 6, `testCamelotParsingAndCompatibilityAcrossNotations`.
-5. **A kept recording that is later split** (#205 separation) leaves protection only on the marked file. Pinned in Task 4, `testSplittingAKeptRecordingLeavesProtectionOnTheMarkedFileOnly`.
+5. **A kept recording whose encodings are later separated** (they stop sharing a recording key) leaves protection only on the marked file. Pinned in Task 4, `testSeparatingAKeptRecordingLeavesProtectionOnTheMarkedFileOnly`.
 
 ---
 
@@ -93,7 +98,7 @@ Each of the five conditions below is pinned by a test in its owning task.
   [Throws=CoreError] sequence<SeratoTrackFacts> read_database_track_facts(string database_path);
   [Throws=CoreError] SeratoAnalysis read_serato_analysis(string file_path);
   ```
-  Swift sees `readDatabaseTrackFacts(databasePath:)` and `readSeratoAnalysis(filePath:)`. `added_at` is Unix seconds from `uadd` (u32 BE), else `tadd` parsed as a decimal string. `beatgrid_locked` is the first byte of `bbgl` being non-zero. A missing field is `None`.
+  Swift sees `readDatabaseTrackFacts(databasePath:)` and `readSeratoAnalysis(filePath:)`. The module function and the FFI function share the name `read_serato_analysis`, so qualify the module path in `ffi.rs`. `added_at` is Unix seconds from `uadd` (u32 BE), else `tadd` parsed as a decimal string. `beatgrid_locked` is the first byte of `bbgl` being non-zero. A missing field is `None`.
 - `read_serato_analysis` fails with `CoreError` for an unsupported container, an unreadable file or a malformed payload. The error message names which, because Workers shows it.
 
 - [ ] **Step 1: Record the baseline before any change.** Run the optimized Test command from `docs/testing.md` § Incremental startup fixture, once with `-only-testing:CrateAgentTests/LibraryStartupPerformanceTests` and once with `-only-testing:CrateAgentTests/LibraryPagingTests/testSongFamilyProjectionStaysWithinPagingBudgetsAtThirtyThousandFiles`. Save the `SONG_FAMILY_PAGING_METRICS` and `STARTUP_*` lines and the commit hash to `$SCRATCHPAD/library-checklist-baseline.txt` (not committed). Expected: both pass.
@@ -107,7 +112,6 @@ Each of the five conditions below is pinned by a test in its owning task.
   #[test] fn markers2_base64_tolerates_newlines_missing_padding_and_a_dangling_character() { /* same body, three encodings, all → 2 */ }
   #[test] fn vorbis_and_mp4_envelopes_unwrap_to_the_same_markers2_body() { /* envelope(body) → 2 cues */ }
   #[test] fn malformed_markers2_is_an_error_not_zero() { assert!(count_markers2_cues(&[0x01, 0x01, b'C', b'U']).is_err()); }
-  #[test] fn beatgrid_header_reports_marker_count() { assert_eq!(beatgrid_marker_count(&beatgrid(3)).unwrap(), 3); }
   #[test] fn wav_with_id3_geob_reads_cues_and_grid_and_untagged_wav_reads_zero() {
       // write_silent_wav + lofty WavFile id3v2 GEOB "Serato Markers2" (2 cues) and "Serato BeatGrid" (1 marker)
       assert_eq!(read_serato_analysis(&tagged).unwrap(), SeratoAnalysis { cue_count: 2, beatgrid_marker_count: 1 });
@@ -122,7 +126,7 @@ Each of the five conditions below is pinned by a test in its owning task.
   }
   ```
 
-- [ ] **Step 3: Run the tests to verify they fail.** Run `cargo test --manifest-path rust-core/Cargo.toml serato_analysis track_facts`. Expected: FAIL, because the functions are not defined.
+- [ ] **Step 3: Run the tests to verify they fail.** Run `cargo test --manifest-path rust-core/Cargo.toml -- serato_analysis track_facts`. Expected: FAIL, because the functions are not defined.
 
 - [ ] **Step 4: Implement.**
   - `serato_analysis.rs`: `pub fn read_serato_analysis(path: &Path) -> Result<SeratoAnalysis, AnalysisError>`. Dispatch on `lofty::file::FileType` from `Probe::open(path)?.guess_file_type()`, and parse with `ParseOptions::new().read_properties(false)`. MPEG, AIFF and WAV read `id3v2()` frames whose ID is `GEOB`, through `GeneralEncapsulatedObject::parse`, matched by descriptor `Serato Markers2` and `Serato BeatGrid`. MP4 reads `ilst()` freeform atoms with mean `com.serato.dj` and names `markersv2` and `beatgrid`. FLAC and Ogg read Vorbis `SERATO_MARKERS_V2` and `SERATO_BEATGRID`. Any other type returns `AnalysisError::UnsupportedFormat`.
@@ -142,11 +146,11 @@ Each of the five conditions below is pinned by a test in its owning task.
 
 **Files:**
 - Create: `CrateAgent/Database/Migrations/AddChecklistFactsMigration.swift` (`030_add_checklist_facts`), `CrateAgent/Services/SeratoLibraryFacts.swift` (plan and apply), `CrateAgent/Services/SeratoLibraryFactsService.swift`
-- Modify: `CrateAgent/Database/Database.swift`, `CrateAgent/App/AppServices.swift` (construct the service and refresh it in the existing `session.$state` `.ready` sink beside `playCountService`), `CrateAgent/Services/SeratoPlayCountService.swift` (generalize `SeratoHistorySessionStamp` into the shared `SeratoDirectoryStamp`)
+- Modify: `CrateAgent/Database/Database.swift`, `CrateAgent/App/AppServices.swift` (construct the service and refresh it in the existing `session.$state` `.ready` sink beside `playCountService`), `CrateAgent/Services/SeratoPlayCountService.swift` (generalize `SeratoHistorySessionStamp` into the shared `SeratoDirectoryStamp`; History passes `historyDirectoryUrl/Sessions` and `"session"`), `CrateAgent/Services/SeratoPlayCounts.swift` (make `SeratoLibraryPathSignature` `Codable`)
 - Test: `CrateAgentTests/SeratoLibraryFactsTests.swift`, `CrateAgentTests/LibraryStartupPerformanceTests.swift`, `CrateAgentTests/Support/LibraryStartupPerformanceFixture.swift`
 
 **Interfaces:**
-- Consumes: `readDatabaseTrackFacts(databasePath:)` and `readCratePaths(cratePath:)` from Task 1, `SeratoPath.normalized`, `SeratoPlayCounts.librarySignature(in:)`, and `SeratoLibraryLocator.subcratesDirectoryUrl` and `databaseV2Url`.
+- Consumes: `readDatabaseTrackFacts(databasePath:)` from Task 1, the existing `readCratePaths(cratePath:)`, `SeratoPath.normalized`, `SeratoPlayCounts.librarySignature(in:)`, and `SeratoLibraryLocator.subcratesDirectoryUrl` and `databaseV2Url`.
 - Schema (migration 030):
   ```sql
   CREATE TABLE serato_track_facts (file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -162,6 +166,7 @@ Each of the five conditions below is pinned by a test in its owning task.
   struct SeratoDirectoryStamp: Codable, Equatable, Sendable { let name: String; let size: Int; let modified: Date
       static func all(in directory: URL, pathExtension: String) throws -> [SeratoDirectoryStamp] }   // History uses it too
   enum ChecklistSource: String, Sendable { case databaseV2 = "database_v2", subcrates }
+  enum DateAddedSource: String, Codable, Sendable, DatabaseValueConvertible { case serato, indexed }   // decoded strictly; unknown text throws
   struct SeratoLibraryFactsSummary: Equatable, Sendable { let trackFactCount: Int; let crateCount: Int; let membershipCount: Int; let unmatchedPathCount: Int }
   enum SeratoLibraryFacts {
       static let factsTable = "serato_track_facts", membershipTable = "serato_crate_memberships", stampTable = "checklist_source_stamps"
@@ -178,16 +183,17 @@ Each of the five conditions below is pinned by a test in its owning task.
   }
   ```
   Each source's stamp is the JSON of its inputs plus `SeratoLibraryPathSignature`. For V2 that is its `SeratoSourceIdentity`. For Subcrates it is `SeratoDirectoryStamp.all(in: subcratesDirectoryUrl, pathExtension: "crate")`. A source is read only when its stored stamp differs, so an unchanged restart reads nothing.
-- `plan` maps paths to `file_id` by `SeratoPath.normalized` over `files.path` for non-retired files. A path two files claim, or none, counts as unmatched. The plan holds only rows that differ from storage. `apply` checks the library signature in each transaction and writes at most 1,000 rows per transaction. It writes the stamp in the last transaction, so an interrupted refresh reruns. The "indexed" fallback for `added_at` is `MIN(events.timestamp) / 1000` per file, taken in one grouped read.
+- `plan` maps paths to `file_id` by `SeratoPath.normalized` over `files.path` for non-retired files. A path two files claim, or none, counts as unmatched. Every non-retired file gets a facts row: one with no V2 record gets `added_source = indexed` and NULL `beatgrid_locked`. The plan holds only rows that differ from storage. `apply` checks the library signature in each transaction and writes at most 1,000 rows per transaction. It writes the stamp in the last transaction, so an interrupted refresh reruns. The "indexed" fallback for `added_at` is `MIN(events.timestamp) / 1000` per file, taken in one grouped read.
 - A failed read keeps the previous rows and stamp, and sets `.failed(reason)`. Task 7 shows that reason in Workers.
 
 - [ ] **Step 1: Write the failing tests.** Use a temporary WAL `LibraryDatabase` with `SeratoTestEncoding` V2 and crate files, as `SeratoRemovalFixture` does, and a real `SeratoWatchdog` reporting closed.
   ```swift
   func testFactsRefreshMapsV2FactsAndSubcratesButNotSmartCrates() async throws {
-      // files A, B, C; V2: A {bbgl 1, uadd 1_700_000_000}, B {}; Subcrates/Warmup.crate: A; SmartCrates/Recent.scrate: B, C
+      // files A, B, C; V2: A {bbgl 1, uadd 1_700_000_000}, B {}; C absent from V2; Subcrates/Warmup.crate: A; SmartCrates/Recent.scrate: B, C
       await service.refresh()
-      XCTAssertEqual(try facts(A), .init(beatgridLocked: true, addedAt: 1_700_000_000, addedSource: "serato"))
-      XCTAssertEqual(try facts(B).addedSource, "indexed")          // first event time
+      XCTAssertEqual(try facts(A), .init(beatgridLocked: true, addedAt: 1_700_000_000, addedSource: .serato))
+      XCTAssertEqual(try facts(B).addedSource, .indexed)           // first event time
+      XCTAssertEqual(try facts(C), .init(beatgridLocked: nil, addedAt: firstEventSeconds(C), addedSource: .indexed))
       XCTAssertEqual(try memberships(), [A: ["Warmup.crate"]])     // B and C only in a SmartCrate
   }
   func testUnchangedSourcesAreNotReadAgainByAFreshService() async throws {
@@ -233,7 +239,9 @@ Each of the five conditions below is pinned by a test in its owning task.
   enum SeratoAnalysisStore { static let table = "file_serato_analysis"
       static func freshJoinSQL(as alias: String = "analysis") -> String   // via DerivedFileCache.freshJoinSQL
       static func pending(limit: Int, in database: GRDB.Database) throws -> [DigestCandidate]   // processable, no fresh row
-      static func save(_ results: [SeratoAnalysisResult], in database: GRDB.Database) throws }  // only while basis still matches
+      static func save(_ results: [SeratoAnalysisResult], in database: GRDB.Database) throws   // only while basis still matches
+      static func coverage(in database: GRDB.Database) throws -> SeratoAnalysisCoverage        // library-wide, processable files
+      static func failures(limit: Int, in database: GRDB.Database) throws -> [WorkerFileRow] }  // reason in `detail`, for Workers
   struct SeratoAnalysisResult: Sendable { let fileID: Int64; let basis: DigestBasis; let outcome: Result<SeratoAnalysis, SeratoAnalysisFailure> }
   struct SeratoAnalysisCoverage: Equatable, Sendable { let read: Int; let pending: Int; let failed: Int }
   public actor SeratoAnalysisWorker {
@@ -258,9 +266,11 @@ Each of the five conditions below is pinned by a test in its owning task.
       // touch the file and update files.mtime as a sync would; stub now returns 5
       _ = try await worker.processAllPendingOnce(); XCTAssertEqual(try analysis(file).cueCount, 5)
   }
-  func testUnreadableFileIsRecordedAsAFailureWithItsReasonNotAsNoCues() async throws {
-      XCTAssertEqual(try analysis(file), .init(cueCount: nil, failure: "unsupported format"))
-      XCTAssertEqual(coverage, SeratoAnalysisCoverage(read: 0, pending: 0, failed: 1))
+  func testUnreadableFileIsRecordedAsAFailureNotAsNoCues() async throws {
+      // reader stub throws CoreError for this file
+      XCTAssertNil(try analysis(file).cueCount); XCTAssertNotNil(try analysis(file).failure)
+      XCTAssertEqual(try coverage(), SeratoAnalysisCoverage(read: 0, pending: 0, failed: 1))   // SeratoAnalysisStore.coverage(in:)
+      XCTAssertEqual(try failures().map(\.id), [file])                                          // SeratoAnalysisStore.failures(limit:in:)
   }
   func testConfirmedMembersExcludeNeedsListeningAndKeptLabelGroups() throws {
       // ConfirmedDuplicateGroup support: one confirmed byte-level pair, one needs-listening perceptual pair, one kept-label pair
@@ -301,18 +311,28 @@ Each of the five conditions below is pinned by a test in its owning task.
   // TrackMutation: case keeper(KeeperOperation)
   // EventType: keeperMarked = "keeper_marked" (inverse .remove), keeperCleared = "keeper_cleared" (inverse .restore)
   enum KeeperMarks { static let table = "keeper_marks"
-      /// SQL CTE body selecting every protected file id (valid own mark, or a track_id shared with a validly marked file).
+      /// Over `files LEFT JOIN tracks ON tracks.id = files.track_id`: MBID, else 'track:' || id, else 'file:' || files.id.
+      static let recordingKeySQL = "COALESCE(\(SongFamilyMutation.versionKeySQL), 'file:' || files.id)"
+      /// A valid mark: marked_revision >= COALESCE(files.last_projection_invalidation_revision, 0).
+      static let validMarkSQL: String
+      /// CTE body selecting every protected file id: a valid own mark, or a recording key shared with a validly marked file.
       static let protectedFilesSQL: String
+      /// CTE body selecting files with a valid mark of their own (suppresses the duplicate item).
+      static let ownMarkFilesSQL: String
       static func isProtected(fileID: Int64, in database: GRDB.Database) throws -> Bool }
   public extension OperationEngine {
       /// Marks or clears the keeper of `token`'s file and its recording; returns the batch id for History.
       func setKeeper(_ isKeeper: Bool, for token: FileMembershipToken) async throws -> String }
   public enum KeeperError: LocalizedError, Equatable { case alreadyKept, notKept, superseded }
   ```
-- Rechecks happen inside the writer transaction (Invariant 1). For `.mark`: the file exists, is not retired, its `membership_revision == expectedRevision`, and it is not already protected (otherwise `.alreadyKept`). For `.clear`: the same file checks, then delete every valid mark on the file and its recording (otherwise `.notKept`). Journal one event per changed mark, with `fileId` set and `trackId` set to the file's recording, so per-file History lists it. `.restore` and `.remove` require each mark's current row state to match and otherwise throw `.superseded`.
-- The `SeratoConflictTargets.mutation` case has `fileIDs`: the target, or the marks' files plus every file sharing their `track_id`, with `include(file)` for each. `sharedTrackIDs` holds those `track_id`s. Keeper writes no Serato file.
+- Rechecks happen inside the writer transaction (Invariant 1).
+  - `.mark`: the file exists and is not retired, else `.superseded`; its `membership_revision == expectedRevision`, else `.superseded`; and it is not already protected, else `.alreadyKept`. An invalid stale row for the file is replaced in the same transaction, and the inverse `.remove` deletes the row.
+  - `.clear`: the same file checks, then delete every valid mark whose file shares `recordingKeySQL` with the target, else `.notKept`.
+  - Journal one event per changed mark, with `fileId` set and `trackId` set to the file's `track_id`, so per-file History lists it.
+  - `.restore` and `.remove` require each mark's current row state to match, else `.superseded`.
+- The `SeratoConflictTargets.mutation` case has `fileIDs`: the target, or the marks' files, plus every file sharing their recording key, with `include(file)` for each. `sharedTrackIDs` holds those files' non-nil `track_id`s. Keeper writes no Serato file.
 
-- [ ] **Step 1: Write the failing tests.** Use a temporary WAL database and an `OperationEngine` as `UndoableRemovalTests` does. Files FLAC and MP3 share `track_id` T. File Z is standalone.
+- [ ] **Step 1: Write the failing tests.** Use a temporary WAL database and an `OperationEngine` as `UndoableRemovalTests` does. FLAC and MP3 have *separate* `tracks` rows that share one `musicbrainz_recording_id` (the normal Invariant 4 shape). File Z is standalone with `track_id == nil`.
   ```swift
   func testMarkingAKeeperProtectsEveryEncodingOfItsRecordingAndUndoRemovesIt() async throws {
       let batch = try await engine.setKeeper(true, for: token(flac))
@@ -320,19 +340,20 @@ Each of the five conditions below is pinned by a test in its owning task.
       try await engine.undoBatch(batch); XCTAssertEqual(try protectedIDs(), [])
   }
   func testClearingAKeeperRemovesEveryMarkOnTheRecordingAndUndoRestoresThem() async throws {
-      // marks on flac and mp3 (second mark inserted via .restore to simulate both marked)
+      // fixture starts with different MBIDs: setKeeper(true) on flac and on mp3, then give both tracks the same MBID in fixture SQL
       let batch = try await engine.setKeeper(false, for: token(mp3))
       XCTAssertEqual(try marks(), []); try await engine.undoBatch(batch); XCTAssertEqual(try marks().map(\.fileId).sorted(), [flac, mp3])
   }
   func testKeeperIsRefusedWhenTheFileChangedSinceItWasShown() async throws {
       await XCTAssertThrowsErrorAsync(try await engine.setKeeper(true, for: staleToken(z))) { error in XCTAssertEqual(error as? KeeperError, .superseded) }
   }
-  func testReplacedContentDropsKeeperProtection() async throws {
+  func testReplacedContentDropsKeeperProtectionAndMarkingAgainReplacesTheStaleRow() async throws {
       // mark z, then apply observeFileIdentity with replaced content (bumps last_projection_invalidation_revision)
       XCTAssertEqual(try protectedIDs(), [])
+      _ = try await engine.setKeeper(true, for: token(z)); XCTAssertEqual(try protectedIDs(), [z])
   }
-  func testSplittingAKeptRecordingLeavesProtectionOnTheMarkedFileOnly() async throws {
-      // mark flac; separate mp3 into its own recording via RecordingIdentityOperation (#205)
+  func testSeparatingAKeptRecordingLeavesProtectionOnTheMarkedFileOnly() async throws {
+      // mark flac; then mp3's track loses the shared MBID (undo of its MusicBrainz match), so the keys differ
       XCTAssertEqual(try protectedIDs(), [flac])
   }
   ```
@@ -342,7 +363,7 @@ Each of the five conditions below is pinned by a test in its owning task.
 
 - [ ] **Step 3: Implement the migration, `KeeperMutation.apply(_:batchId:timestamp:in:)` (modelled on `DuplicateLabelReviewMutation`), the engine dispatch and inverse decoding, the History text ("Marked as keeper", "Keeper cleared") in `HistoryMessages`, and the conflict-target case.** The compiler lists every exhaustive `EventType` switch that needs a case.
 
-- [ ] **Step 4: Run the tests to verify they pass**, plus `UndoableRemovalTests`, `SongFamilyTests` and `RecordingIdentityTests`. Expected: PASS.
+- [ ] **Step 4: Run the tests to verify they pass**, plus `UndoableRemovalTests`, `SongFamilyTests`, `RecordingIdentityTests` and `MusicBrainzMutationTests`. Expected: PASS.
 
 - [ ] **Step 5: Commit.**
   ```bash
@@ -355,17 +376,18 @@ Each of the five conditions below is pinned by a test in its owning task.
 **Files:**
 - Create: `CrateAgent/Services/LibraryPaging/LibraryChecklist.swift` (types, constants and SQL)
 - Modify: `CrateAgent/Services/LibraryPaging/LibraryBrowseQuery.swift`, `CrateAgent/Services/LibraryPaging/LibraryPagedSnapshot.swift`, `CrateAgent/Services/LibraryPaging/LibraryBrowseObservation.swift`, `CrateAgent/Models/BrowserRow.swift`, `CrateAgent/Models/LibraryFamilyState.swift` and `CrateAgent/Constants/LibraryFamilyMessages.swift` (the `isFiltering` rename and copy), `CrateAgent/Models/LibraryBrowserModel.swift` (`setChip`, plus `@Published chipCounts` loaded after the page)
-- Test: `CrateAgentTests/LibraryChecklistTests.swift`, `CrateAgentTests/LibraryPagingTests.swift`
+- Test: `CrateAgentTests/LibraryChecklistTests.swift`, `CrateAgentTests/LibraryPagingTests.swift`, `CrateAgentTests/Support/PagedLibraryFixture.swift`
 
 **Interfaces:**
-- Consumes: the tables from Tasks 2–4, `serato_play_counts`, `KeeperMarks.protectedFilesSQL`, and `SeratoAnalysisStore.freshJoinSQL`.
+- Consumes: the tables from Tasks 2–4, `serato_play_counts`, `KeeperMarks.recordingKeySQL`, `protectedFilesSQL` and `ownMarkFilesSQL`, `SeratoAnalysisStore.freshJoinSQL`, `SongFamilyMutation.versionKeySQL`, and `DateAddedSource`.
 - Produces:
   ```swift
-  enum ChecklistItem: Int, CaseIterable, Sendable { case inCrate, cuePoints, beatgridChecked, metadata, quality, versions, duplicate }  // rawValue = bit
-  struct ChecklistItems: OptionSet, Hashable, Sendable { let rawValue: Int }
-  struct MissingMetadata: OptionSet, Hashable, Sendable { let rawValue: Int; static let artist, title, genre, bpm, key }
-  struct FileChecklist: Hashable, Sendable { let failing: ChecklistItems; let unknown: ChecklistItems; let missingMetadata: MissingMetadata
-      let isProtected: Bool; var isFinished: Bool { isProtected || (failing.isEmpty && unknown.isEmpty) } }
+  enum ChecklistItem: Int, CaseIterable, Hashable, Sendable { case inCrate, cuePoints, beatgridChecked, metadata, quality, versions, duplicate }  // bit = 1 << rawValue
+  enum MetadataField: Int, CaseIterable, Hashable, Sendable { case artist, title, genre, bpm, key }                                        // bit = 1 << rawValue
+  enum ChecklistMask {   // throws ChecklistError.unexpectedBits on any bit no case names
+      static func decode<Item: CaseIterable & Hashable & RawRepresentable>(_ mask: Int, as type: Item.Type) throws -> Set<Item> where Item.RawValue == Int }
+  struct FileChecklist: Hashable, Sendable { let failing: Set<ChecklistItem>; let unknown: Set<ChecklistItem>
+      let missingMetadata: Set<MetadataField>; let isProtected: Bool; let isFinished: Bool; let stillNeedsCount: Int }   // all read from SQL columns
   enum ChecklistChip: String, CaseIterable, Identifiable, Sendable { case needsWork, notInCrate, noCues, gridUnchecked, lowQuality, neverPlayed, tooManyVersions, finished }
   enum LibraryChecklist {
       static let minimumLossyBitrateKbps = 256
@@ -374,14 +396,26 @@ Each of the five conditions below is pinned by a test in its owning task.
       static let refreshThrottle: Duration = .seconds(2)
       static let observedTables: [String]   // facts, memberships, stamps, analysis, duplicates, keeper_marks, serato_play_counts
   }
-  // LibraryBrowseSort.Column += stillNeeds, dateAdded, myPlays   (nulls sort last in both directions)
-  // LibraryBrowseQuery += var chip: ChecklistChip? = nil; var isFiltering: Bool (search, chip or facets)
+  // LibraryBrowseSort.Column += stillNeeds, dateAdded, myPlays   (nullable: sort.sql prefixes `placed.group_key IS NULL ASC`, so nulls are last both ways)
+  // LibraryBrowseQuery += var chip: ChecklistChip? = nil; var isFiltering: Bool { isSearching || chip != nil }   (Task 6 adds facets)
   // BrowserRow += genre: String?, checklistFailingMask: Int?, checklistUnknownMask: Int?, missingMetadataMask: Int?, isProtected: Bool?,
-  //               dateAdded: Int64?, dateAddedSource: String?, playCount: Int?, familyFilesNeedingWork: Int?, familyFileCount: Int?
-  //               var checklist: FileChecklist? { … }   // nil outside the Library projection
+  //               isFinished: Bool?, stillNeedsCount: Int?, beatgridMarkerCount: Int?, dateAdded: Int64?, dateAddedSource: DateAddedSource?,
+  //               playCount: Int?, familyFilesNeedingWork: Int?, familyFileCount: Int?
+  //               func checklist() throws -> FileChecklist?            // nil outside the Library projection; throws on unexpected bits
+  //               var stillNeedsSortKey: Int, dateAddedSortKey: Int64, playCountSortKey: Int   // non-optional, for KeyPathComparator
+  // LibraryBrowseSort.init(comparator:) maps those three key paths to .stillNeeds, .dateAdded and .myPlays
   // LibraryPagedSnapshot: func chipCounts() throws -> [ChecklistChip: Int]   // same DatabaseSnapshot; query without its chip
   ```
-- SQL shape: one materialized `checklist_files` CTE computes, per file in the status scope, the items that do not depend on placement, plus `is_protected`, `date_added` and `play_count`, using primary-key joins only. `placed` joins it by `files.id` and adds the `versions` bit from `families.versions > maximumFamilyVersions AND files.track_id != heads.head_recording_id AND NOT is_protected`, plus the per-family counts. The `duplicate` bit is suppressed for protected files. The Still needs sort key is the number of set bits in `failing | unknown`, with protected files sorting as 0. Item truth:
+- SQL shape. The CTE order is what makes the versions chip computable; reviewers check it.
+  1. `checklist_files AS MATERIALIZED` computes per file in the status scope, using primary-key joins only: the placement-independent bits (`failing`, `unknown`), `missing_metadata`, `is_protected` (from `protectedFilesSQL`), `has_own_mark` (from `ownMarkFilesSQL`), `recording_key` (`recordingKeySQL`), `beatgrid_marker_count`, `date_added`, `date_added_source` and `play_count`. The duplicate bit is set only when `NOT has_own_mark`.
+  2. `family_base` is today's `family_files` without `matches`, joined to `checklist_files`, and selects `recording_key`.
+  3. `heads` is built from `family_base` and also selects `head_recording_key` and the head's checklist sort keys.
+  4. `family_files` comes after `heads`. It adds the versions bit (`families.versions > maximumFamilyVersions AND recording_key != head_recording_key AND NOT is_protected`) and then evaluates `matches` (search AND chip), which feeds `families.matched`.
+  5. `placed` joins `checklist_files` by `files.id`, adds the same versions bit for family members, and projects `is_finished` (`is_protected OR (failing = 0 AND unknown = 0)`), `still_needs_count` (set bits in `failing | unknown`, 0 when protected) and the per-family file counts.
+  - The new sort columns emit expressions over these aliases rather than `Column.sql("files")`. The head's Still needs key excludes `versions`, since the main is exempt.
+  - SQL is the only source of Finished and the needs count. Swift reads `is_finished` and `still_needs_count`.
+
+  Item truth:
 
   | Item | Fails when | Unknown when |
   | --- | --- | --- |
@@ -391,31 +425,33 @@ Each of the five conditions below is pinned by a test in its owning task.
   | metadata | any of artist, title, genre, bpm or key NULL or blank after trim | never |
   | quality | `bitrate_kbps < 256` | bitrate NULL and extension not lossless |
   | versions | (see above) | never |
-  | duplicate | in `checklist_duplicate_members` and not protected | never |
+  | duplicate | in `checklist_duplicate_members` and the file has no valid mark of its own | never |
 
-- Chip predicates: `needsWork` is NOT finished, `finished` is finished, `neverPlayed` is no play-count row, and each other chip is its item's `failing` bit. A chip ANDs into the same `matches` expression as search.
-- The observation adds a second `DatabaseRegionObservation` over `LibraryChecklist.observedTables`, throttled to `refreshThrottle`. The existing projection observation is unchanged.
+- Chip predicates: `needsWork` is NOT `is_finished`, `finished` is `is_finished`, `neverPlayed` is no play-count row, and each other chip is its item's `failing` bit. A chip ANDs into the same `matches` expression as search (step 4 above).
+- The observation adds a second `DatabaseRegionObservation` over `LibraryChecklist.observedTables`, throttled to `refreshThrottle`. The existing projection region also gains `files.genre` and `files.bitrate_kbps` (through `BrowserRow.browserColumnsSQL`), because the metadata and quality items read them.
 
 - [ ] **Step 1: Write the failing tests.** In `LibraryChecklistTests`, set up a temporary WAL database with one file per case, seeding the fact tables directly in SQL.
   ```swift
   func testChecklistReportsEachItemFromStoredFacts() async throws {
-      let rows = try await rowsByTitle(LibraryBrowseQuery())
-      XCTAssertEqual(rows["Uncrated"]?.checklist?.failing, [.inCrate])
-      XCTAssertEqual(rows["Unread"]?.checklist?.unknown, [.cuePoints, .beatgridChecked])
-      XCTAssertEqual(rows["NoGenre"]?.checklist?.missingMetadata, [.genre])
-      XCTAssertEqual(rows["Lossy192"]?.checklist?.failing, [.quality])
-      XCTAssertEqual(rows["FlacNoBitrate"]?.checklist?.failing, [])
-      XCTAssertEqual(rows["Mp3NoBitrate"]?.checklist?.unknown, [.quality])
-      XCTAssertEqual(rows["Dupe"]?.checklist?.failing, [.duplicate])
-      XCTAssertEqual(rows["Complete"]?.checklist?.isFinished, true)
+      let rows = try await checklistsByTitle(LibraryBrowseQuery())   // title → try row.checklist()
+      XCTAssertEqual(rows["Uncrated"]?.failing, [.inCrate])
+      XCTAssertEqual(rows["Unread"]?.unknown, [.cuePoints, .beatgridChecked])
+      XCTAssertEqual(rows["NoGenre"]?.missingMetadata, [.genre])
+      XCTAssertEqual(rows["Lossy192"]?.failing, [.quality])
+      XCTAssertEqual(rows["FlacNoBitrate"]?.failing, [])
+      XCTAssertEqual(rows["Mp3NoBitrate"]?.unknown, [.quality])
+      XCTAssertEqual(rows["Dupe"]?.failing, [.duplicate])
+      XCTAssertEqual(rows["Complete"]?.isFinished, true); XCTAssertEqual(rows["Uncrated"]?.stillNeedsCount, 1)
   }
-  func testKeeperIsFinishedButStillShowsPreparationItems() async throws {
-      let kept = try XCTUnwrap(rowsByTitle(.init())["KeptLossyDupe"]?.checklist)
-      XCTAssertTrue(kept.isFinished); XCTAssertEqual(kept.failing, [.quality])   // duplicate suppressed, quality shown
+  func testKeeperIsFinishedButOnlyItsOwnMarkHidesDuplicate() async throws {
+      // KeptLossyDupe (marked) and KeptSiblingDupe: separate tracks sharing one MBID, both confirmed duplicate members
+      let rows = try await checklistsByTitle(.init())
+      XCTAssertEqual(rows["KeptLossyDupe"]?.isFinished, true); XCTAssertEqual(rows["KeptLossyDupe"]?.failing, [.quality])
+      XCTAssertEqual(rows["KeptSiblingDupe"]?.isFinished, true); XCTAssertEqual(rows["KeptSiblingDupe"]?.failing, [.duplicate])
   }
-  func testTooManyVersionsFlagsOnlyNonMainRecordingsOfFamiliesOverTheLimit() async throws {
-      // family of 5 recordings (main has an MP3 and a FLAC); family of 4
-      XCTAssertEqual(try await titles(.init(chip: .tooManyVersions)), ["V2", "V3", "V4", "V5"])  // main row shown as context is excluded by `titles`
+  func testTooManyVersionsFlagsOnlyNonMainVersionsOfFamiliesOverTheLimit() async throws {
+      // family of 5 versions whose main version is an MP3 and a FLAC on separate tracks sharing an MBID; a family of 4
+      XCTAssertEqual(try await titles(.init(chip: .tooManyVersions)), ["V2", "V3", "V4", "V5"])  // `titles` omits the main row shown as context
   }
   func testChipsCombineWithSearchAndCountFilesInScope() async throws {
       let snapshot = try await LibraryPagedSnapshot.open(pool: pool, query: .init(search: "Artist A", chip: .notInCrate))
@@ -432,7 +468,7 @@ Each of the five conditions below is pinned by a test in its owning task.
 
 - [ ] **Step 2: Run the tests to verify they fail.** Run with `-only-testing:CrateAgentTests/LibraryChecklistTests -only-testing:CrateAgentTests/LibraryPagingTests`. Expected: FAIL, because `checklist` and `chipCounts` are not defined.
 
-- [ ] **Step 3: Implement `LibraryChecklist`, the query and snapshot changes, the `BrowserRow` columns, the rename to `isFiltering`, the throttled observation, and `LibraryBrowserModel.setChip(_:)` plus `chipCounts`.** `chipCounts` loads in its own task after `results.open`, and a newer snapshot cancels it.
+- [ ] **Step 3: Implement `LibraryChecklist`, `ChecklistMask`, the split CTEs, the snapshot changes, the `BrowserRow` columns and sort keys, the rename to `isFiltering`, the observation changes, and `LibraryBrowserModel.setChip(_:)` plus `chipCounts`.** `chipCounts` loads in its own task after `results.open`, and a newer snapshot cancels it.
 
 - [ ] **Step 4: Run the tests to verify they pass**, plus `LibraryFamilyProjectionTests` and `LibraryStatusBrowseTests`, using the optimized command for `LibraryPagingTests`. Expected: PASS, every `CHECKLIST_PAGING_METRICS` value under 500 ms, and the existing family metrics within 20% of the baseline. If a budget fails, apply Ruling 8's fallback before going on.
 
@@ -447,9 +483,10 @@ Each of the five conditions below is pinned by a test in its owning task.
 **Files:**
 - Create: `CrateAgent/Services/LibraryPaging/LibraryFacets.swift` (`LibraryFacets`, `LibraryFacetOptions`), `CrateAgent/Services/CamelotKey.swift`
 - Modify: `CrateAgent/Services/LibraryPaging/LibraryBrowseQuery.swift`, `CrateAgent/Models/LibraryBrowserModel.swift` (`setFacets`, `facetOptions`)
-- Test: `CrateAgentTests/LibraryFacetTests.swift`, `CrateAgentTests/LibraryPagingTests.swift`
+- Test: `CrateAgentTests/LibraryFacetTests.swift`, `CrateAgentTests/LibraryPagingTests.swift`, `CrateAgentTests/Support/PagedLibraryFixture.swift`
 
 **Interfaces:**
+- Consumes: `LibraryBrowseQuery.isFiltering`, the `matches` expression (Task 5 CTE step 4), and `LibraryPagedSnapshot.chipCounts()`.
 - Produces:
   ```swift
   struct CamelotKey: Hashable, Comparable, Sendable { let number: Int; let isMajor: Bool   // 1...12, B = major
@@ -459,11 +496,13 @@ Each of the five conditions below is pinned by a test in its owning task.
   struct LibraryFacets: Hashable, Sendable { var genres: Set<String> = []; var bpmRange: ClosedRange<Double>? = nil
       var compatibleKey: CamelotKey? = nil; var keyValues: Set<String> = []   // stored strings resolved from compatibleKey
       var isEmpty: Bool }
-  struct LibraryFacetOptions: Equatable, Sendable { let genres: [(value: String, count: Int)]; let keys: [CamelotKey: Set<String>]
+  struct GenreOption: Hashable, Sendable { let value: String; let count: Int }
+  struct LibraryFacetOptions: Equatable, Sendable { let genres: [GenreOption]; let keys: [CamelotKey: Set<String>]
       static func load(in database: GRDB.Database, filter: LibraryStatusFilter) throws -> LibraryFacetOptions   // distinct values, one pass each
       func keyValues(compatibleWith key: CamelotKey) -> Set<String> }
-  // LibraryBrowseQuery += var facets = LibraryFacets()
+  // LibraryBrowseQuery += var facets = LibraryFacets(); isFiltering becomes isSearching || chip != nil || !facets.isEmpty
   ```
+  Facet-only queries reveal matching alternates the way search does (Ruling 10). Update any `isHiddenBySearch` call site this touches.
 - SQL, ANDed into `matches`: `files.genre IN (SELECT value FROM json_each(:genres))`, `CAST(files.bpm AS REAL) BETWEEN :bpm_min AND :bpm_max AND CAST(files.bpm AS REAL) > 0`, and `files.musical_key IN (SELECT value FROM json_each(:keys))`. An empty facet adds no predicate. `chipCounts` applies the facets.
 - The Open Key number maps to Camelot as `((openKey + 6) % 12) + 1`, with `m` = A and `d` = B (1m = 8A = A minor). Camelot 8A is A minor and 8B is C major.
 
@@ -483,6 +522,8 @@ Each of the five conditions below is pinned by a test in its owning task.
       facets.keyValues = options.keyValues(compatibleWith: try XCTUnwrap(facets.compatibleKey))
       XCTAssertEqual(facets.keyValues, ["Am", "8A", "Em"])   // Em = 9A
       XCTAssertEqual(try await titles(.init(search: "Artist", chip: .needsWork, facets: facets)), ["House 128.000 Am", "House 126.5 Em"])
+      // facet-only query on a family whose alternate is the only House file: the alternate is revealed beneath its main row
+      XCTAssertEqual(try await visibleRoles(.init(facets: LibraryFacets(genres: ["House Alt"]))), [.main, .alternate])
   }
   ```
   Extend `testChecklistSortFilterAndCountsStayWithinBudgetsAtThirtyThousandFiles` with one interaction: search, genre, BPM range, compatible key and `.needsWork` together, sorted by `.stillNeeds`, plus its `chipCounts()`, each under 500 ms. The fixture's files gain a genre, BPM and key spread.
@@ -503,10 +544,10 @@ Each of the five conditions below is pinned by a test in its owning task.
 
 **Files:**
 - Create: `CrateAgent/Constants/LibraryChecklistMessages.swift`, `CrateAgent/Views/LibraryChecklistChipBar.swift`, `CrateAgent/Views/LibraryFacetBar.swift`, `docs/library-checklist.md`
-- Modify: `CrateAgent/Views/LibraryBrowserColumns.swift` (the Still needs, Date added and My plays columns), `CrateAgent/Views/LibraryBrowserView.swift`, `CrateAgent/Views/LibraryPagedContent.swift` (the `keeper(Bool)` row action and context menu), `CrateAgent/Views/WorkersView.swift` (a Serato analysis card with read, pending and failed counts and failure reasons, and a Serato facts card with the service status, modelled on `PlayCountCard`), `README.md`, `docs/list-controls.md`, `docs/song-families.md` (filters reveal alternates as search does)
+- Modify: `CrateAgent/Views/LibraryBrowserColumns.swift` (the Still needs, Date added and My plays columns), `CrateAgent/Views/LibraryBrowserView.swift`, `CrateAgent/Views/LibraryPagedContent.swift` (the `keeper(Bool)` row action and context menu), `CrateAgent/Services/WorkersModel.swift` (publish `SeratoAnalysisStore.coverage(in:)` and `failures(limit:in:)` with the existing coverage refresh), `CrateAgent/Views/WorkersView.swift` (a Serato analysis card with read, pending and failed counts and the failure list, and a Serato facts card with the service status, modelled on `PlayCountCard`), `README.md`, `docs/list-controls.md`, `docs/song-families.md` (filters reveal alternates as search does)
 
 **Interfaces:**
-- Consumes: `LibraryBrowserModel.setChip`, `setFacets`, `chipCounts` and `facetOptions` (Tasks 5–6), `BrowserRow.checklist`, `dateAdded`, `dateAddedSource` and `playCount`, `OperationEngine.setKeeper(_:for:)` (Task 4), `SeratoAnalysisCoverage`, `SeratoLibraryFactsService.status`, and `SeratoPlayCountService.status`.
+- Consumes: `LibraryBrowserModel.setChip`, `setFacets`, `chipCounts` and `facetOptions` (Tasks 5–6), `BrowserRow.checklist()`, `beatgridMarkerCount`, `dateAdded`, `dateAddedSource`, `playCount`, the three sort keys, `familyFilesNeedingWork` and `familyFileCount`, `OperationEngine.setKeeper(_:for:)` (Task 4), `SeratoAnalysisStore.coverage(in:)` and `failures(limit:in:)` (Task 3), `SeratoLibraryFactsService.status`, and `SeratoPlayCountService.status`.
 - Produces:
   ```swift
   struct LibraryChecklistChipBar: View { @Binding var chip: ChecklistChip?; let counts: [ChecklistChip: Int]?; let neverPlayedAvailable: Bool }
@@ -516,8 +557,8 @@ Each of the five conditions below is pinned by a test in its owning task.
   - Chip titles, exactly as in the spec: "Needs work", "Not in a crate", "No cues", "Grid unchecked", "Low quality", "Never played", "Too many versions", "Finished".
   - Column titles: "Still needs", "Date added", "My plays".
   - Tags: "Crate", "Cues", "Grid", "Tags", "Quality", "Versions", "Duplicate", "Keeper" and "Finished". An unknown item renders as "\(tag) unknown" in secondary color.
-  - A family main row adds "\(needing) of \(total) versions need work".
-  - The Still needs tooltip lists one sentence per item, naming the fix: artist or title through Auto-Tag, genre through the tag editor, BPM or key through "Analyze in Serato", and grid "Lock the beatgrid in Serato". For a file with `beatgrid_marker_count = 0` it says "No beatgrid".
+  - A family main row adds "\(needing) of \(total) files need work". The checklist is per file, and the spec's copy is only "a count like".
+  - The Still needs tooltip lists one sentence per item, naming the fix: artist or title through Auto-Tag, genre through the tag editor, BPM or key through "Analyze in Serato", and grid "Lock the beatgrid in Serato". For a row with `beatgridMarkerCount == 0` it says "No beatgrid".
   - Date added help: "From Serato" or "First indexed by crate-agent".
   - Never played disabled help: "Waiting for Serato History. Close Serato to read play counts."
   - Context menu: "Mark as Keeper" and "Clear Keeper".
@@ -527,7 +568,7 @@ Each of the five conditions below is pinned by a test in its owning task.
   - The keeper action writes no Serato file, so it is not `.seratoWriteGated`.
   - The README gains one paragraph, and `wc -c README.md` must stay under 16,000.
 
-- [ ] **Step 1: Implement the views, columns, context action, Workers cards and messages.** The sort comparators for the new columns map through `LibraryBrowseSort(comparator:)`. This task adds no tests: it is view wiring and copy over contracts Tasks 4–6 test (testing rules 1 and 8).
+- [ ] **Step 1: Implement the views, columns, context action, Workers cards and messages.** The new columns bind `\BrowserRow.stillNeedsSortKey`, `\.dateAddedSortKey` and `\.playCountSortKey`, which Task 5 maps in `LibraryBrowseSort(comparator:)`. This task adds no tests: it is view wiring and copy over contracts Tasks 4–6 test (testing rules 1 and 8).
 
 - [ ] **Step 2: Write `docs/library-checklist.md`** covering the item table, unknown versus failing, keeper semantics, chip counting, facet behavior and where each fact comes from. Link it from the README paragraph.
 
@@ -560,6 +601,6 @@ Each of the five conditions below is pinned by a test in its owning task.
   3. In Serato, lock one track's beatgrid, add a hot cue to another, and add a third to a crate, then close Serato. After the sync, each row's Grid, Cues and Crate tags clear. (This verifies Ruling 2. If Grid doesn't clear, report it, so the `bbgl` fallback can be applied.)
   4. Choose each chip in turn. Counts look plausible, and choosing a chip and clearing it each feel immediate (under half a second).
   5. Search for an artist, choose genre, BPM 124–128 and a compatible key, and sort by Still needs, Date added and My plays. Each change feels immediate.
-  6. Mark a track as a keeper. It moves to Finished, and another encoding of it does too. Undo it from History and it reverts.
-  7. A song family over 4 versions shows "Versions" on its non-main rows and "N of M versions need work" on the main row.
+  6. Mark an Auto-Tagged track as a keeper. It moves to Finished, and another encoding with the same MusicBrainz recording does too, though that encoding keeps any Duplicate tag. Undo it from History and it reverts.
+  7. A song family over 4 versions shows "Versions" on its non-main rows and "N of M files need work" on the main row.
   8. No control shows a chevron or triangle. Every chip and menu is reachable by keyboard.
