@@ -9,7 +9,8 @@ use crate::tags;
 use fingerprint_core as fingerprint;
 
 pub use crate::serato::{
-    SeratoMetadataUpdate, SeratoRemovedRecord, SeratoTrackFacts, SeratoTrackRecord,
+    SeratoMetadataUpdate, SeratoRemovedRecord, SeratoTrackFacts, SeratoTrackFactsScan,
+    SeratoTrackRecord,
 };
 pub use crate::serato_analysis::SeratoAnalysis;
 pub use crate::serato_history::{SeratoHistoryPlay, SeratoHistoryScan};
@@ -396,9 +397,7 @@ pub fn read_database_records_strict(
     Ok(database.strict_track_records()?)
 }
 
-pub fn read_database_track_facts(
-    database_path: String,
-) -> Result<Vec<SeratoTrackFacts>, CoreError> {
+pub fn read_database_track_facts(database_path: String) -> Result<SeratoTrackFactsScan, CoreError> {
     Ok(serato::read_database_track_facts(&PathBuf::from(
         database_path,
     ))?)

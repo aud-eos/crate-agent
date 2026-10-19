@@ -3,9 +3,10 @@
 // Layouts follow https://github.com/Holzhaus/serato-tags:
 //   MPEG, AIFF, WAV   ID3v2 GEOB frames `Serato Markers2` and `Serato BeatGrid`
 //   MP4               freeform atoms `com.serato.dj:markersv2` and `:beatgrid`
-//   FLAC, Ogg         Vorbis comments `SERATO_MARKERS_V2` and `SERATO_BEATGRID`
-// The MP4 and Vorbis values are base64 of an envelope that carries the same
-// bytes as the GEOB frame's data.
+//   FLAC              Vorbis comments `SERATO_MARKERS_V2` and `SERATO_BEATGRID`
+// The MP4 and FLAC values are base64 of an envelope that carries the same
+// bytes as the GEOB frame's data. Ogg uses other keys and a different
+// layout, and Opus and Speex have none documented, so they are unsupported.
 
 use std::path::Path;
 
@@ -21,7 +22,7 @@ use lofty::iff::aiff::AiffFile;
 use lofty::iff::wav::WavFile;
 use lofty::mp4::{AtomData, AtomIdent, Ilst, Mp4File};
 use lofty::mpeg::MpegFile;
-use lofty::ogg::{OpusFile, SpeexFile, VorbisComments, VorbisFile};
+use lofty::ogg::VorbisComments;
 use lofty::probe::Probe;
 use thiserror::Error;
 
@@ -35,7 +36,7 @@ const BEATGRID_MARKER_LENGTH: usize = 8;
 const CUE_MINIMUM_LENGTH: usize = 13;
 
 /// Serato wraps its base64 every 72 characters, sometimes omits padding, and
-/// can leave one dangling character whose bits belong to no byte.
+/// can leave one dangling character, which serato-tags completes with `A`.
 const LENIENT_BASE64: GeneralPurpose = GeneralPurpose::new(
     &STANDARD,
     GeneralPurposeConfig::new()
@@ -113,13 +114,7 @@ fn read_payloads(path: &Path) -> Result<SeratoPayloads, AnalysisError> {
             Mp4File::read_from(&mut reader, options).map(|file| mp4_payloads(file.ilst()))
         }
         Some(FileType::Flac) => FlacFile::read_from(&mut reader, options)
-            .map(|file| vorbis_payloads(file.vorbis_comments())),
-        Some(FileType::Vorbis) => VorbisFile::read_from(&mut reader, options)
-            .map(|file| vorbis_payloads(Some(file.vorbis_comments()))),
-        Some(FileType::Opus) => OpusFile::read_from(&mut reader, options)
-            .map(|file| vorbis_payloads(Some(file.vorbis_comments()))),
-        Some(FileType::Speex) => SpeexFile::read_from(&mut reader, options)
-            .map(|file| vorbis_payloads(Some(file.vorbis_comments()))),
+            .map(|file| flac_payloads(file.vorbis_comments())),
         Some(other) => {
             return Err(AnalysisError::UnsupportedFormat(format!("{other:?}")));
         }
@@ -183,7 +178,7 @@ fn mp4_payloads(ilst: Option<&Ilst>) -> Result<SeratoPayloads, AnalysisError> {
     })
 }
 
-fn vorbis_payloads(comments: Option<&VorbisComments>) -> Result<SeratoPayloads, AnalysisError> {
+fn flac_payloads(comments: Option<&VorbisComments>) -> Result<SeratoPayloads, AnalysisError> {
     let Some(comments) = comments else {
         return Ok(SeratoPayloads::default());
     };
@@ -206,7 +201,7 @@ fn decode_lenient_base64(text: &[u8], field: &'static str) -> Result<Vec<u8>, An
         .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
         .collect();
     if cleaned.len() % 4 == 1 {
-        cleaned.pop();
+        cleaned.push(b'A');
     }
     LENIENT_BASE64
         .decode(&cleaned)
@@ -407,19 +402,58 @@ mod tests {
     }
 
     #[test]
-    fn vorbis_and_mp4_envelopes_unwrap_to_the_same_markers2_body() {
-        let body = standard_body();
-        let text = envelope("Serato Markers2", &geob_payload(&body));
-        let inner = unwrap_envelope(&text, "Serato Markers2").unwrap();
-        assert_eq!(
-            count_markers2_cues(&decode_markers2_geob(&inner).unwrap()).unwrap(),
-            2
-        );
+    fn malformed_markers2_is_an_error_not_zero() {
+        assert!(count_markers2_cues(&[0x01, 0x01, b'C', b'U']).is_err());
+    }
+
+    fn write_empty_flac(path: &Path) {
+        let mut stream_info = Vec::new();
+        stream_info.extend_from_slice(&4_096u16.to_be_bytes());
+        stream_info.extend_from_slice(&4_096u16.to_be_bytes());
+        stream_info.extend_from_slice(&[0; 6]);
+        let sample_rate_channels_bits: u64 = (44_100 << 44) | (15 << 36);
+        stream_info.extend_from_slice(&sample_rate_channels_bits.to_be_bytes());
+        stream_info.extend_from_slice(&[0; 16]);
+        let mut bytes = b"fLaC".to_vec();
+        bytes.push(0x80);
+        bytes.extend_from_slice(&u32::try_from(stream_info.len()).unwrap().to_be_bytes()[1..]);
+        bytes.extend_from_slice(&stream_info);
+        std::fs::write(path, bytes).unwrap();
     }
 
     #[test]
-    fn malformed_markers2_is_an_error_not_zero() {
-        assert!(count_markers2_cues(&[0x01, 0x01, b'C', b'U']).is_err());
+    fn flac_vorbis_comments_read_cues_and_grid() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tagged.flac");
+        write_empty_flac(&path);
+        let mut flac = FlacFile::read_from(
+            &mut std::fs::File::open(&path).unwrap(),
+            ParseOptions::new(),
+        )
+        .unwrap();
+        let mut comments = VorbisComments::default();
+        comments.insert(
+            "SERATO_MARKERS_V2".into(),
+            String::from_utf8(envelope(
+                MARKERS2_DESCRIPTOR,
+                &geob_payload(&markers2_body(&[cue(0), cue(1), cue(2)])),
+            ))
+            .unwrap(),
+        );
+        comments.insert(
+            "SERATO_BEATGRID".into(),
+            String::from_utf8(envelope(BEATGRID_DESCRIPTOR, &beatgrid(2))).unwrap(),
+        );
+        flac.set_vorbis_comments(comments);
+        flac.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        assert_eq!(
+            read_serato_analysis(&path).unwrap(),
+            SeratoAnalysis {
+                cue_count: 3,
+                beatgrid_marker_count: 2
+            }
+        );
     }
 
     fn write_silent_wav(path: &Path) {

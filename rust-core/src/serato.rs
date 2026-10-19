@@ -336,29 +336,51 @@ pub struct SeratoTrackFacts {
     pub added_at: Option<u32>,
 }
 
-pub fn read_database_track_facts(path: &Path) -> Result<Vec<SeratoTrackFacts>, SeratoError> {
+/// Every well-formed track's facts, and how many `otrk` records were
+/// dropped because their nested fields were malformed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeratoTrackFactsScan {
+    pub tracks: Vec<SeratoTrackFacts>,
+    pub malformed_record_count: u32,
+}
+
+pub fn read_database_track_facts(path: &Path) -> Result<SeratoTrackFactsScan, SeratoError> {
     let bytes = fs::read(path)?;
-    let mut facts = Vec::new();
-    let mut every_track_well_formed = true;
+    let mut version_record = None;
+    let mut tracks = Vec::new();
+    let mut malformed_record_count = 0;
     let file_well_formed = walk_nested_fields(&bytes, |tag, payload| {
+        if version_record.is_none() {
+            version_record = Some((*tag, payload));
+            return;
+        }
         if tag != TAG_OTRK {
             return;
         }
-        let (track, well_formed) = track_facts(payload);
-        every_track_well_formed &= well_formed;
-        facts.extend(track);
+        match track_facts(payload) {
+            Some(track) => tracks.extend(track),
+            None => malformed_record_count += 1,
+        }
     });
-    if !(file_well_formed && every_track_well_formed) {
+    if !file_well_formed {
         return Err(SeratoError::InvalidFile(
-            "malformed database V2 record".into(),
+            "malformed database V2 framing".into(),
         ));
     }
-    Ok(facts)
+    check_database_version(
+        version_record
+            .as_ref()
+            .map(|(tag, payload)| (tag, *payload)),
+    )?;
+    Ok(SeratoTrackFactsScan {
+        tracks,
+        malformed_record_count,
+    })
 }
 
-/// The track's facts, `None` without a `pfil`, and whether its `otrk`
-/// payload parsed cleanly.
-fn track_facts(otrk_payload: &[u8]) -> (Option<SeratoTrackFacts>, bool) {
+/// `None` when the `otrk` payload is malformed; otherwise the track's facts,
+/// or `Some(None)` for a track without a `pfil`.
+fn track_facts(otrk_payload: &[u8]) -> Option<Option<SeratoTrackFacts>> {
     let mut path = None;
     let mut beatgrid_locked = None;
     let mut unix_added = None;
@@ -372,12 +394,28 @@ fn track_facts(otrk_payload: &[u8]) -> (Option<SeratoTrackFacts>, bool) {
         }
         _ => {}
     });
-    let track = path.map(|path| SeratoTrackFacts {
-        path,
-        beatgrid_locked,
-        added_at: unix_added.or(text_added),
-    });
-    (track, well_formed)
+    well_formed.then(|| {
+        path.map(|path| SeratoTrackFacts {
+            path,
+            beatgrid_locked,
+            added_at: unix_added.or(text_added),
+        })
+    })
+}
+
+/// The first top-level record of a `database V2` file must be its `vrsn`.
+fn check_database_version(first_record: Option<(&[u8; 4], &[u8])>) -> Result<(), SeratoError> {
+    let Some((tag, payload)) = first_record else {
+        return Err(SeratoError::InvalidFile("missing database version".into()));
+    };
+    if tag != b"vrsn"
+        || decode_utf16be(payload).as_deref() != Some("2.0/Serato Scratch LIVE Database")
+    {
+        return Err(SeratoError::InvalidFile(
+            "unsupported database version".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Return every track path stored in `otrk` containers of the given
@@ -899,17 +937,11 @@ impl DatabaseV2 {
     }
 
     pub fn strict_track_records(&self) -> Result<Vec<SeratoTrackRecord>, SeratoError> {
-        let Some(version) = self.records.first() else {
-            return Err(SeratoError::InvalidFile("missing database version".into()));
-        };
-        if version.tag != *b"vrsn"
-            || decode_utf16be(&version.payload).as_deref()
-                != Some("2.0/Serato Scratch LIVE Database")
-        {
-            return Err(SeratoError::InvalidFile(
-                "unsupported database version".into(),
-            ));
-        }
+        check_database_version(
+            self.records
+                .first()
+                .map(|version| (&version.tag, version.payload.as_slice())),
+        )?;
         let mut tracks = Vec::new();
         for record in &self.records[1..] {
             if record.tag == *b"vrsn" {
@@ -1915,6 +1947,7 @@ mod tests {
 
         let facts: Vec<_> = read_database_track_facts(&database_path)
             .unwrap()
+            .tracks
             .into_iter()
             .map(|track| (track.beatgrid_locked, track.added_at))
             .collect();
@@ -1926,6 +1959,46 @@ mod tests {
                 (None, None)
             ]
         );
+    }
+
+    #[test]
+    fn track_facts_drop_and_count_a_malformed_record() {
+        fn otrk(payload: Vec<u8>) -> TlvRecord {
+            TlvRecord {
+                tag: *TAG_OTRK,
+                payload,
+            }
+        }
+        let path_field = |path: &str| {
+            let mut payload = Vec::new();
+            TlvRecord::write_all(
+                &[TlvRecord {
+                    tag: *TAG_PFIL,
+                    payload: encode_utf16be(path),
+                }],
+                &mut payload,
+            )
+            .unwrap();
+            payload
+        };
+        let mut truncated = path_field("Music/B/Broken.mp3");
+        truncated.extend_from_slice(b"bbgl\0\0\0\x09\x01");
+        let records = [
+            TlvRecord {
+                tag: *b"vrsn",
+                payload: encode_utf16be("2.0/Serato Scratch LIVE Database"),
+            },
+            otrk(path_field("Music/A/Good.mp3")),
+            otrk(truncated),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("database V2");
+        let mut bytes = Vec::new();
+        TlvRecord::write_all(&records, &mut bytes).unwrap();
+        std::fs::write(&database_path, bytes).unwrap();
+
+        let scan = read_database_track_facts(&database_path).unwrap();
+        assert_eq!((scan.tracks.len(), scan.malformed_record_count), (1, 1));
     }
 
     #[test]

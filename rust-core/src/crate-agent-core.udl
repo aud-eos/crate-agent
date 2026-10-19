@@ -108,10 +108,11 @@ namespace crate_agent_core {
   sequence<SeratoTrackRecord> read_database_records_strict(string database_path);
 
   // Read each `database V2` track's beatgrid lock (`bbgl`) and date added
-  // (`uadd`, else `tadd`), for the readiness checklist. A malformed record
-  // fails the whole read.
+  // (`uadd`, else `tadd`), for the readiness checklist. A malformed `otrk`
+  // is dropped and counted; only a missing or unsupported version, or broken
+  // top-level framing, fails the read.
   [Throws=CoreError]
-  sequence<SeratoTrackFacts> read_database_track_facts(string database_path);
+  SeratoTrackFactsScan read_database_track_facts(string database_path);
 
   // Strictly read every `Sessions/*.session` file under Serato's
   // `History` directory and return the deck loads Serato marked as
@@ -357,6 +358,11 @@ dictionary SeratoTrackFacts {
   string path;
   boolean? beatgrid_locked;
   u32? added_at;
+};
+
+dictionary SeratoTrackFactsScan {
+  sequence<SeratoTrackFacts> tracks;
+  u32 malformed_record_count;
 };
 
 dictionary SeratoAnalysis {
