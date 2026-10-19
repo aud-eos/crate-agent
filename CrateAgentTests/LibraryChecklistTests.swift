@@ -220,7 +220,7 @@ final class LibraryChecklistTests: XCTestCase {
         try add(Seed(title: "NoCues", cueCount: .some(0)))
         try add(Seed(title: "UnreadableCues", cueCount: .some(nil)))
         try add(Seed(title: "GridUnlocked", beatgridLocked: .some(false)))
-        try add(Seed(title: "NoGenre", genre: "  "))
+        try add(Seed(title: "NoGenre", genre: " \t\u{00A0}"))
         try add(Seed(title: "Lossy192", bitrateKbps: 192))
         try add(Seed(title: "FlacNoBitrate", bitrateKbps: nil, pathExtension: "flac"))
         try add(Seed(title: "Mp3NoBitrate", bitrateKbps: nil))

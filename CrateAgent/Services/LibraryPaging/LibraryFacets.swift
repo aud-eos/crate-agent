@@ -99,12 +99,12 @@ struct GenreOption: Hashable, Sendable {
 
     /// Trimmed, whitespace collapsed, and folded for case and width; diacritics stay distinct.
     static func normalized(_ genre: String) -> String {
-        genre.split(whereSeparator: \.isWhitespace).joined(separator: " ").folding(options: [.caseInsensitive, .widthInsensitive], locale: nil)
+        genre.split(whereSeparator: BlankText.isWhitespace).joined(separator: " ").folding(options: [.caseInsensitive, .widthInsensitive], locale: nil)
     }
 
-    /// Groups each distinct stored genre and its file count by normalized form, ordered by display value.
+    /// Groups each distinct stored genre and its file count by normalized form, ordered by display value; blank genres join no group.
     static func grouped(_ stored: [(value: String, count: Int)]) -> [GenreOption] {
-        Dictionary(grouping: stored) { genre in normalized(genre.value) }.values.compactMap { spellings -> GenreOption? in
+        Dictionary(grouping: stored) { genre in normalized(genre.value) }.filter { group in !group.key.isEmpty }.values.compactMap { spellings -> GenreOption? in
             guard let commonest = spellings.max(by: { lhs, rhs in lhs.count != rhs.count ? lhs.count < rhs.count : lhs.value > rhs.value })
             else { return nil }
             return GenreOption(value: commonest.value, storedValues: Set(spellings.map(\.value)),
@@ -123,14 +123,14 @@ struct LibraryFacetOptions: Equatable, Sendable {
     static func load(in database: GRDB.Database, filter: LibraryStatusFilter) throws -> LibraryFacetOptions {
         let genreRows = try GRDB.Row.fetchAll(database, sql: """
         SELECT files.genre, COUNT(*) FROM files
-        WHERE \(filter.predicate) AND NULLIF(TRIM(files.genre), '') IS NOT NULL GROUP BY files.genre
+        WHERE \(filter.predicate) AND NOT \(BlankText.isBlankSQL("files.genre")) GROUP BY files.genre
         """)
         let genres = try GenreOption.grouped(genreRows.map { row -> (value: String, count: Int) in
             guard let value: String = row[0], let count: Int = row[1] else { throw PagingError.incompletePage }
             return (value, count)
         })
         let keyValues = try String.fetchAll(database, sql: """
-        SELECT DISTINCT files.musical_key FROM files WHERE \(filter.predicate) AND NULLIF(TRIM(files.musical_key), '') IS NOT NULL
+        SELECT DISTINCT files.musical_key FROM files WHERE \(filter.predicate) AND NOT \(BlankText.isBlankSQL("files.musical_key"))
         """)
         var keys: [CamelotKey: Set<String>] = [:]
         for value in keyValues {

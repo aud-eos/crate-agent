@@ -128,7 +128,7 @@ enum LibraryChecklist {
 
     private static var missingMetadataSQL: String {
         "(" + MetadataField.allCases.map { field in
-            "(CASE WHEN NULLIF(TRIM(files.\(field.column)), '') IS NULL THEN \(ChecklistMask.bit(field)) ELSE 0 END)"
+            "(CASE WHEN \(BlankText.isBlankSQL("files.\(field.column)")) THEN \(ChecklistMask.bit(field)) ELSE 0 END)"
         }.joined(separator: " | ") + ")"
     }
 
@@ -222,3 +222,22 @@ enum LibraryChecklist {
     }
 }
 
+/// Empty text, or text of only Unicode White_Space, is blank. The checklist's SQL and the genre
+/// options' Swift share this one definition, so a tab or no-break space is blank in both.
+enum BlankText {
+    private static let whitespaceRanges: [ClosedRange<UInt32>] = [0x09 ... 0x0D, 0x20 ... 0x20, 0x85 ... 0x85, 0xA0 ... 0xA0, 0x1680 ... 0x1680,
+                                                                  0x2000 ... 0x200A, 0x2028 ... 0x2029, 0x202F ... 0x202F, 0x205F ... 0x205F,
+                                                                  0x3000 ... 0x3000]
+    static let whitespace = Set(whitespaceRanges.joined().compactMap { value in Unicode.Scalar(value) })
+
+    static func isWhitespace(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy(whitespace.contains)
+    }
+
+    /// True when `expression` is NULL or blank.
+    static func isBlankSQL(_ expression: String) -> String {
+        "NULLIF(TRIM(\(expression), \(whitespaceSQL)), '') IS NULL"
+    }
+
+    private static let whitespaceSQL = "char(" + whitespace.map(\.value).sorted().map(String.init).joined(separator: ", ") + ")"
+}
