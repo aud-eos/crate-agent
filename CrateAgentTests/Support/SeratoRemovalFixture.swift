@@ -10,8 +10,21 @@ enum SeratoTestEncoding {
     }
 
     static func library(paths: [String]) -> Data {
-        paths.reduce(record("vrsn", "2.0/Serato Scratch LIVE Database".data(using: .utf16BigEndian)!)) { bytes, path in
-            bytes + record("otrk", record("pfil", path.data(using: .utf16BigEndian)!))
+        library(tracks: paths.map { path in track(path: path) })
+    }
+
+    static func library(tracks: [Data]) -> Data {
+        tracks.reduce(record("vrsn", "2.0/Serato Scratch LIVE Database".data(using: .utf16BigEndian)!), +)
+    }
+
+    /// One V2 `otrk` at `path`, followed by `fields` in order.
+    static func track(path: String, fields: [(tag: String, payload: Data)] = []) -> Data {
+        record("otrk", fields.reduce(record("pfil", path.data(using: .utf16BigEndian)!)) { bytes, field in bytes + record(field.tag, field.payload) })
+    }
+
+    static func crate(paths: [String]) -> Data {
+        paths.reduce(record("vrsn", "1.0/Serato ScratchLive Crate".data(using: .utf16BigEndian)!)) { bytes, path in
+            bytes + record("otrk", record("ptrk", path.data(using: .utf16BigEndian)!))
         }
     }
 }

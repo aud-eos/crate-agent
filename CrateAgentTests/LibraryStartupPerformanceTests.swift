@@ -57,6 +57,30 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         try await verifyUpgradeBackfill(fixture)
         try await verifyNavigationDuringSync(fixture)
         try await verifyWriterHoldWhilePublishingTheCheckpoint(fixture)
+        try await verifyWriterHoldWhileRefreshingSeratoFacts(fixture)
+    }
+
+    /// The first facts refresh caches 30,000 V2 records' beatgrid lock and date
+    /// added, and 20 crates of 1,000 paths, without holding other writers off
+    /// for 500 ms or more.
+    private func verifyWriterHoldWhileRefreshingSeratoFacts(_ fixture: LibraryStartupPerformanceFixture) async throws {
+        try fixture.writeCrates(count: 20, pathsPerCrate: 1000)
+        let service = SeratoLibraryFactsService(database: fixture.database, seratoLocator: fixture.locator, watchdog: fixture.watchdog)
+        let probe = WriterHoldProbe()
+        probe.start(fixture.database) { nil }
+        let start = ContinuousClock.now
+        await service.refresh()
+        let refresh = start.duration(to: .now)
+        let waits = await probe.stop()
+        XCTAssertEqual(service.status, .refreshed(SeratoLibraryFactsSummary(trackFactCount: 30000, crateCount: 20, membershipCount: 20000, unmatchedPathCount: 0)))
+        let longest = try XCTUnwrap(waits.first)
+        XCTAssertLessThan(longest.duration, .milliseconds(500))
+        let refreshMilliseconds = refresh.components.seconds * 1000 + refresh.components.attoseconds / 1_000_000_000_000_000
+        let result = "CHECKLIST_FACTS_WRITER_HOLD files=30000 probes=\(waits.count) longest=\(longest.duration) refresh_ms=\(refreshMilliseconds)"
+        print(result)
+        let attachment = XCTAttachment(string: result)
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     /// A changed saved title leaves the fast path, so the sync republishes the

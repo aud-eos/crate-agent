@@ -48,6 +48,8 @@ final class LibraryStartupPerformanceFixture {
                 for (tag, value) in [("tart", artist), ("tsng", title)] {
                     payload += SeratoTestEncoding.record(tag, Data(value.utf16.flatMap { codeUnit in [UInt8(codeUnit >> 8), UInt8(codeUnit & 255)] }))
                 }
+                payload += SeratoTestEncoding.record("bbgl", Data([UInt8(index % 2)]))
+                payload += SeratoTestEncoding.record("uadd", withUnsafeBytes(of: (UInt32(1_700_000_000) + UInt32(index)).bigEndian) { bytes in Data(bytes) })
                 records += SeratoTestEncoding.record("otrk", payload)
                 var file = FileRecord(path: identity.path, volumeUuid: identity.volumeUuid, inode: identity.inode,
                                       fileSize: identity.fileSize, mtime: identity.mtime, lightweightHash: identity.lightweightHash,
@@ -72,6 +74,16 @@ final class LibraryStartupPerformanceFixture {
                                  operationEngine: engine, watchdog: watchdog, readiness: readiness,
                                  checkpointStore: checkpointed ? SyncCheckpointStore(database: database) : nil,
                                  watchRoots: [directory.path])
+    }
+
+    /// `count` Subcrates of `pathsPerCrate` consecutive library tracks each.
+    func writeCrates(count: Int, pathsPerCrate: Int) throws {
+        for crate in 0 ..< count {
+            let paths = (crate * pathsPerCrate ..< (crate + 1) * pathsPerCrate).map { index in
+                SeratoLibraryLocator.seratoRelativePath(fromAbsolute: directory.appendingPathComponent("track-\(index).wav").path)
+            }
+            try SeratoTestEncoding.crate(paths: paths).write(to: locator.subcratesDirectoryUrl.appendingPathComponent("Crate \(crate).crate"))
+        }
     }
 
     func cleanup() throws {

@@ -18,7 +18,7 @@ struct SeratoPlayCountSummary: Equatable, Sendable {
 /// What the library's path history looked like when plays were attributed:
 /// any import, removal or path change moves it. Path changes always journal
 /// one of `SeratoPlayCounts.pathChangeEvents`.
-struct SeratoLibraryPathSignature: Equatable, Sendable {
+struct SeratoLibraryPathSignature: Codable, Equatable, Sendable {
     let fileCount: Int
     let highestFileID: Int64?
     let highestPathChangeEventID: Int64?
