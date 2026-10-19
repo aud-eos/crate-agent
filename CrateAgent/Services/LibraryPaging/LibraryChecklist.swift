@@ -234,9 +234,10 @@ enum BlankText {
         character.unicodeScalars.allSatisfy(whitespace.contains)
     }
 
-    /// True when `expression` is NULL or blank.
+    /// True when `expression` is NULL or blank. Text with an ASCII letter or digit skips the TRIM,
+    /// whose many-character set costs measurably on every row of a 30,000-file page.
     static func isBlankSQL(_ expression: String) -> String {
-        "NULLIF(TRIM(\(expression), \(whitespaceSQL)), '') IS NULL"
+        "(\(expression) IS NULL OR (\(expression) NOT GLOB '*[0-9A-Za-z]*' AND TRIM(\(expression), \(whitespaceSQL)) = ''))"
     }
 
     private static let whitespaceSQL = "char(" + whitespace.map(\.value).sorted().map(String.init).joined(separator: ", ") + ")"
