@@ -19,10 +19,12 @@ final class SeratoLibraryFactsService: ObservableObject {
     typealias FactsReader = @Sendable (_ databasePath: String) async throws -> SeratoTrackFactsScan
     typealias CrateReader = @Sendable (_ cratePath: String) async throws -> [String]
 
-    /// What a source's stamp records: its files and the library's paths.
+    /// What a source's stamp records: its files, the library's paths, and
+    /// which files are retired.
     private struct SourceInputs<Files: Encodable>: Encodable {
         let files: Files
         let library: SeratoLibraryPathSignature
+        let lastMembershipChange: Int64?
     }
 
     @Published private(set) var status: Status = .notRefreshed
@@ -70,13 +72,16 @@ final class SeratoLibraryFactsService: ObservableObject {
         let subcratesDirectory = seratoLocator.subcratesDirectoryUrl
         do {
             let (identity, crateFiles) = try await Task.detached {
-                try (SeratoSourceIdentity.read(databaseURL), SeratoDirectoryStamp.all(in: subcratesDirectory, pathExtension: "crate"))
+                try (SeratoSourceIdentity.read(databaseURL), SeratoDirectoryStamp.all(in: subcratesDirectory, pathExtension: SeratoLibraryLocator.crateExtension))
             }.value
-            let (library, stored) = try await database.writer.read { connection in
-                try (SeratoPlayCounts.librarySignature(in: connection), SeratoLibraryFacts.storedStamps(in: connection))
+            let (library, membershipChange, stored) = try await database.writer.read { connection in
+                try (SeratoPlayCounts.librarySignature(in: connection), SeratoLibraryFacts.lastMembershipChange(in: connection),
+                     SeratoLibraryFacts.storedStamps(in: connection))
             }
-            let stamps = try [ChecklistSource.databaseV2: Self.encode(SourceInputs(files: identity, library: library)),
-                              .subcrates: Self.encode(SourceInputs(files: crateFiles, library: library))]
+            let stamps = try [
+                ChecklistSource.databaseV2: Self.encode(SourceInputs(files: identity, library: library, lastMembershipChange: membershipChange)),
+                .subcrates: Self.encode(SourceInputs(files: crateFiles, library: library, lastMembershipChange: membershipChange)),
+            ]
             let changed = Set(ChecklistSource.allCases.filter { source in stored[source]?.inputs != stamps[source] })
             guard !changed.isEmpty else {
                 status = Self.status(for: stored.values.map(\.outcome).reduce(SeratoLibraryFactsOutcome(), +))

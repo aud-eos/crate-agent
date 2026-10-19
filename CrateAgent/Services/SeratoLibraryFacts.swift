@@ -56,10 +56,44 @@ struct SeratoLibraryFactsOutcome: Codable, Equatable, Sendable {
 }
 
 struct ChecklistSourceStamp: Codable, Equatable, Sendable {
-    /// JSON of the source's file identities and the library's path signature
-    /// when it was read; the source is read again only when this changes.
+    /// JSON of the source's file identities, the library's path signature and
+    /// its last membership change when it was read; the source is read again
+    /// only when this changes.
     let inputs: String
     let outcome: SeratoLibraryFactsOutcome
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case inputs, outcome
+    }
+
+    init(inputs: String, outcome: SeratoLibraryFactsOutcome) {
+        self.inputs = inputs
+        self.outcome = outcome
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyStampKey.self)
+        let expected = Set(CodingKeys.allCases.map(\.rawValue))
+        if let unknown = container.allKeys.first(where: { key in !expected.contains(key.stringValue) }) {
+            throw DecodingError.dataCorruptedError(forKey: unknown, in: container, debugDescription: "Unknown checklist stamp field \(unknown.stringValue)")
+        }
+        let known = try decoder.container(keyedBy: CodingKeys.self)
+        inputs = try known.decode(String.self, forKey: .inputs)
+        outcome = try known.decode(SeratoLibraryFactsOutcome.self, forKey: .outcome)
+    }
+
+    private struct AnyStampKey: CodingKey {
+        let stringValue: String
+        let intValue: Int? = nil
+
+        init(stringValue: String) {
+            self.stringValue = stringValue
+        }
+
+        init?(intValue _: Int) {
+            nil
+        }
+    }
 }
 
 struct SeratoCrateMembership: Hashable, Sendable {
@@ -130,6 +164,18 @@ enum SeratoLibraryFacts {
         return memberships
     }
 
+    /// Events that change a file's `library_membership`. The shared path
+    /// signature leaves them out because plays still count for retired files,
+    /// but they decide which files the facts cover.
+    static let membershipChangeEvents: [EventType] = [.fileLibraryStateChanged, .fileImportRequested, .fileRestoredFromTrash]
+
+    static func lastMembershipChange(in database: GRDB.Database) throws -> Int64? {
+        let types = membershipChangeEvents.map(\.rawValue)
+        return try Int64.fetchOne(database, sql: """
+        SELECT MAX(event_id) FROM events WHERE event_type IN (\(types.map { _ in "?" }.joined(separator: ", ")))
+        """, arguments: StatementArguments(types))
+    }
+
     static func storedStamps(in database: GRDB.Database) throws -> [ChecklistSource: ChecklistSourceStamp] {
         var stamps: [ChecklistSource: ChecklistSourceStamp] = [:]
         let decoder = JSONDecoder()
@@ -181,18 +227,15 @@ enum SeratoLibraryFacts {
             }
             sourceOutcome.matchedRecordCount = desired.count
             // With records dropped as malformed, a file without one may be
-            // among them, so its facts are left as they were, not invented.
-            let recordsComplete = scan.malformedRecordCount == 0
-            if recordsComplete {
+            // among them, so its facts become unknown rather than invented.
+            if scan.malformedRecordCount == 0 {
                 for fileID in resolver.fileIDs where desired[fileID] == nil {
                     desired[fileID] = SeratoFileFacts(beatgridLocked: nil, addedAt: firstIndexed[fileID], addedSource: .indexed)
                 }
             }
             let current = try facts(in: database)
             factUpserts = desired.filter { fileID, facts in current[fileID] != facts }
-            factDeletions = current.keys.filter { fileID in
-                desired[fileID] == nil && (recordsComplete || !resolver.fileIDs.contains(fileID))
-            }.sorted()
+            factDeletions = current.keys.filter { fileID in desired[fileID] == nil }.sorted()
             factsOutcome = sourceOutcome
         }
         try record(.databaseV2, factsOutcome)

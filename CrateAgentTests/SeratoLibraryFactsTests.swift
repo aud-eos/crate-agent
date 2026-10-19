@@ -88,17 +88,50 @@ final class SeratoLibraryFactsTests: XCTestCase {
     func testMalformedV2RecordsAreReportedAndLeaveFilesWithoutARecordUnknown() async throws {
         let read = try await index("a.wav", eventsAt: [1_600_000_000_000])
         let unread = try await index("b.wav", eventsAt: [1_600_000_000_000])
+        try saveLibrary([SeratoTestEncoding.track(path: relative(read)), SeratoTestEncoding.track(path: relative(unread), fields: [("bbgl", Data([1]))])])
+        await makeService().refresh()
+        let complete = try await storedFacts()
+        XCTAssertEqual(complete[unread.id!]?.beatgridLocked, true)
+
+        try saveLibrary([SeratoTestEncoding.track(path: relative(read))])
         let readPath = relative(read)
         let service = makeService(readFacts: { _ in
             SeratoTrackFactsScan(tracks: [SeratoTrackFacts(path: readPath, beatgridLocked: true, addedAt: 1_700_000_000)], malformedRecordCount: 1)
         })
-
         await service.refresh()
 
         XCTAssertEqual(service.status, .failed(SeratoLibraryFactsMessages.unreadableRecords(1)))
         let facts = try await storedFacts()
         XCTAssertEqual(facts[read.id!], SeratoFileFacts(beatgridLocked: true, addedAt: 1_700_000_000, addedSource: .serato))
-        XCTAssertNil(facts[unread.id!], "Its record may be the unreadable one, so its facts stay unknown")
+        XCTAssertNil(facts[unread.id!], "Its record may be the unreadable one, so its earlier facts are dropped, not kept stale")
+    }
+
+    func testRetiredFilesLoseTheirFactsAndRegainThemWhenReactivated() async throws {
+        let file = try await index("a.wav", eventsAt: [1_600_000_000_000])
+        let fileID = try XCTUnwrap(file.id)
+        try saveLibrary([SeratoTestEncoding.track(path: relative(file), fields: [("bbgl", Data([1]))])])
+        try saveCrate("Warmup.crate", paths: [relative(file)])
+        let service = makeService()
+        await service.refresh()
+        let active = try await fixture.row(file)
+
+        try await fixture.engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: active.membershipRevision,
+                                                                  state: FileLibraryState(membership: .retired, availability: .available,
+                                                                                          libraryID: active.seratoLibraryId, retiredAt: 1_600_000_100))))
+        await service.refresh()
+        let retiredFacts = try await storedFacts()
+        let retiredMemberships = try await storedMemberships()
+        XCTAssertNil(retiredFacts[fileID])
+        XCTAssertEqual(retiredMemberships, [:])
+
+        let retired = try await fixture.row(file)
+        try await fixture.engine.apply(.setFileLibraryState(.init(fileId: fileID, expectedRevision: retired.membershipRevision,
+                                                                  state: active.libraryState)))
+        await service.refresh()
+        let facts = try await storedFacts()
+        let memberships = try await storedMemberships()
+        XCTAssertEqual(facts[fileID]?.beatgridLocked, true)
+        XCTAssertEqual(memberships, [fileID: ["Warmup.crate"]])
     }
 
     func testCrateMembershipMatchesUnicodeFormsAndFollowsRenames() async throws {
