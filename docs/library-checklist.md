@@ -77,6 +77,9 @@ unchecked**, **Low quality**, **Never played**, **Too many versions** and
 - Each count is the number of *files* in the current library status, search and
   genre, BPM and key filters that the chip matches, ignoring the chosen chip.
   Counts read **…** while they load, after the first page.
+- **Not in a crate**, **Grid unchecked** and **Never played** each come from one
+  Serato source: Subcrates, `database V2` and History. Until crate-agent has
+  read that source once, the chip's count reads **unknown**, never 0.
 - **Never played** is disabled until Serato History has been read for the
   first time, because play counts are only read while Serato is closed. Until
   then it matches nothing. Once the History stamp exists it stays available
