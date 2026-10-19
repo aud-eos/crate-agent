@@ -28,6 +28,8 @@ final class LibraryBrowserModel: ObservableObject {
     private var familyMembers: [Int64: [LibraryFamilyPlacement]] = [:]
     private var familyTask: Task<Void, Never>?
     private var chipCountTask: Task<Void, Never>?
+    /// The snapshot whose counts wait for its viewport pages, so the counts query never queues ahead of them.
+    private var countsAwaitingViewport: LibraryPagedSnapshot?
     private var loadedFamilies: (snapshot: LibraryPagedSnapshot, familyIDs: Set<Int64>)?
     private let database: LibraryDatabase
     private let pool: DatabasePool
@@ -53,6 +55,7 @@ final class LibraryBrowserModel: ObservableObject {
         }.store(in: &subscriptions)
         results.$updateID.dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in
             self?.loadFamilyMembers()
+            self?.loadChipCountsOnceViewportLoads()
         }.store(in: &subscriptions)
         selection.$visibleSelectedIDs.receive(on: RunLoop.main).sink { [weak self] selected in
             self?.updateFamilyStates(selected: selected)
@@ -196,7 +199,14 @@ final class LibraryBrowserModel: ObservableObject {
         return resolved
     }
 
-    /// Counts and facet options load in their own task after the page, so they never delay it; a newer snapshot cancels them.
+    /// Counts and facet options share the snapshot's one connection, so they start only once the viewport's pages have loaded.
+    private func loadChipCountsOnceViewportLoads() {
+        guard let snapshot = countsAwaitingViewport, results.snapshot === snapshot, results.isViewportLoaded else { return }
+        countsAwaitingViewport = nil
+        loadChipCounts(for: snapshot)
+    }
+
+    /// Counts and facet options load in their own task, after the page; a newer snapshot cancels them.
     private func loadChipCounts(for snapshot: LibraryPagedSnapshot) {
         chipCountTask?.cancel()
         chipCountTask = Task { [weak self] in
@@ -324,6 +334,7 @@ final class LibraryBrowserModel: ObservableObject {
         familyTask = nil
         chipCountTask?.cancel()
         chipCountTask = nil
+        countsAwaitingViewport = nil
         familyMembers = [:]
         loadedFamilies = nil
         dirty = false
@@ -371,7 +382,9 @@ final class LibraryBrowserModel: ObservableObject {
                     guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }
                     selection.updateScope(snapshot, visibleIdentities: trackedIdentities)
                     selection.reconcile(in: snapshot)
-                    loadChipCounts(for: snapshot)
+                    chipCountTask?.cancel()
+                    countsAwaitingViewport = snapshot
+                    loadChipCountsOnceViewportLoads()
                     error = nil
                 } catch {
                     guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }

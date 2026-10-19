@@ -174,9 +174,32 @@ New checklist measurements (final, `7d00f75`):
 
 The first full-class run on this date measured `CHECKLIST_BACKGROUND` render at
 500.6 ms and failed the 500 ms assert by 0.6 ms while the machine was busy with
-other work (load average about 4). The class rerun alone passed at 436 ms. Render
-here competes with the cue-point backfill for the CPU, so the margin is thin on a
-loaded machine. Compare it against the budget, not as a trend.
+other work (load average about 4). The class rerun alone passed at 436 ms.
+
+That render waited on two things. The throttled checklist observation refreshes
+Library on the very analysis batch commit the test waits for, and a non-reset
+refresh cleared the shown pages, so row 0 stayed empty until the new snapshot's
+page arrived. That page then queued behind the chip counts (a 120-170 ms query),
+facet options and History-stamp read on the snapshot's one connection. Two fixes
+followed: a non-reset refresh keeps the previous pages visible until the new
+snapshot's viewport pages load, and counts start only after those pages load.
+`DatabaseSnapshotPool` would allow concurrent reads at one snapshot, but it can't
+open on a WAL file no transaction has written since launch, so it wasn't used.
+
+Same-day runs of `LibraryStartupPerformanceTests` alone on 2026-10-19,
+alternating a baseline worktree at `3dcb14e` with the fixed build (load average
+4-14 from other work):
+
+| Run | `3dcb14e` render | Fixed render |
+| --- | ---: | ---: |
+| 1 | 87 ms | 103 ms |
+| 2 | 669 ms (failed the assert) | 88 ms |
+| 3 | 466 ms | 102 ms |
+
+The baseline was fast only when the refresh missed the render window. Navigation
+stayed 6-39 ms and the longest writer wait 16-44 ms in every run. The 30,000-file
+`CHECKLIST_PAGING_METRICS` matched `3dcb14e` within a few milliseconds (for
+example Still needs sort: page 322 ms, counts 130 ms; facet options 8 ms).
 
 On-screen smoke checks for the running app are in the PR description.
 

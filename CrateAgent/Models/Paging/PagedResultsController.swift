@@ -30,6 +30,10 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
     }
 
     private var pages: [Int: [Snapshot.Row]] = [:]
+    /// The previous snapshot's pages, shown by a non-reset refresh until the new snapshot's viewport
+    /// pages load, so a background refresh doesn't flash placeholders.
+    private var retainedPages: [Int: [Snapshot.Row]] = [:]
+    private var retainedPageSize = 0
     private var desiredPages: [Int] = []
     private var failures: [Int: String] = [:]
     private var countFailed = false
@@ -57,6 +61,9 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
             guard generation == requestedGeneration, !Task.isCancelled else { return }
             focusAnchor = min(max(0, focused ?? focusFallback ?? anchor ?? fallbackIndex), max(0, count - 1))
             totalCount = count
+            if count == 0 {
+                dropRetainedPages()
+            }
             viewportAnchor = min(max(0, anchor ?? fallbackIndex), max(0, count - 1))
             isLoading = false
             updateID &+= 1
@@ -67,6 +74,7 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
             guard generation == requestedGeneration, !Task.isCancelled else { return }
             totalCount = 0
             countFailed = true
+            dropRetainedPages()
             isLoading = false
             self.error = error.localizedDescription
         }
@@ -112,10 +120,24 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
     }
 
     func row(at index: Int) -> Snapshot.Row? {
-        guard index >= 0, index < totalCount,
-              let page = pages[index / effectivePageSize] else { return nil }
-        let offset = index % effectivePageSize
+        guard index >= 0, index < totalCount else { return nil }
+        if let page = pages[index / effectivePageSize] {
+            return Self.row(at: index, in: page, pageSize: effectivePageSize)
+        }
+        guard retainedPageSize > 0, let page = retainedPages[index / retainedPageSize] else { return nil }
+        return Self.row(at: index, in: page, pageSize: retainedPageSize)
+    }
+
+    private static func row(at index: Int, in page: [Snapshot.Row], pageSize: Int) -> Snapshot.Row? {
+        let offset = index % pageSize
         return offset < page.count ? page[offset] : nil
+    }
+
+    /// Whether every page the viewport covers has loaded from the current snapshot.
+    var isViewportLoaded: Bool {
+        guard snapshot != nil, !isLoading, !countFailed else { return false }
+        guard totalCount > 0, !viewport.isEmpty else { return totalCount == 0 }
+        return (viewport.lowerBound / effectivePageSize ... (viewport.upperBound - 1) / effectivePageSize).allSatisfy { page in pages[page] != nil }
     }
 
     func retry() {
@@ -139,6 +161,12 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
 
     private func invalidate(resetCount: Bool = true) {
         generation &+= 1
+        if resetCount {
+            dropRetainedPages()
+        } else if !pages.isEmpty {
+            retainedPages = pages
+            retainedPageSize = effectivePageSize
+        }
         for request in requests.values {
             request.task.cancel()
         }
@@ -153,6 +181,11 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         viewportAnchor = nil
         focusAnchor = nil
         viewport = 0 ..< 0
+    }
+
+    private func dropRetainedPages() {
+        retainedPages.removeAll()
+        retainedPageSize = 0
     }
 
     private func pump() {
@@ -193,8 +226,12 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
             pages[request.page] = rows
             failures[request.page] = nil
             peakCachedRowCount = max(peakCachedRowCount, cachedRowCount)
+            if isViewportLoaded {
+                dropRetainedPages()
+            }
         case let .failure(failure):
             failures[request.page] = failure.localizedDescription
+            dropRetainedPages()
         }
         error = failures.values.first
         changedRows = IndexSet(integersIn: range)
