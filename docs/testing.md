@@ -206,6 +206,59 @@ numbers measure rows on screen, not fresh-page latency. The 30,000-file
 `CHECKLIST_PAGING_METRICS` matched `3dcb14e` within a few milliseconds (for
 example Still needs sort: page 322 ms, counts 130 ms; facet options 8 ms).
 
+### One projection per interaction
+
+CI on PR #277 (a GitHub macOS runner, about 1.6 times slower than the reference
+Mac) failed `testChecklistSortFilterAndCountsStayWithinBudgetsAtThirtyThousandFiles`:
+the search with Needs work took 519 ms against the 500 ms budget, and every other
+chip and checklist sort page took 372-490 ms. Profiling the 30,000-file fixture
+with `EXPLAIN QUERY PLAN` and per-CTE timings showed the cause. A measured page is
+the snapshot's placements read plus its first page, and with a chip or checklist
+sort both statements ran the whole projection with every file's checklist (about
+140 ms each). Within one run the checklist CTEs took about 70 ms: primary-key
+fact joins 16 ms, blank-metadata tests 11 ms, crate and lossless tests 6 ms each,
+plus materialization and three automatic indexes over `checklist_files`. No
+index or query-plan change saved more than about 5 ms.
+
+The placements read now returns files in display order, and the snapshot keeps
+the visible order in memory. Pages, `index(of:)` and `identities(in:)` read it
+there. The page query fetches only the page's ids, places only the page's
+families and computes only their checklists. Every interaction runs the
+projection once, and the checklist rules are unchanged. Opening the plain view
+now sorts every placement instead of reading them in id order, so the count
+step costs 20-30 ms more, but its pages no longer recompute the family projection.
+
+Quiet runs on 2026-10-19 (`b692493`, then the change), optimized settings:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Still needs sort page | 322 ms | 212 ms |
+| Date added sort page | 284 ms | 219 ms |
+| My plays sort page | 278 ms | 167 ms |
+| Needs work chip page | 292 ms | 165 ms |
+| Other chip pages | 221-275 ms | 129-148 ms |
+| Search with Needs work page | 318 ms | 168 ms |
+| All facets page | 299 ms | 147 ms |
+| Chip counts (query unchanged) | 120-162 ms | 120-161 ms |
+
+Back-to-back runs on 2026-10-20 at load average about 5, before then after:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Checklist sort pages | 300-359 ms | 183-242 ms |
+| Chip pages | 232-311 ms | 139-174 ms |
+| Search with Needs work page | 340 ms | 175 ms |
+| Ungrouped count / first page / distant page | 31 / 21 / 26 ms | 52 / 8 / 8 ms |
+| Grouped count / first page / distant page | 60 / 48 / 50 ms | 79 / 13 / 12 ms |
+| Expand / collapse / include alternates | 147 / 144 / 145 ms | 125 / 123 / 133 ms |
+| Song-family search | 162 ms | 175 ms |
+
+The full `make test-swift` run of the change measured the same checklist pages
+(136-218 ms). Its `testThirtyThousandFileCheckpointRestart` failed with a 1,072 s
+writer wait during an overnight stall of the machine; run alone, it passed
+(`CHECKLIST_FACTS_WRITER_HOLD` longest wait 17 ms, `CHECKLIST_BACKGROUND` render
+97 ms, navigation 28 ms).
+
 On-screen smoke checks for the running app are in the PR description.
 
 ## Duplicate scan fixture
