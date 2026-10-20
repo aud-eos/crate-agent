@@ -100,14 +100,13 @@ struct LibraryBrowseQuery: Hashable, Sendable {
     }
 
     private func arguments() throws -> StatementArguments {
-        let expanded = expandedFamilies.sorted().map(String.init).joined(separator: ",")
-        var arguments: StatementArguments = ["search": trimmedSearch, "expanded": "[\(expanded)]"]
+        var arguments: StatementArguments = ["search": trimmedSearch]
         try arguments += facets.arguments()
         return arguments
     }
 
-    /// Whether ordering or filtering reads the checklist, so every file's is computed before the page.
-    /// Otherwise only the page's files and their families' members get one.
+    /// Whether ordering or filtering reads the checklist, so the placements compute every file's.
+    /// A page always computes only its own files' and their families' members' checklists.
     private var ordersByChecklist: Bool {
         chip != nil || sort.column.isChecklist
     }
@@ -135,8 +134,8 @@ struct LibraryBrowseQuery: Hashable, Sendable {
     /// `family_base` ranks family files into `heads`; `family_files` then evaluates `matches`, whose versions bit
     /// needs the head's recording. The outer pass over `files` only joins their results, so a library without
     /// families pays only primary-key joins per file. The CROSS JOINs pin `family_base` to the `tracks_work_id`
-    /// index; without statistics SQLite otherwise scans `files`.
-    private func placedSQL(withChecklist: Bool) -> String {
+    /// index; without statistics SQLite otherwise scans `files`. `families`, a query of family ids, limits the families placed.
+    private func placedSQL(withChecklist: Bool, families: String? = nil) -> String {
         let checklist = LibraryChecklist.alias
         let familyFailing = Self.failingSQL(versions: "live_families.versions", headRecordingKey: "heads.head_recording_key")
         let placedFailing = Self.failingSQL(versions: "families.versions", headRecordingKey: "heads.head_recording_key")
@@ -153,6 +152,9 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         let matchedFiles = narrowsFiles
             ? "matched_files AS MATERIALIZED (SELECT id FROM files WHERE \(fileMatches.joined(separator: " AND "))),\n"
             : ""
+        let liveFamilies = families.map { scope in
+            "SELECT family_id, versions FROM (\(SongFamilyMutation.liveFamiliesSQL)) WHERE family_id IN (\(scope))"
+        } ?? SongFamilyMutation.liveFamiliesSQL
         let checklistFiles = withChecklist ? LibraryChecklist.filesCTEs(scope: filter.predicate) + ",\n" : ""
         let checklistJoin = withChecklist ? LibraryChecklist.joinSQL : ""
         let familyChecklistJoin = withChecklist ? """
@@ -165,7 +167,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         \(checklist).play_count
         """ : ""
         return """
-        WITH \(matchedFiles)\(checklistFiles)live_families AS MATERIALIZED (\(SongFamilyMutation.liveFamiliesSQL)),
+        WITH \(matchedFiles)\(checklistFiles)live_families AS MATERIALIZED (\(liveFamilies)),
         family_base AS MATERIALIZED (
             SELECT files.id, files.membership_revision, files.title, tracks.work_id AS family_id, files.track_id AS recording_id,
                    tracks.musicbrainz_recording_id AS recording_mbid, \(KeeperMarks.recordingKeySQL) AS recording_key,
@@ -203,25 +205,25 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         """
     }
 
-    /// One page of rows with each file's checklist and its family's file counts. Without `ordersByChecklist`
-    /// the checklist is computed only for the page's files and their families' members, after the page is cut.
+    /// The rows for `ids`, in that order, with each file's checklist and its family's file counts. The placements
+    /// already ordered and filtered the files, so only the page's families are placed, through the status scope's
+    /// projection without the search, facets or chip, and only their files get a checklist.
     private func pageSQL() -> String {
         let checklist = LibraryChecklist.alias
         let page = "placed_page"
-        let pageColumns = ["id", "family_id", "family_role", "group_key", "group_id", "sort_key"]
-            .map { column in "placed.\(column)" }.joined(separator: ", ")
         let pageScope = """
         files.id IN (SELECT id FROM \(page) UNION ALL SELECT members.id FROM tracks CROSS JOIN files AS members ON members.track_id = tracks.id
                      WHERE tracks.work_id IN (SELECT family_id FROM \(page)))
         """
-        let pageChecklist = ordersByChecklist ? "" : ",\n" + LibraryChecklist.filesCTEs(scope: "\(filter.predicate) AND \(pageScope)")
+        let pageFamilies = "SELECT tracks.work_id FROM json_each(:page) AS ids JOIN files ON files.id = ids.value JOIN tracks ON tracks.id = files.track_id"
         let failing = Self.failingSQL(versions: "families.versions", headRecordingKey: "heads.head_recording_key")
         let finished = LibraryChecklist.isFinishedSQL(failing: failing)
         return """
-        \(placedSQL(withChecklist: ordersByChecklist)),
+        \(LibraryBrowseQuery(filter: filter).placedSQL(withChecklist: false, families: pageFamilies)),
         \(page) AS MATERIALIZED (
-            SELECT \(pageColumns) FROM placed WHERE \(visibleSQL) ORDER BY \(sort.sql()) LIMIT :limit OFFSET :offset
-        )\(pageChecklist),
+            SELECT ids.key AS position, placed.id, placed.family_id, placed.family_role FROM json_each(:page) AS ids CROSS JOIN placed ON placed.id = ids.value
+        ),
+        \(LibraryChecklist.filesCTEs(scope: "\(filter.predicate) AND \(pageScope)")),
         page_family_counts AS (
             SELECT page_families.family_id, COUNT(\(finished)) AS file_count, SUM(CASE WHEN \(finished) = 0 THEN 1 ELSE 0 END) AS needing_work
             FROM (SELECT DISTINCT family_id FROM \(page) WHERE family_id IS NOT NULL) AS page_families
@@ -242,36 +244,12 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         LEFT JOIN heads ON heads.family_id = \(page).family_id LEFT JOIN families ON families.family_id = \(page).family_id
         LEFT JOIN checklist_files AS \(checklist) ON \(checklist).file_id = \(page).id
         LEFT JOIN page_family_counts ON page_family_counts.family_id = \(page).family_id
-        ORDER BY \(sort.sql(page))
+        ORDER BY \(page).position
         """
     }
 
-    private var visibleSQL: String {
-        let revealed = isFiltering ? "1" : "placed.family_id IN (SELECT value FROM json_each(:expanded))"
-        return "placed.in_scope AND (placed.family_role != \(LibraryFamilyRole.alternate.rawValue) OR \(revealed))"
-    }
-
-    private func orderedSQL(_ columns: String) -> String {
-        """
-        \(placedSQL(withChecklist: ordersByChecklist))
-        SELECT \(columns) FROM placed
-        WHERE \(visibleSQL) ORDER BY \(sort.sql())
-        """
-    }
-
-    private func page(_ range: Range<Int>) throws -> StatementArguments {
-        guard range.lowerBound >= 0 else { throw PagingError.invalidRange }
-        var page = try arguments()
-        page += ["limit": range.count, "offset": range.lowerBound]
-        return page
-    }
-
-    /// Visible rows, the rows Select all would select, and whether any family is shown.
-    func counts(in database: GRDB.Database) throws -> (visible: Int, selectAll: Int, hasFamilies: Bool) {
-        try counts(of: placements(in: database))
-    }
-
-    /// The same counts from placements already read, so a snapshot runs the projection once for them all.
+    /// Visible rows, the rows Select all would select, and whether any family is shown, from placements
+    /// already read, so a snapshot runs the projection once for them all.
     func counts(of placements: [LibraryFamilyPlacement]) -> (visible: Int, selectAll: Int, hasFamilies: Bool) {
         var visible = 0
         var selectAll = 0
@@ -288,8 +266,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         return (visible, selectAll, hasFamilies)
     }
 
-    /// A counted file shows as a row unless it is the alternate of a family that is neither expanded nor filtered,
-    /// as `visibleSQL` pages them.
+    /// A counted file shows as a row unless it is the alternate of a family that is neither expanded nor filtered.
     func isVisible(_ placement: LibraryFamilyPlacement) -> Bool {
         !placement.isHiddenByFilter
             && (placement.role != .alternate || isFiltering || placement.familyId.map(expandedFamilies.contains) == true)
@@ -318,32 +295,23 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         })
     }
 
-    func rows(in database: GRDB.Database, range: Range<Int>) throws -> [BrowserRow] {
-        try BrowserRow.fetchAll(database, sql: pageSQL(), arguments: page(range))
+    /// The rows for `ids`, in that order. Every id must be a visible placement read at the same snapshot.
+    func rows(in database: GRDB.Database, ids: [Int64]) throws -> [BrowserRow] {
+        let page = "[" + ids.map(String.init).joined(separator: ",") + "]"
+        let rows = try BrowserRow.fetchAll(database, sql: pageSQL(), arguments: ["page": page])
+        guard rows.map(\.id) == ids else { throw PagingError.incompletePage }
+        return rows
     }
 
-    func identities(in database: GRDB.Database, range: Range<Int>) throws -> [PagedIdentity<Int64>] {
-        try GRDB.Row.fetchAll(database, sql: orderedSQL("placed.id, placed.membership_revision") + " LIMIT :limit OFFSET :offset", arguments: page(range))
-            .map { row in .init(id: row["id"], revision: row["membership_revision"]) }
-    }
-
-    func index(of id: Int64, in database: GRDB.Database) throws -> Int? {
-        var lookup = try arguments()
-        lookup += ["id": id]
-        return try Int.fetchOne(database, sql: """
-        SELECT position FROM (\(orderedSQL("placed.id, ROW_NUMBER() OVER (ORDER BY \(sort.sql())) - 1 AS position"))) WHERE id = :id
-        """, arguments: lookup)
-    }
-
-    /// Every counted file's family placement, in id order, with the members
+    /// Every counted file's family placement, in display order, with the members
     /// of shown families that the search or filters hide, so a selection of them stays
-    /// in scope for family commands.
+    /// in scope for family commands. The visible ones, in this order, are the pages.
     /// Read through a cursor by column position: every snapshot opens with this read, over every file.
     func placements(in database: GRDB.Database) throws -> [LibraryFamilyPlacement] {
         let rows = try GRDB.Row.fetchCursor(database, sql: """
         \(placedSQL(withChecklist: ordersByChecklist))
         SELECT id, membership_revision, family_id, family_role, available, NOT in_scope AS hidden_by_filter FROM placed
-        WHERE in_scope OR (family_role = \(LibraryFamilyRole.alternate.rawValue) AND family_matched) ORDER BY id
+        WHERE in_scope OR (family_role = \(LibraryFamilyRole.alternate.rawValue) AND family_matched) ORDER BY \(sort.sql())
         """, arguments: arguments())
         var placements: [LibraryFamilyPlacement] = []
         while let row = try rows.next() {

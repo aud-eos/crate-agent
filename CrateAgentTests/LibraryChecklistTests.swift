@@ -60,18 +60,25 @@ final class LibraryChecklistTests: XCTestCase {
         XCTAssertEqual(rows["Unread"]?.stillNeedsCount, 2)
         XCTAssertEqual(rows["Uncrated"]?.stillNeedsCount, 1)
 
-        // A checklist sort computes every file's checklist before the page; other queries compute only the page's.
+        // A chip filters on every file's checklist; a page shows only its own files' checklists.
         let collapsed = try await self.rows(LibraryBrowseQuery())
         let families = Set(collapsed.compactMap { row in row.familyRole == .main ? row.familyId : nil })
-        let pageScoped = try await checklistsByTitle(LibraryBrowseQuery(expandedFamilies: families))
-        let allFiles = try await checklistsByTitle(LibraryBrowseQuery(sort: .init(column: .stillNeeds), expandedFamilies: families))
-        XCTAssertEqual(pageScoped.count, 31)
-        XCTAssertEqual(pageScoped, allFiles)
-        let collapsedAllFiles = try await self.rows(LibraryBrowseQuery(sort: .init(column: .stillNeeds)))
-        let pageMain = collapsed.first { row in row.title == "V1" }
-        let allFilesMain = collapsedAllFiles.first { row in row.title == "V1" }
-        XCTAssertEqual(pageMain?.familyFileCount, allFilesMain?.familyFileCount)
-        XCTAssertEqual(pageMain?.familyFilesNeedingWork, allFilesMain?.familyFilesNeedingWork)
+        let expanded = try await self.rows(LibraryBrowseQuery(expandedFamilies: families))
+        XCTAssertEqual(expanded.count, 31)
+        let pageScoped = expanded.filter { row in row.familyRole != .main }
+        for chip in ChecklistChip.allCases {
+            let shown = try pageScoped.filter { row in
+                let checklist = try XCTUnwrap(row.checklist())
+                return switch chip.match {
+                case .needsWork: !checklist.isFinished
+                case .finished: checklist.isFinished
+                case .neverPlayed: row.playCount == 0
+                case let .failing(item): checklist.failing.contains(item)
+                }
+            }
+            let filtered = try await titles(LibraryBrowseQuery(chip: chip))
+            XCTAssertEqual(filtered.sorted(), shown.map { row in row.title ?? row.path }.sorted(), chip.rawValue)
+        }
     }
 
     func testRetiredFilesHaveNoChecklistAndCountTowardNoChip() async throws {
