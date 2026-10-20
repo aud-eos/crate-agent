@@ -32,6 +32,8 @@ public final class AppServices: ObservableObject {
     public let libraryScanner: LibraryScanner
     public let importCoordinator: ImportCoordinator
     public let fingerprintWorker: FingerprintWorker
+    let seratoAnalysisWorker: SeratoAnalysisWorker
+    let checklistDuplicateRefresher: ChecklistDuplicateRefresher
     public let duplicateEvidenceVerifier: DuplicateEvidenceVerifier
     let recordingIdentity: RecordingIdentityService
     public let activityLog: ActivityLog
@@ -41,6 +43,7 @@ public final class AppServices: ObservableObject {
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
     let playCountService: SeratoPlayCountService
+    let libraryFactsService: SeratoLibraryFactsService
     let musicBrainzWorkBackfill: MusicBrainzWorkBackfill
     @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
     @Published private(set) var syncPhase: SeratoLibrarySyncSession.SyncPhase?
@@ -114,6 +117,10 @@ public final class AppServices: ObservableObject {
     /// via @Published; nil before the worker has emitted anything.
     @Published public private(set) var fingerprintProgress: FingerprintWorker.Progress?
 
+    /// Latest report from the Serato cue-point worker: coverage after each
+    /// pass, or why it stopped. Nil before its first pass finishes.
+    @Published private(set) var seratoAnalysisStatus: SeratoAnalysisWorker.Status?
+
     private let seratoSyncCoordinator: SeratoSyncCoordinator
     private let fsEventsWatcher: FSEventsWatcher
     private var filesystemEventsTask: Task<Void, Never>?
@@ -121,12 +128,14 @@ public final class AppServices: ObservableObject {
     private let startupCoordinator: LibraryStartupCoordinator
     private let filesystemContinuation: AsyncStream<FilesystemEventBatch>.Continuation
     private var retryTask: Task<Void, Never>?
+    /// Awaited before stopping, so a launch-time start can't land after the stop.
+    private var analysisStart: Task<Void, Never>?
     let readiness: LibrarySyncReadiness
     private var filesystemDeliveryStopped = false
     private var fingerprintMilestones = FingerprintActivityMilestones()
     private var scanMilestones = ScanActivityMilestones()
     private var scanActivitySubscription: AnyCancellable?
-    private var playCountSubscription: AnyCancellable?
+    private var seratoFactsSubscription: AnyCancellable?
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -195,6 +204,8 @@ public final class AppServices: ObservableObject {
 
         let worker = FingerprintWorker(database: database, readiness: readiness)
         fingerprintWorker = worker
+        seratoAnalysisWorker = SeratoAnalysisWorker(database: database, readiness: readiness)
+        checklistDuplicateRefresher = ChecklistDuplicateRefresher(database: database)
 
         // Shared between AcoustID and MusicBrainz per Ruling G / the
         // design plan: MusicBrainz requires ≤1 request/second, and
@@ -233,6 +244,7 @@ public final class AppServices: ObservableObject {
                                                checkpointStore: SyncCheckpointStore(database: database), watchRoots: watchConfiguration.watchedPaths)
         syncSession = session
         playCountService = SeratoPlayCountService(database: database, seratoLocator: seratoLocator, watchdog: seratoWatchdog)
+        libraryFactsService = SeratoLibraryFactsService(database: database, seratoLocator: seratoLocator, watchdog: seratoWatchdog)
         let resumeFromEventId = watchConfiguration.resumeEventID {
             UserPreferences.lastFSEventId(forWatchedPath: $0)
         }
@@ -294,10 +306,11 @@ public final class AppServices: ObservableObject {
             guard let self else { return }
             logActivity(scanMilestones.entries(for: progress), category: .scan)
         }
-        // A finished sync means Serato is closed; the service re-reads History only if it or the library's paths changed.
-        playCountSubscription = session.$state.sink { [weak self] state in
-            guard case .ready = state, let service = self?.playCountService else { return }
-            Task { await service.refresh() }
+        // A finished sync means Serato is closed; each service re-reads its Serato files only if they or the library's paths changed.
+        seratoFactsSubscription = session.$state.sink { [weak self] state in
+            guard case .ready = state, let playCounts = self?.playCountService, let libraryFacts = self?.libraryFactsService else { return }
+            Task { await playCounts.refresh() }
+            Task { await libraryFacts.refresh() }
         }
         session.$phase.assign(to: &$syncPhase)
         session.$fileInfoFailures.assign(to: &$syncFileInfoFailures)
@@ -307,6 +320,13 @@ public final class AppServices: ObservableObject {
         )
 
         startFingerprinting()
+        let analysisWorker = seratoAnalysisWorker
+        analysisStart = Task {
+            await analysisWorker.start { [weak self] status in
+                Task { @MainActor in self?.seratoAnalysisStatus = status }
+            }
+        }
+        checklistDuplicateRefresher.start()
         startup.start()
     }
 
@@ -318,6 +338,14 @@ public final class AppServices: ObservableObject {
         fsEventsWatcher.stop()
         let worker = fingerprintWorker
         Task { await worker.stop() }
+        let analysisWorker = seratoAnalysisWorker
+        let analysisStart = analysisStart
+        Task {
+            await analysisStart?.value
+            await analysisWorker.stop()
+        }
+        let duplicateRefresher = checklistDuplicateRefresher
+        Task { @MainActor in duplicateRefresher.stop() }
     }
 
     func retrySync() {
@@ -370,11 +398,11 @@ public final class AppServices: ObservableObject {
                 await worker.waitUntilStopped()
             }
             guard let self else { return }
-            await worker.start { progress in
-                Task { @MainActor [weak self] in
+            await worker.start { [weak self] progress in
+                Task { @MainActor in
                     guard let self else { return }
-                    fingerprintProgress = progress
-                    logActivity(fingerprintMilestones.entries(for: progress), category: .fingerprint)
+                    self.fingerprintProgress = progress
+                    self.logActivity(self.fingerprintMilestones.entries(for: progress), category: .fingerprint)
                 }
             }
         }

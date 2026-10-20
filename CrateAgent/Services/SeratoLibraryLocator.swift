@@ -50,6 +50,9 @@ public struct SeratoLibraryLocator: Sendable, Equatable {
         seratoDirectory.appendingPathComponent("History", isDirectory: true)
     }
 
+    static let crateExtension = "crate"
+    static let smartCrateExtension = "scrate"
+
     public var subcratesDirectoryUrl: URL {
         seratoDirectory.appendingPathComponent("Subcrates", isDirectory: true)
     }
@@ -71,11 +74,11 @@ public struct SeratoLibraryLocator: Sendable, Equatable {
     public func enumerateCrateFiles() throws -> [URL] {
         let regular = try enumerateFiles(
             in: subcratesDirectoryUrl,
-            extension: "crate"
+            extension: Self.crateExtension
         )
         let smart = try enumerateFiles(
             in: smartCratesDirectoryUrl,
-            extension: "scrate"
+            extension: Self.smartCrateExtension
         )
         return (regular + smart).sorted(by: { lhs, rhs in lhs.path < rhs.path })
     }

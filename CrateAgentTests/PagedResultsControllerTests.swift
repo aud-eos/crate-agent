@@ -40,6 +40,22 @@ final class PagedResultsControllerTests: XCTestCase {
         XCTAssertNil(controller.error)
     }
 
+    func testRefreshKeepsShownRowsUntilTheNewSnapshotsViewportLoads() async {
+        let shown = PagedQueryFixture(rowCount: 30, signature: "old")
+        let controller = PagedResultsController<PagedQueryFixture>()
+        await controller.open(shown)
+        controller.setViewport(0 ..< 10)
+        await pagingEventually { controller.row(at: 0) != nil }
+        let refreshed = PagedQueryFixture(rowCount: 30, signature: "new")
+        await refreshed.holdPages()
+        await controller.open(refreshed)
+        controller.setViewport(0 ..< 10)
+        await pagingEventually { await !refreshed.requestedRanges().isEmpty }
+        XCTAssertEqual(controller.row(at: 0)?.name, "old-0")
+        await refreshed.releaseAll()
+        await pagingEventually { controller.row(at: 0)?.name == "new-0" }
+    }
+
     func testCountAndPageFailuresStayVisibleUntilRetry() async {
         let source = PagedQueryFixture(rowCount: 12, signature: "retry")
         let controller = PagedResultsController<PagedQueryFixture>()

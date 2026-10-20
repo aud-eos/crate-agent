@@ -356,6 +356,7 @@ dependencies = [
 name = "crate-agent-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "fingerprint-core",
  "lofty",
  "serde",

@@ -14,11 +14,22 @@ final class LibraryBrowserModel: ObservableObject {
     @Published var differentRecordingsOffer: LibraryDifferentRecordingsOffer?
     /// Selection and eligibility of each visible family's members, including collapsed alternates.
     @Published private(set) var familyStates: [Int64: LibraryFamilyState] = [:]
+    /// How many files each chip matches in the current scope without the chip; loaded after each snapshot's first page.
+    /// Nil until the counts for the current search, status and facets have loaded.
+    @Published private(set) var chipCounts: [ChecklistChip: ChecklistChipCount]?
+    /// The genres and keys the facets can choose from in the status scope; loaded after each snapshot's first page.
+    @Published private(set) var facetOptions: LibraryFacetOptions?
+    /// Whether Serato History has ever been read, from its persisted stamp; nil until the first snapshot loads it.
+    /// Never played and My plays are unknown until it is true.
+    @Published private(set) var playCountsKnown: Bool?
     /// Changes whenever a family row's selection or disclosure display changes.
     @Published private(set) var familyRevision: UInt64 = 0
     private let selectionStore: LibrarySelectionStore
     private var familyMembers: [Int64: [LibraryFamilyPlacement]] = [:]
     private var familyTask: Task<Void, Never>?
+    private var chipCountTask: Task<Void, Never>?
+    /// The snapshot whose counts wait for its viewport pages, so the counts query never queues ahead of them.
+    private var countsAwaitingViewport: LibraryPagedSnapshot?
     private var loadedFamilies: (snapshot: LibraryPagedSnapshot, familyIDs: Set<Int64>)?
     private let database: LibraryDatabase
     private let pool: DatabasePool
@@ -44,6 +55,7 @@ final class LibraryBrowserModel: ObservableObject {
         }.store(in: &subscriptions)
         results.$updateID.dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in
             self?.loadFamilyMembers()
+            self?.loadChipCountsOnceViewportLoads()
         }.store(in: &subscriptions)
         selection.$visibleSelectedIDs.receive(on: RunLoop.main).sink { [weak self] selected in
             self?.updateFamilyStates(selected: selected)
@@ -87,7 +99,7 @@ final class LibraryBrowserModel: ObservableObject {
         var states: [Int64: LibraryFamilyState] = [:]
         for (familyID, members) in familyMembers {
             states[familyID] = LibraryFamilyState(members: members, selected: selected, isExpanded: query.expandedFamilies.contains(familyID),
-                                                  isSearching: query.isSearching)
+                                                  isFiltering: query.isFiltering)
         }
         guard states != familyStates else { return }
         familyStates = states
@@ -109,7 +121,7 @@ final class LibraryBrowserModel: ObservableObject {
     /// alternate collapses its family onto the main row. Returns false when nothing
     /// changes, so the key keeps its usual meaning.
     func disclose(_ expand: Bool, row rowID: Int64) -> Bool {
-        guard !query.isSearching, let row = results.cachedRows.first(where: { row in row.id == rowID }),
+        guard !query.isFiltering, let row = results.cachedRows.first(where: { row in row.id == rowID }),
               let familyID = row.familyId, let state = familyStates[familyID]
         else { return false }
         switch row.familyRole {
@@ -166,6 +178,60 @@ final class LibraryBrowserModel: ObservableObject {
         await performFamilyAction(offer.action, on: offer.row, using: offer.actions, asDifferentRecordings: true)
     }
 
+    /// Shows only the files `chip` matches, or every file for nil.
+    func setChip(_ chip: ChecklistChip?) {
+        var updated = query
+        updated.chip = chip
+        apply(updated, reset: true)
+    }
+
+    /// Shows only the files `facets` match. The compatible key matches the stored key strings
+    /// the loaded options resolve it to; they are resolved again whenever the options reload.
+    func setFacets(_ facets: LibraryFacets) {
+        var updated = query
+        updated.facets = resolved(facets)
+        apply(updated, reset: true)
+    }
+
+    private func resolved(_ facets: LibraryFacets) -> LibraryFacets {
+        var resolved = facets
+        resolved.keyValues = facets.compatibleKey.map { key in facetOptions?.keyValues(compatibleWith: key) ?? [] } ?? []
+        return resolved
+    }
+
+    /// Counts and facet options share the snapshot's one connection, so they start only once the viewport's pages have loaded.
+    private func loadChipCountsOnceViewportLoads() {
+        guard let snapshot = countsAwaitingViewport, results.snapshot === snapshot, results.isViewportLoaded else { return }
+        countsAwaitingViewport = nil
+        loadChipCounts(for: snapshot)
+    }
+
+    /// Counts and facet options load in their own task, after the page; a newer snapshot cancels them.
+    private func loadChipCounts(for snapshot: LibraryPagedSnapshot) {
+        chipCountTask?.cancel()
+        chipCountTask = Task { [weak self] in
+            do {
+                let counts = try await snapshot.chipCounts()
+                let options = try await snapshot.facetOptions()
+                let playsKnown = try await snapshot.playCountsKnown()
+                guard let self, !Task.isCancelled, results.snapshot === snapshot else { return }
+                chipCounts = counts
+                facetOptions = options
+                playCountsKnown = playsKnown
+                let facets = resolved(query.facets)
+                if facets != query.facets {
+                    var updated = query
+                    updated.facets = facets
+                    apply(updated, reset: false)
+                }
+            } catch is CancellationError {
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
     func setIncludeAlternates(_ include: Bool) {
         var updated = query
         updated.includeAlternates = include
@@ -178,7 +244,7 @@ final class LibraryBrowserModel: ObservableObject {
         selection.set(state.eligibleAlternates, selected: selected)
     }
 
-    /// Selects or deselects the processable members of the family that the search hides.
+    /// Selects or deselects the processable members of the family that the search or filters hide.
     func setHiddenMembersSelected(_ selected: Bool, family familyID: Int64) {
         guard let state = familyStates[familyID] else { return }
         selection.set(state.hiddenEligible, selected: selected)
@@ -224,6 +290,9 @@ final class LibraryBrowserModel: ObservableObject {
 
     private func apply(_ query: LibraryBrowseQuery, reset: Bool) {
         guard self.query != query else { return }
+        if query.filter != self.query.filter || query.search != self.query.search || query.facets != self.query.facets {
+            chipCounts = nil
+        }
         self.query = query
         queryVersion &+= 1
         if reset {
@@ -263,6 +332,9 @@ final class LibraryBrowserModel: ObservableObject {
         refreshTask = nil
         familyTask?.cancel()
         familyTask = nil
+        chipCountTask?.cancel()
+        chipCountTask = nil
+        countsAwaitingViewport = nil
         familyMembers = [:]
         loadedFamilies = nil
         dirty = false
@@ -310,6 +382,9 @@ final class LibraryBrowserModel: ObservableObject {
                     guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }
                     selection.updateScope(snapshot, visibleIdentities: trackedIdentities)
                     selection.reconcile(in: snapshot)
+                    chipCountTask?.cancel()
+                    countsAwaitingViewport = snapshot
+                    loadChipCountsOnceViewportLoads()
                     error = nil
                 } catch {
                     guard active, session == requestedSession, version == queryVersion, !Task.isCancelled else { continue }

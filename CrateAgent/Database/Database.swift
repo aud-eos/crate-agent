@@ -143,6 +143,9 @@ public final class LibraryDatabase {
         AddMusicBrainzWorkMigration.register(in: &migrator)
         AddFilesProcessableIndexMigration.register(in: &migrator)
         AddSeratoRemovalCapturesMigration.register(in: &migrator)
+        AddChecklistFactsMigration.register(in: &migrator)
+        AddSeratoAnalysisMigration.register(in: &migrator)
+        AddKeeperMarksMigration.register(in: &migrator)
         return migrator
     }
 }

@@ -111,6 +111,156 @@ and error/retry races, and native table tests cover deferred selection and conte
 IDs independently of Library's row type.
 
 
+## Library checklist fixture
+
+The Library readiness checklist (Still needs, chips, genre/BPM/key filters, Date
+added and My plays sorts, keeper) is measured on the same 30,000-file fixtures as
+the paged Library and incremental startup:
+
+- `LibraryPagingTests` builds the 30,000-row WAL database (26,000 rows once song
+  families group). `testSongFamilyProjectionStaysWithinPagingBudgetsAtThirtyThousandFiles`
+  keeps the song-family metrics; the checklist test reports `CHECKLIST_PAGING_METRICS`
+  for every sort and chip plus search and the combined facets, each as a page and a
+  count query.
+- `LibraryStartupPerformanceTests` uses the 30,000 real WAV files.
+  `CHECKLIST_FACTS_WRITER_HOLD` times the first Serato facts refresh (30,000 V2
+  records, 20 crates of 1,000 paths) against a 5 ms writer probe.
+  `CHECKLIST_BACKGROUND` times Library render and navigation while the cue-point
+  backfill, a facts refresh and a 30,000-file duplicate-members refresh all run.
+
+Every wait and render must stay under 500 ms; the asserts are unchanged.
+Run with the optimized **Test** settings above, adding
+`-only-testing:CrateAgentTests/LibraryPagingTests` for the paging suite.
+
+Reference run on 2026-10-19 (native arm64, optimized settings, one xcodebuild at a
+time). Baseline is `daeaa4a` (before the checklist); final is `7d00f75`.
+
+| Song-family metric | Baseline | Final (median of 4) | Change |
+| --- | ---: | ---: | ---: |
+| Ungrouped count | 14.7 ms | 14.2 ms | -4% |
+| Ungrouped first page | 12.9 ms | 18.2 ms | +41% |
+| Ungrouped distant page | 21.8 ms | 22.2 ms | +2% |
+| Grouped count | 37.4 ms | 37.5 ms | 0% |
+| Grouped first page | 34.9 ms | 41.9 ms | +20% |
+| Grouped distant page | 43.1 ms | 44.9 ms | +4% |
+| Expand | 83.9 ms | 90.1 ms | +7% |
+| Collapse | 84.7 ms | 90.6 ms | +7% |
+| Include alternates | 82.3 ms | 90.9 ms | +10% |
+| Search | 115.5 ms | 124.1 ms | +7% |
+
+The first-page regressions are the per-file checklist columns now computed in the
+page query. Both pages stay far below the 500 ms budget, so the cost is accepted.
+
+| Startup measurement | Baseline | Final |
+| --- | ---: | ---: |
+| Full validation | 103.9 s | 100.6 s (102.4 s in the first run) |
+| Unchanged restart ready | 118 ms | 116 ms |
+| Upgrade backfill | 14.3 s | 14.2 s |
+| Upgrade backfill longest writer wait | 59 ms | 56 ms |
+| Production content render during held sync | 75 ms | 79 ms |
+| Navigation during held sync | 38 ms | 20 ms |
+| Longest writer wait while publishing | 19.6 ms | 28.3 ms |
+
+New checklist measurements (final, `7d00f75`):
+
+- `CHECKLIST_PAGING_METRICS`: each sort or chip page takes 218-307 ms and its
+  counts 120-170 ms (for example Needs work: page 273 ms, counts 122 ms; Still
+  needs sort: page 305 ms, counts 128 ms; the combined facets: page 305 ms, counts
+  170 ms). Facet option lookup takes 9 ms.
+- `CHECKLIST_FACTS_WRITER_HOLD`: 141 probes, longest writer wait 14 ms, refresh
+  1.09 s.
+- `CHECKLIST_BACKGROUND`: render 436 ms, navigation 4 ms, longest writer wait
+  15 ms, 5,200 files analysed and duplicate refresh 1.33 s.
+
+The first full-class run on this date measured `CHECKLIST_BACKGROUND` render at
+500.6 ms and failed the 500 ms assert by 0.6 ms while the machine was busy with
+other work (load average about 4). The class rerun alone passed at 436 ms.
+
+That render waited on two things. The throttled checklist observation refreshes
+Library on the very analysis batch commit the test waits for, and a non-reset
+refresh cleared the shown pages, so row 0 stayed empty until the new snapshot's
+page arrived. That page then queued behind the chip counts (a 120-170 ms query),
+facet options and History-stamp read on the snapshot's one connection. Two fixes
+followed: a non-reset refresh keeps the previous pages visible until the new
+snapshot's viewport pages load, and counts start only after those pages load.
+`DatabaseSnapshotPool` would allow concurrent reads at one snapshot, but it can't
+open on a WAL file no transaction has written since launch, so it wasn't used.
+
+Same-day runs of `LibraryStartupPerformanceTests` alone on 2026-10-19,
+alternating a baseline worktree at `3dcb14e` with the fixed build (load average
+4-14 from other work):
+
+| Run | `3dcb14e` render | Fixed render |
+| --- | ---: | ---: |
+| 1 | 87 ms | 103 ms |
+| 2 | 669 ms (failed the assert) | 88 ms |
+| 3 | 466 ms | 102 ms (load average 84; the test's separate 5 s wait for the first analysis batch timed out) |
+
+The full `make test-swift` run of the fixed build measured render 85 ms,
+navigation 57 ms, longest writer wait 32 ms, and `CHECKLIST_FACTS_WRITER_HOLD`
+longest wait 18 ms. The baseline was fast only when the refresh missed the render
+window. In the alternating runs, navigation stayed 6-39 ms and the longest writer
+wait 16-44 ms. The render clock stops at the first visible row, which during a
+background refresh can be a retained row from the previous snapshot, so these
+numbers measure rows on screen, not fresh-page latency. The 30,000-file
+`CHECKLIST_PAGING_METRICS` matched `3dcb14e` within a few milliseconds (for
+example Still needs sort: page 322 ms, counts 130 ms; facet options 8 ms).
+
+### One projection per interaction
+
+CI on PR #277 (a GitHub macOS runner, about 1.6 times slower than the reference
+Mac) failed `testChecklistSortFilterAndCountsStayWithinBudgetsAtThirtyThousandFiles`:
+the search with Needs work took 519 ms against the 500 ms budget, and every other
+chip and checklist sort page took 372-490 ms. Profiling the 30,000-file fixture
+with `EXPLAIN QUERY PLAN` and per-CTE timings showed the cause. A measured page is
+the snapshot's placements read plus its first page, and with a chip or checklist
+sort both statements ran the whole projection with every file's checklist (about
+140 ms each). Within one run the checklist CTEs took about 70 ms: primary-key
+fact joins 16 ms, blank-metadata tests 11 ms, crate and lossless tests 6 ms each,
+plus materialization and three automatic indexes over `checklist_files`. No
+index or query-plan change saved more than about 5 ms.
+
+The placements read now returns files in display order, and the snapshot keeps
+the visible order in memory. Pages, `index(of:)` and `identities(in:)` read it
+there. The page query fetches only the page's ids, places only the page's
+families and computes only their checklists. Every interaction runs the
+projection once, and the checklist rules are unchanged. Opening the plain view
+now sorts every placement instead of reading them in id order, so the count
+step costs 20-30 ms more, but its pages no longer recompute the family projection.
+
+Quiet runs on 2026-10-19 (`b692493`, then the change), optimized settings:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Still needs sort page | 322 ms | 212 ms |
+| Date added sort page | 284 ms | 219 ms |
+| My plays sort page | 278 ms | 167 ms |
+| Needs work chip page | 292 ms | 165 ms |
+| Other chip pages | 221-275 ms | 129-148 ms |
+| Search with Needs work page | 318 ms | 168 ms |
+| All facets page | 299 ms | 147 ms |
+| Chip counts (query unchanged) | 120-162 ms | 120-161 ms |
+
+Back-to-back runs on 2026-10-20 at load average about 5, before then after:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Checklist sort pages | 300-359 ms | 183-242 ms |
+| Chip pages | 232-311 ms | 139-174 ms |
+| Search with Needs work page | 340 ms | 175 ms |
+| Ungrouped count / first page / distant page | 31 / 21 / 26 ms | 52 / 8 / 8 ms |
+| Grouped count / first page / distant page | 60 / 48 / 50 ms | 79 / 13 / 12 ms |
+| Expand / collapse / include alternates | 147 / 144 / 145 ms | 125 / 123 / 133 ms |
+| Song-family search | 162 ms | 175 ms |
+
+The full `make test-swift` run of the change measured the same checklist pages
+(136-218 ms). Its `testThirtyThousandFileCheckpointRestart` failed with a 1,072 s
+writer wait during an overnight stall of the machine; run alone, it passed
+(`CHECKLIST_FACTS_WRITER_HOLD` longest wait 17 ms, `CHECKLIST_BACKGROUND` render
+97 ms, navigation 28 ms).
+
+On-screen smoke checks for the running app are in the PR description.
+
 ## Duplicate scan fixture
 
 `DuplicateScanPerformanceTests` builds a temporary WAL database with 30,000

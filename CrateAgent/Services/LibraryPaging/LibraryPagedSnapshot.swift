@@ -5,23 +5,24 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
     typealias Row = BrowserRow
     nonisolated let signature: LibraryBrowseQuery
     private let reader: DatabaseSnapshot
-    private let total: Int
     private let selectAllTotal: Int
     /// Whether any family main row is in scope; Library hides the family columns otherwise.
     nonisolated let hasFamilies: Bool
-    /// Read once when the snapshot opens: the counts, selection scopes and
-    /// family members all come from it, so one interaction runs the family
-    /// projection for these and once more for its page (#258).
+    /// Read once when the snapshot opens, in id order: the counts, selection scopes and
+    /// family members all come from it (#258).
     private let placements: [LibraryFamilyPlacement]
+    /// The visible placements in display order, from the same read, so a page reads
+    /// only its own rows and never runs the projection over every file again.
+    private let visible: [PagedIdentity<Int64>]
     private var cachedSelectAll: [LibraryFamilyPlacement]?
     private var cachedFamilyMembers: [Int64: [LibraryFamilyPlacement]]?
 
-    private init(reader: DatabaseSnapshot, query: LibraryBrowseQuery, placements: [LibraryFamilyPlacement]) {
+    private init(reader: DatabaseSnapshot, query: LibraryBrowseQuery, placements ordered: [LibraryFamilyPlacement]) {
         self.reader = reader
         signature = query
-        self.placements = placements
-        let counts = query.counts(of: placements)
-        total = counts.visible
+        placements = ordered.sorted { first, second in first.identity.id < second.identity.id }
+        visible = ordered.filter(query.isVisible).map(\.identity)
+        let counts = query.counts(of: ordered)
         selectAllTotal = counts.selectAll
         hasFamilies = counts.hasFamilies
     }
@@ -35,7 +36,7 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
     }
 
     func count() -> Int {
-        total
+        visible.count
     }
 
     func selectAllCount() -> Int {
@@ -44,17 +45,35 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
 
     func rows(in range: Range<Int>) throws -> [BrowserRow] {
         try Task.checkCancellation()
-        guard range.lowerBound >= 0, range.upperBound <= total else { throw PagingError.invalidRange }
-        return try reader.read { database in try signature.rows(in: database, range: range) }
+        guard range.lowerBound >= 0, range.upperBound <= visible.count else { throw PagingError.invalidRange }
+        let ids = visible[range].map(\.id)
+        return try reader.read { database in try signature.rows(in: database, ids: ids) }
+    }
+
+    /// How many files each chip matches in the scope this snapshot shows without its chip.
+    func chipCounts() throws -> [ChecklistChip: ChecklistChipCount] {
+        try Task.checkCancellation()
+        return try reader.read { database in try signature.chipCounts(in: database) }
+    }
+
+    /// Whether Serato History has been read at least once, so play counts and Never played are known.
+    func playCountsKnown() throws -> Bool {
+        try Task.checkCancellation()
+        return try reader.read { database in try SeratoLibraryFacts.hasStamp(.history, in: database) }
+    }
+
+    /// The genres and keys the facets can choose from in this snapshot's status scope.
+    func facetOptions() throws -> LibraryFacetOptions {
+        try Task.checkCancellation()
+        return try reader.read { database in try LibraryFacetOptions.load(in: database, filter: signature.filter) }
     }
 
     func index(of id: Int64) throws -> Int? {
-        try Task.checkCancellation()
-        return try reader.read { database in try signature.index(of: id, in: database) }
+        visible.firstIndex { identity in identity.id == id }
     }
 
     /// Every counted file, including alternates of collapsed families and
-    /// shown families' members a search hides, so those selections stay in scope.
+    /// shown families' members a search or filter hides, so those selections stay in scope.
     func identities(after id: Int64?, limit: Int) throws -> [PagedIdentity<Int64>] {
         try slice(placements, after: id, limit: limit)
     }
@@ -80,9 +99,8 @@ actor LibraryPagedSnapshot: PagedQuerySnapshot {
     }
 
     func identities(in range: Range<Int>) throws -> [PagedIdentity<Int64>] {
-        try Task.checkCancellation()
-        guard range.lowerBound >= 0, range.upperBound <= total else { throw PagingError.invalidRange }
-        return try reader.read { database in try signature.identities(in: database, range: range) }
+        guard range.lowerBound >= 0, range.upperBound <= visible.count else { throw PagingError.invalidRange }
+        return Array(visible[range])
     }
 
     nonisolated func identity(for row: BrowserRow) -> PagedIdentity<Int64> {

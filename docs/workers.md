@@ -20,6 +20,11 @@ that are easy to confuse:
   Byte-twin copying uses only usable fingerprints, so an invalid result is never
   copied to another file. A decoder that returns no hashes is recorded as a failure.
 - **Deferred Serato writes**: the durable write queue, with why it is waiting.
+- **Library checklist facts**: the Serato crates and beatgrid locks read from
+  Serato's database, cue points read from each file's Serato tags (read,
+  pending, failed and unsupported counts, and the files that couldn't be read,
+  faults before unsupported formats), and the duplicate checklist. Each shows
+  its failure in red. See the [library checklist](library-checklist.md#where-the-facts-come-from).
 - **MusicBrainz works**: **Record Works** looks up the MusicBrainz work of each
   matched recording that has none, for [Find Versions](song-families.md#musicbrainz-works).
 

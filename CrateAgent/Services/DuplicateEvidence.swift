@@ -176,15 +176,39 @@ enum DuplicateCheckError: LocalizedError, Equatable {
     }
 }
 
-enum DuplicateDigestStore {
-    /// Joins each file to its digest row while the indexed size, mtime and
-    /// inode match; the nanosecond mtime and ctime are compared with the
-    /// live file by `DuplicateEvidenceVerifier` and the cleanup boundary.
-    static func freshJoinSQL(_ kind: DigestKind, as alias: String = "digest") -> String {
+/// A per-file cache keyed by `file_id` and stamped with the `DigestBasis`
+/// it was computed from.
+enum DerivedFileCache {
+    /// Joins each file to its `table` row while the indexed size, mtime and
+    /// inode match; a row computed for other bytes reads as absent.
+    static func freshJoinSQL(table: String, alias: String) -> String {
         """
-        LEFT JOIN \(kind.table) AS \(alias) ON \(alias).file_id = files.id
+        LEFT JOIN \(table) AS \(alias) ON \(alias).file_id = files.id
           AND \(alias).file_size = files.file_size AND \(alias).mtime = files.mtime AND \(alias).inode = files.inode
         """
+    }
+
+    /// Replaces the file's row only while the file still has the indexed
+    /// size, mtime and inode `basis` was read for; a file changed since then
+    /// is read again later.
+    static func save(columns: String, values: [(any DatabaseValueConvertible)?], table: String, fileID: Int64, basis: DigestBasis,
+                     in database: Database) throws
+    {
+        try database.execute(sql: """
+            INSERT OR REPLACE INTO \(table)
+                (file_id, file_size, mtime, inode, modified_nanoseconds, changed_seconds, changed_nanoseconds, \(columns))
+            SELECT id, file_size, mtime, inode, ?, ?, ?, \(databaseQuestionMarks(count: values.count)) FROM files
+            WHERE id = ? AND file_size = ? AND mtime = ? AND inode = ?
+            """, arguments: StatementArguments([basis.modifiedNanoseconds, basis.changedSeconds, basis.changedNanoseconds])
+                + StatementArguments(values) + StatementArguments([fileID, basis.fileSize, basis.mtime, basis.inode]))
+    }
+}
+
+enum DuplicateDigestStore {
+    /// The nanosecond mtime and ctime are compared with the live file by
+    /// `DuplicateEvidenceVerifier` and the cleanup boundary.
+    static func freshJoinSQL(_ kind: DigestKind, as alias: String = "digest") -> String {
+        DerivedFileCache.freshJoinSQL(table: kind.table, alias: alias)
     }
 
     /// The digest column that proves two files `.identical` under `kind`.
@@ -239,9 +263,6 @@ enum DuplicateDigestStore {
                            changedNanoseconds: row["digest_changed_nanoseconds"])
     }
 
-    /// Stores each result only while its file still has the indexed size,
-    /// mtime and inode it was computed for; a file changed since then is
-    /// checked again later.
     static func save(_ results: [DigestResult], kind: DigestKind, in database: Database) throws {
         for result in results {
             let columns: String
@@ -261,14 +282,7 @@ enum DuplicateDigestStore {
             case (.content, .audio), (.decoded, .content):
                 throw DuplicateCheckError.inconsistentCacheRow(fileID: result.fileID)
             }
-            let basis = result.basis
-            try database.execute(sql: """
-                INSERT OR REPLACE INTO \(kind.table)
-                    (file_id, file_size, mtime, inode, modified_nanoseconds, changed_seconds, changed_nanoseconds, \(columns))
-                SELECT id, file_size, mtime, inode, ?, ?, ?, \(databaseQuestionMarks(count: values.count)) FROM files
-                WHERE id = ? AND file_size = ? AND mtime = ? AND inode = ?
-                """, arguments: StatementArguments([basis.modifiedNanoseconds, basis.changedSeconds, basis.changedNanoseconds])
-                    + StatementArguments(values) + StatementArguments([result.fileID, basis.fileSize, basis.mtime, basis.inode]))
+            try DerivedFileCache.save(columns: columns, values: values, table: kind.table, fileID: result.fileID, basis: result.basis, in: database)
         }
     }
 

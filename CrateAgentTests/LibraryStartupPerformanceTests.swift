@@ -57,6 +57,86 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         try await verifyUpgradeBackfill(fixture)
         try await verifyNavigationDuringSync(fixture)
         try await verifyWriterHoldWhilePublishingTheCheckpoint(fixture)
+        try await verifyWriterHoldWhileRefreshingSeratoFacts(fixture)
+        try await verifyBrowsingWhileChecklistFactsCompute(fixture)
+    }
+
+    /// The first cue-point backfill over 30,000 WAVs, a full facts refresh
+    /// and a duplicate-members refresh over one 30,000-file byte-level
+    /// cluster run while the production Library renders and navigates.
+    private func verifyBrowsingWhileChecklistFactsCompute(_ fixture: LibraryStartupPerformanceFixture) async throws {
+        try await fixture.database.writer.write { database in
+            try database.execute(sql: "DELETE FROM checklist_source_stamps; DELETE FROM serato_track_facts")
+        }
+        let worker = SeratoAnalysisWorker(database: fixture.database, readiness: fixture.readiness)
+        let service = SeratoLibraryFactsService(database: fixture.database, seratoLocator: fixture.locator, watchdog: fixture.watchdog)
+        let duplicates = ChecklistDuplicateRefresher(database: fixture.database)
+        let probe = WriterHoldProbe()
+        probe.start(fixture.database) { nil }
+        await worker.start()
+        let refreshing = Task { await service.refresh() }
+        let duplicatesStart = ContinuousClock.now
+        duplicates.start()
+        let browsing = try await measureBrowsing(fixture) {
+            await pagingEventually { await (try? self.analysedFileCount(fixture.database)) ?? 0 >= SeratoAnalysisWorker.batchSize }
+        }
+        await refreshing.value
+        var duplicatesRefreshed: Duration?
+        let duplicatesDeadline = duplicatesStart.advanced(by: .seconds(60))
+        while duplicatesRefreshed == nil, ContinuousClock.now < duplicatesDeadline {
+            switch duplicates.status {
+            case .refreshed, .failed: duplicatesRefreshed = duplicatesStart.duration(to: .now)
+            case .notRefreshed, .refreshing: try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        duplicates.stop()
+        XCTAssertEqual(duplicates.status, .refreshed(memberCount: 0), "Unverified copies are not confirmed duplicates")
+        let duplicatesMilliseconds = try Self.milliseconds(XCTUnwrap(duplicatesRefreshed))
+        await worker.stop()
+        await worker.waitUntilStopped()
+        let waits = await probe.stop()
+        let analysed = try await analysedFileCount(fixture.database)
+        let longest = try XCTUnwrap(waits.first)
+        XCTAssertGreaterThanOrEqual(analysed, SeratoAnalysisWorker.batchSize)
+        XCTAssertLessThan(browsing.render, .milliseconds(500))
+        XCTAssertLessThan(browsing.navigation, .milliseconds(500))
+        XCTAssertLessThan(longest.duration, .milliseconds(500))
+        let result = "CHECKLIST_BACKGROUND files=30000 render_ms=\(Self.milliseconds(browsing.render)) navigation_ms=\(Self.milliseconds(browsing.navigation)) longest_writer_wait=\(longest.duration) analysed=\(analysed) duplicate_refresh_ms=\(duplicatesMilliseconds)"
+        print(result)
+        let attachment = XCTAttachment(string: result)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func analysedFileCount(_ database: LibraryDatabase) async throws -> Int {
+        try await database.writer.read { database in try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM \(SeratoAnalysisStore.table)") ?? 0 }
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Int64 {
+        duration.components.seconds * 1000 + duration.components.attoseconds / 1_000_000_000_000_000
+    }
+
+    /// The first facts refresh caches 30,000 V2 records' beatgrid lock and date
+    /// added, and 20 crates of 1,000 paths, without holding other writers off
+    /// for 500 ms or more.
+    private func verifyWriterHoldWhileRefreshingSeratoFacts(_ fixture: LibraryStartupPerformanceFixture) async throws {
+        try fixture.writeCrates(count: 20, pathsPerCrate: 1000)
+        let service = SeratoLibraryFactsService(database: fixture.database, seratoLocator: fixture.locator, watchdog: fixture.watchdog)
+        let probe = WriterHoldProbe()
+        probe.start(fixture.database) { nil }
+        let start = ContinuousClock.now
+        await service.refresh()
+        let refresh = start.duration(to: .now)
+        let waits = await probe.stop()
+        XCTAssertEqual(service.status, .refreshed(SeratoLibraryFactsSummary(trackFactCount: 30000, crateCount: 20, membershipCount: 20000, unmatchedPathCount: 0)))
+        let longest = try XCTUnwrap(waits.first)
+        XCTAssertLessThan(longest.duration, .milliseconds(500))
+        let refreshMilliseconds = refresh.components.seconds * 1000 + refresh.components.attoseconds / 1_000_000_000_000_000
+        let result = "CHECKLIST_FACTS_WRITER_HOLD files=30000 probes=\(waits.count) longest=\(longest.duration) refresh_ms=\(refreshMilliseconds)"
+        print(result)
+        let attachment = XCTAttachment(string: result)
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     /// A changed saved title leaves the fast path, so the sync republishes the
@@ -127,18 +207,11 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         }
     }
 
-    private func verifyNavigationDuringSync(_ fixture: LibraryStartupPerformanceFixture) async throws {
-        let barrier = SessionBarrier()
-        let reader = SeratoMembershipSnapshotReader(locator: fixture.locator, watchdog: fixture.watchdog, afterParsing: { await barrier.pauseFirst() })
-        let session = SeratoLibrarySyncSession(reader: reader,
-                                               reconciler: SeratoMembershipReconciler(database: fixture.database, operationEngine: fixture.engine, reader: reader),
-                                               scanner: fixture.scanner, operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: fixture.readiness,
-                                               checkpointStore: SyncCheckpointStore(database: fixture.database), watchRoots: [fixture.directory.path])
-        let files = try await fixture.scanner.identityProjectionsForConflictAnalysis()
-        let file = try XCTUnwrap(files.first)
-        _ = try updateDatabaseRecord(databasePath: fixture.locator.databaseV2Url.path, trackPath: file.path,
-                                     update: SeratoMetadataUpdate(artist: nil, title: "Changed during navigation", album: nil, genre: nil,
-                                                                  bpm: nil, key: nil, comment: nil, length: nil, label: nil))
+    /// Mounts the production Library and sidebar, runs `beforeRendering`,
+    /// then times the first content render and a sidebar navigation.
+    private func measureBrowsing(_ fixture: LibraryStartupPerformanceFixture,
+                                 beforeRendering: () async throws -> Void) async throws -> (render: Duration, navigation: Duration)
+    {
         LibraryNavigationFixture.prepareWindowChrome()
         let model = try LibraryBrowserModel(database: fixture.database)
         await model.start()
@@ -148,10 +221,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         window.contentView = NSView(frame: window.contentLayoutRect)
         window.orderFront(nil)
         defer { model.stop(); window.close() }
-        let counters = LibrarySyncMetrics()
-        let syncing = Task { try await LibrarySyncMetrics.$current.withValue(counters) { try await session.synchronize() } }
-        await barrier.waitForEntry()
-        XCTAssertEqual(session.phase, .parsing)
+        try await beforeRendering()
         let renderStart = ContinuousClock.now
         let host = NSHostingView(rootView: LibraryNavigationFixture(selection: selection, model: model, readiness: fixture.readiness))
         window.contentView = host
@@ -171,18 +241,42 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         await pagingEventually { findSidebar(host) != nil && model.results.row(at: 0) != nil }
         let sidebar = try XCTUnwrap(findSidebar(host))
         let renderLatency = renderStart.duration(to: .now)
-        XCTAssertLessThan(renderLatency, .milliseconds(500))
         let start = ContinuousClock.now
         sidebar.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
         await pagingEventually { selection.section == .history }
         host.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
         let navigationLatency = start.duration(to: .now)
+        return (renderLatency, navigationLatency)
+    }
+
+    private func verifyNavigationDuringSync(_ fixture: LibraryStartupPerformanceFixture) async throws {
+        let barrier = SessionBarrier()
+        let reader = SeratoMembershipSnapshotReader(locator: fixture.locator, watchdog: fixture.watchdog, afterParsing: { await barrier.pauseFirst() })
+        let session = SeratoLibrarySyncSession(reader: reader,
+                                               reconciler: SeratoMembershipReconciler(database: fixture.database, operationEngine: fixture.engine, reader: reader),
+                                               scanner: fixture.scanner, operationEngine: fixture.engine, watchdog: fixture.watchdog, readiness: fixture.readiness,
+                                               checkpointStore: SyncCheckpointStore(database: fixture.database), watchRoots: [fixture.directory.path])
+        let files = try await fixture.scanner.identityProjectionsForConflictAnalysis()
+        let file = try XCTUnwrap(files.first)
+        _ = try updateDatabaseRecord(databasePath: fixture.locator.databaseV2Url.path, trackPath: file.path,
+                                     update: SeratoMetadataUpdate(artist: nil, title: "Changed during navigation", album: nil, genre: nil,
+                                                                  bpm: nil, key: nil, comment: nil, length: nil, label: nil))
+        let counters = LibrarySyncMetrics()
+        var syncing: Task<Void, Error>?
+        let browsing = try await measureBrowsing(fixture) {
+            syncing = Task { try await LibrarySyncMetrics.$current.withValue(counters) { try await session.synchronize() } }
+            await barrier.waitForEntry()
+            XCTAssertEqual(session.phase, .parsing)
+        }
+        let renderLatency = browsing.render
+        let navigationLatency = browsing.navigation
+        XCTAssertLessThan(renderLatency, .milliseconds(500))
         XCTAssertEqual(session.state, .reconciling)
         XCTAssertLessThan(navigationLatency, .milliseconds(500))
         let resumed = ContinuousClock.now
         await barrier.release()
-        try await syncing.value
+        try await XCTUnwrap(syncing).value
         let slowPath = resumed.duration(to: .now)
         XCTAssertLessThan(slowPath, .seconds(30))
         XCTAssertEqual(counters.snapshot().snapshotParses, 1)

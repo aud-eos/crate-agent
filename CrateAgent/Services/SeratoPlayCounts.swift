@@ -18,7 +18,7 @@ struct SeratoPlayCountSummary: Equatable, Sendable {
 /// What the library's path history looked like when plays were attributed:
 /// any import, removal or path change moves it. Path changes always journal
 /// one of `SeratoPlayCounts.pathChangeEvents`.
-struct SeratoLibraryPathSignature: Equatable, Sendable {
+struct SeratoLibraryPathSignature: Codable, Equatable, Sendable {
     let fileCount: Int
     let highestFileID: Int64?
     let highestPathChangeEventID: Int64?
@@ -112,10 +112,12 @@ enum SeratoPlayCounts {
                                    deletions: stored.keys.filter { fileID in counts[fileID] == nil }.sorted())
     }
 
-    /// Writes only the plan's row changes. Returns false, writing nothing,
-    /// when the library's paths changed since the plan was attributed.
-    static func apply(_ plan: SeratoPlayCountPlan, in database: GRDB.Database) throws -> Bool {
+    /// Writes only the plan's row changes, and the History stamp that says play counts are known.
+    /// Returns false, writing nothing, when the library's paths changed since the plan was attributed.
+    static func apply(_ plan: SeratoPlayCountPlan, historyStamp: String, in database: GRDB.Database) throws -> Bool {
         guard try librarySignature(in: database) == plan.library else { return false }
+        try SeratoLibraryFacts.writeStamp(.history, historyStamp, in: database)
+        guard plan.changesTable else { return true }
         let delete = try database.makeStatement(sql: "DELETE FROM \(table) WHERE file_id = ?")
         for fileID in plan.deletions {
             try delete.execute(arguments: [fileID])

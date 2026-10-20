@@ -7,7 +7,7 @@ enum LibraryFamilyMessages {
     static let alternate = "Alternate"
     static let versionsColumn = "Versions"
     static let versionsHelp = "Versions counts the family's different recordings. The files beneath the main row also include other encodings of the main version."
-    static let searchRevealHelp = "While searching, every matching file is shown beneath its main row. Clear the search to show or hide files."
+    static let searchRevealHelp = "While searching or filtering, every matching file is shown beneath its main row. Clear the search and filters to show or hide files."
     static let groupSelected = "Group Selected as Song Family"
     static let addSelected = "Add Selected to This Song Family"
     static let mergeSelected = "Merge Selected Song Families"
@@ -27,7 +27,7 @@ enum LibraryFamilyMessages {
     static func versions(_ count: Int, selected: Int, of members: Int, hidden: Int, selectedHidden: Int) -> String {
         let versions = count == 1 ? "1 version" : "\(count) versions"
         guard hidden > 0 else { return selected > 0 ? "\(versions) · \(selected) selected" : versions }
-        let scope = selectedHidden > 0 ? "includes \(selectedHidden) hidden by search" : "\(hidden) hidden by search"
+        let scope = selectedHidden > 0 ? "includes \(selectedHidden) hidden by search or filters" : "\(hidden) hidden by search or filters"
         return selected > 0 ? "\(versions) · \(selected) of \(members) selected · \(scope)" : "\(versions) · \(scope)"
     }
 
@@ -39,7 +39,7 @@ enum LibraryFamilyMessages {
         "\(label) members of \(title)"
     }
 
-    static let hiddenSelectionHelp = "The search hides these members of the family. Family commands act on every selected member, hidden or not."
+    static let hiddenSelectionHelp = "The search or filters hide these members of the family. Family commands act on every selected member, hidden or not."
 
     static func disclosure(expanded: Bool, files: Int) -> String {
         let noun = files == 1 ? "1 file" : "\(files) files"

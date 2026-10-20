@@ -54,6 +54,8 @@ final class PagedTableTests: XCTestCase {
         XCTAssertTrue(selected.isEmpty)
         let held = PagedQueryFixture(rowCount: 5, signature: "held")
         await held.holdPages()
+        // A refresh keeps the shown rows until its pages load; only a reset query shows placeholders.
+        controller.stop()
         await controller.open(held)
         await pagingEventually { controller.row(at: 0) == nil }
         await Task.yield()

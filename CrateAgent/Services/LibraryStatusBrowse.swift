@@ -44,7 +44,9 @@ enum LibraryStatusBrowse {
     {
         guard limit > 0, offset >= 0 else { throw BrowseError.invalidBounds }
         let query = LibraryBrowseQuery(filter: filter, search: search, sort: .init(comparator: sortOrder.first))
-        return try Results(rows: query.rows(in: db, range: offset ..< (offset + limit)), totalCount: query.counts(in: db).visible)
+        let placements = try query.placements(in: db)
+        let page = placements.lazy.filter(query.isVisible).dropFirst(offset).prefix(limit).map(\.identity.id)
+        return try Results(rows: query.rows(in: db, ids: Array(page)), totalCount: query.counts(of: placements).visible)
     }
 
     static func observation(filter: LibraryStatusFilter, search: String, sortOrder: [KeyPathComparator<BrowserRow>], limit: Int) -> ValueObservation<ValueReducers.RemoveDuplicates<ValueReducers.Fetch<Results>>> {

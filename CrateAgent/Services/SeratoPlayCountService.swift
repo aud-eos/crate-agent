@@ -17,8 +17,8 @@ final class SeratoPlayCountService: ObservableObject {
 
     /// What a refresh read: every session file's name, size and modification
     /// time, and the library's path history.
-    private struct Inputs: Equatable {
-        let sessions: [SeratoHistorySessionStamp]
+    private struct Inputs: Codable, Equatable {
+        let sessions: [SeratoDirectoryStamp]
         let library: SeratoLibraryPathSignature
     }
 
@@ -66,9 +66,10 @@ final class SeratoPlayCountService: ObservableObject {
         }
         let revision = watchdog.stateRevision
         let historyDirectory = seratoLocator.historyDirectoryUrl
+        let sessionsDirectory = historyDirectory.appendingPathComponent("Sessions", isDirectory: true)
         var inputs: Inputs?
         do {
-            let sessions = try await Task.detached { try SeratoHistorySessionStamp.all(in: historyDirectory) }.value
+            let sessions = try await Task.detached { try SeratoDirectoryStamp.all(in: sessionsDirectory, pathExtension: "session") }.value
             let library = try await database.writer.read { connection in try SeratoPlayCounts.librarySignature(in: connection) }
             let current = Inputs(sessions: sessions, library: library)
             inputs = current
@@ -83,13 +84,15 @@ final class SeratoPlayCountService: ObservableObject {
                 return
             }
             let plan = try await database.writer.read { connection in try SeratoPlayCounts.plan(from: scan, in: connection) }
-            if plan.changesTable {
-                guard try await database.writer.write({ connection in try SeratoPlayCounts.apply(plan, in: connection) }) else {
-                    refreshRequested = true
-                    return
-                }
+            let readInputs = Inputs(sessions: sessions, library: plan.library)
+            let historyStamp = try String(decoding: JSONEncoder().encode(readInputs), as: UTF8.self)
+            guard try await database.writer.write({ connection in
+                try SeratoPlayCounts.apply(plan, historyStamp: historyStamp, in: connection)
+            }) else {
+                refreshRequested = true
+                return
             }
-            finish(Inputs(sessions: sessions, library: plan.library), outcome: .refreshed(plan.summary))
+            finish(readInputs, outcome: .refreshed(plan.summary))
         } catch {
             let reason = (error as? CoreError)?.message ?? error.localizedDescription
             if let inputs {
@@ -106,29 +109,29 @@ final class SeratoPlayCountService: ObservableObject {
     }
 }
 
-/// One History session file as the directory lists it; a changed name, size
-/// or modification time means Serato wrote History since the last read.
-struct SeratoHistorySessionStamp: Equatable, Sendable {
+/// One file of a Serato directory as it lists it; a changed name, size or
+/// modification time means Serato wrote the file since the last read.
+struct SeratoDirectoryStamp: Codable, Equatable, Sendable {
     let name: String
     let size: Int
     let modified: Date
 
     private static let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
 
-    static func all(in historyDirectory: URL) throws -> [SeratoHistorySessionStamp] {
-        let sessions = historyDirectory.appendingPathComponent("Sessions", isDirectory: true)
+    /// Every file in `directory` with `pathExtension`, by name; a missing directory has none.
+    static func all(in directory: URL, pathExtension: String) throws -> [SeratoDirectoryStamp] {
         let entries: [URL]
         do {
-            entries = try FileManager.default.contentsOfDirectory(at: sessions, includingPropertiesForKeys: keys)
+            entries = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)
         } catch CocoaError.fileReadNoSuchFile {
             return []
         }
-        return try entries.map { entry in
+        return try entries.filter { entry in entry.pathExtension == pathExtension }.map { entry in
             let values = try entry.resourceValues(forKeys: Set(keys))
             guard let size = values.fileSize, let modified = values.contentModificationDate else {
                 throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: entry.path])
             }
-            return SeratoHistorySessionStamp(name: entry.lastPathComponent, size: size, modified: modified)
+            return SeratoDirectoryStamp(name: entry.lastPathComponent, size: size, modified: modified)
         }.sorted { first, second in first.name < second.name }
     }
 }

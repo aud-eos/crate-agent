@@ -6,6 +6,8 @@ enum LibraryBrowserAction: Equatable {
     case history
     case open(OpenTarget)
     case reveal
+    /// Marks the file's recording as a keeper, or clears its keeper, if the file is still at the revision the row showed.
+    case keeper(Bool, revision: Int64)
 }
 
 /// Song-family changes offered from a Library row's context menu.
@@ -79,8 +81,8 @@ struct LibraryPagedContent: View {
         } else if model.isRefreshing || model.results.isLoading {
             ProgressView("Loading library…").frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.error == nil, model.results.error == nil {
-            AppEmptyState(title: model.query.search.isEmpty ? "No tracks in this view" : ListControlLabels.noMatches,
-                          detail: model.query.search.isEmpty ? "Import tracks or choose another library status." : ListControlLabels.resetSearch,
+            AppEmptyState(title: model.query.isFiltering ? LibraryChecklistMessages.noMatches : "No tracks in this view",
+                          detail: model.query.isFiltering ? LibraryChecklistMessages.clearToSeeMore : "Import tracks or choose another library status.",
                           systemImage: "music.note.list")
         } else {
             Spacer()
@@ -152,6 +154,14 @@ struct LibraryPagedContent: View {
         menu.addItem(.separator())
         menu.addItem(LibraryActionMenuItem(title: FileOpenerMessages.reveal) { onAction(identifier, .reveal) })
         guard let row else { return menu }
+        if row.hasChecklist, let isProtected = row.isProtected {
+            menu.addItem(.separator())
+            let keeper = LibraryActionMenuItem(title: isProtected ? LibraryChecklistMessages.clearKeeper : LibraryChecklistMessages.markKeeper) {
+                onAction(identifier, .keeper(!isProtected, revision: row.membershipRevision))
+            }
+            keeper.toolTip = LibraryChecklistMessages.keeperMenuHelp
+            menu.addItem(keeper)
+        }
         let targetCount = model.familyTargetCount(for: row)
         let familyActions = LibraryFamilyAction.allCases.filter { action in action.applies(to: row, targetCount: targetCount) }
         if !familyActions.isEmpty {
@@ -163,7 +173,7 @@ struct LibraryPagedContent: View {
             menu.addItem(item)
         }
         if row.familyRole == .main, let familyID = row.familyId, let state = model.familyStates[familyID] {
-            if state.alternateCount > 0, !state.isRevealedBySearch {
+            if state.alternateCount > 0, !state.isRevealedByFilter {
                 menu.addItem(LibraryActionMenuItem(title: state.disclosureLabel) { model.setExpanded(!state.isExpanded, family: familyID) })
             }
             if !state.eligibleAlternates.isEmpty {

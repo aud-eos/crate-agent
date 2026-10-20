@@ -46,6 +46,9 @@ extension TrackMutation {
         case .duplicateLabelReview: nil
         // Writes a recording's work, which no file or Serato field mirrors.
         case .recordMusicBrainzWork: nil
+        // Rechecks its file's revision and retirement in the transaction; a
+        // keeper needs no readable file.
+        case .keeper: nil
         // Find their file by path, re-indexed earlier in the same undo, and check it themselves.
         case .restoreFromTrash, .restoreSeratoRecords: nil
         case let .setMetadata(payload): payload.isSeratoAuthoritative == true ? nil : payload.fileId

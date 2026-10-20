@@ -169,3 +169,21 @@ enum WorkerCoverageError: LocalizedError {
         }
     }
 }
+
+/// Processable files by what their Serato cue read found. `failed` excludes
+/// `unsupported`; `retryable` are the `failed` files read again later.
+struct SeratoAnalysisCoverage: Equatable, Sendable {
+    let read: Int
+    let pending: Int
+    let failed: Int
+    let unsupported: Int
+    let retryable: Int
+
+    init(read: Int, pending: Int, failed: Int, unsupported: Int = 0, retryable: Int = 0) {
+        self.read = read
+        self.pending = pending
+        self.failed = failed
+        self.unsupported = unsupported
+        self.retryable = retryable
+    }
+}

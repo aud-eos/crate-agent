@@ -136,12 +136,14 @@ replaced, and returns when it is available again.
     main row.
   - Arrow keys that would change nothing keep their usual meaning.
   - Selecting a main row never expands it, and collapsing keeps every selection.
-- **Search.** A search matches every member, and a family appears when any
-  member matches.
-  - While searching, the matching files are always shown beneath their main
-    row, and the button reads **2 matching files shown** and is disabled.
-  - Clearing the search returns to the saved disclosure. Nothing is selected
-    automatically.
+- **Search and filters.** A search, checklist chip or genre, BPM or key
+  filter matches every member, and a family appears when any member matches
+  ([library checklist](library-checklist.md)).
+  - While searching or filtering, the matching files are always shown beneath
+    their main row, and the button reads **2 matching files shown** and is
+    disabled.
+  - Clearing the search, chip and filters returns to the saved disclosure.
+    Nothing is selected automatically.
 - **Select all and Include alternates.**
   - **Select all** selects main and standalone rows.
   - With **Include alternates** checked beside it, Select all also selects each

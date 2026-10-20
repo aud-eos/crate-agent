@@ -42,6 +42,9 @@ fingerprint-core = { path = "fingerprint-core" }
 # accepts. Unified Accessor API across formats.
 lofty = "0.24"
 
+# Serato stores cue and beatgrid analysis as base64 inside audio tags.
+base64 = "0.22"
+
 # Same-directory temporary files for atomic Serato library rewrites (#193).
 tempfile = "3.27"
 

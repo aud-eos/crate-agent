@@ -1183,7 +1183,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared: nil
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared: nil
         }
     }
 
@@ -1574,7 +1574,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
             false
         }
     }
@@ -1677,7 +1677,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
             return []
         }
     }
@@ -1724,7 +1724,7 @@ public actor OperationEngine {
         let dropped = Set(droppedTrashMoves.map(\.payload.removalEventID))
         let reverted = decoded.filter { entry in entry.event.eventId.map(dropped.contains) != true }
         let revertedEvents = reverted.map(\.event)
-        let inverseMutations = reverted.compactMap(\.inverse)
+        let inverseMutations = Self.mergingKeeperRestores(reverted.compactMap(\.inverse))
         let context = mutationContext
         try await database.writer.read { database in
             for move in droppedTrashMoves {
@@ -1767,6 +1767,21 @@ public actor OperationEngine {
             try await refreshQueueDepth()
         }
         return undoBatchId
+    }
+
+    /// A keeper clear journals one event per mark. Undo restores them as one
+    /// set, so the restore refuses only a keeper the clear didn't remove.
+    private static func mergingKeeperRestores(_ mutations: [TrackMutation]) -> [TrackMutation] {
+        let marks = mutations.flatMap { mutation -> [KeeperMark] in
+            guard case let .keeper(.restore(restored)) = mutation else { return [] }
+            return restored
+        }
+        var merged = false
+        return mutations.compactMap { mutation in
+            guard case .keeper(.restore) = mutation else { return mutation }
+            defer { merged = true }
+            return merged ? nil : .keeper(.restore(marks))
+        }
     }
 
     /// The files whose removal `events` journal, finished or not; a finished
@@ -2251,6 +2266,10 @@ public actor OperationEngine {
             return try .recordingIdentity(.reseparate(decoder.decode(RecordingSeparation.self, from: inverseJsonData)))
         case .musicBrainzWorkRecorded, .musicBrainzWorkCleared:
             return try .recordMusicBrainzWork(decoder.decode(RecordMusicBrainzWorkPayload.self, from: inverseJsonData))
+        case .keeperMarked:
+            return try .keeper(.remove([decoder.decode(KeeperMark.self, from: inverseJsonData)]))
+        case .keeperCleared:
+            return try .keeper(.restore([decoder.decode(KeeperMark.self, from: inverseJsonData)]))
         }
     }
 
@@ -3853,6 +3872,9 @@ public actor OperationEngine {
         case let .recordMusicBrainzWork(payload):
             let eventId = try MusicBrainzWorkMutation.apply(payload, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .keeper(operation):
+            let eventId = try KeeperMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [])
         }
     }
 
@@ -4784,6 +4806,8 @@ public enum TrackMutation: Sendable {
     /// Records an already-matched recording's MusicBrainz work; produced by
     /// `MusicBrainzWorkBackfill` and by undoing it.
     case recordMusicBrainzWork(RecordMusicBrainzWorkPayload)
+    /// Marks or clears a recording's keeper, or undoes that.
+    case keeper(KeeperOperation)
 }
 
 /// Move the file at `fileId` to the user's Trash via
