@@ -18,6 +18,10 @@ enum PrepareMessages {
     static let seratoNotInstalled = "Serato DJ isn't installed, or can't open this file."
     static let showVersions = "Show other versions"
     static let showVersionsHelp = "Open the Library on this track's song family."
+    static let addToCrate = "Add to crate"
+    static let addToCrateHelp = "Add this track to one of your Serato crates. Undo it from History."
+    static let noCrates = "Serato has no crates yet. Create one in Serato first."
+    static let crateWhileSeratoRunning = SeratoGateMessages.quitBefore("adding tracks to a crate")
     static let moveToTrash = "Move to Trash"
     static let moveToTrashHelp = "Move the file to the Trash and remove it from Serato's library and crates. "
         + RemovalUndoMessages.undoableWhileInTrash
@@ -41,6 +45,15 @@ enum PrepareMessages {
     static func confirmTrashMessage(frees size: Int64) -> String {
         let freed = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
         return "It leaves Serato's library and every crate, and frees \(freed). " + RemovalUndoMessages.undoableWhileInTrash
+    }
+
+    static func addedToCrate(_ crate: String) -> String {
+        "Added to \(crate). Serato shows it after its next launch."
+    }
+
+    /// `Parent%%Child.crate` is how Serato files a nested crate.
+    static func crateDisplayName(_ crateFileName: String) -> String {
+        (crateFileName as NSString).deletingPathExtension.replacingOccurrences(of: "%%", with: " / ")
     }
 
     static func movedToTrash(_ name: String) -> String {

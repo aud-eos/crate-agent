@@ -173,6 +173,11 @@ private struct PrepareCardPager: View {
                 await services.fileOpener.open(fileID: row.id, with: .application(application))
             case let .keeper(isKeeper):
                 _ = try await services.operationEngine.setKeeper(isKeeper, for: FileMembershipToken(fileId: row.id, revision: row.membershipRevision))
+            case let .addToCrate(crateFileName):
+                _ = try await services.operationEngine.apply(.setCrateMembership(.init(fileId: row.id, crateFileName: crateFileName, present: true)),
+                                                             expectedMembershipToken: FileMembershipToken(fileId: row.id, revision: row.membershipRevision),
+                                                             batchId: "prepare:\(UUID().uuidString)")
+                notice = PrepareMessages.addedToCrate(PrepareMessages.crateDisplayName(crateFileName))
             case .showVersions:
                 let title = row.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 services.showInLibrary(search: title.isEmpty ? row.path : title)
@@ -201,6 +206,7 @@ private struct PrepareCardPager: View {
 
 enum PrepareCardAction {
     case fixTags
+    case addToCrate(String)
     case openInSerato(OpenApplication)
     case keeper(Bool)
     case showVersions
@@ -226,6 +232,7 @@ private struct PrepareCard: View {
     let row: BrowserRow
     let isActing: Bool
     let perform: (PrepareCardAction) -> Void
+    @State private var crateFileNames: [String] = []
 
     private var display: StillNeedsDisplay {
         StillNeedsDisplay(row: row)
@@ -301,6 +308,16 @@ private struct PrepareCard: View {
                 }
             }
             .disabled(seratoApplication == nil || isActing).help(seratoApplication == nil ? PrepareMessages.seratoNotInstalled : PrepareMessages.openInSeratoHelp)
+            Menu(PrepareMessages.addToCrate) {
+                ForEach(crateFileNames, id: \.self) { crateFileName in
+                    Button(PrepareMessages.crateDisplayName(crateFileName)) { perform(.addToCrate(crateFileName)) }
+                }
+            }
+            .fixedSize()
+            .disabled(!row.canProcess || isActing || crateFileNames.isEmpty)
+            .seratoWriteGated(help: crateFileNames.isEmpty ? PrepareMessages.noCrates : row.processingBlockReason ?? PrepareMessages.addToCrateHelp,
+                              runningHelp: PrepareMessages.crateWhileSeratoRunning)
+            .onAppear { crateFileNames = (try? services.seratoLocator.enumerateCrateFiles().map(\.lastPathComponent).sorted()) ?? [] }
             if row.hasChecklist, let isProtected = row.isProtected {
                 Button(isProtected ? LibraryChecklistMessages.clearKeeper : LibraryChecklistMessages.markKeeper) { perform(.keeper(!isProtected)) }
                     .disabled(isActing).help(LibraryChecklistMessages.keeperMenuHelp)
