@@ -517,7 +517,9 @@ move was dropped (superseded, discarded or interrupted) without a recorded item
 restores only the Serato records, after verifying the file is still at its path
 with its original identity; an interrupted move whose file is gone refuses. Trash
 recovery after a crash records the item it finds in the Trash for the file.
-Undoing that undo is not supported yet (#270).
+Undoing that undo removes the restored file again through the same staged cleanup
+path as any removal, so its row goes only after the Trash move and Serato removals
+land; the restore events themselves have no inverse of their own (#270).
 
 Physical move rollback and retained-source cleanup use `OwnedAudioIdentity`:
 precise device/inode/size/mtime/ctime plus a streaming SHA-256 digest of every byte.

@@ -264,6 +264,36 @@ final class UndoableRemovalTests: XCTestCase {
         }
     }
 
+    func testUndoingARestoreRemovesTheFileAgainThroughTheStagedCleanup() async throws {
+        let fixture = try SeratoRemovalFixture()
+        defer { fixture.cleanup() }
+        let engine = try temporaryTrashEngine(fixture)
+        let cleaned = try await cleanDuplicate(fixture, engine: engine)
+        let seratoPath = SeratoLibraryLocator.seratoRelativePath(fromAbsolute: cleaned.target.path).data(using: .utf16BigEndian)!
+        let restoreBatchID = try await engine.undoBatch(cleaned.batchID)
+        try await assertFileRestored(cleaned, in: fixture)
+        let history = try await EventHistoryQuery.loadRecentBatches(database: fixture.database)
+        XCTAssertEqual(history.first { batch in batch.batchId == restoreBatchID }?.canUndo, true)
+
+        let redoBatchID = try await engine.undoBatch(restoreBatchID)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cleaned.target.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: Self.trashDirectory(fixture).appendingPathComponent("target.wav").path))
+        let row = try await fixture.database.writer.read { database in
+            try FileRecord.filter(Column("path") == cleaned.target.path).fetchOne(database)
+        }
+        XCTAssertNil(row, "The row goes only after the Trash move and Serato removals land")
+        for path in cleaned.originalBytes.keys {
+            XCTAssertNil(try Data(contentsOf: URL(fileURLWithPath: path)).range(of: seratoPath), "\(path) still holds the file")
+        }
+
+        try await engine.undoBatch(redoBatchID)
+        try await assertFileRestored(cleaned, in: fixture)
+        for (path, bytes) in cleaned.originalBytes {
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes, path)
+        }
+    }
+
     func testRemovingAFileWithoutAKeeperIsUndoable() async throws {
         let fixture = try SeratoRemovalFixture()
         defer { fixture.cleanup() }
