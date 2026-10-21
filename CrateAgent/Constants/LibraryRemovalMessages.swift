@@ -10,6 +10,7 @@ enum LibraryRemovalMessages {
     static let confirm = "Move to Trash"
     static let cancel = "Cancel"
     static let missingFile = "a file that is no longer in the library"
+    static let removing = "Moving the selected files to the Trash…"
     static let shownNames = 8
 
     static func button(_ count: Int) -> String {
@@ -25,6 +26,18 @@ enum LibraryRemovalMessages {
 
     static func andMore(_ count: Int) -> String {
         "and \(count.formatted()) more"
+    }
+
+    static func notRemovable(_ files: [String]) -> String {
+        "\(named(files)) \(files.count == 1 ? "is" : "are") not active and on disk, so \(files.count == 1 ? "it" : "they") can't be moved to the Trash. Deselect \(files.count == 1 ? "it" : "them"), then retry."
+    }
+
+    static func alreadyRemoving(_ files: [String]) -> String {
+        "\(named(files)) \(files.count == 1 ? "is" : "are") already being removed. Deselect \(files.count == 1 ? "it" : "them"), then retry."
+    }
+
+    private static func named(_ files: [String]) -> String {
+        files.map { file in "“\(file)”" }.formatted(.list(type: .and))
     }
 
     static func outcome(_ outcome: LibraryBatchRemoval.Outcome) -> String {

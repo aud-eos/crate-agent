@@ -33,16 +33,25 @@ struct LibraryBatchRemoval {
     let database: LibraryDatabase
     let engine: OperationEngine
 
+    /// Refuses, rather than trims, a selection the engine would partly refuse:
+    /// files that are not active and on disk, and files whose removal is already
+    /// saved and waiting, which a new batch would count but neither move nor undo.
     func plan(_ identities: [PagedIdentity<Int64>]) async throws -> Plan {
         let revisions = Dictionary(uniqueKeysWithValues: identities.map { identity in (identity.id, identity.revision) })
-        let files = try await database.writer.read { connection in
-            try FileRecord.filter(keys: identities.map(\.id)).order(Column("id")).fetchAll(connection)
+        let (files, alreadyRemoving) = try await database.writer.read { connection in
+            let files = try FileRecord.filter(keys: identities.map(\.id)).order(Column("id")).fetchAll(connection)
+            let removing = try DuplicateCleanupStore.pendingTargetFileIDs(among: identities.map(\.id), in: connection)
+            return (files, removing)
         }
         let changed = files.filter { file in file.id.map { identifier in revisions[identifier] != file.membershipRevision } ?? true }
         let missing = identities.count - files.count
         guard changed.isEmpty, missing == 0 else {
             throw LibrarySelectionError.changedSinceSelected(files: changed.map(\.displayName) + Array(repeating: LibraryRemovalMessages.missingFile, count: missing))
         }
+        let notProcessable = files.filter { file in !FileProcessingEligibility.isProcessable(membership: file.libraryMembership, availability: file.fileAvailability) }
+        guard notProcessable.isEmpty else { throw LibraryBatchRemovalError.notRemovable(files: notProcessable.map(\.displayName)) }
+        let waiting = files.filter { file in file.id.map(alreadyRemoving.contains) ?? false }
+        guard waiting.isEmpty else { throw LibraryBatchRemovalError.alreadyRemoving(files: waiting.map(\.displayName)) }
         return Plan(files: files)
     }
 
@@ -63,5 +72,17 @@ struct LibraryBatchRemoval {
             }
         }
         return outcome
+    }
+}
+
+enum LibraryBatchRemovalError: LocalizedError, Equatable {
+    case notRemovable(files: [String])
+    case alreadyRemoving(files: [String])
+
+    var errorDescription: String? {
+        switch self {
+        case let .notRemovable(files): LibraryRemovalMessages.notRemovable(files)
+        case let .alreadyRemoving(files): LibraryRemovalMessages.alreadyRemoving(files)
+        }
     }
 }

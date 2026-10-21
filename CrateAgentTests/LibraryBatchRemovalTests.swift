@@ -29,6 +29,17 @@ final class LibraryBatchRemovalTests: XCTestCase {
             XCTAssertEqual(files, [first.displayName])
         }
 
+        let missing = try await fixture.add("missing.wav", bytes: FinalRemovalIntegrationTests.wav(sample: 3))
+        try await fixture.database.writer.write { connection in
+            try connection.execute(sql: "UPDATE files SET file_availability = 'missing' WHERE id = ?", arguments: [missing.id!])
+        }
+        do {
+            _ = try await removal.plan([PagedIdentity(id: missing.id!, revision: missing.membershipRevision)])
+            XCTFail("A file that is not on disk must refuse the plan")
+        } catch let LibraryBatchRemovalError.notRemovable(files) {
+            XCTAssertEqual(files, [missing.displayName])
+        }
+
         let plan = try await removal.plan(identities)
         XCTAssertEqual(plan.files.map(\.path), [first.path, second.path])
         XCTAssertEqual(plan.totalBytes, first.fileSize + second.fileSize)

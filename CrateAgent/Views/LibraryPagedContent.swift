@@ -25,6 +25,7 @@ struct LibraryPagedContent: View {
     @State private var offersPopularitySources = false
     @State private var removalPlan: LibraryBatchRemoval.Plan?
     @State private var isPlanningRemoval = false
+    @State private var isRemoving = false
     @State private var removalNotice: String?
     @State private var removalFailures: String?
 
@@ -80,16 +81,16 @@ struct LibraryPagedContent: View {
                     }
                 }
                 Button(ListControlLabels.clearSelection) { model.selection.clear() }
-                    .disabled(model.selection.summary?.total == 0 && !model.selection.isBusy)
+                    .disabled((model.selection.summary?.total == 0 && !model.selection.isBusy) || isRemoving)
                 if removal != nil {
-                    let selected = summary?.total ?? 0
+                    let selected = summary?.inScope ?? 0
                     Button(LibraryRemovalMessages.button(selected), role: .destructive) { Task { await planRemoval() } }
-                        .disabled(!enabled || selected == 0 || isPlanningRemoval)
+                        .disabled(!enabled || selected == 0 || isPlanningRemoval || isRemoving)
                         .seratoWriteGated(help: LibraryRemovalMessages.help, runningHelp: LibraryRemovalMessages.runningHelp)
                 }
             }
-            if isPlanningRemoval {
-                HStack { ProgressView().controlSize(.small); Text(LibraryRemovalMessages.reviewing).font(.callout) }
+            if isPlanningRemoval || isRemoving {
+                HStack { ProgressView().controlSize(.small); Text(isRemoving ? LibraryRemovalMessages.removing : LibraryRemovalMessages.reviewing).font(.callout) }
             }
             if model.selection.isBusy {
                 HStack { ProgressView().controlSize(.small); Text(PagingLabels.selectionBusy).font(.callout) }
@@ -170,13 +171,16 @@ struct LibraryPagedContent: View {
         } catch { removalFailures = error.localizedDescription }
     }
 
+    /// Removed rows leave the selection through the refresh's reconcile; files
+    /// that failed stay selected so they can be retried or inspected.
     private func remove(_ plan: LibraryBatchRemoval.Plan) async {
-        guard let removal else { return }
+        guard let removal, !isRemoving else { return }
         removalPlan = nil
+        isRemoving = true
+        defer { isRemoving = false }
         let outcome = await removal.remove(plan)
         removalNotice = LibraryRemovalMessages.outcome(outcome)
         removalFailures = outcome.failures.isEmpty ? nil : LibraryRemovalMessages.failures(outcome.failures)
-        model.selection.clear()
     }
 
     private var familyControls: LibraryFamilyControls {

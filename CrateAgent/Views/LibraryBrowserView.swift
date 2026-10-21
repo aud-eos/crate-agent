@@ -41,7 +41,7 @@ struct LibraryBrowserView: View {
                     .padding(.horizontal, density.pagePadding).padding(.bottom, density.spacing)
                 LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness,
                                     player: services.trackPlayer, opener: services.fileOpener, popularity: services.popularityService,
-                                    removal: LibraryBatchRemoval(database: services.database, engine: services.operationEngine))
+                                    removal: statusFilter == .active ? LibraryBatchRemoval(database: services.database, engine: services.operationEngine) : nil)
                 { identifier, action in
                     Task { await perform(action, for: identifier) }
                 } onFamilyAction: { row, action in

@@ -85,9 +85,12 @@ Serato's library and every crate, is moved to the Trash and has its row
 retired, through the same staged removal Library Cleanup uses
 (`LibraryBatchRemoval`, one `OperationEngine.removeFile` per file under one
 History batch, so one undo restores them all while they are in the Trash).
-The command takes at most 500 files at once, and refuses when a selected file
-changed after it was selected. A file that fails is reported and the others
-still go. While Serato is running the button is disabled and a banner says why.
+The command is offered in the Active view only, counts the selected files the
+current search and filters show, and takes at most 500 at once. It refuses the
+whole selection, naming the files, when one changed after it was selected, is
+not active and on disk, or is already being removed. A file that fails is
+reported and stays selected; the removed rows leave the selection. While Serato
+is running the button is disabled and a banner says why.
 
 ## Chips
 
