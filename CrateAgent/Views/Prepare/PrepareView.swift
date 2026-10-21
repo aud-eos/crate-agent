@@ -317,7 +317,7 @@ private struct PrepareCard: View {
             .disabled(!row.canProcess || isActing || crateFileNames.isEmpty)
             .seratoWriteGated(help: crateFileNames.isEmpty ? PrepareMessages.noCrates : row.processingBlockReason ?? PrepareMessages.addToCrateHelp,
                               runningHelp: PrepareMessages.crateWhileSeratoRunning)
-            .onAppear { crateFileNames = (try? services.seratoLocator.enumerateCrateFiles().map(\.lastPathComponent).sorted()) ?? [] }
+            .task(id: row.id) { crateFileNames = (try? services.seratoLocator.enumerateSubcrateFiles().map(\.lastPathComponent)) ?? [] }
             if row.hasChecklist, let isProtected = row.isProtected {
                 Button(isProtected ? LibraryChecklistMessages.clearKeeper : LibraryChecklistMessages.markKeeper) { perform(.keeper(!isProtected)) }
                     .disabled(isActing).help(LibraryChecklistMessages.keeperMenuHelp)

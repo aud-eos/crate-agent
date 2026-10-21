@@ -18,6 +18,10 @@ final class CrateMembershipMutationTests: XCTestCase {
         XCTAssertEqual(try readCratePaths(cratePath: crate.path), [SeratoLibraryLocator.seratoRelativePath(fromAbsolute: file.path)])
         let added = try await memberships(fixture, fileID: fileID)
         XCTAssertEqual(added, ["Warmup.crate"])
+        do {
+            _ = try await fixture.engine.apply(.setCrateMembership(.init(fileId: fileID, crateFileName: "Warmup.crate", present: true)))
+            XCTFail("A second add must refuse rather than journal an inverse that removes the membership")
+        } catch OperationEngineError.crateMembershipUnchanged {}
 
         _ = try await fixture.engine.undoBatch(batch)
         XCTAssertEqual(try readCratePaths(cratePath: crate.path), [])

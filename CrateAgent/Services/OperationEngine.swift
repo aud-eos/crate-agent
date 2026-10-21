@@ -3953,8 +3953,20 @@ public actor OperationEngine {
             throw OperationEngineError.fileNotFound(fileId: payload.fileId)
         }
         try FileProcessingEligibility.requireProcessable(file)
+        // Smart crates fill from their rules, so only a `.crate` name is journaled;
+        // a crate deleted since it was listed fails its queued write visibly.
+        guard (payload.crateFileName as NSString).pathExtension == SeratoLibraryLocator.crateExtension, !payload.crateFileName.contains("/") else {
+            throw OperationEngineError.crateNotFound(crateFileName: payload.crateFileName)
+        }
+        let alreadyPresent = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM \(SeratoLibraryFacts.membershipTable) WHERE file_id = ? AND crate_name = ?)",
+                                               arguments: [payload.fileId, payload.crateFileName]) ?? false
+        // A no-op forward would journal an inverse that undoes a membership
+        // Serato owned, so it refuses instead (Invariant 2).
+        guard alreadyPresent != payload.present else {
+            throw OperationEngineError.crateMembershipUnchanged(crateFileName: payload.crateFileName, present: payload.present)
+        }
         if payload.present {
-            try db.execute(sql: "INSERT OR IGNORE INTO \(SeratoLibraryFacts.membershipTable) (file_id, crate_name) VALUES (?, ?)",
+            try db.execute(sql: "INSERT INTO \(SeratoLibraryFacts.membershipTable) (file_id, crate_name) VALUES (?, ?)",
                            arguments: [payload.fileId, payload.crateFileName])
         } else {
             try db.execute(sql: "DELETE FROM \(SeratoLibraryFacts.membershipTable) WHERE file_id = ? AND crate_name = ?",
@@ -5575,6 +5587,7 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case eventPayloadDecodingFailed(eventId: Int64?, batchId: String, eventType: EventType, underlying: String)
     case seratoEnumerationFailed(directory: String, underlying: String)
     case crateNotFound(crateFileName: String)
+    case crateMembershipUnchanged(crateFileName: String, present: Bool)
     case seratoRewriteFailed(path: String, underlying: String)
     /// Serato's `database V2` is missing, so queued changes that rewrite it
     /// (metadata updates and renames, which also rewrite crates) stay queued
@@ -5662,6 +5675,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Failed to enumerate Serato crate files in \(directory): \(underlying)"
         case let .crateNotFound(crateFileName):
             "Serato has no crate file named \(crateFileName) any more."
+        case let .crateMembershipUnchanged(crateFileName, present):
+            "The track is \(present ? "already" : "not") in \(PrepareMessages.crateDisplayName(crateFileName))."
         case let .seratoRewriteFailed(path, underlying):
             "Failed to rewrite Serato library file \(path): \(underlying)"
         case let .seratoDatabaseMissing(path, waitingCount):

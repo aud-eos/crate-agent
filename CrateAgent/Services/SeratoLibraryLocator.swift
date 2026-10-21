@@ -83,6 +83,13 @@ public struct SeratoLibraryLocator: Sendable, Equatable {
         return (regular + smart).sorted(by: { lhs, rhs in lhs.path < rhs.path })
     }
 
+    /// The crates a track can be added to: Serato fills smart crates from
+    /// their rules, so only `Subcrates/*.crate` take a membership write.
+    public func enumerateSubcrateFiles() throws -> [URL] {
+        try enumerateFiles(in: subcratesDirectoryUrl, extension: Self.crateExtension)
+            .sorted(by: { lhs, rhs in lhs.path < rhs.path })
+    }
+
     private func enumerateFiles(
         in directory: URL,
         extension fileExtension: String
