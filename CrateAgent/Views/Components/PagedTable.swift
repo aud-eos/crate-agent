@@ -102,15 +102,16 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
                 guard let self, let row = configuration.controller.row(at: index) else { return false }
                 return configuration.onDisclose(row.id, expanded)
             }
+            // Space and Open act on a row's data, so a retained row shown during a refresh is ignored.
             table.spaceAction = { [weak self] index in
                 guard let self, let onSpace = configuration.onSpace else { return false }
-                if let row = configuration.controller.row(at: index) {
+                if let row = configuration.controller.currentRow(at: index) {
                     onSpace(row)
                 }
                 return true
             }
             table.openAction = { [weak self] index in
-                guard let self, let onOpen = configuration.onOpen, let row = configuration.controller.row(at: index) else { return false }
+                guard let self, let onOpen = configuration.onOpen, let row = configuration.controller.currentRow(at: index) else { return false }
                 onOpen(row)
                 return true
             }
@@ -197,6 +198,11 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
             pendingSelection = nil
             guard configuration.enabled, index >= 0, index < configuration.controller.totalCount else { return }
             if modifiers.contains(.shift), let rangeAnchor {
+                // A range is resolved by index in the current snapshot, so it waits for its viewport rows.
+                guard configuration.controller.isViewportLoaded else {
+                    pendingSelection = (configuration.controller.generation, configuration.selectionVersion(), index, modifiers)
+                    return
+                }
                 configuration.onSelectRange(min(rangeAnchor, index) ..< (max(rangeAnchor, index) + 1), true)
             } else if let row = configuration.controller.row(at: index) {
                 if !modifiers.contains(.command) {
@@ -237,7 +243,7 @@ struct PagedTable<Snapshot: PagedQuerySnapshot>: NSViewRepresentable {
                 configuration.onFocus(focusedRow.id, table.selectedRow)
             }
             if let pendingSelection, pendingSelection.generation == displayedGeneration,
-               configuration.controller.row(at: pendingSelection.index) != nil
+               configuration.controller.currentRow(at: pendingSelection.index) != nil
             {
                 select(index: pendingSelection.index, modifiers: pendingSelection.modifiers)
             }

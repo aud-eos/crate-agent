@@ -51,9 +51,10 @@ protocol PagedSelectionProvider: Sendable {
 }
 
 enum PagingError: LocalizedError {
-    case invalidRange, incompletePage, unavailableDatabase, missingFile
+    case invalidRange, incompletePage, unavailableDatabase, missingFile, blankGenre
     var errorDescription: String? {
         switch self {
+        case .blankGenre: "The library returned a blank genre as a facet."
         case .invalidRange: "The requested library range is invalid."
         case .incompletePage: "The library returned an incomplete page. Retry to reload it."
         case .unavailableDatabase: "Library paging requires a WAL database pool."

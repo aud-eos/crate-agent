@@ -119,13 +119,19 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         pump()
     }
 
+    /// The row shown at `index`: the current snapshot's, or the previous snapshot's while a refresh still loads.
     func row(at index: Int) -> Snapshot.Row? {
-        guard index >= 0, index < totalCount else { return nil }
-        if let page = pages[index / effectivePageSize] {
-            return Self.row(at: index, in: page, pageSize: effectivePageSize)
+        if let row = currentRow(at: index) {
+            return row
         }
-        guard retainedPageSize > 0, let page = retainedPages[index / retainedPageSize] else { return nil }
+        guard index >= 0, index < totalCount, retainedPageSize > 0, let page = retainedPages[index / retainedPageSize] else { return nil }
         return Self.row(at: index, in: page, pageSize: retainedPageSize)
+    }
+
+    /// The current snapshot's row at `index`, for actions that use the row's data rather than its identity.
+    func currentRow(at index: Int) -> Snapshot.Row? {
+        guard index >= 0, index < totalCount, let page = pages[index / effectivePageSize] else { return nil }
+        return Self.row(at: index, in: page, pageSize: effectivePageSize)
     }
 
     private static func row(at index: Int, in page: [Snapshot.Row], pageSize: Int) -> Snapshot.Row? {
@@ -163,7 +169,8 @@ final class PagedResultsController<Snapshot: PagedQuerySnapshot>: ObservableObje
         generation &+= 1
         if resetCount {
             dropRetainedPages()
-        } else if !pages.isEmpty {
+        } else if !pages.isEmpty, isViewportLoaded || retainedPages.isEmpty {
+            // A refresh that interrupts another keeps the pages that covered the viewport.
             retainedPages = pages
             retainedPageSize = effectivePageSize
         }

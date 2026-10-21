@@ -696,7 +696,8 @@ enum DuplicateCleanupStore {
     }
 
     static func isKeeper(fileID: Int64, in database: Database) throws -> Bool {
-        try fetchAll(in: database).contains { intent in intent.authority.keeper?.token.fileId == fileID }
+        try Bool.fetchOne(database, sql: "SELECT EXISTS(SELECT 1 FROM duplicate_cleanup_intents WHERE keeper_file_id = ?)",
+                          arguments: [fileID]) ?? false
     }
 
     static func save(_ intent: PendingFileRemoval, in database: Database) throws {
@@ -708,9 +709,10 @@ enum DuplicateCleanupStore {
         }
         let authority = try SyncCheckpointStore.encodeCanonical(stored)
         try database.execute(sql: """
-        INSERT OR REPLACE INTO duplicate_cleanup_intents (target_file_id, payload, step, waiting_event_id, removed_v2, failure)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, arguments: [intent.target.token.fileId, authority, intent.step, intent.waitingEventID, intent.removedV2, intent.failure])
+        INSERT OR REPLACE INTO duplicate_cleanup_intents (target_file_id, payload, keeper_file_id, step, waiting_event_id, removed_v2, failure)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, arguments: [intent.target.token.fileId, authority, stored.keeper?.token.fileId, intent.step, intent.waitingEventID,
+                         intent.removedV2, intent.failure])
     }
 
     static func delete(targetFileID: Int64, in database: Database) throws {
