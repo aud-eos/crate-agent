@@ -855,6 +855,30 @@ impl CrateFile {
         rewritten.len()
     }
 
+    /// Append an otrk holding only `ptrk` for `track_path`, the record Serato
+    /// writes when a track is dragged into a crate. Returns false, leaving the
+    /// crate unchanged, when an otrk already holds that path. Must only run
+    /// while Serato is NOT running; the Swift caller gates via `SeratoWatchdog`.
+    pub fn add_track(&mut self, track_path: &str) -> bool {
+        let target = PathKeys::new([track_path]);
+        if self.records.iter().any(|record| {
+            &record.tag == TAG_OTRK && otrk_has_path_in(&record.payload, TAG_PTRK, &target)
+        }) {
+            return false;
+        }
+        let path_record = TlvRecord {
+            tag: *TAG_PTRK,
+            payload: encode_utf16be(track_path),
+        };
+        let mut payload = Vec::with_capacity(8 + path_record.payload.len());
+        TlvRecord::write_all(&[path_record], &mut payload).expect("writing to Vec<u8> cannot fail");
+        self.records.push(TlvRecord {
+            tag: *TAG_OTRK,
+            payload,
+        });
+        true
+    }
+
     /// Drop every otrk whose path field points at `target_path`, returning
     /// what was removed so it can be restored. Must only run while Serato is
     /// NOT running; the Swift caller gates via `SeratoWatchdog`.
@@ -2353,6 +2377,26 @@ mod tests {
         let mut bytes = Vec::new();
         TlvRecord::write_all(records, &mut bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn add_track_appends_a_ptrk_otrk_once() {
+        let original =
+            synthetic_library("1.0/Serato ScratchLive Crate", TAG_PTRK, &["Music/A/a.mp3"]);
+        let mut crate_file = CrateFile::from_bytes(&original).unwrap();
+        assert!(crate_file.add_track("Music/B/b.mp3"));
+        assert!(!crate_file.add_track("Music/B/b.mp3"));
+        assert!(!crate_file.add_track("Music/A/a.mp3"));
+        assert_eq!(
+            crate_file.track_paths(),
+            vec!["Music/A/a.mp3", "Music/B/b.mp3"]
+        );
+        let expected = synthetic_library(
+            "1.0/Serato ScratchLive Crate",
+            TAG_PTRK,
+            &["Music/A/a.mp3", "Music/B/b.mp3"],
+        );
+        assert_eq!(crate_file.to_bytes().unwrap(), expected);
     }
 
     #[test]

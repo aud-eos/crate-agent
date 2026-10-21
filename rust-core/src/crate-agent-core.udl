@@ -72,6 +72,13 @@ namespace crate_agent_core {
   // matches `track_path`. Sweep this across every `.crate` in the
   // Subcrates directory to fully de-register a deleted file.
   // Returns the number of entries removed from this one file.
+  // Append a `ptrk`-only otrk for `track_path` to one `.crate`, as Serato
+  // does when a track is dragged into the crate. Returns false, writing
+  // nothing, when the crate already holds that path. Call only while Serato
+  // is not running.
+  [Throws=CoreError]
+  boolean add_path_to_crate(string crate_path, string track_path);
+
   [Throws=CoreError]
   u32 remove_path_from_crate(string crate_path, string track_path);
 

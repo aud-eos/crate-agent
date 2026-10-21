@@ -316,6 +316,16 @@ pub fn remove_track_from_database_capturing(
     Ok(removed)
 }
 
+pub fn add_path_to_crate(crate_path: String, track_path: String) -> Result<bool, CoreError> {
+    let path = PathBuf::from(crate_path);
+    let mut crate_file = serato::CrateFile::read_from_path(&path)?;
+    let added = crate_file.add_track(&track_path);
+    if added {
+        crate_file.write_to_path(&path)?;
+    }
+    Ok(added)
+}
+
 pub fn remove_path_from_crate(crate_path: String, track_path: String) -> Result<u32, CoreError> {
     let removed = remove_path_from_crate_capturing(crate_path, track_path)?;
     Ok(u32::try_from(removed.len()).expect("remove count exceeded u32"))
