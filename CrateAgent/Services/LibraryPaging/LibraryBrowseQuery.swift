@@ -3,7 +3,7 @@ import GRDB
 
 struct LibraryBrowseSort: Hashable, Sendable {
     enum Column: String, Sendable {
-        case artist, title, bpm, musicalKey, album, path, stillNeeds, dateAdded, myPlays
+        case artist, title, bpm, musicalKey, album, path, stillNeeds, dateAdded, myPlays, popularity, hot
 
         /// The sort key over `files` and the projection's `checklist` join, given the file's failing bits.
         func sql(_ table: String, failing: String) -> String {
@@ -17,6 +17,8 @@ struct LibraryBrowseSort: Hashable, Sendable {
             case .stillNeeds: LibraryChecklist.stillNeedsSQL(failing: failing)
             case .dateAdded: "\(LibraryChecklist.alias).date_added"
             case .myPlays: "\(LibraryChecklist.alias).play_count"
+            case .popularity: "\(LibraryChecklist.alias).popularity_all_time"
+            case .hot: "\(LibraryChecklist.alias).popularity_hot"
             }
         }
 
@@ -25,7 +27,7 @@ struct LibraryBrowseSort: Hashable, Sendable {
         var isChecklist: Bool {
             switch self {
             case .artist, .title, .bpm, .musicalKey, .album, .path: false
-            case .stillNeeds, .dateAdded, .myPlays: true
+            case .stillNeeds, .dateAdded, .myPlays, .popularity, .hot: true
             }
         }
     }
@@ -59,6 +61,8 @@ struct LibraryBrowseSort: Hashable, Sendable {
         case \BrowserRow.stillNeedsSortKey: column = .stillNeeds
         case \BrowserRow.dateAddedSortKey: column = .dateAdded
         case \BrowserRow.playCountSortKey: column = .myPlays
+        case \BrowserRow.popularitySortKey: column = .popularity
+        case \BrowserRow.hotSortKey: column = .hot
         default: column = .path
         }
     }
@@ -164,7 +168,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
         let placedChecklist = withChecklist ? """
         ,
         \(placedFailing) AS checklist_failing_mask, \(LibraryChecklist.isFinishedSQL(failing: placedFailing)) AS is_finished,
-        \(checklist).play_count
+        \(checklist).play_count, \(checklist).popularity_all_time, \(checklist).popularity_hot
         """ : ""
         return """
         WITH \(matchedFiles)\(checklistFiles)live_families AS MATERIALIZED (\(liveFamilies)),
@@ -239,6 +243,7 @@ struct LibraryBrowseQuery: Hashable, Sendable {
                \(checklist).missing_metadata AS missing_metadata_mask, \(checklist).is_protected,
                \(finished) AS is_finished, \(LibraryChecklist.stillNeedsSQL(failing: failing)) AS still_needs_count,
                \(checklist).beatgrid_marker_count, \(checklist).date_added, \(checklist).date_added_source, \(checklist).play_count,
+               \(checklist).popularity_all_time, \(checklist).popularity_hot, \(checklist).popularity_detail,
                page_family_counts.needing_work AS family_files_needing_work, page_family_counts.file_count AS family_file_count
         FROM \(page) JOIN files ON files.id = \(page).id LEFT JOIN tracks ON tracks.id = files.track_id LEFT JOIN works ON works.id = tracks.work_id
         LEFT JOIN heads ON heads.family_id = \(page).family_id LEFT JOIN families ON families.family_id = \(page).family_id

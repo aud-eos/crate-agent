@@ -12,7 +12,7 @@ public struct MusicBrainzClient: Sendable {
     /// MusicBrainz etiquette requires an identifying `User-Agent` naming the
     /// application, its version, and a contact URL — a request without one
     /// can be throttled or blocked.
-    private static let contactURL = "https://github.com/aud-eos/crate-agent"
+    static let contactURL = "https://github.com/aud-eos/crate-agent"
     private static let fallbackAppVersion = "0.0.0"
 
     private let requester: RetryingLookupRequester

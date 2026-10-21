@@ -5,6 +5,8 @@ enum LibraryChecklistMessages {
     static let stillNeedsColumn = "Still needs"
     static let dateAddedColumn = "Date added"
     static let myPlaysColumn = "My plays"
+    static let popularityColumn = PopularityMessages.title
+    static let hotColumn = PopularityMessages.hotTitle
     static let unknown = "unknown"
     static let keeperTag = "Keeper"
     static let finishedTag = "Finished"

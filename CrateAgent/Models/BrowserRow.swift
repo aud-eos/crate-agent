@@ -60,6 +60,10 @@ public struct BrowserRow:
     var dateAddedSource: DateAddedSource?
     /// 0 when Serato History has no play of the file; nil until History has ever been read.
     var playCount: Int?
+    /// Popularity scores, 0 to 100; nil until a source looked the recording up.
+    var popularityAllTime: Double?
+    var popularityHot: Double?
+    var popularityDetail: String?
     /// Files of the row's family in the status scope that are not Finished, and all of them.
     var familyFilesNeedingWork: Int?
     var familyFileCount: Int?
@@ -96,6 +100,9 @@ public struct BrowserRow:
             try Self.decode(DateAddedSource.self, rawValue: stored, column: "date_added_source")
         }
         playCount = row["play_count"]
+        popularityAllTime = row["popularity_all_time"]
+        popularityHot = row["popularity_hot"]
+        popularityDetail = row["popularity_detail"]
         familyFilesNeedingWork = row["family_files_needing_work"]
         familyFileCount = row["family_file_count"]
     }
@@ -167,6 +174,14 @@ public struct BrowserRow:
 
     var playCountSortKey: Int {
         playCount ?? Int.min
+    }
+
+    var popularitySortKey: Double {
+        popularityAllTime ?? -Double.infinity
+    }
+
+    var hotSortKey: Double {
+        popularityHot ?? -Double.infinity
     }
 
     /// Whether the Library projection computed a checklist for this file; retired files have none.

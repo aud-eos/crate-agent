@@ -144,7 +144,7 @@ final class LibraryPagingTests: XCTestCase {
             XCTAssertLessThan(counted, .milliseconds(500), "\(label) counts")
             metrics.append("\(label)_rows=\(total) \(label)_page_ms=\(paged.milliseconds) \(label)_counts_ms=\(counted.milliseconds)")
         }
-        for column in [LibraryBrowseSort.Column.stillNeeds, .dateAdded, .myPlays] {
+        for column in [LibraryBrowseSort.Column.stillNeeds, .dateAdded, .myPlays, .popularity, .hot] {
             try await measure("sort_\(column.rawValue)", .init(sort: .init(column: column)))
         }
         for chip in ChecklistChip.allCases {

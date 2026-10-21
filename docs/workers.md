@@ -27,6 +27,9 @@ that are easy to confuse:
   its failure in red. See the [library checklist](library-checklist.md#where-the-facts-come-from).
 - **MusicBrainz works**: **Record Works** looks up the MusicBrainz work of each
   matched recording that has none, for [Find Versions](song-families.md#musicbrainz-works).
+- **Popularity**: the last lookup pass on the sources switched on, with
+  **Refresh now**; "off" until a source is on. See
+  [Popularity and Hot](library-checklist.md#popularity-and-hot).
 
 ## Files needing attention
 

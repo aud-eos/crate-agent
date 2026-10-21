@@ -1,13 +1,15 @@
 import Foundation
 import GRDB
 
-/// A Serato source the checklist caches, keyed in `checklist_source_stamps`. `SeratoLibraryFactsService`
+/// A source the checklist caches, keyed in `checklist_source_stamps`. `SeratoLibraryFactsService`
 /// owns `databaseV2` and `subcrates`; `SeratoPlayCountService` owns `history`, whose stamp says
-/// Serato History has been read at least once, so play counts are known.
+/// Serato History has been read at least once, so play counts are known; `PopularityService` owns
+/// `popularity`, whose stamp says a lookup pass has completed since a source was switched on.
 enum ChecklistSource: String, CaseIterable, Sendable {
     case databaseV2 = "database_v2"
     case subcrates
     case history
+    case popularity
 }
 
 /// Where a file's date added came from: Serato's V2 record, or, when V2 has
@@ -207,7 +209,7 @@ enum SeratoLibraryFacts {
             switch source {
             case .databaseV2, .subcrates:
                 stamps[source] = try decoder.decode(ChecklistSourceStamp.self, from: Data((row["stamp"] as String).utf8))
-            case .history:
+            case .history, .popularity:
                 continue
             }
         }

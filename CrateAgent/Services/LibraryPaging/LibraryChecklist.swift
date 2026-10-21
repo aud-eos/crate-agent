@@ -113,7 +113,8 @@ enum LibraryChecklist {
     static let maximumFamilyVersions = 4
     static let refreshThrottle: DispatchQueue.SchedulerTimeType.Stride = .seconds(2)
     static let observedTables = [SeratoLibraryFacts.factsTable, SeratoLibraryFacts.membershipTable, SeratoLibraryFacts.stampTable,
-                                 SeratoAnalysisStore.table, ChecklistDuplicates.table, KeeperMarks.table, SeratoPlayCounts.table]
+                                 SeratoAnalysisStore.table, ChecklistDuplicates.table, KeeperMarks.table, SeratoPlayCounts.table,
+                                 PopularityStore.scoresTable]
 
     /// The alias every projection CTE joins `checklist_files` under.
     static let alias = "checklist"
@@ -167,8 +168,10 @@ enum LibraryChecklist {
                    \(fact).beatgrid_locked, \(fact).added_at AS date_added, \(fact).added_source AS date_added_source,
                    CASE WHEN EXISTS (SELECT 1 FROM \(SeratoLibraryFacts.stampTable) WHERE source = '\(ChecklistSource.history.rawValue)')
                         THEN COALESCE(plays.play_count, 0) END AS play_count, duplicates.file_id IS NOT NULL AS is_duplicate,
+                   popularity.all_time AS popularity_all_time, popularity.hot AS popularity_hot, popularity.detail AS popularity_detail,
                    files.bitrate_kbps, \(losslessSQL) AS is_lossless, \(missingMetadataSQL) AS missing_metadata
             FROM files LEFT JOIN tracks ON tracks.id = files.track_id
+            LEFT JOIN \(PopularityStore.scoresTable) AS popularity ON popularity.recording_key = \(KeeperMarks.recordingKeySQL)
             \(SeratoAnalysisStore.freshJoinSQL(as: analysis))
             LEFT JOIN \(SeratoLibraryFacts.factsTable) AS \(fact) ON \(fact).file_id = files.id
             LEFT JOIN \(SeratoPlayCounts.table) AS plays ON plays.file_id = files.id
@@ -178,7 +181,7 @@ enum LibraryChecklist {
         ),
         checklist_files AS MATERIALIZED (
             SELECT file_id, recording_key, is_protected, missing_metadata, beatgrid_marker_count, date_added, date_added_source, play_count,
-                   \(failing) AS failing, \(unknown) AS unknown
+                   popularity_all_time, popularity_hot, popularity_detail, \(failing) AS failing, \(unknown) AS unknown
             FROM checklist_facts
         )
         """

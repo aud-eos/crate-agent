@@ -66,6 +66,8 @@ final class PagedLibraryFixture {
                 SELECT id, file_size, mtime, inode, 0, 0, 0, id % 4, 1, NULL FROM files WHERE id <= 24000;
             INSERT INTO serato_crate_memberships (file_id, crate_name) SELECT id, 'Crate ' || (id % 20) FROM files WHERE id <= 20000;
             INSERT INTO serato_play_counts (file_id, play_count) SELECT id, id % 50 + 1 FROM files WHERE id % 3 = 0;
+            INSERT INTO popularity_scores (recording_key, all_time, hot, detail, updated_at)
+                SELECT 'file:' || id, id % 100, CASE WHEN id % 4 = 0 THEN id % 50 END, 'Deezer rank ' || id, 1 FROM files WHERE id % 2 = 0;
             INSERT INTO checklist_duplicate_members (file_id, group_key) SELECT id, 'group-' || (id / 200) FROM files WHERE id % 100 = 7;
             INSERT INTO keeper_marks (file_id, marked_revision, marked_at) SELECT id, 0, 1 FROM files WHERE id % 60 = 1;
             """)

@@ -23,6 +23,7 @@ struct WorkersView: View {
                     fingerprintJob
                     deferredWrites
                     PlayCountCard(service: services.playCountService)
+                    PopularityCard(service: services.popularityService)
                     SeratoFactsCard(service: services.libraryFactsService)
                     seratoAnalysisCard
                     ChecklistDuplicateCard(refresher: services.checklistDuplicateRefresher)
@@ -277,6 +278,36 @@ private struct PlayCountCard: View {
                 Text(SeratoPlayCountMessages.failed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
             Text(SeratoPlayCountMessages.explanation).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct PopularityCard: View {
+    @ObservedObject var service: PopularityService
+
+    var body: some View {
+        WorkerCard(title: PopularityMessages.title) {
+            switch service.status {
+            case .off:
+                Text(PopularityMessages.offStatus).font(.callout)
+            case .notRefreshed:
+                Text(PopularityMessages.notRefreshed).font(.callout)
+            case let .refreshing(done, total):
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(PopularityMessages.refreshing(done: done, total: total)).font(.callout.monospacedDigit())
+                }
+            case let .refreshed(count):
+                Text(PopularityMessages.refreshedCount(count)).font(.callout.monospacedDigit())
+            case let .failed(reason):
+                Text(PopularityMessages.failed(reason)).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            HStack {
+                Text(PopularityMessages.settingsFooter).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(PopularityMessages.refreshNow) { Task { await service.refresh() } }
+                    .disabled(service.enabledSources.isEmpty)
+            }
         }
     }
 }
