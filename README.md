@@ -30,7 +30,8 @@ Chips such as **Needs work** and **Not in a crate** filter by those items with
 live counts, and combine with search and the genre, BPM and compatible-key
 filters. **Mark as Keeper** protects a recording and counts it as Finished;
 undo it from History. Facts not read yet show as unknown, never as failing. See
-the [library checklist](docs/library-checklist.md).
+the [library checklist](docs/library-checklist.md). A selection can be
+moved to the Trash as one reviewed, undoable batch.
 
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the

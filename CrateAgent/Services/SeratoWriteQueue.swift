@@ -691,6 +691,13 @@ enum DuplicateCleanupStore {
         try Row.fetchAll(database, sql: "SELECT * FROM duplicate_cleanup_intents ORDER BY target_file_id").map(decode)
     }
 
+    static func pendingTargetFileIDs(among fileIDs: [Int64], in database: Database) throws -> Set<Int64> {
+        guard !fileIDs.isEmpty else { return [] }
+        let placeholders = databaseQuestionMarks(count: fileIDs.count)
+        return try Set(Int64.fetchAll(database, sql: "SELECT target_file_id FROM duplicate_cleanup_intents WHERE target_file_id IN (\(placeholders))",
+                                      arguments: StatementArguments(fileIDs)))
+    }
+
     static func exists(in database: Database) throws -> Bool {
         try Bool.fetchOne(database, sql: "SELECT EXISTS(SELECT 1 FROM duplicate_cleanup_intents)") ?? false
     }

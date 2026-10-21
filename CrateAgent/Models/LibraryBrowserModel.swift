@@ -159,6 +159,13 @@ final class LibraryBrowserModel: ObservableObject {
         return LibraryFamilyActionTarget(clicked: row, files: files)
     }
 
+    /// Every selected file the view still shows, for a selection-wide command; refuses past the shared limit
+    /// or when a selected file changed since it was selected.
+    func selectedIdentities() async throws -> [PagedIdentity<Int64>] {
+        guard let snapshot = results.snapshot else { throw PagingError.unavailableDatabase }
+        return try await selectionStore.selectedIdentities(in: snapshot, limit: LibraryRemovalMessages.selectionLimit)
+    }
+
     func performFamilyAction(_ action: LibraryFamilyAction, on row: BrowserRow, using actions: LibraryFamilyActions,
                              asDifferentRecordings: Bool = false) async
     {

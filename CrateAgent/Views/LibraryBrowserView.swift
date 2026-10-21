@@ -25,6 +25,7 @@ struct LibraryBrowserView: View {
         VStack(spacing: 0) {
             PageHeading("Library", subtitle: "Search your indexed Serato tracks. Right-click a track to rename, open or reveal it in Finder.")
                 .padding(density.pagePadding)
+            SeratoRunningBanner(message: LibraryRemovalMessages.runningHelp)
             statusHeader
             Divider()
             LibraryStatusFilterBar(selection: $statusFilter)
@@ -39,7 +40,8 @@ struct LibraryBrowserView: View {
                 LibraryChecklistFilters(model: model, playCounts: services.playCountService)
                     .padding(.horizontal, density.pagePadding).padding(.bottom, density.spacing)
                 LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness,
-                                    player: services.trackPlayer, opener: services.fileOpener, popularity: services.popularityService)
+                                    player: services.trackPlayer, opener: services.fileOpener, popularity: services.popularityService,
+                                    removal: statusFilter == .active ? LibraryBatchRemoval(database: services.database, engine: services.operationEngine) : nil)
                 { identifier, action in
                     Task { await perform(action, for: identifier) }
                 } onFamilyAction: { row, action in
