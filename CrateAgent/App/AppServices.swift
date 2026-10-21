@@ -79,7 +79,11 @@ public final class AppServices: ObservableObject {
 
     /// Library search also matches paths, so a full path narrows the list to that file.
     func showInLibrary(path: String) {
-        librarySearchRequest = path
+        showInLibrary(search: path)
+    }
+
+    func showInLibrary(search: String) {
+        librarySearchRequest = search
         open(.library)
     }
 

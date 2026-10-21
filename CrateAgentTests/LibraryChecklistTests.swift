@@ -149,6 +149,33 @@ final class LibraryChecklistTests: XCTestCase {
         XCTAssertNil(hottest.last?.popularityHot)
     }
 
+    func testPrepareRankOrdersMostPromisingFirstAndNoSignalLast() async throws {
+        let popular = try XCTUnwrap(fileIDs["Played 2"])
+        let played = try XCTUnwrap(fileIDs["Played 9"])
+        let unplayed = try XCTUnwrap(fileIDs["Complete"])
+        try await pool.write { connection in
+            try PopularityStore.record([PopularityObservation(recordingKey: "file:\(popular)", source: .deezer, observedAt: 100, value: 950_000)],
+                                       now: 100, in: connection)
+            try PopularityStore.seedHot([(recordingKey: "file:\(popular)", hot: 5)], now: 100, in: connection)
+            try connection.execute(sql: "DELETE FROM checklist_source_stamps WHERE source = ?", arguments: [ChecklistSource.history.rawValue])
+        }
+        // Plays are unknown until History has been read, so only popularity ranks: 95 + 5 for Played 2, nothing for the rest.
+        let unread = try await rows(.init(sort: .init(column: .prepareRank, ascending: false)))
+        XCTAssertEqual(unread.first?.id, popular)
+        XCTAssertEqual(unread.first?.prepareRankSortKey, 100)
+        XCTAssertEqual(unread.last?.prepareRankSortKey, -Double.infinity, "No signal sorts last in both directions")
+        let unreadAscending = try await ids(.init(sort: .init(column: .prepareRank, ascending: true)))
+        XCTAssertEqual(unreadAscending.first, popular, "Ascending still puts the unranked rows last")
+
+        try await pool.write { connection in try SeratoLibraryFacts.writeStamp(.history, "{}", in: connection) }
+        let read = try await rows(.init(sort: .init(column: .prepareRank, ascending: false)))
+        XCTAssertEqual(Array(read.prefix(2).map(\.id)), [popular, played], "95 + 5 + 2 plays × 10 beats 9 plays × 10")
+        XCTAssertEqual(read.first?.prepareRankSortKey, 120)
+        XCTAssertEqual(read.first { row in row.id == unplayed }?.prepareRankSortKey, 0, "A played-count of 0 is a known signal")
+        let standalone = read.filter { row in row.familyId == nil }.map(\.prepareRankSortKey)
+        XCTAssertEqual(standalone, standalone.sorted(by: >), "SQL order matches the Swift formula")
+    }
+
     func testPlaysAndUnreadSourcesChipCountsAreUnknownAndNeverPlayedMatchesNothingUntilHistoryHasBeenRead() async throws {
         try await pool.write { connection in
             try connection.execute(sql: "DELETE FROM checklist_source_stamps WHERE source IN (?, ?)",

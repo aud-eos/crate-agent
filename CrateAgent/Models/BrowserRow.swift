@@ -184,6 +184,10 @@ public struct BrowserRow:
         popularityHot ?? -Double.infinity
     }
 
+    var prepareRankSortKey: Double {
+        PrepareRanking.score(allTime: popularityAllTime, hot: popularityHot, plays: playCount) ?? -Double.infinity
+    }
+
     /// Whether the Library projection computed a checklist for this file; retired files have none.
     var hasChecklist: Bool {
         checklistFailingMask != nil

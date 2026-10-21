@@ -145,6 +145,32 @@ SQL from them each time the Library loads.
 | Popularity, Hot | ListenBrainz and Deezer, by `PopularityService` | After each sync and every 6 hours, stalest recordings first, once a source is on |
 | Artist, title, genre, BPM, key, bitrate | The indexed `files` columns | With every sync |
 
+## Prepare
+
+**Prepare** works through the unfinished tracks one at a time, most promising
+first. It runs the Library query with the **Needs work** chip, the same search,
+chips and genre, BPM and key filters, and one fixed order: the rank in
+`PrepareRanking`, which is the track's Popularity plus its Hot plus ten points
+for each of your own plays. A track with none of the three signals has no rank
+and comes last, so until a source is on, your plays decide the order.
+
+Each card shows the track, what it still needs with the fix for each item, and
+its signals, and offers the fixes:
+
+- **Play**, through the app-wide player.
+- **Fix tags** selects the track in Auto-Tag and opens it; if a scan is in
+  progress the card says so instead.
+- **Open in Serato** opens the file in Serato DJ, for cue points and the
+  beatgrid; it is disabled when Serato DJ isn't installed.
+- **Mark as Keeper** and **Clear Keeper**, as in the Library.
+- **Show other versions** opens the Library on the track's family.
+- **Move to Trash** asks first, saying how much space it frees, then runs the
+  same undoable removal the Library Cleanup uses. It is disabled while Serato
+  is running.
+
+Adding to a crate is not offered yet. **Previous** and **Next** move through
+the list; a track that becomes Finished leaves it on the next refresh.
+
 ## Popularity and Hot
 
 Two sortable columns say how well known a recording is and whether it is rising.

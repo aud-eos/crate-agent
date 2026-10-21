@@ -3,7 +3,7 @@ import GRDB
 
 struct LibraryBrowseSort: Hashable, Sendable {
     enum Column: String, Sendable {
-        case artist, title, bpm, musicalKey, album, path, stillNeeds, dateAdded, myPlays, popularity, hot
+        case artist, title, bpm, musicalKey, album, path, stillNeeds, dateAdded, myPlays, popularity, hot, prepareRank
 
         /// The sort key over `files` and the projection's `checklist` join, given the file's failing bits.
         func sql(_ table: String, failing: String) -> String {
@@ -19,6 +19,7 @@ struct LibraryBrowseSort: Hashable, Sendable {
             case .myPlays: "\(LibraryChecklist.alias).play_count"
             case .popularity: "\(LibraryChecklist.alias).popularity_all_time"
             case .hot: "\(LibraryChecklist.alias).popularity_hot"
+            case .prepareRank: PrepareRanking.sql(LibraryChecklist.alias)
             }
         }
 
@@ -27,7 +28,7 @@ struct LibraryBrowseSort: Hashable, Sendable {
         var isChecklist: Bool {
             switch self {
             case .artist, .title, .bpm, .musicalKey, .album, .path: false
-            case .stillNeeds, .dateAdded, .myPlays, .popularity, .hot: true
+            case .stillNeeds, .dateAdded, .myPlays, .popularity, .hot, .prepareRank: true
             }
         }
     }
@@ -63,6 +64,7 @@ struct LibraryBrowseSort: Hashable, Sendable {
         case \BrowserRow.playCountSortKey: column = .myPlays
         case \BrowserRow.popularitySortKey: column = .popularity
         case \BrowserRow.hotSortKey: column = .hot
+        case \BrowserRow.prepareRankSortKey: column = .prepareRank
         default: column = .path
         }
     }

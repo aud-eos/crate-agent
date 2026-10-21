@@ -285,7 +285,7 @@ struct LibraryBrowserView: View {
 
 /// The checklist chips and the genre, BPM and key filters, bound to the Library model. Never played waits
 /// until Serato History has ever been read, from its persisted stamp (amended plan ruling 14).
-private struct LibraryChecklistFilters: View {
+struct LibraryChecklistFilters: View {
     @ObservedObject var model: LibraryBrowserModel
     @ObservedObject var playCounts: SeratoPlayCountService
     @AppStorage(AppPresentation.densityPreference) private var density: AppDensity = .comfortable
