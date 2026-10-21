@@ -246,8 +246,9 @@ public enum EventHistoryQuery {
     static func canUndoBatch(typeList: [String]) -> Bool {
         // Mirror OperationEngine.decodeInverseMutation: these event types
         // have no inverse it accepts. Observations and import requests
-        // record state rather than change it, `trackAddedToSerato` has no
-        // inverse yet, and the two removal-restore types refuse redo.
+        // record state rather than change it, and `trackAddedToSerato` has no
+        // inverse yet. A removal's restore is undone by removing the file
+        // again through the staged cleanup path.
         let unsupportedRaw: Set<String> = [
             EventType.trackAddedToSerato.rawValue,
             EventType.fileLocationObserved.rawValue,
@@ -255,9 +256,6 @@ public enum EventHistoryQuery {
             EventType.fileModificationTimeRecorded.rawValue,
             EventType.fileLibraryStateChanged.rawValue,
             EventType.fileImportRequested.rawValue,
-            // Redo of an undone removal is #270.
-            EventType.fileRestoredFromTrash.rawValue,
-            EventType.seratoRecordsRestored.rawValue,
         ]
         return !typeList.contains(where: unsupportedRaw.contains)
     }

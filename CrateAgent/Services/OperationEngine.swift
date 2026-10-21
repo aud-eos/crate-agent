@@ -1695,6 +1695,9 @@ public actor OperationEngine {
         guard !events.isEmpty else {
             throw OperationEngineError.batchNotFound(batchId: batchId)
         }
+        if let redoBatchId = try await redoRemovals(undoneBy: events, batchId: batchId) {
+            return redoBatchId
+        }
 
         let unfinished = try await unfinishedCleanups(batchId: batchId)
         let queueIDs = Set(unfinished.flatMap(\.writes).map(\.queueID))
@@ -1767,6 +1770,38 @@ public actor OperationEngine {
             try await refreshQueueDepth()
         }
         return undoBatchId
+    }
+
+    /// Undoing a removal's undo removes each restored file again through the
+    /// staged cleanup path, so its row goes only after the Trash move and
+    /// Serato removals land (#270). Replaying the removal mutations as inverses
+    /// would delete the row at once while those effects only queued.
+    private func redoRemovals(undoneBy events: [EventRecord], batchId: String) async throws -> String? {
+        let restoreTypes: Set<EventType> = [.fileRestoredFromTrash, .seratoRecordsRestored]
+        var fileIDs: [Int64] = []
+        for event in events where restoreTypes.contains(event.eventType) {
+            guard let fileID = event.fileId else { throw OperationEngineError.undoNotSupported(eventType: event.eventType) }
+            if !fileIDs.contains(fileID) {
+                fileIDs.append(fileID)
+            }
+        }
+        guard !fileIDs.isEmpty else { return nil }
+        let targets = try await database.writer.read { database in
+            try fileIDs.map { fileID in
+                guard let file = try FileRecord.fetchOne(database, key: fileID) else { throw OperationEngineError.fileNotFound(fileId: fileID) }
+                return file
+            }
+        }
+        let redoBatchId = "undo:\(batchId):\(UUID().uuidString)"
+        for target in targets {
+            switch try await removeFile(target: target, batchID: redoBatchId) {
+            case .pending, .completed:
+                continue
+            case let .failed(message), let .superseded(message):
+                throw OperationEngineError.removalRedoFailed(path: target.path, message: message)
+            }
+        }
+        return redoBatchId
     }
 
     /// A keeper clear journals one event per mark. Undo restores them as one
@@ -1935,8 +1970,9 @@ public actor OperationEngine {
 
     /// The events of a removal's undo that discarding its stuck Serato
     /// restores leaves in place: the restored file and row stay, and the
-    /// restores are only dropped. Redoing a removal is not supported (#270), so
-    /// a restore whose write may have landed, or already completed, refuses.
+    /// restores are only dropped. A restore whose write may have landed, or
+    /// already completed, refuses: removing the file again is History's undo
+    /// of the restore, not a discard.
     private func removalUndoEventsKept(_ plan: DiscardPlan) async throws -> Set<Int64> {
         let undoTypes: Set<EventType> = [.trackImported, .fileRestoredFromTrash, .seratoRecordsRestored]
         let undoEvents = plan.events.filter { event in undoTypes.contains(event.eventType) }
@@ -2225,8 +2261,9 @@ public actor OperationEngine {
             return try .restoreSeratoRecords(decoder.decode(RemovalRestoreMutation.RecordsInverse.self, from: inverseJsonData)
                 .payload(removalEventID: removalEventID(of: event)))
         case .fileRestoredFromTrash, .seratoRecordsRestored:
-            // Redoing a removal must run through a cleanup intent, which
-            // sequences the row's deletion after its queued Trash move.
+            // `undoBatch` redoes a removal through a cleanup intent, which
+            // sequences the row's deletion after its queued Trash move; the
+            // restore events have no inverse mutation of their own.
             throw OperationEngineError.removalRedoNotSupported(eventType: event.eventType)
         case .fileTagsWritten:
             // Undoable when previousMetadata was captured at forward
@@ -5522,7 +5559,10 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case queuedChangeHasLaterChanges(path: String, later: [String])
     /// Undoing a removal can't put the file or its Serato records back as they were.
     case restoreBlocked(path: String, reason: RestoreBlockReason)
+    /// A restore is redone only by `undoBatch`, which removes the file again; its events have no inverse of their own.
     case removalRedoNotSupported(eventType: EventType)
+    /// Removing a restored file again stopped before it reached the Trash and Serato.
+    case removalRedoFailed(path: String, message: String)
     /// A pending removal keeps this file as the copy that stays.
     case removalTargetIsKept(path: String)
     /// A removal or Trash move reached its I/O in a segment that was not its one queued row.
@@ -5588,6 +5628,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
             RemovalUndoMessages.restoreBlocked(path: path, reason: reason)
         case .removalRedoNotSupported:
             RemovalUndoMessages.redoNotSupported
+        case let .removalRedoFailed(path, message):
+            RemovalUndoMessages.redoFailed(path: path, message: message)
         case let .removalTargetIsKept(path):
             FileRemovalMessages.targetIsKept(path: path)
         case let .singleRowSegmentExpected(rowCount):

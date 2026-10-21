@@ -28,7 +28,11 @@ enum RemovalUndoMessages {
 
     static let undoneBeforeLanding = "Not applied: the removal was undone before it reached Serato or the Trash."
 
-    static let redoNotSupported = "A removal that was undone can't be redone from History yet. Remove the file again instead."
+    static let redoNotSupported = "A restored file is removed again by undoing its restore from History; its restore can't be reverted on its own."
+
+    static func redoFailed(path: String, message: String) -> String {
+        "Can't remove \((path as NSString).lastPathComponent) again: \(message)"
+    }
 
     /// `unrecorded` stores no longer exist either, and may never have had records removed.
     static func storesMissing(_ storePaths: [String], unrecorded: [String]) -> String {
