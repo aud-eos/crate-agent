@@ -6,12 +6,13 @@ enum PrepareMessages {
     static let previous = "Previous"
     static let next = "Next"
     static let emptyTitle = "Nothing left to prepare"
-    static let emptyDetail = "Every track in this view is Finished. Clear the search or filters to see more."
+    static let emptyDetail = "Every track in this view is Finished. Clear the search or the genre, BPM and key filters to see more."
     static let stillNeedsHeading = "Still needs"
     static let signalsHeading = "Signals"
     static let fixTags = "Fix tags"
-    static let fixTagsHelp = "Select this track in Auto-Tag to fill its artist, title and other tags from MusicBrainz."
+    static let fixTagsHelp = "Add this track to Auto-Tag's selection and open it, to fill its tags from MusicBrainz."
     static let autoTagBusy = "Auto-Tag is busy with a scan. Finish or reset it first."
+    static let notSelectable = "The file can't be processed right now."
     static let openInSerato = "Open in Serato"
     static let openInSeratoHelp = "Open the file in Serato DJ to set cue points and check its beatgrid."
     static let seratoNotInstalled = "Serato DJ isn't installed, or can't open this file."
@@ -24,6 +25,10 @@ enum PrepareMessages {
     static let trashBannerAction = "moving tracks to the Trash"
     static let cancel = "Cancel"
     static let seratoApplicationPrefix = "Serato DJ"
+
+    static func couldNotSelect(_ reason: String) -> String {
+        "Auto-Tag could not select this track: \(reason)"
+    }
 
     static func position(_ index: Int, of total: Int) -> String {
         "Track \(index + 1) of \(total.formatted())"

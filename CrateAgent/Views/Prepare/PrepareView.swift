@@ -21,7 +21,7 @@ struct PrepareView: View {
             }
             ListSearchField(text: $searchText).padding(.horizontal, density.pagePadding).padding(.vertical, density.spacing)
             if let model {
-                LibraryChecklistFilters(model: model, playCounts: services.playCountService)
+                LibraryFacetBar(facets: Binding(get: { model.query.facets }, set: { facets in model.setFacets(facets) }), options: model.facetOptions)
                     .padding(.horizontal, density.pagePadding).padding(.bottom, density.spacing)
                 Divider()
                 PrepareCardPager(model: model)
@@ -50,12 +50,12 @@ struct PrepareView: View {
             let browser = try LibraryBrowserModel(database: services.database)
             model = browser
             loadError = nil
-            await browser.start()
             var query = browser.query
             query.filter = .active
             query.chip = .needsWork
             query.sort = .init(column: .prepareRank, ascending: false)
             browser.setQuery(query)
+            await browser.start()
         } catch { loadError = error.localizedDescription }
     }
 
@@ -116,8 +116,17 @@ private struct PrepareCardPager: View {
         .padding(density.pagePadding)
         .onAppear { load() }
         .onChange(of: index) { _, _ in load() }
-        .onChange(of: model.results.generation) { _, _ in load() }
+        .onChange(of: model.query) { _, _ in
+            index = 0
+            load()
+        }
         .onChange(of: total) { _, _ in load() }
+        .onChange(of: model.results.updateID) { _, _ in
+            if let anchor = model.results.viewportAnchor, anchor != index, model.results.row(at: index) == nil {
+                index = anchor
+            }
+            load()
+        }
         .alert(PrepareMessages.confirmTrashTitle(trashCandidate?.filenameOnly ?? ""), isPresented: Binding(get: { trashCandidate != nil }, set: {
             shown in if !shown {
                 trashCandidate = nil
@@ -153,8 +162,11 @@ private struct PrepareCardPager: View {
             switch action {
             case .fixTags:
                 let session = services.autoTagSession
+                guard !session.isScanning, !session.isApplying, session.scannedFileIDs.isEmpty else { throw PrepareActionError.autoTagBusy }
                 session.selectVisibleFileIDs([row.id])
-                guard session.selectedFileIDs.contains(row.id) else { throw PrepareActionError.autoTagBusy }
+                guard session.selectedFileIDs.contains(row.id) else {
+                    throw PrepareActionError.notSelectable(session.actionError ?? row.processingBlockReason ?? PrepareMessages.notSelectable)
+                }
                 services.open(.autoTag)
             case let .openInSerato(application):
                 _ = try await model.resolveFile(id: row.id)
@@ -162,7 +174,8 @@ private struct PrepareCardPager: View {
             case let .keeper(isKeeper):
                 _ = try await services.operationEngine.setKeeper(isKeeper, for: FileMembershipToken(fileId: row.id, revision: row.membershipRevision))
             case .showVersions:
-                services.showInLibrary(search: row.title ?? row.path)
+                let title = row.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                services.showInLibrary(search: title.isEmpty ? row.path : title)
             case .moveToTrash:
                 let record = try await model.resolveFile(id: row.id)
                 try FileProcessingEligibility.requireProcessable(record)
@@ -196,10 +209,12 @@ enum PrepareCardAction {
 
 private enum PrepareActionError: LocalizedError {
     case autoTagBusy
+    case notSelectable(String)
 
     var errorDescription: String? {
         switch self {
         case .autoTagBusy: PrepareMessages.autoTagBusy
+        case let .notSelectable(reason): PrepareMessages.couldNotSelect(reason)
         }
     }
 }

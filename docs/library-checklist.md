@@ -148,11 +148,12 @@ SQL from them each time the Library loads.
 ## Prepare
 
 **Prepare** works through the unfinished tracks one at a time, most promising
-first. It runs the Library query with the **Needs work** chip, the same search,
-chips and genre, BPM and key filters, and one fixed order: the rank in
+first. It runs the Library query with the **Needs work** chip fixed, the same
+search and genre, BPM and key filters, and one fixed order: the rank in
 `PrepareRanking`, which is the track's Popularity plus its Hot plus ten points
 for each of your own plays. A track with none of the three signals has no rank
-and comes last, so until a source is on, your plays decide the order.
+and comes last, so until a source is on, your plays decide the order. A new
+search or filter starts again from the top.
 
 Each card shows the track, what it still needs with the fix for each item, and
 its signals, and offers the fixes:
