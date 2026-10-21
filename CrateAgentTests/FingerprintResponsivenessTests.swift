@@ -134,7 +134,7 @@ final class FingerprintResponsivenessTests: XCTestCase {
                 maximumScroll = max(maximumScroll, scrollStart.duration(to: .now))
                 let navigationStart = ContinuousClock.now
                 let section: MainWindowView.Section = iteration.isMultiple(of: 2) ? .history : .library
-                sidebar.selectRowIndexes(IndexSet(integer: iteration.isMultiple(of: 2) ? 4 : 0), byExtendingSelection: false)
+                sidebar.selectRowIndexes(IndexSet(integer: section.sidebarRow), byExtendingSelection: false)
                 await pagingEventually { selection.section == section }
                 host.layoutSubtreeIfNeeded()
                 window.displayIfNeeded()
