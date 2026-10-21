@@ -163,6 +163,11 @@ its signals, and offers the fixes:
   progress the card says so instead.
 - **Open in Serato** opens the file in Serato DJ, for cue points and the
   beatgrid; it is disabled when Serato DJ isn't installed.
+- **Add to crate** lists your existing Serato crates (`Subcrates/*.crate`) and
+  appends the track to the one you pick: the crate membership is recorded at
+  once, so **Not in a crate** clears, and the crate file is written through the
+  queue (it waits while Serato is running). Undo from History removes it again.
+  Creating crates stays in Serato (#141).
 - **Mark as Keeper** and **Clear Keeper**, as in the Library.
 - **Show other versions** opens the Library on the track's family.
 - **Move to Trash** asks first, saying how much space it frees, then runs the

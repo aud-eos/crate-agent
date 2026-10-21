@@ -1175,6 +1175,7 @@ public actor OperationEngine {
         case .trackAddedToSerato: .addTrack
         case .trackRemovedFromSerato: .removeFromDatabase
         case .fileRemovedFromCrates: .removeFromCrates
+        case .crateMembershipSet: .crateMembership
         case .fileTrashed: .trashFile
         case .trackImported, .fileRemoved, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved, .fileModificationTimeRecorded, .fileImportRequested,
              .fileRestoredFromTrash, .seratoRecordsRestored,
@@ -1435,7 +1436,7 @@ public actor OperationEngine {
                 year: keepYear ? tagWrite.year : nil,
                 clearYear: keepYear ? tagWrite.clearYear : false
             ))
-        case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile, .restoreRecords:
+        case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile, .restoreRecords, .crateMembership:
             return write
         }
     }
@@ -1535,7 +1536,7 @@ public actor OperationEngine {
                     if tagWrite.year != nil || tagWrite.clearYear {
                         tag[fileId, default: [:]]["year"] = eventId
                     }
-                case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile, .restoreRecords:
+                case .rename, .addTrack, .removeFromDatabase, .removeFromCrates, .trashFile, .restoreRecords, .crateMembership:
                     break
                 }
             }
@@ -1574,7 +1575,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared, .crateMembershipSet:
             false
         }
     }
@@ -1677,7 +1678,7 @@ public actor OperationEngine {
              .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared, .crateMembershipSet:
             return []
         }
     }
@@ -2307,6 +2308,8 @@ public actor OperationEngine {
             return try .keeper(.remove([decoder.decode(KeeperMark.self, from: inverseJsonData)]))
         case .keeperCleared:
             return try .keeper(.restore([decoder.decode(KeeperMark.self, from: inverseJsonData)]))
+        case .crateMembershipSet:
+            return try .setCrateMembership(decoder.decode(SetCrateMembershipPayload.self, from: inverseJsonData))
         }
     }
 
@@ -2840,7 +2843,7 @@ public actor OperationEngine {
         let path = switch write {
         case let .rename(rename): rename.oldAbsolutePath
         case let .metadataUpdate(update): update.absolutePath
-        case .addTrack, .fileTagWrite, .removeFromDatabase, .removeFromCrates, .trashFile, .restoreRecords:
+        case .addTrack, .fileTagWrite, .removeFromDatabase, .removeFromCrates, .trashFile, .restoreRecords, .crateMembership:
             preconditionFailure("Only renames and metadata updates report a path with no Serato entry; restores name their stores")
         }
         return "Serato's database has no entry at this path: \((path as NSString).lastPathComponent)."
@@ -3084,6 +3087,28 @@ public actor OperationEngine {
             try await applyTrashFileOperation(trash, guardedWrites: guardedWrites)
         case .restoreRecords:
             preconditionFailure("Queued restores are applied by applySeratoRecordRestore, which reports stores deleted since")
+        case let .crateMembership(membership):
+            try await applySeratoCrateMembership(membership, guardedWrites: guardedWrites)
+        }
+    }
+
+    /// Appends the track to, or removes it from, one crate file. A crate that
+    /// already matches is left as it is: the write still completes, since the
+    /// intent holds.
+    private func applySeratoCrateMembership(_ membership: SeratoPendingCrateMembership, guardedWrites: [GuardedSeratoWrite]) async throws {
+        _ = try requireSeratoDatabase(waitingCount: guardedWrites.count)
+        let cratePath = seratoLocator.subcratesDirectoryUrl.appendingPathComponent(membership.crateFileName).path
+        guard FileManager.default.fileExists(atPath: cratePath) else {
+            throw OperationEngineError.crateNotFound(crateFileName: membership.crateFileName)
+        }
+        let seratoRelativePath = SeratoLibraryLocator.seratoRelativePath(fromAbsolute: membership.absolutePath)
+        try await performExternalWrite(guardedWrites, completing: true) { _, io in
+            if membership.present {
+                _ = try addPathToCrate(cratePath: cratePath, trackPath: seratoRelativePath)
+            } else {
+                _ = try removePathFromCrate(cratePath: cratePath, trackPath: seratoRelativePath)
+            }
+            io.recordReturned()
         }
     }
 
@@ -3912,7 +3937,44 @@ public actor OperationEngine {
         case let .keeper(operation):
             let eventId = try KeeperMutation.apply(operation, batchId: batchId, timestamp: timestampMillis, in: db)
             return ExecutionResult(eventId: eventId, seratoWrites: [])
+        case let .setCrateMembership(payload):
+            let (eventId, membership) = try applySetCrateMembership(payload, batchId: batchId, timestamp: timestampMillis, in: db)
+            return ExecutionResult(eventId: eventId, seratoWrites: [.crateMembership(membership)])
         }
+    }
+
+    /// Records the membership in `serato_crate_memberships` at once, so the
+    /// checklist's **Not in a crate** reflects the intent, and queues the crate
+    /// file write; the next crate scan sees the same row either way.
+    private static func applySetCrateMembership(
+        _ payload: SetCrateMembershipPayload, batchId: String, timestamp: Int64, in db: GRDB.Database
+    ) throws -> (Int64, SeratoPendingCrateMembership) {
+        guard let file = try FileRecord.fetchOne(db, key: payload.fileId) else {
+            throw OperationEngineError.fileNotFound(fileId: payload.fileId)
+        }
+        try FileProcessingEligibility.requireProcessable(file)
+        // Smart crates fill from their rules, so only a `.crate` name is journaled;
+        // a crate deleted since it was listed fails its queued write visibly.
+        guard (payload.crateFileName as NSString).pathExtension == SeratoLibraryLocator.crateExtension, !payload.crateFileName.contains("/") else {
+            throw OperationEngineError.crateNotFound(crateFileName: payload.crateFileName)
+        }
+        let alreadyPresent = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM \(SeratoLibraryFacts.membershipTable) WHERE file_id = ? AND crate_name = ?)",
+                                               arguments: [payload.fileId, payload.crateFileName]) ?? false
+        // A no-op forward would journal an inverse that undoes a membership
+        // Serato owned, so it refuses instead (Invariant 2).
+        guard alreadyPresent != payload.present else {
+            throw OperationEngineError.crateMembershipUnchanged(crateFileName: payload.crateFileName, present: payload.present)
+        }
+        if payload.present {
+            try db.execute(sql: "INSERT INTO \(SeratoLibraryFacts.membershipTable) (file_id, crate_name) VALUES (?, ?)",
+                           arguments: [payload.fileId, payload.crateFileName])
+        } else {
+            try db.execute(sql: "DELETE FROM \(SeratoLibraryFacts.membershipTable) WHERE file_id = ? AND crate_name = ?",
+                           arguments: [payload.fileId, payload.crateFileName])
+        }
+        let eventId = try insertEvent(batchId: batchId, timestamp: timestamp, fileId: payload.fileId, eventType: .crateMembershipSet,
+                                      forwardPayload: payload, inversePayload: payload.inverse, in: db)
+        return (eventId, SeratoPendingCrateMembership(absolutePath: file.path, crateFileName: payload.crateFileName, present: payload.present))
     }
 
     private static func applyRemoveFile(
@@ -4845,6 +4907,25 @@ public enum TrackMutation: Sendable {
     case recordMusicBrainzWork(RecordMusicBrainzWorkPayload)
     /// Marks or clears a recording's keeper, or undoes that.
     case keeper(KeeperOperation)
+    /// Puts a file into, or takes it out of, one existing Serato crate (#284).
+    /// The inverse is the same payload with `present` flipped.
+    case setCrateMembership(SetCrateMembershipPayload)
+}
+
+public struct SetCrateMembershipPayload: Codable, Sendable, Equatable {
+    public let fileId: Int64
+    public let crateFileName: String
+    public let present: Bool
+
+    public init(fileId: Int64, crateFileName: String, present: Bool) {
+        self.fileId = fileId
+        self.crateFileName = crateFileName
+        self.present = present
+    }
+
+    var inverse: SetCrateMembershipPayload {
+        SetCrateMembershipPayload(fileId: fileId, crateFileName: crateFileName, present: !present)
+    }
 }
 
 /// Move the file at `fileId` to the user's Trash via
@@ -5398,10 +5479,20 @@ enum SeratoPendingWrite: Sendable, Equatable {
     case removeFromCrates(SeratoPendingRemoval)
     case trashFile(SeratoPendingTrash)
     case restoreRecords(SeratoPendingRestore)
+    case crateMembership(SeratoPendingCrateMembership)
 
     var writesSeratoLibrary: Bool {
         kind.writesSeratoLibrary
     }
+}
+
+/// Queued membership of one track in one `.crate` under Subcrates, named by
+/// its file name so nested crates (`Parent%%Child.crate`) need no re-encoding:
+/// appended when `present`, removed otherwise.
+struct SeratoPendingCrateMembership: Codable, Sendable, Equatable {
+    let absolutePath: String
+    let crateFileName: String
+    let present: Bool
 }
 
 /// Queued removal of a file's references from Serato. Same payload
@@ -5495,6 +5586,8 @@ public enum OperationEngineError: LocalizedError, Equatable {
     case payloadEncodingFailed
     case eventPayloadDecodingFailed(eventId: Int64?, batchId: String, eventType: EventType, underlying: String)
     case seratoEnumerationFailed(directory: String, underlying: String)
+    case crateNotFound(crateFileName: String)
+    case crateMembershipUnchanged(crateFileName: String, present: Bool)
     case seratoRewriteFailed(path: String, underlying: String)
     /// Serato's `database V2` is missing, so queued changes that rewrite it
     /// (metadata updates and renames, which also rewrite crates) stay queued
@@ -5580,6 +5673,10 @@ public enum OperationEngineError: LocalizedError, Equatable {
             "Could not encode mutation payload as UTF-8 JSON."
         case let .seratoEnumerationFailed(directory, underlying):
             "Failed to enumerate Serato crate files in \(directory): \(underlying)"
+        case let .crateNotFound(crateFileName):
+            "Serato has no crate file named \(crateFileName) any more."
+        case let .crateMembershipUnchanged(crateFileName, present):
+            "The track is \(present ? "already" : "not") in \(PrepareMessages.crateDisplayName(crateFileName))."
         case let .seratoRewriteFailed(path, underlying):
             "Failed to rewrite Serato library file \(path): \(underlying)"
         case let .seratoDatabaseMissing(path, waitingCount):

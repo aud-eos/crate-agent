@@ -60,7 +60,8 @@ enum SeratoConflictQueue {
         switch (first.write, second.write) {
         case (.rename, .rename), (.metadataUpdate, .metadataUpdate), (.addTrack, .addTrack),
              (.fileTagWrite, .fileTagWrite), (.removeFromDatabase, .removeFromDatabase),
-             (.removeFromCrates, .removeFromCrates), (.trashFile, .trashFile), (.restoreRecords, .restoreRecords): return true
+             (.removeFromCrates, .removeFromCrates), (.trashFile, .trashFile), (.restoreRecords, .restoreRecords),
+             (.crateMembership, .crateMembership): return true
         default: return false
         }
     }

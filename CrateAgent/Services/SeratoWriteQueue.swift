@@ -10,13 +10,14 @@ enum SeratoWriteKind: String, Codable, Sendable {
     case removeFromCrates
     case trashFile
     case restoreRecords
+    case crateMembership
 
     /// Writes to Serato's library files (database V2, crates, smart crates),
     /// which all wait together while `database V2` is missing (#192). Audio
     /// tags and Trash are not Serato library files.
     var writesSeratoLibrary: Bool {
         switch self {
-        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates, .restoreRecords: true
+        case .rename, .metadataUpdate, .addTrack, .removeFromDatabase, .removeFromCrates, .restoreRecords, .crateMembership: true
         case .fileTagWrite, .trashFile: false
         }
     }
@@ -38,6 +39,7 @@ extension SeratoPendingWrite: Codable {
         case .removeFromCrates: .removeFromCrates
         case .trashFile: .trashFile
         case .restoreRecords: .restoreRecords
+        case .crateMembership: .crateMembership
         }
     }
 
@@ -52,6 +54,7 @@ extension SeratoPendingWrite: Codable {
         case .removeFromCrates: self = try .removeFromCrates(container.decode(SeratoPendingRemoval.self, forKey: .value))
         case .trashFile: self = try .trashFile(container.decode(SeratoPendingTrash.self, forKey: .value))
         case .restoreRecords: self = try .restoreRecords(container.decode(SeratoPendingRestore.self, forKey: .value))
+        case .crateMembership: self = try .crateMembership(container.decode(SeratoPendingCrateMembership.self, forKey: .value))
         }
     }
 
@@ -66,6 +69,7 @@ extension SeratoPendingWrite: Codable {
         case let .removeFromDatabase(value), let .removeFromCrates(value): try container.encode(value, forKey: .value)
         case let .trashFile(value): try container.encode(value, forKey: .value)
         case let .restoreRecords(value): try container.encode(value, forKey: .value)
+        case let .crateMembership(value): try container.encode(value, forKey: .value)
         }
     }
 }
@@ -246,6 +250,7 @@ enum SeratoWriteQueue {
             case let .rename(later): later.oldAbsolutePath
             case let .metadataUpdate(update): update.absolutePath
             case let .removeFromDatabase(removal), let .removeFromCrates(removal): removal.absolutePath
+            case let .crateMembership(membership): membership.absolutePath
             case .addTrack, .fileTagWrite, .trashFile, .restoreRecords: nil
             }
             guard let referencePath, SeratoPath.normalized(referencePath) == newPath else { continue }

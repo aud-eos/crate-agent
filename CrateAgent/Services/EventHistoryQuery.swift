@@ -366,6 +366,8 @@ public enum EventHistoryQuery {
             return HistoryMessages.keeperMarkedPhrase(count: count)
         case .keeperCleared:
             return HistoryMessages.keeperClearedPhrase(count: count)
+        case .crateMembershipSet:
+            return "Changed the crate membership of \(count) file\(pluralS)"
         }
     }
 
