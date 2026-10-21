@@ -17,11 +17,40 @@ struct SettingsView: View {
                 .tabItem { Label("Filename Template", systemImage: "textformat") }
             AutoTagSettingsView()
                 .tabItem { Label("Auto-Tag", systemImage: "wand.and.stars") }
+            PopularitySettingsView()
+                .tabItem { Label(PopularityMessages.title, systemImage: "chart.line.uptrend.xyaxis") }
             AboutSettingsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
         .frame(minWidth: 560, idealWidth: 660, minHeight: 400, idealHeight: 500)
         .appPresentation()
+    }
+}
+
+// MARK: - Popularity
+
+/// The popularity sources, each off until switched on here or from the Library's sheet.
+struct PopularitySettingsView: View {
+    @State private var preferences: PreferencesStore?
+    @State private var loadError: String?
+
+    var body: some View {
+        Form {
+            PageHeading(PopularityMessages.title, subtitle: PopularityMessages.sheetBody)
+            Section {
+                if let preferences {
+                    PopularitySourceToggles(preferences: preferences)
+                } else if let loadError {
+                    Label(loadError, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
+                }
+            } footer: {
+                Text(PopularityMessages.settingsFooter).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            do { preferences = try PreferencesStore.live() } catch { loadError = error.localizedDescription }
+        }
     }
 }
 

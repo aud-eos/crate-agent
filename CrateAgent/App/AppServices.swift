@@ -43,6 +43,7 @@ public final class AppServices: ObservableObject {
     let autoTagSession: AutoTagSession
     let syncSession: SeratoLibrarySyncSession
     let playCountService: SeratoPlayCountService
+    let popularityService: PopularityService
     let libraryFactsService: SeratoLibraryFactsService
     let musicBrainzWorkBackfill: MusicBrainzWorkBackfill
     @Published private(set) var syncState: SeratoLibrarySyncSession.State = .idle
@@ -136,6 +137,9 @@ public final class AppServices: ObservableObject {
     private var scanMilestones = ScanActivityMilestones()
     private var scanActivitySubscription: AnyCancellable?
     private var seratoFactsSubscription: AnyCancellable?
+    private var popularityRefreshTask: Task<Void, Never>?
+    /// How often popularity re-checks its stalest recordings while the app runs.
+    static let popularityRefreshInterval: Duration = .seconds(6 * 60 * 60)
 
     private static let logger = Logger(
         subsystem: "com.crateagent.app",
@@ -244,6 +248,9 @@ public final class AppServices: ObservableObject {
                                                checkpointStore: SyncCheckpointStore(database: database), watchRoots: watchConfiguration.watchedPaths)
         syncSession = session
         playCountService = SeratoPlayCountService(database: database, seratoLocator: seratoLocator, watchdog: seratoWatchdog)
+        popularityService = try PopularityService(database: database, preferences: PreferencesStore.live(), readiness: readiness,
+                                                  listenBrainz: ListenBrainzClient(loader: URLSession.shared, limiter: RateLimiter(minInterval: 1.0, clock: SystemClock())),
+                                                  deezer: DeezerClient(loader: URLSession.shared, limiter: RateLimiter(minInterval: 1.0, clock: SystemClock())))
         libraryFactsService = SeratoLibraryFactsService(database: database, seratoLocator: seratoLocator, watchdog: seratoWatchdog)
         let resumeFromEventId = watchConfiguration.resumeEventID {
             UserPreferences.lastFSEventId(forWatchedPath: $0)
@@ -308,9 +315,19 @@ public final class AppServices: ObservableObject {
         }
         // A finished sync means Serato is closed; each service re-reads its Serato files only if they or the library's paths changed.
         seratoFactsSubscription = session.$state.sink { [weak self] state in
-            guard case .ready = state, let playCounts = self?.playCountService, let libraryFacts = self?.libraryFactsService else { return }
+            guard case .ready = state, let playCounts = self?.playCountService, let libraryFacts = self?.libraryFactsService,
+                  let popularity = self?.popularityService else { return }
             Task { await playCounts.refresh() }
             Task { await libraryFacts.refresh() }
+            Task { await popularity.refresh() }
+        }
+        let popularity = popularityService
+        popularityRefreshTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.popularityRefreshInterval)
+                guard !Task.isCancelled else { return }
+                await popularity.refresh()
+            }
         }
         session.$phase.assign(to: &$syncPhase)
         session.$fileInfoFailures.assign(to: &$syncFileInfoFailures)
@@ -335,6 +352,7 @@ public final class AppServices: ObservableObject {
         filesystemEventsTask?.cancel()
         filesystemContinuation.finish()
         retryTask?.cancel()
+        popularityRefreshTask?.cancel()
         fsEventsWatcher.stop()
         let worker = fingerprintWorker
         Task { await worker.stop() }

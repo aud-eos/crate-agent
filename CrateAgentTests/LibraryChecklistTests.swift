@@ -127,6 +127,28 @@ final class LibraryChecklistTests: XCTestCase {
         XCTAssertEqual(Array(played.prefix(2)), [fileIDs["Played 9"], fileIDs["Played 2"]])
     }
 
+    func testPopularitySortsKnownScoresFirstAndUnknownLast() async throws {
+        let low = try XCTUnwrap(fileIDs["Played 2"])
+        let high = try XCTUnwrap(fileIDs["Played 9"])
+        try await pool.write { connection in
+            try PopularityStore.record([
+                PopularityObservation(recordingKey: "file:\(low)", source: .deezer, observedAt: 100, value: 200_000),
+                PopularityObservation(recordingKey: "file:\(high)", source: .deezer, observedAt: 100, value: 800_000),
+            ], now: 100, in: connection)
+            try PopularityStore.seedHot([(recordingKey: "file:\(low)", hot: 90)], now: 100, in: connection)
+        }
+        let ascending = try await ids(.init(sort: .init(column: .popularity, ascending: true)))
+        XCTAssertEqual(Array(ascending.prefix(2)), [low, high])
+        let descending = try await ids(.init(sort: .init(column: .popularity, ascending: false)))
+        XCTAssertEqual(Array(descending.prefix(2)), [high, low])
+        let hottest = try await rows(.init(sort: .init(column: .hot, ascending: false)))
+        XCTAssertEqual(hottest.first?.id, low)
+        XCTAssertEqual(hottest.first?.popularityHot, 90)
+        XCTAssertEqual(hottest.first?.popularityAllTime, 20)
+        XCTAssertEqual(hottest.first?.popularityDetail, "Deezer rank 200,000")
+        XCTAssertNil(hottest.last?.popularityHot)
+    }
+
     func testPlaysAndUnreadSourcesChipCountsAreUnknownAndNeverPlayedMatchesNothingUntilHistoryHasBeenRead() async throws {
         try await pool.write { connection in
             try connection.execute(sql: "DELETE FROM checklist_source_stamps WHERE source IN (?, ?)",

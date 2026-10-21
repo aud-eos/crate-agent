@@ -13,13 +13,16 @@ enum LibraryBrowserColumns {
     private static let previewIdentifier = "preview"
     private static let versionsIdentifier = "versions"
     private static let alternatesIdentifier = "alternates"
+    /// `popularityEnabled` says whether any popularity source is on; while none is, the two popularity columns read "off".
     static func make(showsFilenames: Bool, density: AppDensity, readiness: LibrarySyncReadiness? = nil,
-                     player: TrackPlayer? = nil, families: LibraryFamilyControls? = nil) -> [PagedTableColumn<BrowserRow>]
+                     player: TrackPlayer? = nil, families: LibraryFamilyControls? = nil,
+                     popularityEnabled: @escaping () -> Bool = { false }) -> [PagedTableColumn<BrowserRow>]
     {
         let definitions: [(LibraryBrowseSort.Column?, String, CGFloat)] = [
             (.artist, "Artist", 220), (.title, "Title", 280), (.bpm, "BPM", 70), (.musicalKey, "Key", 50),
             (.stillNeeds, LibraryChecklistMessages.stillNeedsColumn, 240), (.dateAdded, LibraryChecklistMessages.dateAddedColumn, 110),
-            (.myPlays, LibraryChecklistMessages.myPlaysColumn, 70), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
+            (.myPlays, LibraryChecklistMessages.myPlaysColumn, 70), (.popularity, LibraryChecklistMessages.popularityColumn, 80),
+            (.hot, LibraryChecklistMessages.hotColumn, 60), (.album, "Album", 200), (nil, "Status", 240), (.path, "Folder", 240),
         ]
         let previewColumns = player.map { player in
             [PagedTableColumn<BrowserRow>(identifier: previewIdentifier, title: "", width: 28, makeCell: { TrackPlayCell() }, updateCell: { view, row in
@@ -45,7 +48,8 @@ enum LibraryBrowserColumns {
             let identifier = column?.rawValue ?? statusIdentifier
             return PagedTableColumn(identifier: identifier, title: title, width: width, makeCell: { LibraryBrowserCell() }, updateCell: { view, row in
                 guard let cell = view as? LibraryBrowserCell else { preconditionFailure("Unexpected Library cell") }
-                cell.update(row: row?.applyingConflictScope(readiness), column: column, title: title, showsFilenames: showsFilenames, density: density)
+                cell.update(row: row?.applyingConflictScope(readiness), column: column, title: title, showsFilenames: showsFilenames, density: density,
+                            popularityEnabled: popularityEnabled())
             }, sortable: column != nil)
         }
     }
@@ -82,7 +86,7 @@ private final class LibraryBrowserCell: NSTableCellView {
         super.init(coder: coder)
     }
 
-    func update(row: BrowserRow?, column: LibraryBrowseSort.Column?, title: String, showsFilenames: Bool, density: AppDensity) {
+    func update(row: BrowserRow?, column: LibraryBrowseSort.Column?, title: String, showsFilenames: Bool, density: AppDensity, popularityEnabled: Bool) {
         needsLayout = true
         primary.font = .systemFont(ofSize: density == .compact ? 11 : 13)
         primary.textColor = .labelColor
@@ -155,6 +159,22 @@ private final class LibraryBrowserCell: NSTableCellView {
             }
             primary.stringValue = plays.formatted()
             primary.font = .monospacedDigitSystemFont(ofSize: density == .compact ? 11 : 13, weight: .regular)
+        case .popularity, .hot:
+            guard row.hasChecklist else { primary.stringValue = ""; break }
+            guard let score = column == .popularity ? row.popularityAllTime : row.popularityHot else {
+                if popularityEnabled {
+                    showUnknown()
+                } else {
+                    showOff()
+                }
+                setAccessibilityLabel("\(title): \(primary.stringValue)")
+                return
+            }
+            primary.stringValue = Int(score.rounded()).formatted()
+            primary.font = .monospacedDigitSystemFont(ofSize: density == .compact ? 11 : 13, weight: .regular)
+            toolTip = row.popularityDetail
+            setAccessibilityLabel("\(title): \(primary.stringValue)")
+            return
         case .none:
             primary.stringValue = row.statusText
             primary.textColor = row.canProcess ? .secondaryLabelColor : .systemOrange
@@ -169,6 +189,12 @@ private final class LibraryBrowserCell: NSTableCellView {
     private func showUnknown() {
         primary.stringValue = LibraryChecklistMessages.unknown
         primary.textColor = .secondaryLabelColor
+    }
+
+    private func showOff() {
+        primary.stringValue = PopularityMessages.off
+        primary.textColor = .secondaryLabelColor
+        toolTip = PopularityMessages.offStatus
     }
 }
 

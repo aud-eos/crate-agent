@@ -134,9 +134,43 @@ struct PreferencesStore {
         }
     }
 
+    /// Each popularity source starts off; nothing is sent to it until the owner turns it on.
+    func isPopularitySourceEnabled(_ source: PopularitySource) -> Bool {
+        defaults.bool(forKey: Key.popularitySourcePrefix + source.rawValue)
+    }
+
+    func setPopularitySource(_ source: PopularitySource, enabled: Bool) {
+        defaults.set(enabled, forKey: Key.popularitySourcePrefix + source.rawValue)
+    }
+
+    var enabledPopularitySources: Set<PopularitySource> {
+        Set(PopularitySource.allCases.filter(isPopularitySourceEnabled))
+    }
+
+    /// Whether the sources sheet was offered once; sorting by Popularity while every source is off offers it.
+    var popularityPromptShown: Bool {
+        get { defaults.bool(forKey: Key.popularityPromptShown) }
+        nonmutating set { defaults.set(newValue, forKey: Key.popularityPromptShown) }
+    }
+
+    /// Unix seconds of the last Deezer chart seeding of Hot, or nil.
+    var popularityChartSeededAt: Int64? {
+        get { defaults.object(forKey: Key.popularityChartSeededAt) as? Int64 }
+        nonmutating set {
+            if let newValue {
+                defaults.set(newValue, forKey: Key.popularityChartSeededAt)
+            } else {
+                defaults.removeObject(forKey: Key.popularityChartSeededAt)
+            }
+        }
+    }
+
     enum Key {
         static let watchedMusicFolderPath = "WatchedMusicFolderPath"
         static let lastFSEventIdPrefix = "LastFSEventId:"
         static let filenameTemplate = "FilenameTemplate"
+        static let popularitySourcePrefix = "PopularitySource:"
+        static let popularityPromptShown = "PopularityPromptShown"
+        static let popularityChartSeededAt = "PopularityChartSeededAt"
     }
 }

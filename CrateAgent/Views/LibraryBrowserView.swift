@@ -39,7 +39,7 @@ struct LibraryBrowserView: View {
                 LibraryChecklistFilters(model: model, playCounts: services.playCountService)
                     .padding(.horizontal, density.pagePadding).padding(.bottom, density.spacing)
                 LibraryPagedContent(model: model, density: density, showsFilenames: statusFilter != .active, readiness: services.readiness,
-                                    player: services.trackPlayer, opener: services.fileOpener)
+                                    player: services.trackPlayer, opener: services.fileOpener, popularity: services.popularityService)
                 { identifier, action in
                     Task { await perform(action, for: identifier) }
                 } onFamilyAction: { row, action in

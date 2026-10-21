@@ -147,6 +147,7 @@ public final class LibraryDatabase {
         AddSeratoAnalysisMigration.register(in: &migrator)
         AddKeeperMarksMigration.register(in: &migrator)
         AddCleanupKeeperIndexMigration.register(in: &migrator)
+        AddPopularityMigration.register(in: &migrator)
         return migrator
     }
 }

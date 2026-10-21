@@ -127,7 +127,44 @@ SQL from them each time the Library loads.
 | Cue points, beatgrid markers | The audio file's Serato tags, by `SeratoAnalysisWorker` | In the background, once per file content |
 | Duplicates | Cached digests, by `ChecklistDuplicateRefresher` | When duplicate evidence changes, at most every 30 seconds |
 | Play counts | Serato History, by `SeratoPlayCountService` | After each sync, while Serato is closed |
+| Popularity, Hot | ListenBrainz and Deezer, by `PopularityService` | After each sync and every 6 hours, stalest recordings first, once a source is on |
 | Artist, title, genre, BPM, key, bitrate | The indexed `files` columns | With every sync |
+
+## Popularity and Hot
+
+Two sortable columns say how well known a recording is and whether it is rising.
+Both start **off**: no lookup runs and the cells read "off" until a source is
+switched on, in Settings → Popularity or in the sheet the Library offers the
+first time either column is sorted. Only the artist, title, ISRC and MusicBrainz
+recording ID ever leave the machine. A recording no source answered shows
+"unknown", never 0, and sorts last in both directions.
+
+- **ListenBrainz** receives MusicBrainz recording IDs and returns total listens.
+- **Deezer** receives the ISRC, or the artist and title when there is none, and
+  returns the track's rank. A search hit whose artist is not the file's artist is
+  discarded.
+
+**Popularity** is the mean of each source's figure normalized to 0 to 100: ten
+million ListenBrainz listens or a Deezer rank of one million both score 100.
+**Hot** is the percentage growth between a recording's latest figure and an
+earlier one at least seven days older within the last four weeks, averaged
+across sources, so it needs two lookups of the same recording. Until then the
+Deezer chart fills it, at most once a week: the top track scores 100 and the
+hundredth scores 1, for every encoding of a matching recording. A computed
+growth always replaces the chart figure, a recording that leaves the chart
+loses it, and a growth whose earlier lookup ages out of the four weeks reads
+"unknown" again.
+
+Scores attach to the recording key the keeper uses (the MusicBrainz recording ID,
+else the track, else the file), so every encoding of a recording shares them.
+`PopularityStore` is the only writer of `popularity_lookups` (each source's raw
+figure over time) and `popularity_scores` (the derived columns the Library
+joins). A pass looks up at most 500 recordings in batches of 50, one request per
+second per source. A failed answer for one request skips that recording until
+its next weekly turn; being offline, rate limited (Deezer's quota envelope
+included) or interrupted ends the pass and keeps what landed, and a pass that
+starts during a library sync waits for it. The Workers window's Popularity card
+shows the pass and offers **Refresh now**.
 
 **Workers** shows each service's status: the Serato crates and beatgrid locks
 card, the cue-point card with read, pending, failed and unsupported counts and

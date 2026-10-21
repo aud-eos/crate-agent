@@ -18,8 +18,10 @@ struct LibraryPagedContent: View {
     var readiness: LibrarySyncReadiness?
     var player: TrackPlayer?
     var opener: FileOpener?
+    var popularity: PopularityService?
     let onAction: (Int64, LibraryBrowserAction) -> Void
     var onFamilyAction: (BrowserRow, LibraryFamilyAction) -> Void = { _, _ in }
+    @State private var offersPopularitySources = false
 
     private var enabled: Bool {
         !model.isRefreshing && !model.selection.isBusy && model.results.snapshot != nil
@@ -91,7 +93,8 @@ struct LibraryPagedContent: View {
 
     private var table: some View {
         PagedTable(controller: model.results, columns: LibraryBrowserColumns.make(showsFilenames: showsFilenames, density: density, readiness: readiness, player: player,
-                                                                                  families: model.showsFamilies ? familyControls : nil),
+                                                                                  families: model.showsFamilies ? familyControls : nil,
+                                                                                  popularityEnabled: { [popularity] in popularity?.enabledSources.isEmpty == false }),
                    accessibilityLabel: "Library files", rowHeight: density.minimumRowHeight + (showsFilenames ? 12 : 0),
                    isSelected: { identifier in model.selection.visibleSelectedIDs.contains(identifier) },
                    onSelect: { rows, selected in
@@ -110,12 +113,21 @@ struct LibraryPagedContent: View {
                        var query = model.query
                        query.sort = .init(column: column, ascending: ascending)
                        model.setQuery(query)
+                       // The first sort by a popularity column while every source is off offers the sources once.
+                       if [.popularity, .hot].contains(column), let popularity, popularity.enabledSources.isEmpty, !popularity.preferences.popularityPromptShown {
+                           offersPopularitySources = true
+                       }
                    }, contextMenu: menu(for:), selectionVersion: { model.selection.interactionVersion }, enabled: enabled,
                    contentRevision: (readiness?.scopeRevision ?? 0) &+ model.familyRevision,
                    onFocus: { identifier, index in model.focus(id: identifier, index: index) },
                    onDisclose: { identifier, expanded in model.disclose(expanded, row: identifier) },
                    onSpace: player.map { player in { row in Task { await player.toggle(PlayerTrack(row)) } } },
                    onOpen: opener.map { _ in { row in onAction(row.id, .open(.defaultApplication)) } })
+            .sheet(isPresented: $offersPopularitySources) {
+                if let popularity {
+                    PopularitySourcesSheet(preferences: popularity.preferences, service: popularity) { offersPopularitySources = false }
+                }
+            }
     }
 
     private var familyControls: LibraryFamilyControls {
