@@ -167,7 +167,8 @@ private final class LibraryBrowserCell: NSTableCellView {
                 } else {
                     showOff()
                 }
-                break
+                setAccessibilityLabel("\(title): \(primary.stringValue)")
+                return
             }
             primary.stringValue = Int(score.rounded()).formatted()
             primary.font = .monospacedDigitSystemFont(ofSize: density == .compact ? 11 : 13, weight: .regular)

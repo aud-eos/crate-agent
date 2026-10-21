@@ -168,7 +168,7 @@ enum LibraryChecklist {
                    \(fact).beatgrid_locked, \(fact).added_at AS date_added, \(fact).added_source AS date_added_source,
                    CASE WHEN EXISTS (SELECT 1 FROM \(SeratoLibraryFacts.stampTable) WHERE source = '\(ChecklistSource.history.rawValue)')
                         THEN COALESCE(plays.play_count, 0) END AS play_count, duplicates.file_id IS NOT NULL AS is_duplicate,
-                   popularity.all_time AS popularity_all_time, popularity.hot AS popularity_hot, popularity.detail AS popularity_detail,
+                   popularity.all_time AS popularity_all_time, COALESCE(popularity.hot, popularity.chart_hot) AS popularity_hot, popularity.detail AS popularity_detail,
                    files.bitrate_kbps, \(losslessSQL) AS is_lossless, \(missingMetadataSQL) AS missing_metadata
             FROM files LEFT JOIN tracks ON tracks.id = files.track_id
             LEFT JOIN \(PopularityStore.scoresTable) AS popularity ON popularity.recording_key = \(KeeperMarks.recordingKeySQL)

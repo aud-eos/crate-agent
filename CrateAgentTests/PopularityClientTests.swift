@@ -25,6 +25,14 @@ final class PopularityClientTests: XCTestCase {
 
         XCTAssertNil(track)
         XCTAssertEqual(loader.lastRequest?.url?.absoluteString, "https://api.deezer.com/track/isrc:GBAYE0601498")
+
+        let quota = DeezerClient(loader: StubLoader(status: 200, body: Data(#"{"error":{"type":"Exception","message":"Quota limit exceeded","code":4}}"#.utf8)), limiter: .noop)
+        do {
+            _ = try await quota.track(isrc: "GBAYE0601498")
+            XCTFail("A quota envelope is a failure, not a missing track")
+        } catch let error as LookupError {
+            XCTAssertEqual(error, .rateLimited)
+        }
     }
 
     func testDeezerSearchQuotesArtistAndTitle() async throws {
@@ -32,11 +40,12 @@ final class PopularityClientTests: XCTestCase {
         let loader = StubLoader(status: 200, body: body)
         let client = DeezerClient(loader: loader, limiter: .noop)
 
-        let track = try await client.search(artist: "Daft Punk", title: "Harder, Better, Faster, Stronger")
+        let track = try await client.search(artist: "Daft + Punk", title: "Harder, \"Better\", Faster, Stronger")
 
         XCTAssertEqual(track, DeezerTrack(id: 3_135_556, title: "Harder, Better, Faster, Stronger", artist: "Daft Punk", rank: 850_000))
         let query = try XCTUnwrap(URLComponents(url: XCTUnwrap(loader.lastRequest?.url), resolvingAgainstBaseURL: false)?.queryItems)
-        XCTAssertEqual(query.first { item in item.name == "q" }?.value, #"artist:"Daft Punk" track:"Harder, Better, Faster, Stronger""#)
+        XCTAssertEqual(query.first { item in item.name == "q" }?.value, #"artist:"Daft + Punk" track:"Harder, Better, Faster, Stronger""#)
+        XCTAssertTrue(loader.lastRequest?.url?.absoluteString.contains("Daft%20%2B%20Punk") == true, "A plus must survive form decoding")
         XCTAssertEqual(query.first { item in item.name == "limit" }?.value, "1")
     }
 

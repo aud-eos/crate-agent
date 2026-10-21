@@ -10,9 +10,10 @@ enum PopularityMessages {
     static let sheetBody = "Popularity looks each track up on the services you turn on, in the background. Only the artist, title, ISRC and MusicBrainz recording ID are sent. Nothing is sent until you turn a source on."
     static let enable = "Turn on"
     static let notNow = "Not now"
-    static let settingsFooter = "All-time popularity is each source's listener or rank figure, normalized to 0 to 100. Hot is growth since an earlier lookup at least a week old, seeded from the Deezer chart."
+    static let settingsFooter = "All-time popularity is each source's listener or rank figure, normalized to 0 to 100. Hot is growth since an earlier lookup at least a week old, filled from the Deezer chart until then."
     static let refreshNow = "Refresh now"
     static let notRefreshed = "Not looked up yet"
+    static let waitingForSync = "Waiting for the library sync to finish."
     static let refreshed = "Up to date"
     static let offline = "Offline. Scores shown are from the last lookup."
 

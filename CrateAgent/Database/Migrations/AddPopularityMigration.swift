@@ -19,6 +19,7 @@ enum AddPopularityMigration {
                 recording_key TEXT PRIMARY KEY,
                 all_time REAL,
                 hot REAL,
+                chart_hot REAL,
                 detail TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );

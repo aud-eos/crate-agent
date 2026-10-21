@@ -149,16 +149,22 @@ million ListenBrainz listens or a Deezer rank of one million both score 100.
 **Hot** is the percentage growth between a recording's latest figure and an
 earlier one at least seven days older within the last four weeks, averaged
 across sources, so it needs two lookups of the same recording. Until then the
-Deezer chart seeds it, at most once a week: the top track scores 100 and the
-hundredth scores 1, for every encoding of a matching recording.
+Deezer chart fills it, at most once a week: the top track scores 100 and the
+hundredth scores 1, for every encoding of a matching recording. A computed
+growth always replaces the chart figure, a recording that leaves the chart
+loses it, and a growth whose earlier lookup ages out of the four weeks reads
+"unknown" again.
 
 Scores attach to the recording key the keeper uses (the MusicBrainz recording ID,
 else the track, else the file), so every encoding of a recording shares them.
 `PopularityStore` is the only writer of `popularity_lookups` (each source's raw
 figure over time) and `popularity_scores` (the derived columns the Library
 joins). A pass looks up at most 500 recordings in batches of 50, one request per
-second per source, and a lookup error ends the pass and keeps what landed. The
-Workers window's Popularity card shows the pass and offers **Refresh now**.
+second per source. A failed answer for one request skips that recording until
+its next weekly turn; being offline, rate limited (Deezer's quota envelope
+included) or interrupted ends the pass and keeps what landed, and a pass that
+starts during a library sync waits for it. The Workers window's Popularity card
+shows the pass and offers **Refresh now**.
 
 **Workers** shows each service's status: the Serato crates and beatgrid locks
 card, the cue-point card with read, pending, failed and unsupported counts and

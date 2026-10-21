@@ -11,6 +11,8 @@ final class PopularityService: ObservableObject {
     enum Status: Equatable {
         case off
         case notRefreshed
+        /// The library sync holds the writer; the pass runs when it finishes.
+        case waitingForSync
         case refreshing(done: Int, total: Int)
         case refreshed(count: Int)
         /// The reason the last pass stopped; scores already stored stay.
@@ -74,6 +76,7 @@ final class PopularityService: ObservableObject {
         do {
             authorization = try readiness?.capture()
         } catch {
+            status = .waitingForSync
             return
         }
         let startedAt = now()
@@ -88,12 +91,17 @@ final class PopularityService: ObservableObject {
                     try PopularityStore.staleRecordingKeys(limit: Self.batchSize, olderThan: startedAt - PopularityScoring.refreshInterval, in: connection)
                 }
                 guard !candidates.isEmpty else { break }
-                let observations = try await observe(candidates, sources: sources)
+                let observed = await observe(candidates, sources: sources)
                 try authorization?.check()
                 let recordedAt = now()
                 try await database.writer.write { connection in
-                    try PopularityStore.record(observations, now: recordedAt, in: connection)
-                    try Self.markLookedUp(candidates, observed: Set(observations.map(\.recordingKey)), now: recordedAt, in: connection)
+                    try PopularityStore.record(observed.observations, now: recordedAt, in: connection)
+                    if observed.halt == nil {
+                        try Self.markLookedUp(candidates, observed: Set(observed.observations.map(\.recordingKey)), now: recordedAt, in: connection)
+                    }
+                }
+                if let halt = observed.halt {
+                    throw halt
                 }
                 lookedUp += candidates.count
                 status = .refreshing(done: lookedUp, total: total)
@@ -111,28 +119,43 @@ final class PopularityService: ObservableObject {
     }
 
     /// Every source's figure for the candidates it can look up; a source with nothing to send is skipped.
-    private func observe(_ candidates: [PopularityCandidate], sources: Set<PopularitySource>) async throws -> [PopularityObservation] {
+    /// A per-request failure (`LookupError.transport`) skips that request, so one bad answer never blocks
+    /// the recordings behind it; being offline, rate limited or cancelled halts the pass, and the figures
+    /// gathered before the halt are returned with it so they are kept.
+    private func observe(_ candidates: [PopularityCandidate], sources: Set<PopularitySource>) async -> (observations: [PopularityObservation], halt: Error?) {
         let observedAt = now()
         var observations: [PopularityObservation] = []
-        if sources.contains(.listenBrainz) {
-            let withMBID = candidates.filter { candidate in candidate.recordingMBID != nil }
-            if !withMBID.isEmpty {
-                let counts = try await listenBrainz.listenCounts(recordingMBIDs: withMBID.compactMap(\.recordingMBID))
-                for candidate in withMBID {
-                    if let mbid = candidate.recordingMBID, let count = counts[mbid] {
-                        observations.append(PopularityObservation(recordingKey: candidate.recordingKey, source: .listenBrainz, observedAt: observedAt, value: Double(count)))
+        do {
+            if sources.contains(.listenBrainz) {
+                let withMBID = candidates.filter { candidate in candidate.recordingMBID != nil }
+                if !withMBID.isEmpty {
+                    let counts = try await skippingTransportErrors { try await listenBrainz.listenCounts(recordingMBIDs: withMBID.compactMap(\.recordingMBID)) } ?? [:]
+                    for candidate in withMBID {
+                        if let mbid = candidate.recordingMBID, let count = counts[mbid] {
+                            observations.append(PopularityObservation(recordingKey: candidate.recordingKey, source: .listenBrainz, observedAt: observedAt, value: Double(count)))
+                        }
                     }
                 }
             }
-        }
-        if sources.contains(.deezer) {
-            for candidate in candidates {
-                try Task.checkCancellation()
-                guard let track = try await deezerTrack(for: candidate) else { continue }
-                observations.append(PopularityObservation(recordingKey: candidate.recordingKey, source: .deezer, observedAt: observedAt, value: Double(track.rank)))
+            if sources.contains(.deezer) {
+                for candidate in candidates {
+                    try Task.checkCancellation()
+                    guard let track = try await skippingTransportErrors({ try await deezerTrack(for: candidate) }) ?? nil else { continue }
+                    observations.append(PopularityObservation(recordingKey: candidate.recordingKey, source: .deezer, observedAt: observedAt, value: Double(track.rank)))
+                }
             }
+        } catch {
+            return (observations, error)
         }
-        return observations
+        return (observations, nil)
+    }
+
+    private func skippingTransportErrors<Value>(_ lookup: () async throws -> Value) async throws -> Value? {
+        do {
+            return try await lookup()
+        } catch LookupError.transport {
+            return nil
+        }
     }
 
     /// An ISRC hit is authoritative; a search hit counts only when its artist is the candidate's.

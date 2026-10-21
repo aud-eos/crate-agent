@@ -76,13 +76,21 @@ final class PopularityStoreTests: XCTestCase {
             try PopularityStore.seedHot([(recordingKey: "k", hot: 98), (recordingKey: "new", hot: 97)], now: self.now, in: connection)
         }
         let rows = try await database.writer.read { connection in
-            try Row.fetchAll(connection, sql: "SELECT recording_key, all_time, hot FROM popularity_scores ORDER BY recording_key")
+            try Row.fetchAll(connection, sql: "SELECT recording_key, all_time, COALESCE(hot, chart_hot) AS hot FROM popularity_scores ORDER BY recording_key")
         }
         XCTAssertEqual(rows.map { row in row["recording_key"] as String }, ["k", "new"])
         XCTAssertEqual(rows[0]["all_time"] as Double?, 50)
         XCTAssertEqual(rows[0]["hot"] as Double?, 98)
         XCTAssertNil(rows[1]["all_time"] as Double?)
         XCTAssertEqual(rows[1]["hot"] as Double?, 97)
+
+        try await database.writer.write { connection in
+            try PopularityStore.seedHot([(recordingKey: "new", hot: 99)], now: self.now, in: connection)
+        }
+        let withdrawn = try await database.writer.read { connection in
+            try Row.fetchAll(connection, sql: "SELECT COALESCE(hot, chart_hot) AS hot FROM popularity_scores ORDER BY recording_key").map { row in row["hot"] as Double? }
+        }
+        XCTAssertEqual(withdrawn, [nil, 99], "A recording that left the chart loses its seed")
     }
 
     func testRecordingKeysMatchFoldedArtistAndTitleAcrossEncodings() async throws {

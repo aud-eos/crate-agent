@@ -34,7 +34,7 @@ enum PopularityStore {
     static func staleRecordingKeys(limit: Int, olderThan: Int64, in database: GRDB.Database) throws -> [PopularityCandidate] {
         try Row.fetchAll(database, sql: """
         SELECT \(KeeperMarks.recordingKeySQL) AS recording_key, MIN(tracks.musicbrainz_recording_id) AS recording_mbid, MIN(tracks.isrc) AS isrc,
-               MIN(COALESCE(tracks.artist, files.artist, '')) AS artist, MIN(COALESCE(tracks.title, files.title, '')) AS title,
+               MAX(COALESCE(tracks.artist, files.artist, '')) AS artist, MAX(COALESCE(tracks.title, files.title, '')) AS title,
                scores.updated_at AS updated_at
         \(candidateJoinSQL)
         LEFT JOIN \(scoresTable) AS scores ON scores.recording_key = \(KeeperMarks.recordingKeySQL)
@@ -48,12 +48,14 @@ enum PopularityStore {
         }
     }
 
-    /// Sets Hot from a chart position; all-time and detail stay, and a recording never looked up stays due for one.
+    /// Replaces every chart seed with these positions: a recording off the chart loses its seed, and a computed
+    /// Hot always wins over a seed. All-time and detail stay, and a recording never looked up stays due for one.
     static func seedHot(_ seeds: [(recordingKey: String, hot: Double)], now _: Int64, in database: GRDB.Database) throws {
+        try database.execute(sql: "UPDATE \(scoresTable) SET chart_hot = NULL WHERE chart_hot IS NOT NULL")
         for seed in seeds {
             try database.execute(sql: """
-            INSERT INTO \(scoresTable) (recording_key, all_time, hot, detail, updated_at) VALUES (?, NULL, ?, '', 0)
-            ON CONFLICT(recording_key) DO UPDATE SET hot = excluded.hot
+            INSERT INTO \(scoresTable) (recording_key, all_time, hot, chart_hot, detail, updated_at) VALUES (?, NULL, NULL, ?, '', 0)
+            ON CONFLICT(recording_key) DO UPDATE SET chart_hot = excluded.chart_hot
             """, arguments: [seed.recordingKey, seed.hot])
         }
     }
@@ -102,8 +104,8 @@ enum PopularityStore {
         let hot = PopularityScoring.hot(history: history, now: now)
         try database.execute(sql: """
         INSERT INTO \(scoresTable) (recording_key, all_time, hot, detail, updated_at) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(recording_key) DO UPDATE SET all_time = excluded.all_time, detail = excluded.detail, updated_at = excluded.updated_at,
-            hot = COALESCE(excluded.hot, \(scoresTable).hot)
+        ON CONFLICT(recording_key) DO UPDATE SET all_time = excluded.all_time, hot = excluded.hot, detail = excluded.detail,
+            updated_at = excluded.updated_at
         """, arguments: [recordingKey, PopularityScoring.allTime(latest: latest), hot, PopularityScoring.detail(latest: latest), now])
     }
 }

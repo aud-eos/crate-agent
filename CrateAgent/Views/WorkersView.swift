@@ -292,6 +292,8 @@ private struct PopularityCard: View {
                 Text(PopularityMessages.offStatus).font(.callout)
             case .notRefreshed:
                 Text(PopularityMessages.notRefreshed).font(.callout)
+            case .waitingForSync:
+                Text(PopularityMessages.waitingForSync).font(.callout)
             case let .refreshing(done, total):
                 HStack {
                     ProgressView().controlSize(.small)

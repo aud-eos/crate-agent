@@ -97,7 +97,7 @@ final class PopularityServiceTests: XCTestCase {
 
         let hot = try await fixture.database.writer.read { connection in
             try Row.fetchAll(connection, sql: """
-            SELECT files.title, scores.hot FROM files LEFT JOIN tracks ON tracks.id = files.track_id
+            SELECT files.title, COALESCE(scores.hot, scores.chart_hot) AS hot FROM files LEFT JOIN tracks ON tracks.id = files.track_id
             LEFT JOIN popularity_scores AS scores ON scores.recording_key = \(KeeperMarks.recordingKeySQL) ORDER BY files.id
             """).map { row in (row["title"] as String, row["hot"] as Double?) }
         }
