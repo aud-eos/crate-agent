@@ -77,6 +77,18 @@ Keeper** to remove the protection.
   its mark. Undoing a removal doesn't bring the mark back: the file's
   retirement invalidated it, so mark the file again if it should stay a keeper.
 
+## Removing several files
+
+Select files in the Library and choose **Move N to Trash…**. The review names
+the files, how much space they free and what happens: each file leaves
+Serato's library and every crate, is moved to the Trash and has its row
+retired, through the same staged removal Library Cleanup uses
+(`LibraryBatchRemoval`, one `OperationEngine.removeFile` per file under one
+History batch, so one undo restores them all while they are in the Trash).
+The command takes at most 500 files at once, and refuses when a selected file
+changed after it was selected. A file that fails is reported and the others
+still go. While Serato is running the button is disabled and a banner says why.
+
 ## Chips
 
 The chips are **Needs work**, **Not in a crate**, **No cues**, **Grid

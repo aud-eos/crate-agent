@@ -19,9 +19,14 @@ struct LibraryPagedContent: View {
     var player: TrackPlayer?
     var opener: FileOpener?
     var popularity: PopularityService?
+    var removal: LibraryBatchRemoval?
     let onAction: (Int64, LibraryBrowserAction) -> Void
     var onFamilyAction: (BrowserRow, LibraryFamilyAction) -> Void = { _, _ in }
     @State private var offersPopularitySources = false
+    @State private var removalPlan: LibraryBatchRemoval.Plan?
+    @State private var isPlanningRemoval = false
+    @State private var removalNotice: String?
+    @State private var removalFailures: String?
 
     private var enabled: Bool {
         !model.isRefreshing && !model.selection.isBusy && model.results.snapshot != nil
@@ -42,6 +47,12 @@ struct LibraryPagedContent: View {
             }
             if let message = model.selection.error {
                 failure(message) { model.selection.retry() }
+            }
+            if let removalFailures {
+                HStack { ActionErrorMessage(message: removalFailures); Button(CommonLabels.dismiss) { self.removalFailures = nil } }
+            }
+            if let removalNotice {
+                HStack { ActionNoticeMessage(message: removalNotice); Button(CommonLabels.dismiss) { self.removalNotice = nil } }
             }
             if let offer = model.differentRecordingsOffer, let title = offer.action.differentRecordingsTitle {
                 HStack {
@@ -70,6 +81,15 @@ struct LibraryPagedContent: View {
                 }
                 Button(ListControlLabels.clearSelection) { model.selection.clear() }
                     .disabled(model.selection.summary?.total == 0 && !model.selection.isBusy)
+                if removal != nil {
+                    let selected = summary?.total ?? 0
+                    Button(LibraryRemovalMessages.button(selected), role: .destructive) { Task { await planRemoval() } }
+                        .disabled(!enabled || selected == 0 || isPlanningRemoval)
+                        .seratoWriteGated(help: LibraryRemovalMessages.help, runningHelp: LibraryRemovalMessages.runningHelp)
+                }
+            }
+            if isPlanningRemoval {
+                HStack { ProgressView().controlSize(.small); Text(LibraryRemovalMessages.reviewing).font(.callout) }
             }
             if model.selection.isBusy {
                 HStack { ProgressView().controlSize(.small); Text(PagingLabels.selectionBusy).font(.callout) }
@@ -128,6 +148,35 @@ struct LibraryPagedContent: View {
                     PopularitySourcesSheet(preferences: popularity.preferences, service: popularity) { offersPopularitySources = false }
                 }
             }
+            .sheet(isPresented: Binding(get: { removalPlan != nil }, set: {
+                shown in if !shown {
+                    removalPlan = nil
+                }
+            })) {
+                if let removalPlan {
+                    LibraryRemovalReviewSheet(plan: removalPlan, confirm: { Task { await remove(removalPlan) } }, cancel: { self.removalPlan = nil })
+                }
+            }
+    }
+
+    private func planRemoval() async {
+        guard let removal else { return }
+        isPlanningRemoval = true
+        defer { isPlanningRemoval = false }
+        removalFailures = nil
+        removalNotice = nil
+        do {
+            removalPlan = try await removal.plan(model.selectedIdentities())
+        } catch { removalFailures = error.localizedDescription }
+    }
+
+    private func remove(_ plan: LibraryBatchRemoval.Plan) async {
+        guard let removal else { return }
+        removalPlan = nil
+        let outcome = await removal.remove(plan)
+        removalNotice = LibraryRemovalMessages.outcome(outcome)
+        removalFailures = outcome.failures.isEmpty ? nil : LibraryRemovalMessages.failures(outcome.failures)
+        model.selection.clear()
     }
 
     private var familyControls: LibraryFamilyControls {
