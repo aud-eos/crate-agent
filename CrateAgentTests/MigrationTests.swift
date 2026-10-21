@@ -26,6 +26,24 @@ final class MigrationTests: XCTestCase {
         }
     }
 
+    func testKeeperIndexMigrationBackfillsPendingRemovalsSavedBeforeIt() throws {
+        let queue = try DatabaseQueue()
+        let migrator = LibraryDatabase.makeMigrator()
+        try migrator.migrate(queue, upTo: "032_add_keeper_marks")
+        try queue.write { connection in
+            let duplicatePayload = #"{"batchID":"b","keeper":{"token":{"fileId":7,"revision":1}},"target":{"token":{"fileId":9,"revision":1}}}"#
+            let ownerChoicePayload = #"{"batchID":"b","keeper":null,"target":{"token":{"fileId":8,"revision":1}}}"#
+            try connection.execute(sql: "INSERT INTO duplicate_cleanup_intents (target_file_id, payload, step) VALUES (9, ?, 0), (8, ?, 0)",
+                                   arguments: [Data(duplicatePayload.utf8), Data(ownerChoicePayload.utf8)])
+        }
+        try migrator.migrate(queue)
+        try queue.read { connection in
+            XCTAssertTrue(try DuplicateCleanupStore.isKeeper(fileID: 7, in: connection))
+            XCTAssertFalse(try DuplicateCleanupStore.isKeeper(fileID: 8, in: connection))
+            XCTAssertFalse(try DuplicateCleanupStore.isKeeper(fileID: 9, in: connection))
+        }
+    }
+
     func testMigration007AddsMusicBrainzColumns() async throws {
         let database = try LibraryDatabase.openInMemory()
         let columnNames: [String] = try await database.writer.read { connection in

@@ -56,6 +56,32 @@ final class PagedResultsControllerTests: XCTestCase {
         await pagingEventually { controller.row(at: 0)?.name == "new-0" }
     }
 
+    func testInterruptedRefreshKeepsThePagesThatCoveredTheViewport() async {
+        let shown = PagedQueryFixture(rowCount: 600, signature: "old")
+        let controller = PagedResultsController<PagedQueryFixture>()
+        await controller.open(shown)
+        controller.setViewport(0 ..< 10)
+        await pagingEventually { controller.row(at: 0) != nil }
+        let refreshed = PagedQueryFixture(rowCount: 600, signature: "new")
+        await refreshed.holdPages()
+        await controller.open(refreshed)
+        controller.setViewport(0 ..< 10)
+        await pagingEventually { await refreshed.requestedRanges().contains(200 ..< 400) }
+        await refreshed.release(200 ..< 400)
+        await pagingEventually { controller.row(at: 200)?.name == "new-200" }
+        XCTAssertEqual(controller.row(at: 0)?.name, "old-0")
+        let again = PagedQueryFixture(rowCount: 600, signature: "again")
+        await again.holdPages()
+        await controller.open(again)
+        controller.setViewport(0 ..< 10)
+        // The interrupted refresh's held reads finish late, as cancelled reads do, and are ignored.
+        await refreshed.releaseAll()
+        await pagingEventually { await !again.requestedRanges().isEmpty }
+        XCTAssertEqual(controller.row(at: 0)?.name, "old-0", "The viewport's rows stay until a refresh covers it")
+        await again.releaseAll()
+        await pagingEventually { controller.row(at: 0)?.name == "again-0" }
+    }
+
     func testCountAndPageFailuresStayVisibleUntilRetry() async {
         let source = PagedQueryFixture(rowCount: 12, signature: "retry")
         let controller = PagedResultsController<PagedQueryFixture>()

@@ -102,13 +102,14 @@ struct GenreOption: Hashable, Sendable {
         genre.split(whereSeparator: BlankText.isWhitespace).joined(separator: " ").folding(options: [.caseInsensitive, .widthInsensitive], locale: nil)
     }
 
-    /// Groups each distinct stored genre and its file count by normalized form, ordered by display value; blank genres join no group.
-    static func grouped(_ stored: [(value: String, count: Int)]) -> [GenreOption] {
-        Dictionary(grouping: stored) { genre in normalized(genre.value) }.filter { group in !group.key.isEmpty }.values.compactMap { spellings -> GenreOption? in
-            guard let commonest = spellings.max(by: { lhs, rhs in lhs.count != rhs.count ? lhs.count < rhs.count : lhs.value > rhs.value })
-            else { return nil }
-            return GenreOption(value: commonest.value, storedValues: Set(spellings.map(\.value)),
-                               count: spellings.reduce(0) { total, genre in total + genre.count })
+    /// Groups each distinct stored genre and its file count by normalized form, ordered by display value.
+    /// The query already excludes blank genres by the same definition, so a blank group is an error.
+    static func grouped(_ stored: [(value: String, count: Int)]) throws -> [GenreOption] {
+        try Dictionary(grouping: stored) { genre in normalized(genre.value) }.map { group -> GenreOption in
+            guard !group.key.isEmpty, let commonest = group.value.max(by: { lhs, rhs in lhs.count != rhs.count ? lhs.count < rhs.count : lhs.value > rhs.value })
+            else { throw PagingError.blankGenre }
+            return GenreOption(value: commonest.value, storedValues: Set(group.value.map(\.value)),
+                               count: group.value.reduce(0) { total, genre in total + genre.count })
         }.sorted { lhs, rhs in lhs.value.localizedStandardCompare(rhs.value) == .orderedAscending }
     }
 }

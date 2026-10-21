@@ -146,6 +146,7 @@ public final class LibraryDatabase {
         AddChecklistFactsMigration.register(in: &migrator)
         AddSeratoAnalysisMigration.register(in: &migrator)
         AddKeeperMarksMigration.register(in: &migrator)
+        AddCleanupKeeperIndexMigration.register(in: &migrator)
         return migrator
     }
 }

@@ -12,7 +12,7 @@ actor PagedQueryFixture: PagedQuerySnapshot {
     nonisolated let signature: String
     let rowCount: Int
     var held = false
-    var waiters: [CheckedContinuation<Void, Never>] = []
+    var waiters: [(range: Range<Int>, continuation: CheckedContinuation<Void, Never>)] = []
     var ranges: [Range<Int>] = []
     var failPage = false
     var failCount = false
@@ -50,14 +50,23 @@ actor PagedQueryFixture: PagedQuerySnapshot {
         let pending = waiters
         waiters.removeAll()
         for waiter in pending {
-            waiter.resume()
+            waiter.continuation.resume()
+        }
+    }
+
+    /// Lets one held page through while the others stay held.
+    func release(_ range: Range<Int>) {
+        let pending = waiters.filter { waiter in waiter.range == range }
+        waiters.removeAll { waiter in waiter.range == range }
+        for waiter in pending {
+            waiter.continuation.resume()
         }
     }
 
     func rows(in range: Range<Int>) async throws -> [FixtureRow] {
         ranges.append(range)
         if held {
-            await withCheckedContinuation { waiters.append($0) }
+            await withCheckedContinuation { continuation in waiters.append((range, continuation)) }
         }
         if failPage {
             failPage = false

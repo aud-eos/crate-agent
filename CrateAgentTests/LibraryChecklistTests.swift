@@ -65,9 +65,9 @@ final class LibraryChecklistTests: XCTestCase {
         let families = Set(collapsed.compactMap { row in row.familyRole == .main ? row.familyId : nil })
         let expanded = try await self.rows(LibraryBrowseQuery(expandedFamilies: families))
         XCTAssertEqual(expanded.count, 31)
-        let pageScoped = expanded.filter { row in row.familyRole != .main }
+        let chipCounts = try await LibraryPagedSnapshot.open(pool: pool, query: LibraryBrowseQuery()).chipCounts()
         for chip in ChecklistChip.allCases {
-            let shown = try pageScoped.filter { row in
+            let matching = try expanded.filter { row in
                 let checklist = try XCTUnwrap(row.checklist())
                 return switch chip.match {
                 case .needsWork: !checklist.isFinished
@@ -76,6 +76,9 @@ final class LibraryChecklistTests: XCTestCase {
                 case let .failing(item): checklist.failing.contains(item)
                 }
             }
+            // The count covers every file, a family's main row included.
+            XCTAssertEqual(chipCounts[chip], .files(matching.count), chip.rawValue)
+            let shown = matching.filter { row in row.familyRole != .main }
             let filtered = try await titles(LibraryBrowseQuery(chip: chip))
             XCTAssertEqual(filtered.sorted(), shown.map { row in row.title ?? row.path }.sorted(), chip.rawValue)
         }
