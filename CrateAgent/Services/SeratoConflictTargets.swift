@@ -48,6 +48,7 @@ enum SeratoConflictTargets {
         case let .trashFile(payload): fileID = payload.fileId
         case let .removeTrackFromSerato(payload): fileID = payload.fileId
         case let .removeFileFromCrates(payload): fileID = payload.fileId
+        case let .setCrateMembership(payload): fileID = payload.fileId
         case let .restoreFromTrash(payload):
             fileID = try FileRecord.filter(Column("path") == payload.originalPath).fetchOne(database)?.id
             target.paths.append(payload.originalPath)
@@ -211,6 +212,7 @@ extension SeratoPendingWrite {
         case let .removeFromDatabase(payload), let .removeFromCrates(payload): [payload.absolutePath]
         case let .trashFile(payload): [payload.absolutePath]
         case let .restoreRecords(payload): [payload.absolutePath]
+        case let .crateMembership(payload): [payload.absolutePath]
         }
     }
 }

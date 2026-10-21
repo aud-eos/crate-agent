@@ -101,6 +101,7 @@ enum QueuedChangeDiscardMutation {
         case .trackAddedToSerato: [.addTrack]
         case .trackRemovedFromSerato: [.removeFromDatabase]
         case .fileRemovedFromCrates: [.removeFromCrates]
+        case .crateMembershipSet: [.crateMembership]
         case .fileTrashed: [.trashFile]
         case .seratoRecordsRestored: [.restoreRecords]
         case .trackImported, .fileRemoved, .fileRestoredFromTrash, .metadataSet, .fileLibraryStateChanged, .fileLocationObserved, .fileIdentityObserved,
@@ -162,7 +163,7 @@ enum QueuedChangeDiscardMutation {
              .songFamilyRepresentativeChanged, .songFamilyRestored, .songFamilyRecordingLinked, .songFamilyRecordingUnlinked,
              .duplicateLabelsKeptBoth, .duplicateLabelsReopened, .queuedSeratoChangeDiscarded,
              .recordingSeparated, .recordingSeparatedForGrouping, .recordingRejoined,
-             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared:
+             .musicBrainzWorkRecorded, .musicBrainzWorkCleared, .keeperMarked, .keeperCleared, .crateMembershipSet:
             return []
         }
     }

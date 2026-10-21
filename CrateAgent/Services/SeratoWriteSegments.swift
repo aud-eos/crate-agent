@@ -82,7 +82,7 @@ enum SeratoWriteSegmenter {
             case .removeFromDatabase, .restoreRecords:
                 segments.append(SeratoWriteSegment(kind: .single, entries: [entry]))
                 pathEffectsSinceOpen.formUnion(entry.dependency)
-            case .fileTagWrite, .removeFromCrates, .trashFile:
+            case .fileTagWrite, .removeFromCrates, .trashFile, .crateMembership:
                 segments.append(SeratoWriteSegment(kind: .single, entries: [entry]))
             }
         }

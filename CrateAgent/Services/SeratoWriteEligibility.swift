@@ -67,6 +67,8 @@ enum SeratoWriteEligibility {
             result.write = .removeFromDatabase(.init(absolutePath: referencePath(write.absolutePath, file: file)))
         case let .removeFromCrates(write):
             result.write = .removeFromCrates(.init(absolutePath: referencePath(write.absolutePath, file: file)))
+        case let .crateMembership(write):
+            result.write = .crateMembership(.init(absolutePath: file.path, crateFileName: write.crateFileName, present: write.present))
         case .rename, .restoreRecords: break
         }
         return result
@@ -106,6 +108,7 @@ enum SeratoWriteEligibility {
         case let .metadataUpdate(write): try requireReference(write.absolutePath, file: file)
         case let .removeFromDatabase(write): try requireReference(write.absolutePath, file: file)
         case let .removeFromCrates(write): try requireReference(write.absolutePath, file: file)
+        case let .crateMembership(write): try requirePath(write.absolutePath, file: file)
         case let .rename(write):
             // A rename some Serato file already took must finish in the rest,
             // or V2 and the crates would disagree about where its track is.
