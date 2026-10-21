@@ -175,6 +175,8 @@ private final class LibraryBrowserCell: NSTableCellView {
             toolTip = row.popularityDetail
             setAccessibilityLabel("\(title): \(primary.stringValue)")
             return
+        case .prepareRank:
+            preconditionFailure("Prepare rank orders Prepare and is never a Library column")
         case .none:
             primary.stringValue = row.statusText
             primary.textColor = row.canProcess ? .secondaryLabelColor : .systemOrange
@@ -200,8 +202,8 @@ private final class LibraryBrowserCell: NSTableCellView {
 
 /// A row's Still needs tags and the tooltip naming each fix. Unknown items read "<tag> unknown" in secondary color;
 /// a checklist with unexpected bits shows as unreadable, with the reason in the tooltip.
-private struct StillNeedsDisplay {
-    private var parts: [(text: String, color: NSColor)] = []
+struct StillNeedsDisplay {
+    private(set) var parts: [(text: String, color: NSColor)] = []
     private(set) var help: String?
 
     init(row: BrowserRow) {

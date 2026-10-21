@@ -31,7 +31,8 @@ live counts, and combine with search and the genre, BPM and compatible-key
 filters. **Mark as Keeper** protects a recording and counts it as Finished;
 undo it from History. Facts not read yet show as unknown, never as failing. See
 the [library checklist](docs/library-checklist.md). A selection can be
-moved to the Trash as one reviewed, undoable batch.
+moved to the Trash as one reviewed, undoable batch. **Prepare** walks the
+unfinished tracks one card at a time, most promising first, with every fix on it.
 
 Track lists share search and explicit batch selection. Cleanup and Organize start
 with nothing selected; filtered selections remain visible in the counts. See the

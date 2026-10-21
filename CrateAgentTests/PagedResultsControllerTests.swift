@@ -136,3 +136,10 @@ func pagingEventually(file: StaticString = #filePath, line: UInt = #line, _ pred
     }
     XCTFail("Paging did not reach the expected state", file: file, line: line)
 }
+
+extension MainWindowView.Section {
+    /// The sidebar lists the sections in declaration order and hides only Conflicts, the last one.
+    var sidebarRow: Int {
+        Self.allCases.firstIndex(of: self)!
+    }
+}

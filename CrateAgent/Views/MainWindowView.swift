@@ -8,6 +8,7 @@ import SwiftUI
 struct MainWindowView: View {
     enum Section: String, Hashable, CaseIterable, Identifiable {
         case library
+        case prepare
         case organize
         case cleanup
         case autoTag
@@ -22,6 +23,7 @@ struct MainWindowView: View {
         var displayName: String {
             switch self {
             case .library: "Library"
+            case .prepare: PrepareMessages.sectionTitle
             case .organize: "Organize"
             case .cleanup: "Library Cleanup"
             case .autoTag: "Auto-Tag"
@@ -34,6 +36,7 @@ struct MainWindowView: View {
         var iconName: String {
             switch self {
             case .library: "music.note.list"
+            case .prepare: "checklist"
             case .organize: "folder.badge.gearshape"
             case .cleanup: "sparkles"
             case .autoTag: "wand.and.stars"
@@ -94,6 +97,8 @@ struct MainWindowView: View {
         switch selection {
         case .library:
             LibraryBrowserView()
+        case .prepare:
+            PrepareView()
         case .organize:
             OrganizeView()
         case .cleanup:

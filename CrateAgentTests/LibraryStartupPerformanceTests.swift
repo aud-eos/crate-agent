@@ -242,7 +242,7 @@ final class LibraryStartupPerformanceTests: XCTestCase {
         let sidebar = try XCTUnwrap(findSidebar(host))
         let renderLatency = renderStart.duration(to: .now)
         let start = ContinuousClock.now
-        sidebar.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
+        sidebar.selectRowIndexes(IndexSet(integer: MainWindowView.Section.history.sidebarRow), byExtendingSelection: false)
         await pagingEventually { selection.section == .history }
         host.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
