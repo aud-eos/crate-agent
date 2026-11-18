@@ -135,6 +135,16 @@ Nothing in the checklist writes Serato files. The facts are cached in
 crate-agent's database by background services, and the checklist is computed in
 SQL from them each time the Library loads.
 
+The checklist is deliberately not stored as a per-file mask. Its inputs change
+through at least ten writers (metadata mirroring, tag edits, family mutations,
+recording identity, keeper marks, duplicate digests, crate membership, V2 facts,
+cue analysis and play counts), and a stored mask would need invalidation in
+every one of them. SQL is the only source of the rule: it projects `is_finished`
+and `still_needs_count`, and Swift reads them and never recomputes them. If a
+30,000-file query ever misses its 500 ms budget, the fallback is a
+`file_checklist` table maintained by one service on the same observed tables,
+behind the same query contract. It is not a mask updated by each writer.
+
 | Fact | Source | Refreshed |
 | --- | --- | --- |
 | Crate membership | `Subcrates/*.crate`, by `SeratoLibraryFactsService` | After each sync, while Serato is closed, when the crate files change |
@@ -144,6 +154,15 @@ SQL from them each time the Library loads.
 | Play counts | Serato History, by `SeratoPlayCountService` | After each sync, while Serato is closed |
 | Popularity, Hot | ListenBrainz and Deezer, by `PopularityService` | After each sync and every 6 hours, stalest recordings first, once a source is on |
 | Artist, title, genre, BPM, key, bitrate | The indexed `files` columns | With every sync |
+
+Crate membership, beatgrid lock and date added are read by
+`SeratoLibraryFactsService`, not inside `SeratoLibrarySyncSession`, on purpose.
+An unchanged launch takes the checkpoint path, which rebuilds its snapshot from
+cached records and does not parse `database V2`, so a fact read inside the
+session would be missing after such a launch. The session is also the most
+delicate code in the app and should not carry facts it does not need. A new
+read-only fact from `database V2` or the crates belongs in the facts service,
+with its own stamp in `checklist_source_stamps`.
 
 ## Prepare
 
@@ -174,7 +193,7 @@ its signals, and offers the fixes:
   same undoable removal the Library Cleanup uses. It is disabled while Serato
   is running.
 
-Adding to a crate is not offered yet. **Previous** and **Next** move through
+**Previous** and **Next** move through
 the list; a track that becomes Finished leaves it on the next refresh.
 
 ## Popularity and Hot
@@ -190,6 +209,13 @@ recording ID ever leave the machine. A recording no source answered shows
 - **Deezer** receives the ISRC, or the artist and title when there is none, and
   returns the track's rank. A search hit whose artist is not the file's artist is
   discarded.
+
+Spotify is not a source. Its February 2026 Web API changes removed the track and
+artist `popularity` fields and the artist top-tracks endpoint, and limited
+Development Mode apps to 5 users with a Premium owner. Last.fm (`track.getInfo`
+listeners and play count, with a free API key) was considered as an optional
+third source and was not built. None of these services offers a clean per-track
+trending number, which is why Hot is computed here from stored lookups.
 
 **Popularity** is the mean of each source's figure normalized to 0 to 100: ten
 million ListenBrainz listens or a Deezer rank of one million both score 100.
@@ -218,6 +244,6 @@ card, the cue-point card with read, pending, failed and unsupported counts and
 the files that couldn't be read, and the duplicate checklist card. A failure in
 any of them is shown in red with its reason.
 
-The query contract, its CTE order and the budgets are in
-`LibraryChecklist.swift` and the
-[library readiness plan](superpowers/plans/2026-10-18-library-readiness-checklist.md).
+The query contract and its CTE order are in `LibraryChecklist.swift` and
+`LibraryBrowseQuery.swift`. The budgets and measured results are in
+[testing](testing.md#library-checklist-fixture).
